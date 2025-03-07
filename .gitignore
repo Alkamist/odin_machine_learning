@@ -1,0 +1,8 @@
+*.exe
+*.dll
+*.lib
+*.json
+*.csv
+*.txt
+*.sublime-project
+*.sublime-workspace
