@@ -1,8 +1,9 @@
+ols.json
 *.exe
 *.dll
-*.lib
-*.json
 *.csv
-*.txt
-*.sublime-project
-*.sublime-workspace
+*.png
+*.lib
+*.bin
+*.ttf
+*.pdb
