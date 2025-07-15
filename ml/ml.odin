@@ -24,9 +24,8 @@ import "core:thread"
 // the gradients, update parameters, and repeat.
 //
 // One downside to doing all of this from scratch is that this library isn't
-// particularly optimized. Linear calculations are parallelized in batches, but it
-// can definitely be improved. I'm not sure if my approach to parallelization is
-// very good.
+// particularly optimized. Some calculations are parallelized, but they can definitely
+// be improved. I'm not sure if my approach to parallelization is very good.
 
 
 MAX_OPERATIONS :: 4096
@@ -34,12 +33,24 @@ MAX_OPERATIONS :: 4096
 _thread_count := 1
 _thread_pool: thread.Pool
 
+_startup_thread_pool :: proc(thread_count: int) {
+	thread.pool_init(&_thread_pool, context.allocator, thread_count)
+	thread.pool_start(&_thread_pool)
+}
+
+_cleanup_thread_pool :: proc() {
+	thread.pool_join(&_thread_pool)
+	thread.pool_destroy(&_thread_pool)
+	_thread_pool = {}
+}
+
 // Get the current thread count.
 thread_count :: #force_inline proc() -> int {
 	return _thread_count
 }
 
-// Set the thread count for linear calculations.
+// Set the thread count for parallelized calculations.
+// Should only be called from the main thread.
 set_thread_count :: proc(count: int, loc := #caller_location) {
 	assert(count > 0, "Thread count must be at least 1", loc=loc)
 
@@ -48,23 +59,19 @@ set_thread_count :: proc(count: int, loc := #caller_location) {
 		return
 	}
 
-	// Single-threaded.
+	// Cleanup the thread pool if necessary.
+	if _thread_count > 1 {
+		_cleanup_thread_pool()
+	}
+
+	// Single-threaded, no need to startup a new thread pool.
 	if count == 1 {
-		// Cleanup the thread pool if necessary.
-		if _thread_count > 1 {
-			thread.pool_join(&_thread_pool)
-			thread.pool_destroy(&_thread_pool)
-		}
-
 		_thread_count = 1
-
 		return
 	}
 
-	// Multi-threaded.
-	thread.pool_init(&_thread_pool, context.allocator, count)
-	thread.pool_start(&_thread_pool)
-
+	// Multi-threaded, so start up a new thread pool.
+	_startup_thread_pool(count)
 	_thread_count = count
 }
 
@@ -75,8 +82,7 @@ thread_pool_fini :: proc() {
 		return
 	}
 
-	thread.pool_join(&_thread_pool)
-	thread.pool_destroy(&_thread_pool)
+	_cleanup_thread_pool()
 }
 
 // Parallelize a job within the given amount of parallel tasks.
@@ -1242,7 +1248,7 @@ Attention :: struct {
 attention :: proc(input: Array, token_count, head_count: int, causal := true, loc := #caller_location) -> (output: Array) {
 	assert(len(input) % token_count == 0, "Input length must be divisible by token count")
 
-	input_size  := len(input) / token_count
+	input_size := len(input) / token_count
 	assert(input_size % 3 == 0, "Input size must be divisible by 3 (for Q, K, V)", loc=loc)
 
 	output_size := input_size / 3
@@ -1256,14 +1262,46 @@ attention :: proc(input: Array, token_count, head_count: int, causal := true, lo
 	head_size := output_size / head_count
 	scale     := 1.0 / math.sqrt(f32(head_size))
 
-	for t in 0 ..< token_count {
+	op := Operation{
+		input =   input,
+		output =  output,
+		variant = Attention{
+			input_size  = input_size,
+			output_size = output_size,
+			token_count = token_count,
+			head_count  = head_count,
+			head_size   = head_size,
+			scale       = scale,
+			causal      = causal,
+
+			pre_attention_scores  = pre_attention_scores,
+			post_attention_scores = post_attention_scores,
+		}
+	}
+
+	parallelize(token_count, thread_count(), op, proc(index: int, op: Operation) {
+		input, output := op.input, op.output
+
+		variant               := op.variant.(Attention)
+		input_size            := variant.input_size
+		output_size           := variant.output_size
+		token_count           := variant.token_count
+		head_count            := variant.head_count
+		head_size             := variant.head_size
+		scale                 := variant.scale
+		causal                := variant.causal
+		pre_attention_scores  := variant.pre_attention_scores
+		post_attention_scores := variant.post_attention_scores
+
+		t := index
+
 		for h in 0 ..< head_count {
 			query_offset := t * input_size + h * head_size
 			score_offset := h * token_count * token_count + t * token_count
 
-			max_value := math.NEG_INF_F32
-
 			max_t2 := causal ? t : token_count - 1
+
+			max_value := math.NEG_INF_F32
 
 			// Compute raw attention scores.
 			for t2 in 0 ..= max_t2 {
@@ -1316,43 +1354,32 @@ attention :: proc(input: Array, token_count, head_count: int, causal := true, lo
 				}
 			}
 		}
-	}
+	})
 
-	append_operation({
-		input =   input,
-		output =  output,
-		variant = Attention{
-			input_size  = input_size,
-			output_size = output_size,
-			token_count = token_count,
-			head_count  = head_count,
-			head_size   = head_size,
-			scale       = scale,
-			causal      = causal,
-
-			pre_attention_scores  = pre_attention_scores,
-			post_attention_scores = post_attention_scores,
-		}
-	}, loc=loc)
+	append_operation(op, loc=loc)
 
 	return
 }
 
 attention_backward :: proc(op: Operation, loc := #caller_location) {
-	input, output := op.input, op.output
+	token_count := op.variant.(Attention).token_count
 
-	variant               := op.variant.(Attention)
-	input_size            := variant.input_size
-	output_size           := variant.output_size
-	token_count           := variant.token_count
-	head_count            := variant.head_count
-	head_size             := variant.head_size
-	scale                 := variant.scale
-	causal                := variant.causal
-	pre_attention_scores  := variant.pre_attention_scores
-	post_attention_scores := variant.post_attention_scores
+	parallelize(token_count, token_count, op, proc(index: int, op: Operation) {
+		input, output := op.input, op.output
 
-	for t in 0 ..< token_count {
+		variant               := op.variant.(Attention)
+		input_size            := variant.input_size
+		output_size           := variant.output_size
+		token_count           := variant.token_count
+		head_count            := variant.head_count
+		head_size             := variant.head_size
+		scale                 := variant.scale
+		causal                := variant.causal
+		pre_attention_scores  := variant.pre_attention_scores
+		post_attention_scores := variant.post_attention_scores
+
+		t := index
+
 		for h in 0 ..< head_count {
 			score_offset  := h * token_count * token_count + t * token_count
 			query_offset  := t * input_size + h * head_size
@@ -1387,7 +1414,7 @@ attention_backward :: proc(op: Operation, loc := #caller_location) {
 				}
 			}
 		}
-	}
+	})
 }
 
 Rope :: struct {

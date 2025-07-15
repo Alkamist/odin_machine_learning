@@ -13,6 +13,10 @@ Basically, one day I asked the question: is it possible to do machine learning i
 
 This is the result of tugging on that thread. Hopefully someone else finds it useful.
 
+As a good place to start, I'd recommend going into the freeplay example and trying to play CartPole yourself for a while, and see how high of a score you can get. Then go into the ppo example, comment out train(), uncomment play(), and switch MODEL_FILE to cartpole.json. That will have a pretrained model play CartPole at a high level.
+
+Something to keep in mind is that this library is currently CPU only, and not very optimized. Some things are mildly parallelized but there is a ton of room for improvement I think, even on the CPU.
+
 Here are some of the resources that helped me a lot in my research:
 * [3Blue1Brown Neural Network Series](https://www.youtube.com/watch?v=aircAruvnKk)
 * [Crash Course in Deep Learning](https://gpuopen.com/learn/deep_learning_crash_course/)

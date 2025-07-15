@@ -33,7 +33,7 @@ main :: proc() {
 
 	ml.init(1024 * 1024 * 16)
 	ml.set_thread_count(24)
-
+	
 	model := make_model()
 	defer destroy_model(model)
 
