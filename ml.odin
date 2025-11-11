@@ -30,119 +30,134 @@ import "core:thread"
 
 MAX_OPERATIONS :: 4096
 
-_thread_count := 1
-_thread_pool: thread.Pool
+when thread.IS_SUPPORTED {
+	_thread_count := 1
+	_thread_pool: thread.Pool
 
-_startup_thread_pool :: proc(thread_count: int) {
-	thread.pool_init(&_thread_pool, context.allocator, thread_count)
-	thread.pool_start(&_thread_pool)
-}
-
-_cleanup_thread_pool :: proc() {
-	thread.pool_join(&_thread_pool)
-	thread.pool_destroy(&_thread_pool)
-	_thread_pool = {}
-}
-
-// Get the current thread count.
-thread_count :: #force_inline proc() -> int {
-	return _thread_count
-}
-
-// Set the thread count for parallelized calculations.
-// Should only be called from the main thread.
-set_thread_count :: proc(count: int, loc := #caller_location) {
-	assert(count > 0, "Thread count must be at least 1", loc=loc)
-
-	// If the thread count hasn't changed, there's no need to do anything.
-	if count == _thread_count {
-		return
+	_startup_thread_pool :: proc(thread_count: int) {
+		thread.pool_init(&_thread_pool, context.allocator, thread_count)
+		thread.pool_start(&_thread_pool)
 	}
 
-	// Cleanup the thread pool if necessary.
-	if _thread_count > 1 {
+	_cleanup_thread_pool :: proc() {
+		thread.pool_join(&_thread_pool)
+		thread.pool_destroy(&_thread_pool)
+		_thread_pool = {}
+	}
+
+	// Get the current thread count.
+	thread_count :: #force_inline proc() -> int {
+		return _thread_count
+	}
+
+	// Set the thread count for parallelized calculations.
+	// Should only be called from the main thread.
+	set_thread_count :: proc(count: int, loc := #caller_location) {
+		assert(count > 0, "Thread count must be at least 1", loc=loc)
+
+		// If the thread count hasn't changed, there's no need to do anything.
+		if count == _thread_count {
+			return
+		}
+
+		// Cleanup the thread pool if necessary.
+		if _thread_count > 1 {
+			_cleanup_thread_pool()
+		}
+
+		// Single-threaded, no need to startup a new thread pool.
+		if count == 1 {
+			_thread_count = 1
+			return
+		}
+
+		// Multi-threaded, so start up a new thread pool.
+		_startup_thread_pool(count)
+		_thread_count = count
+	}
+
+	@(fini)
+	thread_pool_fini :: proc "contextless" () {
+		// If thread count is 1 or less, there's no need to clean up anything.
+		if _thread_count <= 1 {
+			return
+		}
+
+		context = _global_odin_context
+
 		_cleanup_thread_pool()
 	}
 
-	// Single-threaded, no need to startup a new thread pool.
-	if count == 1 {
-		_thread_count = 1
-		return
+	// Parallelize a job within the given amount of parallel tasks.
+	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data)) {
+		if job_count <= 1 {
+			job(0, data)
+			return
+		}
+
+		if task_count <= 1 || _thread_count <= 1 {
+			for i in 0 ..< job_count {
+				job(i, data)
+			}
+			return
+		}
+
+		Task_Data :: struct {
+			job_count:  int,
+			task_count: int,
+			data:       Data,
+			job:        proc(index: int, data: Data),
+		}
+
+		task_data := Task_Data{
+			job_count  = job_count,
+			task_count = task_count,
+			data       = data,
+			job        = job,
+		}
+
+		task_proc :: proc(task: thread.Task) {
+			task_data := cast(^Task_Data)task.data
+
+			// Calculate bounds for the task.
+			jobs_per_task := (task_data.job_count + task_data.task_count - 1) / task_data.task_count
+			start         := task.user_index * jobs_per_task
+			end           := math.min(start + jobs_per_task, task_data.job_count)
+
+			// Execute jobs within calculated bounds.
+			for i in start ..< end {
+				task_data.job(i, task_data.data)
+			}
+		}
+
+		for i in 0 ..< task_count {
+			// Quick bounds check to avoid creating unnecessary tasks.
+			jobs_per_task := (job_count + task_count - 1) / task_count
+			start         := i * jobs_per_task
+			if start >= job_count {
+				break
+			}
+
+			thread.pool_add_task(&_thread_pool, context.allocator, task_proc, &task_data, i)
+		}
+
+		// Wait for all of the tasks to finish.
+		for !thread.pool_is_empty(&_thread_pool) {
+			thread.pool_pop_done(&_thread_pool)
+		}
+	}
+} else {
+	thread_count :: #force_inline proc() -> int {
+		return 1
 	}
 
-	// Multi-threaded, so start up a new thread pool.
-	_startup_thread_pool(count)
-	_thread_count = count
-}
-
-@(fini)
-thread_pool_fini :: proc "contextless" () {
-	// If thread count is 1 or less, there's no need to clean up anything.
-	if _thread_count <= 1 {
-		return
+	set_thread_count :: proc(count: int, loc := #caller_location) {
 	}
 
-	context = _global_odin_context
-
-	_cleanup_thread_pool()
-}
-
-// Parallelize a job within the given amount of parallel tasks.
-parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data)) {
-	if job_count <= 1 {
-		job(0, data)
-		return
-	}
-
-	if task_count <= 1 || _thread_count <= 1 {
+	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data)) {
 		for i in 0 ..< job_count {
 			job(i, data)
 		}
-		return
-	}
-
-	Task_Data :: struct {
-		job_count:  int,
-		task_count: int,
-		data:       Data,
-		job:        proc(index: int, data: Data),
-	}
-
-	task_data := Task_Data{
-		job_count  = job_count,
-		task_count = task_count,
-		data       = data,
-		job        = job,
-	}
-
-	task_proc :: proc(task: thread.Task) {
-		task_data := cast(^Task_Data)task.data
-
-		// Calculate bounds for the task.
-		jobs_per_task := (task_data.job_count + task_data.task_count - 1) / task_data.task_count
-		start         := task.user_index * jobs_per_task
-		end           := math.min(start + jobs_per_task, task_data.job_count)
-
-		// Execute jobs within calculated bounds.
-		for i in start ..< end {
-			task_data.job(i, task_data.data)
-		}
-	}
-
-	for i in 0 ..< task_count {
-		// Quick bounds check to avoid creating unnecessary tasks.
-		jobs_per_task := (job_count + task_count - 1) / task_count
-		start         := i * jobs_per_task
-		if start >= job_count {
-			break
-		}
-
-		thread.pool_add_task(&_thread_pool, context.allocator, task_proc, &task_data, i)
-	}
-
-	// Wait for all of the tasks to finish.
-	for !thread.pool_is_empty(&_thread_pool) {
-		thread.pool_pop_done(&_thread_pool)
 	}
 }
 
