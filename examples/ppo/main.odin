@@ -7,8 +7,8 @@ import "core:math/rand"
 import "core:slice"
 import "core:encoding/json"
 import "../utility"
-import "../../ml"
-import "../../ml/mlp"
+import ml "../../"
+import "../../mlp"
 
 import game "../cartpole"
 

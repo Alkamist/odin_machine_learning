@@ -76,11 +76,13 @@ set_thread_count :: proc(count: int, loc := #caller_location) {
 }
 
 @(fini)
-thread_pool_fini :: proc() {
+thread_pool_fini :: proc "contextless" () {
 	// If thread count is 1 or less, there's no need to clean up anything.
 	if _thread_count <= 1 {
 		return
 	}
+
+	context = _global_odin_context
 
 	_cleanup_thread_pool()
 }
@@ -166,15 +168,20 @@ Context :: struct {
 }
 
 @(thread_local)
+_global_odin_context: runtime.Context
+
+@(thread_local)
 _ctx: Context
 
 @(init)
-init_global_context_cleaner :: proc() {
+init_global_context_cleaner :: proc "contextless" () {
 	runtime.add_thread_local_cleaner(destroy_global_context)
 }
 
 // Initialize the global context.
 init :: proc(size: int, allocator := context.allocator, loc := #caller_location) {
+	_global_odin_context = context
+
 	destroy_global_context()
 
 	data, err := builtin.make([]byte, size, allocator=allocator, loc=loc)
@@ -184,11 +191,13 @@ init :: proc(size: int, allocator := context.allocator, loc := #caller_location)
 
 // Destroy the global context. Called automatically.
 @(fini)
-destroy_global_context :: proc() {
+destroy_global_context :: proc "contextless" () {
 	if _ctx.arena.data == nil {
 		_ctx = {}
 		return
 	}
+
+	context = _global_odin_context
 
 	builtin.delete(_ctx.arena.data)
 	_ctx = {}

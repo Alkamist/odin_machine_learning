@@ -2,10 +2,9 @@ package main
 
 import "core:fmt"
 import "core:math/rand"
-import "core:slice"
 import "../utility"
-import "../../ml"
-import "../../ml/mlp"
+import ml "../../"
+import "../../mlp"
 
 import game "../cartpole"
 

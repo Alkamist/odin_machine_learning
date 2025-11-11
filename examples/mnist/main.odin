@@ -6,9 +6,8 @@ import "core:math/rand"
 import "core:slice"
 import "core:strconv"
 import "core:encoding/csv"
-import "core:encoding/json"
-import "../../ml"
-import "../../ml/mlp"
+import ml "../../"
+import "../../mlp"
 
 
 // In this example, a Multilayer Perceptron will learn how
@@ -43,7 +42,7 @@ main :: proc() {
 		order[i] = i
 	}
 
-	for epoch in 0 ..< 15 {
+	for epoch in 0 ..< 50 {
 		defer free_all(context.temp_allocator)
 
 		rand.shuffle(order)
@@ -75,7 +74,7 @@ Model :: struct {
 }
 
 make_model :: proc(allocator := context.allocator) -> (model: Model) {
-	model.mlp = mlp.make(MNIST_IMAGE_SIZE, 128, MNIST_CLASS_COUNT)
+	model.mlp = mlp.make(MNIST_IMAGE_SIZE, 128, MNIST_CLASS_COUNT, allocator=allocator)
 	return
 }
 

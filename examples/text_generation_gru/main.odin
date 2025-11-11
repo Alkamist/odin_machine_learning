@@ -2,13 +2,11 @@ package main
 
 import "core:os"
 import "core:fmt"
-import "core:math"
 import "core:math/rand"
-import "core:slice"
 import "../utility"
-import "../../ml"
-import "../../ml/mlp"
-import "../../ml/gru"
+import ml "../../"
+import "../../mlp"
+import "../../gru"
 
 
 // In this example, a Gated Recurrent Unit looks at random

@@ -76,12 +76,12 @@ embedding :: proc(state: State) -> Embedding {
 	}
 }
 
-Category :: enum u32 {
+Category :: enum u64 {
 	Normal,
 	Pole,
 }
 
-Category_Set :: bit_set[Category; u32]
+Category_Set :: bit_set[Category; u64]
 
 Box :: struct {
 	body:  b2.BodyId,
@@ -104,17 +104,18 @@ make_box :: proc(state: State, type: b2.BodyType, position, size: [2]f32, densit
 
 	shape_def                    := b2.DefaultShapeDef()
 	shape_def.density             = density
-	shape_def.friction            = 0
-	shape_def.filter.categoryBits = transmute(u32)category
-	shape_def.filter.maskBits     = transmute(u32)mask
+	shape_def.filter.categoryBits = transmute(u64)category
+	shape_def.filter.maskBits     = transmute(u64)mask
 
 	box.shape = b2.CreatePolygonShape(box.body, shape_def, b2.MakeBox(size.x / 2.0, size.y / 2.0))
+
+	b2.Shape_SetFriction(box.shape, 0)
 
 	return
 }
 
 destroy_box :: proc(box: Box) {
-	if box.shape != {} do b2.DestroyShape(box.shape)
+	if box.shape != {} do b2.DestroyShape(box.shape, true)
 	if box.body  != {} do b2.DestroyBody(box.body)
 }
 

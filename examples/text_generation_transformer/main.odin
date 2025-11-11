@@ -2,12 +2,10 @@ package main
 
 import "core:os"
 import "core:fmt"
-import "core:math"
 import "core:math/rand"
-import "core:slice"
 import "../utility"
-import "../../ml"
-import tfm "../../ml/transformer"
+import ml "../../"
+import tfm "../../transformer"
 
 
 // In this example, a Transformer looks at random snippets of 
