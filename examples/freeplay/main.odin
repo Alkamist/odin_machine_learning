@@ -1,13 +1,11 @@
+// In this example, you can freely play a game without any AI involved.
+
 package main
 
 import "core:fmt"
 import "../utility"
 
 import game "../cartpole"
-
-
-// In this example, you can freely play a game without any AI involved.
-
 
 main :: proc() {
 	defer fmt.println("Finished")

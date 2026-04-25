@@ -1,3 +1,7 @@
+// In this example, you can play either CartPole or Circles by
+// swapping out the import above. An agent will learn from your
+// recorded gameplay.
+
 package main
 
 import "core:fmt"
@@ -7,12 +11,6 @@ import ml "../../"
 import "../../mlp"
 
 import game "../cartpole"
-
-
-// In this example, you can play either CartPole or Circles by
-// swapping out the import above. An agent will learn from your
-// recorded gameplay.
-
 
 main :: proc() {
 	defer fmt.println("Finished")

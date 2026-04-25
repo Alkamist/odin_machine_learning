@@ -1,13 +1,11 @@
+// These are basic utility functions used throughout the examples.
+
 package utility
 
 import "core:time"
 import "core:math"
 import "core:math/rand"
 import "core:slice"
-
-
-// These are basic utility functions used throughout the examples.
-
 
 Rolling_f32 :: struct($N: int) where N > 0 {
 	offset: int,

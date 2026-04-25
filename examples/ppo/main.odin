@@ -1,3 +1,11 @@
+// In this example, Proximal Policy Optimization is used to
+// train a Multilayer Perceptron to play either CartPole or
+// Circles, based on the import.
+//
+// Comment or uncomment train or play to train a model and
+// save it to a file, or load a model from a file and play
+// with it.
+
 package main
 
 import "core:os"
@@ -11,16 +19,6 @@ import ml "../../"
 import "../../mlp"
 
 import game "../cartpole"
-
-
-// In this example, Proximal Policy Optimization is used to
-// train a Multilayer Perceptron to play either CartPole or
-// Circles, based on the import.
-//
-// Comment or uncomment train or play to train a model and
-// save it to a file, or load a model from a file and play
-// with it.
-
 
 MODEL_FILE :: "model.json"
 
@@ -173,8 +171,8 @@ make_model :: proc(allocator := context.allocator) -> (model: Model) {
 }
 
 load_model :: proc(file_name: string, allocator := context.allocator) -> (model: Model) {
-	data, file_ok := os.read_entire_file_from_filename(file_name, allocator=context.temp_allocator)
-	if !file_ok {
+	data, file_err := os.read_entire_file(file_name, allocator=context.temp_allocator)
+	if file_err != nil{
 		fmt.println("Failed to load model file")
 		return make_model()
 	}
@@ -222,7 +220,7 @@ save_model :: proc(model: Model, file_name: string) {
 		return
 	}
 
-	os.write_entire_file(file_name, data)
+	_ = os.write_entire_file(file_name, data)
 }
 
 choose_action :: proc(network: Network, embedding: game.Embedding, sample := false) -> (action: game.Action, log_probability: f32) {

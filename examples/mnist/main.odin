@@ -1,3 +1,9 @@
+// In this example, a Multilayer Perceptron will learn how
+// to look at the raw data of hand-drawn digits from the
+// MNIST dataset and predict which digits they are.
+//
+// You will need to unzip the dataset in the data folder first.
+
 package main
 
 import "core:os"
@@ -8,14 +14,6 @@ import "core:strconv"
 import "core:encoding/csv"
 import ml "../../"
 import "../../mlp"
-
-
-// In this example, a Multilayer Perceptron will learn how
-// to look at the raw data of hand-drawn digits from the
-// MNIST dataset and predict which digits they are.
-//
-// You will need to unzip the dataset in the data folder first.
-
 
 BATCH_SIZE :: 100
 
@@ -125,9 +123,9 @@ Mnist :: struct {
 }
 
 load_mnist :: proc(file_name: string, samples: int, allocator := context.allocator) -> (mnist: Mnist) {
-	file_data, success := os.read_entire_file(file_name, context.temp_allocator)
-	if !success {
-		fmt.eprintln("Failed to load mnist data from ", file_name)
+	file_data, err := os.read_entire_file(file_name, context.temp_allocator)
+	if err != nil {
+		fmt.eprintfln("Failed to load mnist data from ", file_name)
 		return
 	}
 

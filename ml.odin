@@ -1,14 +1,3 @@
-package machine_learning
-
-import "base:runtime"
-import "base:builtin"
-import "core:fmt"
-import "core:mem"
-import "core:math"
-import "core:math/rand"
-import "core:thread"
-
-
 // This library was designed with the goal of exploring and understanding machine
 // learning. Some of the main goals are simplicity and understandability.
 //
@@ -27,6 +16,15 @@ import "core:thread"
 // particularly optimized. Some calculations are parallelized, but they can definitely
 // be improved. I'm not sure if my approach to parallelization is very good.
 
+package machine_learning
+
+import "base:runtime"
+import "base:builtin"
+import "core:fmt"
+import "core:mem"
+import "core:math"
+import "core:math/rand"
+import "core:thread"
 
 MAX_OPERATIONS :: 4096
 

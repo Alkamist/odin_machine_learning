@@ -1,3 +1,8 @@
+// In this example, a Transformer looks at random snippets of 
+// text from the file and learns how to predict the next byte. 
+// You can then predict the next byte and feed the result back 
+// into the network to generate text.
+
 package main
 
 import "core:os"
@@ -6,13 +11,6 @@ import "core:math/rand"
 import "../utility"
 import ml "../../"
 import tfm "../../transformer"
-
-
-// In this example, a Transformer looks at random snippets of 
-// text from the file and learns how to predict the next byte. 
-// You can then predict the next byte and feed the result back 
-// into the network to generate text.
-
 
 FILE_NAME :: "../data/stories_short.txt"
 
@@ -35,10 +33,11 @@ main :: proc() {
 	model := make_model()
 	defer destroy_model(model)
 
-	text, text_ok := os.read_entire_file(FILE_NAME)
-	if !text_ok {
+	text, text_err := os.read_entire_file(FILE_NAME, context.allocator)
+	if text_err != nil {
 		fmt.eprintfln("Failed to read %v", FILE_NAME)
 	}
+	defer delete(text)
 
 	training_split := int(0.9 * f32(len(text)))
 
