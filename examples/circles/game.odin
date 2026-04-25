@@ -1,3 +1,6 @@
+// In this game, the goal is to move the smaller circle into
+// the bigger circle, as centered as possible.
+
 package circles
 
 import "core:time"
@@ -6,11 +9,6 @@ import "core:math/rand"
 import "core:math/linalg"
 import rl "vendor:raylib"
 import "../utility"
-
-
-// In this game, the goal is to move the smaller circle into
-// the bigger circle, as centered as possible.
-
 
 FIXED_DELTA :: 1.0 / 60.0
 

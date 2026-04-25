@@ -20,27 +20,95 @@ package machine_learning
 
 import "base:runtime"
 import "base:builtin"
+import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
 import "core:math"
 import "core:math/rand"
+import "core:simd"
+import "core:sync"
 import "core:thread"
 
 MAX_OPERATIONS :: 4096
 
 when thread.IS_SUPPORTED {
-	_thread_count := 1
-	_thread_pool: thread.Pool
+	// Persistent worker pool. Each worker parks on its own semaphore and is
+	// signaled directly per parallelize call — no per-call allocation, no
+	// global queue, no busy-wait on completion.
+	//
+	// Worker 0 is the calling (main) thread; spawned workers serve task ids
+	// 1 .. _thread_count-1.
+
+	_Worker :: struct {
+		thread:    ^thread.Thread,
+		id:        int,
+		start_sem: sync.Sema,
+	}
+
+	_Dispatch :: struct {
+		chunk_proc: proc(start, end: int, raw: rawptr),
+		data:       rawptr,
+		job_count:  int,
+		task_count: int,
+	}
+
+	_thread_count: int = 1
+
+	_workers:  []^_Worker
+	_shutdown: bool
+	_dispatch: _Dispatch
+	_done_wg:  sync.Wait_Group
+
+	_worker_proc :: proc(t: ^thread.Thread) {
+		w := cast(^_Worker)t.data
+
+		for {
+			sync.sema_wait(&w.start_sem)
+			if _shutdown do return
+
+			d := _dispatch
+			if w.id < d.task_count {
+				chunk := (d.job_count + d.task_count - 1) / d.task_count
+				start := w.id * chunk
+				end   := start + chunk
+				if end > d.job_count do end = d.job_count
+
+				if start < end {
+					d.chunk_proc(start, end, d.data)
+				}
+			}
+
+			sync.wait_group_done(&_done_wg)
+		}
+	}
 
 	_startup_thread_pool :: proc(thread_count: int) {
-		thread.pool_init(&_thread_pool, context.allocator, thread_count)
-		thread.pool_start(&_thread_pool)
+		_shutdown = false
+		n := thread_count - 1
+		_workers = builtin.make([]^_Worker, n)
+		for i in 0 ..< n {
+			w := builtin.new(_Worker)
+			w.id = i + 1
+			w.thread = thread.create(_worker_proc)
+			w.thread.data = w
+			w.thread.init_context = _global_odin_context
+			thread.start(w.thread)
+			_workers[i] = w
+		}
 	}
 
 	_cleanup_thread_pool :: proc() {
-		thread.pool_join(&_thread_pool)
-		thread.pool_destroy(&_thread_pool)
-		_thread_pool = {}
+		_shutdown = true
+		for w in _workers {
+			sync.sema_post(&w.start_sem)
+		}
+		for w in _workers {
+			thread.join(w.thread)
+			thread.destroy(w.thread)
+			builtin.free(w)
+		}
+		builtin.delete(_workers)
+		_workers = nil
 	}
 
 	// Get the current thread count.
@@ -53,30 +121,25 @@ when thread.IS_SUPPORTED {
 	set_thread_count :: proc(count: int, loc := #caller_location) {
 		assert(count > 0, "Thread count must be at least 1", loc=loc)
 
-		// If the thread count hasn't changed, there's no need to do anything.
 		if count == _thread_count {
 			return
 		}
 
-		// Cleanup the thread pool if necessary.
 		if _thread_count > 1 {
 			_cleanup_thread_pool()
 		}
 
-		// Single-threaded, no need to startup a new thread pool.
 		if count == 1 {
 			_thread_count = 1
 			return
 		}
 
-		// Multi-threaded, so start up a new thread pool.
 		_startup_thread_pool(count)
 		_thread_count = count
 	}
 
 	@(fini)
 	thread_pool_fini :: proc "contextless" () {
-		// If thread count is 1 or less, there's no need to clean up anything.
 		if _thread_count <= 1 {
 			return
 		}
@@ -86,63 +149,59 @@ when thread.IS_SUPPORTED {
 		_cleanup_thread_pool()
 	}
 
-	// Parallelize a job within the given amount of parallel tasks.
+	// Parallelize a job over `task_count` workers. Each worker invokes `job`
+	// once per index in its chunk of [0, job_count). The thunk type-erases
+	// `data` and the user `job` pointer so the dispatch state is non-generic.
 	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data)) {
+		Thunk_Data :: struct {
+			data: Data,
+			job:  proc(index: int, data: Data),
+		}
+
+		thunk :: proc(start, end: int, raw: rawptr) {
+			td := cast(^Thunk_Data)raw
+			for i in start ..< end {
+				td.job(i, td.data)
+			}
+		}
+
 		if job_count <= 1 {
 			job(0, data)
 			return
 		}
 
-		if task_count <= 1 || _thread_count <= 1 {
+		n := task_count
+		if n > _thread_count do n = _thread_count
+		if n > job_count     do n = job_count
+
+		if n <= 1 {
 			for i in 0 ..< job_count {
 				job(i, data)
 			}
 			return
 		}
 
-		Task_Data :: struct {
-			job_count:  int,
-			task_count: int,
-			data:       Data,
-			job:        proc(index: int, data: Data),
-		}
+		td := Thunk_Data{data = data, job = job}
 
-		task_data := Task_Data{
+		_dispatch = _Dispatch{
+			chunk_proc = thunk,
+			data       = &td,
 			job_count  = job_count,
-			task_count = task_count,
-			data       = data,
-			job        = job,
+			task_count = n,
 		}
 
-		task_proc :: proc(task: thread.Task) {
-			task_data := cast(^Task_Data)task.data
-
-			// Calculate bounds for the task.
-			jobs_per_task := (task_data.job_count + task_data.task_count - 1) / task_data.task_count
-			start         := task.user_index * jobs_per_task
-			end           := math.min(start + jobs_per_task, task_data.job_count)
-
-			// Execute jobs within calculated bounds.
-			for i in start ..< end {
-				task_data.job(i, task_data.data)
-			}
+		// Wake n-1 spawned workers; main thread runs slice 0 itself.
+		sync.wait_group_add(&_done_wg, n - 1)
+		for i in 0 ..< n - 1 {
+			sync.sema_post(&_workers[i].start_sem)
 		}
 
-		for i in 0 ..< task_count {
-			// Quick bounds check to avoid creating unnecessary tasks.
-			jobs_per_task := (job_count + task_count - 1) / task_count
-			start         := i * jobs_per_task
-			if start >= job_count {
-				break
-			}
+		chunk := (job_count + n - 1) / n
+		end := chunk
+		if end > job_count do end = job_count
+		thunk(0, end, &td)
 
-			thread.pool_add_task(&_thread_pool, context.allocator, task_proc, &task_data, i)
-		}
-
-		// Wait for all of the tasks to finish.
-		for !thread.pool_is_empty(&_thread_pool) {
-			thread.pool_pop_done(&_thread_pool)
-		}
+		sync.wait_group_wait(&_done_wg)
 	}
 } else {
 	thread_count :: #force_inline proc() -> int {
@@ -1153,6 +1212,74 @@ deinterleave_backward :: proc(op: Operation, loc := #caller_location) {
 	}
 }
 
+// Use 8-lane (256-bit / AVX) SIMD when the target supports AVX; otherwise fall
+// back to plain scalar loops that LLVM auto-vectorizes for whatever the target
+// does support (typically 4-lane SSE). Forcing 256-bit ops on a non-AVX target
+// makes LLVM emit 2x128 SSE pairs plus a software fma (mul+add), which ends up
+// noticeably slower than letting the compiler auto-vectorize the scalar form.
+_HAS_AVX :: intrinsics.has_target_feature("avx")
+
+when _HAS_AVX {
+	_SIMD_LANES :: 8
+	_F32x8      :: #simd[_SIMD_LANES]f32
+
+	// sum(a[i] * b[i]) for i in 0..<n. Uses FMA when available.
+	_simd_dot_f32 :: #force_inline proc "contextless" (a, b: [^]f32, n: int) -> f32 {
+		acc: _F32x8
+		i := 0
+		for ; i + _SIMD_LANES <= n; i += _SIMD_LANES {
+			av := intrinsics.unaligned_load((^_F32x8)(&a[i]))
+			bv := intrinsics.unaligned_load((^_F32x8)(&b[i]))
+			acc = simd.fma(av, bv, acc)
+		}
+		sum := simd.reduce_add_bisect(acc)
+		for ; i < n; i += 1 {
+			sum += a[i] * b[i]
+		}
+		return sum
+	}
+
+	// y[i] += a * x[i] for i in 0..<n. Standard SAXPY.
+	_simd_axpy_f32 :: #force_inline proc "contextless" (y, x: [^]f32, a: f32, n: int) {
+		av := _F32x8(a)
+		i := 0
+		for ; i + _SIMD_LANES <= n; i += _SIMD_LANES {
+			xv := intrinsics.unaligned_load((^_F32x8)(&x[i]))
+			yv := intrinsics.unaligned_load((^_F32x8)(&y[i]))
+			intrinsics.unaligned_store((^_F32x8)(&y[i]), simd.fma(xv, av, yv))
+		}
+		for ; i < n; i += 1 {
+			y[i] += a * x[i]
+		}
+	}
+} else {
+	// Use 4 independent accumulators so LLVM can auto-vectorize the reduction
+	// into parallel SSE adds. A single accumulator forces a serial fp dep chain
+	// (fp add isn't associative without -ffast-math) and the loop ends up
+	// running scalar.
+	_simd_dot_f32 :: #force_inline proc "contextless" (a, b: [^]f32, n: int) -> f32 {
+		s0, s1, s2, s3: f32
+		i := 0
+		for ; i + 4 <= n; i += 4 {
+			s0 += a[i + 0] * b[i + 0]
+			s1 += a[i + 1] * b[i + 1]
+			s2 += a[i + 2] * b[i + 2]
+			s3 += a[i + 3] * b[i + 3]
+		}
+		sum := (s0 + s1) + (s2 + s3)
+		for ; i < n; i += 1 {
+			sum += a[i] * b[i]
+		}
+		return sum
+	}
+
+	_simd_axpy_f32 :: #force_inline proc "contextless" (y, x: [^]f32, a: f32, n: int) {
+		for i in 0 ..< n {
+			y[i] += a * x[i]
+		}
+	}
+}
+
 Linear :: struct {
 	weight:      Array,
 	input_size:  int,
@@ -1191,27 +1318,16 @@ linear :: proc(input, weight: Array, count := 1, loc := #caller_location) -> (ou
 		weight      := variant.weight
 		input_size  := variant.input_size
 		output_size := variant.output_size
-		count       := variant.count
 
-		BLOCK_SIZE :: 8
+		input_ptr  := ([^]f32)(raw_data(input.data))
+		output_ptr := ([^]f32)(raw_data(output.data))
+		weight_ptr := ([^]f32)(raw_data(weight.data))
 
-		input_offset  := index * input_size
-		output_offset := index * output_size
+		x := input_ptr [index * input_size:]
+		y := output_ptr[index * output_size:]
 
-		for o_block := 0; o_block < output_size; o_block += BLOCK_SIZE {
-			o_end := math.min(o_block + BLOCK_SIZE, output_size)
-
-			for i_block := 0; i_block < input_size; i_block += BLOCK_SIZE {
-				i_end := math.min(i_block + BLOCK_SIZE, input_size)
-
-				for o in o_block ..< o_end {
-					sum: f32
-					for i in i_block ..< i_end {
-						sum += weight.data[o * input_size + i] * input.data[input_offset + i]
-					}
-					output.data[output_offset + o] += sum
-				}
-			}
+		for o in 0 ..< output_size {
+			y[o] = _simd_dot_f32(weight_ptr[o * input_size:], x, input_size)
 		}
 	})
 
@@ -1231,23 +1347,27 @@ linear_backward :: proc(op: Operation, loc := #caller_location) {
 		input_size  := variant.input_size
 		output_size := variant.output_size
 
-		input_offset  := index * input_size
-		output_offset := index * output_size
+		input_data_ptr  := ([^]f32)(raw_data(input.data))
+		input_grad_ptr  := ([^]f32)(raw_data(input.gradient))
+		output_grad_ptr := ([^]f32)(raw_data(output.gradient))
+		weight_data_ptr := ([^]f32)(raw_data(weight.data))
+		weight_grad_ptr := ([^]f32)(raw_data(weight.gradient))
+
+		x      := input_data_ptr [index * input_size:]
+		dx     := input_grad_ptr [index * input_size:]
+		dy     := output_grad_ptr[index * output_size:]
 
 		for o in 0 ..< output_size {
-			output_gradient := output.gradient[output_offset + o]
+			dout := dy[o]
+			if dout == 0 do continue
 
-			if output_gradient == 0 do continue
+			w_data := weight_data_ptr[o * input_size:]
+			w_grad := weight_grad_ptr[o * input_size:]
 
-			w := o * input_size
-
-			for i in 0 ..< input_size {
-				weight.gradient[w + i] += input.data[input_offset + i] * output_gradient
-			}
-
-			for i in 0 ..< input_size {
-				input.gradient[input_offset + i] += weight.data[w + i] * output_gradient
-			}
+			// weight.gradient[o, :] += x * dout
+			_simd_axpy_f32(w_grad, x, dout, input_size)
+			// input.gradient[c, :] += weight[o, :] * dout
+			_simd_axpy_f32(dx, w_data, dout, input_size)
 		}
 	})
 }
@@ -1317,6 +1437,9 @@ attention :: proc(input: Array, token_count, head_count: int, causal := true, lo
 
 		t := index
 
+		input_ptr  := ([^]f32)(raw_data(input.data))
+		output_ptr := ([^]f32)(raw_data(output.data))
+
 		for h in 0 ..< head_count {
 			query_offset := t * input_size + h * head_size
 			score_offset := h * token_count * token_count + t * token_count
@@ -1325,25 +1448,17 @@ attention :: proc(input: Array, token_count, head_count: int, causal := true, lo
 
 			max_value := math.NEG_INF_F32
 
-			// Compute raw attention scores.
+			// Compute raw attention scores: dot(Q[t,h], K[t2,h]) * scale.
 			for t2 in 0 ..= max_t2 {
 				key_offset := t2 * input_size + h * head_size + output_size
 
-				// Compute dot product between query and key.
-				value: f32
-				for i in 0 ..< head_size {
-					value += input.data[query_offset + i] * input.data[key_offset + i]
-				}
-
-				// Apply scaling factor.
+				value := _simd_dot_f32(input_ptr[query_offset:], input_ptr[key_offset:], head_size)
 				value *= scale
 
-				// Track maximum for numerical stability.
 				if value > max_value {
 					max_value = value
 				}
 
-				// Store raw attention score.
 				pre_attention_scores.data[score_offset + t2] = value
 			}
 
@@ -1367,13 +1482,11 @@ attention :: proc(input: Array, token_count, head_count: int, causal := true, lo
 
 			output_offset := t * output_size + h * head_size
 
-			// Accumulate weighted values.
+			// Accumulate weighted values: output[t,h] += sum_t2 score[t,t2] * V[t2,h].
 			for t2 in 0 ..= max_t2 {
 				value_offset := t2 * input_size + h * head_size + output_size * 2
 				score        := post_attention_scores.data[score_offset + t2]
-				for i in 0 ..< head_size {
-					output.data[output_offset + i] += score * input.data[value_offset + i]
-				}
+				_simd_axpy_f32(output_ptr[output_offset:], input_ptr[value_offset:], score, head_size)
 			}
 		}
 	})
@@ -1409,13 +1522,24 @@ attention_backward :: proc(op: Operation, loc := #caller_location) {
 
 			max_t2 := causal ? t : token_count - 1
 
+			input_data_ptr  := ([^]f32)(raw_data(input.data))
+			input_grad_ptr  := ([^]f32)(raw_data(input.gradient))
+			output_grad_ptr := ([^]f32)(raw_data(output.gradient))
+
 			// Backpropagate through weighted sum of values.
+			//   post_attn_grad[t2] += dot(V[t2,h], dout[t,h])
+			//   input_grad[V[t2,h]] += post_attn[t2] * dout[t,h]
 			for t2 in 0 ..= max_t2 {
 				value_offset := t2 * input_size + h * head_size + output_size * 2
-				for i in 0 ..< head_size {
-					post_attention_scores.gradient[score_offset + t2] += input.data[value_offset + i] * output.gradient[output_offset + i]
-					input.gradient[value_offset + i] += post_attention_scores.data[score_offset + t2] * output.gradient[output_offset + i]
-				}
+
+				post_attention_scores.gradient[score_offset + t2] += _simd_dot_f32(
+					input_data_ptr[value_offset:],
+					output_grad_ptr[output_offset:],
+					head_size,
+				)
+
+				score := post_attention_scores.data[score_offset + t2]
+				_simd_axpy_f32(input_grad_ptr[value_offset:], output_grad_ptr[output_offset:], score, head_size)
 			}
 
 			// Backpropagate through softmax.
@@ -1428,12 +1552,15 @@ attention_backward :: proc(op: Operation, loc := #caller_location) {
 			}
 
 			// Backpropagate through scaled dot product.
+			//   input_grad[Q[t,h]] += factor * K[t2,h]
+			//   input_grad[K[t2,h]] += factor * Q[t,h]
+			// where factor = pre_attn_grad[t2] * scale.
 			for t2 in 0 ..= max_t2 {
 				key_offset := t2 * input_size + h * head_size + output_size
-				for i in 0 ..< head_size {
-					input.gradient[query_offset + i] += input.data[key_offset + i] * pre_attention_scores.gradient[score_offset + t2] * scale
-					input.gradient[key_offset + i]   += input.data[query_offset + i] * pre_attention_scores.gradient[score_offset + t2] * scale
-				}
+				factor     := pre_attention_scores.gradient[score_offset + t2] * scale
+
+				_simd_axpy_f32(input_grad_ptr[query_offset:], input_data_ptr[key_offset:],   factor, head_size)
+				_simd_axpy_f32(input_grad_ptr[key_offset:],   input_data_ptr[query_offset:], factor, head_size)
 			}
 		}
 	})

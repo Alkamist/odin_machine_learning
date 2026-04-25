@@ -1,15 +1,13 @@
+// In this game, the goal is to flip the rod so it points upward,
+// and maintain it in that position as straight as possible for
+// as long as possible.
+
 package cartpole
 
 import "core:math"
 import rl "vendor:raylib"
 import b2 "vendor:box2d"
 import "../utility"
-
-
-// In this game, the goal is to flip the rod so it points upward,
-// and maintain it in that position as straight as possible for
-// as long as possible.
-
 
 FIXED_DELTA :: 1.0 / 60.0
 
