@@ -1,0 +1,28 @@
+// Merge three same-shape buffers into a striped output along the trailing
+// dim. Used to reassemble QKV after per-stream RoPE on Q and K.
+//   out[i*3 + 0] = a[i]
+//   out[i*3 + 1] = b[i]
+//   out[i*3 + 2] = c[i]
+//
+// Variadic interleave on the CPU is variable-stream; the transformer only
+// uses 3-way (Q/K/V), so a fixed kernel keeps things simple.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer A   { float a[]; };
+layout(set = 0, binding = 1) readonly  buffer B   { float b[]; };
+layout(set = 0, binding = 2) readonly  buffer C   { float c[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
+
+layout(push_constant) uniform Params {
+    uint n_in;        // element count of each of a, b, c
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n_in) return;
+    o[i * 3u + 0u] = a[i];
+    o[i * 3u + 1u] = b[i];
+    o[i * 3u + 2u] = c[i];
+}

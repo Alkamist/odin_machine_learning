@@ -39,13 +39,13 @@ when thread.IS_SUPPORTED {
 	// Worker 0 is the calling (main) thread; spawned workers serve task ids
 	// 1 .. _thread_count-1.
 
-	_Worker :: struct {
+	Worker :: struct {
 		thread:    ^thread.Thread,
 		id:        int,
 		start_sem: sync.Sema,
 	}
 
-	_Dispatch :: struct {
+	Dispatch :: struct {
 		chunk_proc: proc(start, end: int, raw: rawptr),
 		data:       rawptr,
 		job_count:  int,
@@ -54,13 +54,13 @@ when thread.IS_SUPPORTED {
 
 	_thread_count: int = 1
 
-	_workers:  []^_Worker
+	_workers:  []^Worker
 	_shutdown: bool
-	_dispatch: _Dispatch
+	_dispatch: Dispatch
 	_done_wg:  sync.Wait_Group
 
 	_worker_proc :: proc(t: ^thread.Thread) {
-		w := cast(^_Worker)t.data
+		w := cast(^Worker)t.data
 
 		for {
 			sync.sema_wait(&w.start_sem)
@@ -85,9 +85,9 @@ when thread.IS_SUPPORTED {
 	_startup_thread_pool :: proc(thread_count: int) {
 		_shutdown = false
 		n := thread_count - 1
-		_workers = builtin.make([]^_Worker, n)
+		_workers = builtin.make([]^Worker, n)
 		for i in 0 ..< n {
-			w := builtin.new(_Worker)
+			w := builtin.new(Worker)
 			w.id = i + 1
 			w.thread = thread.create(_worker_proc)
 			w.thread.data = w
@@ -183,7 +183,7 @@ when thread.IS_SUPPORTED {
 
 		td := Thunk_Data{data = data, job = job}
 
-		_dispatch = _Dispatch{
+		_dispatch = Dispatch{
 			chunk_proc = thunk,
 			data       = &td,
 			job_count  = job_count,
@@ -566,6 +566,7 @@ Operation_Variant :: union {
 	Transpose,
 	Select,
 	Slice,
+	Slice_Trailing,
 	Concat,
 	Interleave,
 	Deinterleave,
@@ -629,6 +630,7 @@ backward :: proc(loc := #caller_location) {
 		case Transpose:          transpose_backward         (op, loc=loc)
 		case Select:             select_backward            (op, loc=loc)
 		case Slice:              slice_backward             (op, loc=loc)
+		case Slice_Trailing:     slice_trailing_backward    (op, loc=loc)
 		case Concat:             concat_backward            (op, loc=loc)
 		case Interleave:         interleave_backward        (op, loc=loc)
 		case Deinterleave:       deinterleave_backward      (op, loc=loc)
@@ -1178,6 +1180,61 @@ slice_backward :: proc(op: Operation, loc := #caller_location) {
 	}
 }
 
+Slice_Trailing :: struct {
+	start, end: int,
+}
+
+// Slice along the trailing dim, preserving rank. Output shape =
+// input.shape with the trailing dim replaced by (end - start).
+@(require_results)
+slice_trailing :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank >= 1, "slice_trailing input must have rank >= 1", loc=loc)
+	trailing := input.shape[input.rank - 1]
+	fmt.assertf(start >= 0 && end <= trailing && start <= end, "slice_trailing indices out of bounds %v:%v (trailing=%v)", start, end, trailing, loc=loc)
+
+	new_trailing := end - start
+	output = _zeros_replace_trailing(input, new_trailing, loc=loc)
+
+	leading := _leading_count(input)
+	for r in 0 ..< leading {
+		in_off  := r * trailing + start
+		out_off := r * new_trailing
+		for i in 0 ..< new_trailing {
+			output.data[out_off + i] = input.data[in_off + i]
+		}
+	}
+
+	append_operation({
+		input   = input,
+		output  = output,
+		variant = Slice_Trailing{
+			start = start,
+			end   = end,
+		},
+	}, loc=loc)
+
+	return
+}
+
+slice_trailing_backward :: proc(op: Operation, loc := #caller_location) {
+	input, output := op.input, op.output
+
+	variant := op.variant.(Slice_Trailing)
+	start   := variant.start
+
+	trailing     := input.shape[input.rank - 1]
+	new_trailing := output.shape[output.rank - 1]
+	leading      := _leading_count(input)
+
+	for r in 0 ..< leading {
+		in_off  := r * trailing + start
+		out_off := r * new_trailing
+		for i in 0 ..< new_trailing {
+			input.gradient[in_off + i] += output.gradient[out_off + i]
+		}
+	}
+}
+
 Concat :: struct {
 	inputs: []Tensor,
 }
@@ -1206,10 +1263,20 @@ concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 
 	output = _zeros_replace_trailing(first, trailing_sum, loc=loc)
 
-	start := 0
+	leading      := _leading_count(first)
+	out_trailing := trailing_sum
+
+	dst_col := 0
 	for input in inputs_copy {
-		builtin.copy(output.data[start:][:len(input)], input.data)
-		start += len(input)
+		in_trailing := input.shape[input.rank - 1]
+		for r in 0 ..< leading {
+			out_off := r * out_trailing + dst_col
+			in_off  := r * in_trailing
+			for i in 0 ..< in_trailing {
+				output.data[out_off + i] = input.data[in_off + i]
+			}
+		}
+		dst_col += in_trailing
 	}
 
 	append_operation({
@@ -1229,12 +1296,20 @@ concat_backward :: proc(op: Operation, loc := #caller_location) {
 	variant := op.variant.(Concat)
 	inputs  := variant.inputs
 
-	start := 0
+	leading      := _leading_count(inputs[0])
+	out_trailing := output.shape[output.rank - 1]
+
+	src_col := 0
 	for input in inputs {
-		for i in 0 ..< len(input) {
-			input.gradient[i] += output.gradient[start + i]
+		in_trailing := input.shape[input.rank - 1]
+		for r in 0 ..< leading {
+			out_off := r * out_trailing + src_col
+			in_off  := r * in_trailing
+			for i in 0 ..< in_trailing {
+				input.gradient[in_off + i] += output.gradient[out_off + i]
+			}
 		}
-		start += len(input)
+		src_col += in_trailing
 	}
 }
 
@@ -1344,19 +1419,19 @@ deinterleave_backward :: proc(op: Operation, loc := #caller_location) {
 // does support (typically 4-lane SSE). Forcing 256-bit ops on a non-AVX target
 // makes LLVM emit 2x128 SSE pairs plus a software fma (mul+add), which ends up
 // noticeably slower than letting the compiler auto-vectorize the scalar form.
-_HAS_AVX :: intrinsics.has_target_feature("avx")
+HAS_AVX :: intrinsics.has_target_feature("avx")
 
-when _HAS_AVX {
-	_SIMD_LANES :: 8
-	_F32x8      :: #simd[_SIMD_LANES]f32
+when HAS_AVX {
+	SIMD_LANES :: 8
+	F32x8      :: #simd[SIMD_LANES]f32
 
 	// sum(a[i] * b[i]) for i in 0..<n. Uses FMA when available.
 	_simd_dot_f32 :: #force_inline proc "contextless" (a, b: [^]f32, n: int) -> f32 {
-		acc: _F32x8
+		acc: F32x8
 		i := 0
-		for ; i + _SIMD_LANES <= n; i += _SIMD_LANES {
-			av := intrinsics.unaligned_load((^_F32x8)(&a[i]))
-			bv := intrinsics.unaligned_load((^_F32x8)(&b[i]))
+		for ; i + SIMD_LANES <= n; i += SIMD_LANES {
+			av := intrinsics.unaligned_load((^F32x8)(&a[i]))
+			bv := intrinsics.unaligned_load((^F32x8)(&b[i]))
 			acc = simd.fma(av, bv, acc)
 		}
 		sum := simd.reduce_add_bisect(acc)
@@ -1368,12 +1443,12 @@ when _HAS_AVX {
 
 	// y[i] += a * x[i] for i in 0..<n. Standard SAXPY.
 	_simd_axpy_f32 :: #force_inline proc "contextless" (y, x: [^]f32, a: f32, n: int) {
-		av := _F32x8(a)
+		av := F32x8(a)
 		i := 0
-		for ; i + _SIMD_LANES <= n; i += _SIMD_LANES {
-			xv := intrinsics.unaligned_load((^_F32x8)(&x[i]))
-			yv := intrinsics.unaligned_load((^_F32x8)(&y[i]))
-			intrinsics.unaligned_store((^_F32x8)(&y[i]), simd.fma(xv, av, yv))
+		for ; i + SIMD_LANES <= n; i += SIMD_LANES {
+			xv := intrinsics.unaligned_load((^F32x8)(&x[i]))
+			yv := intrinsics.unaligned_load((^F32x8)(&y[i]))
+			intrinsics.unaligned_store((^F32x8)(&y[i]), simd.fma(xv, av, yv))
 		}
 		for ; i < n; i += 1 {
 			y[i] += a * x[i]

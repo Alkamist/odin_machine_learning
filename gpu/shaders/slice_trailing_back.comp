@@ -1,0 +1,24 @@
+// Backward of slice_trailing. Scatters dy back into the [start, start +
+// new_trailing) slice of dx. Other columns of dx are untouched (they get
+// their gradient from sibling ops).
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0)          buffer DX { float dx[]; };
+layout(set = 0, binding = 1) readonly buffer DY { float dy[]; };
+
+layout(push_constant) uniform Params {
+    uint leading;
+    uint trailing;       // dx trailing dim
+    uint new_trailing;   // dy trailing dim (= end - start)
+    uint start;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.leading * p.new_trailing) return;
+    uint r = gid / p.new_trailing;
+    uint i = gid % p.new_trailing;
+    dx[r * p.trailing + p.start + i] += dy[r * p.new_trailing + i];
+}

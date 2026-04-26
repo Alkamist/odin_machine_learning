@@ -1,0 +1,25 @@
+// Embedding lookup: out[i, j] = table[indices[i], j]
+//   table:   [vocab, size]
+//   indices: [n_indices]   (uint32, see select.odin for int->u32 conversion)
+//   out:     [n_indices, size]
+//
+// 2D dispatch: WG.x covers `size` along the column, WG.y picks the index.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer T   { float t[];  };
+layout(set = 0, binding = 1) readonly  buffer Idx { uint  ix[]; };
+layout(set = 0, binding = 2) writeonly buffer O   { float o[];  };
+
+layout(push_constant) uniform Params {
+    uint n_indices;
+    uint size;
+} p;
+
+void main() {
+    uint i = gl_WorkGroupID.y;
+    uint j = gl_GlobalInvocationID.x;
+    if (i >= p.n_indices || j >= p.size) return;
+    o[i * p.size + j] = t[ix[i] * p.size + j];
+}

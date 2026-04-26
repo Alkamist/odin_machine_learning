@@ -15,8 +15,8 @@ import "core:time"
 import "core:os"
 import "core:math"
 import "core:math/rand"
-import ml "../"
-import tfm "../transformer"
+import ml "../../"
+import tfm "../../transformer"
 
 // Fixed seed so checksums are reproducible across runs (and across versions).
 SEED :: 0xC0FFEE
@@ -51,6 +51,14 @@ main :: proc() {
 
 	fmt.printfln("threads=%v warmup=%v iterations=%v", thread_count, WARMUP, ITERATIONS)
 	fmt.println("================================================================")
+
+	// Run once before timing: verifies multi-step training trajectory from a
+	// fresh seeded model. Per-iteration losses + final param checksum should
+	// match across versions (within ~1 ULP on ST). Catches backward/update
+	// bugs that the single-step forward checksums in the timed benches miss.
+	ml.set_thread_count(1)
+	verify_training_trajectory()
+	fmt.println()
 
 	// Sweep thread counts so threading overhead vs SIMD work-per-thread is
 	// visible. Single-threaded numbers are the algorithmic ground truth;
@@ -134,6 +142,14 @@ sum :: proc(t: ml.Tensor) -> f32 {
 	return s
 }
 
+sum_grad :: proc(t: ml.Tensor) -> f32 {
+	s: f32
+	for v in t.gradient {
+		s += v
+	}
+	return s
+}
+
 // --- Micro-benchmarks ---
 
 // Small-batch linear: count=1 means parallelize-over-count gives no parallelism.
@@ -177,7 +193,7 @@ bench_linear_inference :: proc() -> Result {
 		ml.fill_value(x, 0.01)
 		y := ml.linear(x, w_state)
 		ml.backward()
-		return sum(y)
+		return sum(y) + sum_grad(x) + sum_grad(w_state)
 	}
 
 	state_w = w
@@ -225,7 +241,7 @@ bench_linear_training :: proc() -> Result {
 		ml.fill_value(x, 0.01)
 		y := ml.linear(x, w_state)
 		ml.backward()
-		return sum(y)
+		return sum(y) + sum_grad(x) + sum_grad(w_state)
 	}
 
 	state_w = w
@@ -244,7 +260,7 @@ bench_attention :: proc() -> Result {
 		ml.fill_value(qkv, 0.01)
 		y := ml.attention(qkv, HEADS)
 		ml.backward()
-		return sum(y)
+		return sum(y) + sum_grad(qkv)
 	}
 
 	return time_iters("attention forward+backward (64t, 4h, 128e)", run)
@@ -265,7 +281,7 @@ bench_layernorm :: proc() -> Result {
 		ml.fill_value(x, 0.01)
 		y := ml.layernorm(x, w_state)
 		ml.backward()
-		return sum(y)
+		return sum(y) + sum_grad(x) + sum_grad(w_state)
 	}
 
 	state_w = w
@@ -282,7 +298,7 @@ bench_softmax :: proc() -> Result {
 		ml.fill_value(x, 0.01)
 		y := ml.softmax(x)
 		ml.backward()
-		return sum(y)
+		return sum(y) + sum_grad(x)
 	}
 
 	return time_iters("softmax forward+backward (64x256)", run)
@@ -297,7 +313,7 @@ bench_gelu :: proc() -> Result {
 		ml.fill_value(x, 0.01)
 		y := ml.gelu(x)
 		ml.backward()
-		return sum(y)
+		return sum(y) + sum_grad(x)
 	}
 
 	return time_iters("gelu forward+backward (32768)", run)
@@ -326,7 +342,11 @@ bench_adam_update :: proc() -> Result {
 		if ml.optimize(&opt, period = 1) {
 			ml.update(opt, w_state)
 		}
-		return w_state.data[0]
+		s: f32
+		for v in w_state.data {
+			s += v
+		}
+		return s
 	}
 
 	return time_iters("adam update (65536 params)", run)
@@ -376,6 +396,60 @@ bench_transformer_step :: proc() -> Result {
 	}
 
 	return time_iters("transformer training step (4L 4H 128e 64t)", run)
+}
+
+// Multi-step training trajectory check. Builds a fresh seeded transformer,
+// runs TRAJECTORY_STEPS optimizer steps, and prints the loss after each step
+// plus a final parameter checksum. Loss should decrease monotonically (or
+// near-so) and the per-step values + final checksum should match across
+// versions on a single thread (within ~1 ULP). This catches backward/update
+// bugs that the iteration-0 forward checksums in the timed benches miss.
+TRAJECTORY_STEPS :: 10
+
+verify_training_trajectory :: proc() {
+	rand.reset(SEED)
+	model := tfm.make(E2E_LAYERS, E2E_HEADS, E2E_EMBEDDING_SIZE, E2E_VOCABULARY)
+	defer tfm.destroy(model)
+
+	tokens := make([]int, E2E_SEQUENCE_LENGTH)
+	defer delete(tokens)
+	targets := make([]int, E2E_SEQUENCE_LENGTH)
+	defer delete(targets)
+	for i in 0 ..< E2E_SEQUENCE_LENGTH {
+		tokens[i]  = i % E2E_VOCABULARY
+		targets[i] = (i + 1) % E2E_VOCABULARY
+	}
+
+	fmt.println("--- training trajectory (single-threaded, fresh model) ---")
+	fmt.printfln("%-10s %16s", "step", "loss")
+
+	for step in 0 ..< TRAJECTORY_STEPS {
+		ml.clear()
+		logits := tfm.forward(model, tokens)
+		ce     := ml.cross_entropy(logits, targets)
+		loss   := ml.mean(ce)
+		ml.backward()
+
+		opt: ml.Optimizer
+		if ml.optimize(&opt, period = 1) {
+			tfm.update(opt, model)
+		}
+
+		step_s := fmt.tprintf("%v", step)
+		loss_s := fmt.tprintf("%.6f", loss.data[0])
+		fmt.printfln("%-10s %16s", step_s, loss_s)
+	}
+
+	// Final parameter checksum: forward once more on the trained model and
+	// sum the logits. Sensitive to any drift in the trained weights.
+	ml.clear()
+	final_logits := tfm.forward(model, tokens)
+	checksum: f32
+	for v in final_logits.data {
+		checksum += v
+	}
+	csum_s := fmt.tprintf("%.6f", checksum)
+	fmt.printfln("final logits checksum: %16s", csum_s)
 }
 
 // Module-local globals used to smuggle setup state into the closure-less

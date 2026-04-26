@@ -1,0 +1,42 @@
+// Step 4 of attention backward: gradient w.r.t. Q.
+//
+//   dQ[t, h, d] += scale * sum_{t2 <= t (if causal)} pre_grad[t, h, t2] * K[t2, h, d]
+//
+// Thread per (t, h, d). Accumulates into d_qkv at the Q slot.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer In   { float qkv[];   };
+layout(set = 0, binding = 1) readonly buffer PreG { float preg[];  };
+layout(set = 0, binding = 2)          buffer DIn  { float d_qkv[]; };
+
+layout(push_constant) uniform Params {
+    uint  token_count;
+    uint  head_count;
+    uint  head_size;
+    float scale;
+    uint  causal;
+} p;
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    uint h = gl_GlobalInvocationID.y;
+    uint d = gl_GlobalInvocationID.z;
+    if (t >= p.token_count || h >= p.head_count || d >= p.head_size) return;
+
+    uint output_size = p.head_count * p.head_size;
+    uint input_size  = 3u * output_size;
+    uint max_t2      = (p.causal != 0u) ? t : (p.token_count - 1u);
+
+    uint preg_row = t * p.head_count * p.token_count + h * p.token_count;
+
+    float acc = 0.0;
+    for (uint t2 = 0u; t2 <= max_t2; t2++) {
+        uint k_off = t2 * input_size + h * p.head_size + output_size;
+        acc += preg[preg_row + t2] * qkv[k_off + d];
+    }
+
+    uint q_off = t * input_size + h * p.head_size;
+    d_qkv[q_off + d] += p.scale * acc;
+}

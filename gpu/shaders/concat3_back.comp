@@ -1,0 +1,36 @@
+// Backward of concat3 (trailing-dim concat of three tensors). Splits dy
+// into three contiguous trailing slabs and accumulates each into the
+// matching input gradient.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0)          buffer DA { float da[]; };
+layout(set = 0, binding = 1)          buffer DB { float db[]; };
+layout(set = 0, binding = 2)          buffer DC { float dc[]; };
+layout(set = 0, binding = 3) readonly buffer DY { float dy[]; };
+
+layout(push_constant) uniform Params {
+    uint leading;
+    uint t_a;
+    uint t_b;
+    uint t_c;
+} p;
+
+void main() {
+    uint gid     = gl_GlobalInvocationID.x;
+    uint total_t = p.t_a + p.t_b + p.t_c;
+    if (gid >= p.leading * total_t) return;
+
+    uint r  = gid / total_t;
+    uint c  = gid % total_t;
+    float v = dy[r * total_t + c];
+
+    if (c < p.t_a) {
+        da[r * p.t_a + c] += v;
+    } else if (c < p.t_a + p.t_b) {
+        db[r * p.t_b + (c - p.t_a)] += v;
+    } else {
+        dc[r * p.t_c + (c - p.t_a - p.t_b)] += v;
+    }
+}

@@ -119,14 +119,19 @@ forward :: proc(transformer: Transformer, tokens: []int) -> (output: ml.Tensor) 
 		norm_output := ml.layernorm(residual, layer.norm0_weight)
 		qkv         := ml.linear(norm_output, layer.qkv_weight)
 
-		q := ml.deinterleave(qkv, 0, 3)
-		k := ml.deinterleave(qkv, 1, 3)
-		v := ml.deinterleave(qkv, 2, 3)
+		// QKV is laid out per-row as [Q-block | K-block | V-block]
+		// (concatenated, not striped). slice_trailing pulls each block out
+		// preserving the [tokens, embed] shape; concat reassembles after
+		// RoPE on Q and K.
+		embed := transformer.embedding_size
+		q := ml.slice_trailing(qkv, 0,         embed)
+		k := ml.slice_trailing(qkv, embed,     2 * embed)
+		v := ml.slice_trailing(qkv, 2 * embed, 3 * embed)
 
 		q  = ml.rope(q, transformer.head_count)
 		k  = ml.rope(k, transformer.head_count)
 
-		qkv = ml.interleave(q, k, v)
+		qkv = ml.concat(q, k, v)
 
 		attn_output := ml.attention(qkv, transformer.head_count)
 		attn_output  = ml.linear(attn_output, layer.proj_weight)

@@ -1,0 +1,92 @@
+// Step 0 of attention backward. Recomputes the forward attention's
+// softmax output into a [token_count, head_count, token_count] buffer
+// so the rest of backward can read it directly.
+//
+// Forward attention doesn't currently save these scores, and recomputing
+// once here is way cheaper than recomputing per-output-element in dV/dK.
+// One workgroup per (t, h); same shared-memory pattern as forward.
+//
+// post[t, h, t2] for t2 > max_t2 is left at 0 (causal positions).
+#version 450
+
+#define WG 128
+#define MAX_TOKENS 2048
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer In   { float qkv[];  };
+layout(set = 0, binding = 1) writeonly buffer Post { float post[]; };
+
+layout(push_constant) uniform Params {
+    uint  token_count;
+    uint  head_count;
+    uint  head_size;
+    float scale;
+    uint  causal;
+} p;
+
+shared float s_scores[MAX_TOKENS];
+shared float s_reduce[WG];
+
+void main() {
+    uint t   = gl_WorkGroupID.x;
+    uint h   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= p.token_count || h >= p.head_count) return;
+
+    uint output_size = p.head_count * p.head_size;
+    uint input_size  = 3u * output_size;
+    uint head_size   = p.head_size;
+
+    uint max_t2  = (p.causal != 0u) ? t : (p.token_count - 1u);
+    uint q_off   = t * input_size + h * head_size;
+    uint post_row = t * p.head_count * p.token_count + h * p.token_count;
+
+    // Phase 1: scaled dot-product, find max.
+    float local_max = -3.402823e38;
+    for (uint t2 = tid; t2 <= max_t2; t2 += WG) {
+        uint k_off = t2 * input_size + h * head_size + output_size;
+        float dot = 0.0;
+        for (uint d = 0u; d < head_size; d++) {
+            dot += qkv[q_off + d] * qkv[k_off + d];
+        }
+        float v = dot * p.scale;
+        s_scores[t2] = v;
+        if (v > local_max) local_max = v;
+    }
+    s_reduce[tid] = local_max;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + stride]);
+        barrier();
+    }
+    float max_v = s_reduce[0];
+    barrier();
+
+    // Phase 2: exp(score - max), sum.
+    float local_sum = 0.0;
+    for (uint t2 = tid; t2 <= max_t2; t2 += WG) {
+        float e = exp(s_scores[t2] - max_v);
+        s_scores[t2] = e;
+        local_sum += e;
+    }
+    s_reduce[tid] = local_sum;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_reduce[tid] += s_reduce[tid + stride];
+        barrier();
+    }
+    float exp_sum     = s_reduce[0];
+    float exp_sum_inv = exp_sum == 0.0 ? 0.0 : (1.0 / exp_sum);
+    barrier();
+
+    // Phase 3: write normalized post into the [t, h, *] row, zero the
+    // tail past max_t2 so causal positions are clean.
+    for (uint t2 = tid; t2 < p.token_count; t2 += WG) {
+        if (t2 <= max_t2) {
+            post[post_row + t2] = s_scores[t2] * exp_sum_inv;
+        } else {
+            post[post_row + t2] = 0.0;
+        }
+    }
+}

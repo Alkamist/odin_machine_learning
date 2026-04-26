@@ -1,0 +1,108 @@
+// Multi-head causal scaled-dot-product attention, matching CPU `ml.attention`.
+//   qkv: [token_count, 3 * embed]   row-major, layout [Q | K | V] per row
+//   out: [token_count, embed]       row-major
+//
+// Per-row offsets (with input_size = 3*embed, output_size = embed):
+//   Q[t,h,d] = qkv[t*input_size + h*head_size + d]
+//   K[t,h,d] = qkv[t*input_size + h*head_size + d + output_size]
+//   V[t,h,d] = qkv[t*input_size + h*head_size + d + 2*output_size]
+//
+// One workgroup per (head, query_token). 128 threads cooperate on:
+//   1. score[t2] = scale * dot(Q[t,h], K[t2,h])  for t2 in [0, max_t2]
+//   2. tree-reduce max
+//   3. score[t2] = exp(score[t2] - max); tree-reduce sum; multiply by 1/sum
+//      (or 0 if sum==0, matching the CPU's guard)
+//   4. out[t,h,d] = sum_t2 score[t2] * V[t2,h,d]
+//
+// MAX_TOKENS bounds the per-WG shared score buffer. 2048 fits any current
+// transformer config we're targeting; bumpable as needed.
+#version 450
+
+#define WG 128
+#define MAX_TOKENS 2048
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer In  { float qkv[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float y[];   };
+
+layout(push_constant) uniform Params {
+    uint  token_count;
+    uint  head_count;
+    uint  head_size;
+    float scale;        // 1 / sqrt(head_size)
+    uint  causal;       // 1 = mask future tokens, 0 = full
+} p;
+
+shared float s_scores[MAX_TOKENS];
+shared float s_reduce[WG];
+
+void main() {
+    uint t   = gl_WorkGroupID.x;
+    uint h   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= p.token_count || h >= p.head_count) return;
+
+    uint output_size = p.head_count * p.head_size;
+    uint input_size  = 3u * output_size;
+    uint head_size   = p.head_size;
+
+    uint max_t2 = (p.causal != 0u) ? t : (p.token_count - 1u);
+
+    uint q_off = t * input_size + h * head_size;
+
+    // --- Phase 1: scaled dot-product scores. ---
+    float local_max = -3.402823e38;
+    for (uint t2 = tid; t2 <= max_t2; t2 += WG) {
+        uint k_off = t2 * input_size + h * head_size + output_size;
+        float dot = 0.0;
+        for (uint d = 0u; d < head_size; ++d) {
+            dot += qkv[q_off + d] * qkv[k_off + d];
+        }
+        float v = dot * p.scale;
+        s_scores[t2] = v;
+        if (v > local_max) local_max = v;
+    }
+
+    s_reduce[tid] = local_max;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + stride]);
+        barrier();
+    }
+    float max_value = s_reduce[0];
+    barrier();
+
+    // --- Phase 2: exp(score - max), sum, normalize. ---
+    float local_sum = 0.0;
+    for (uint t2 = tid; t2 <= max_t2; t2 += WG) {
+        float e = exp(s_scores[t2] - max_value);
+        s_scores[t2] = e;
+        local_sum += e;
+    }
+    s_reduce[tid] = local_sum;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_reduce[tid] += s_reduce[tid + stride];
+        barrier();
+    }
+    float exp_sum     = s_reduce[0];
+    float exp_sum_inv = exp_sum == 0.0 ? 0.0 : (1.0 / exp_sum);
+    barrier();
+
+    for (uint t2 = tid; t2 <= max_t2; t2 += WG) {
+        s_scores[t2] = s_scores[t2] * exp_sum_inv;
+    }
+    barrier();
+
+    // --- Phase 3: weighted sum over V. ---
+    uint out_off = t * output_size + h * head_size;
+    for (uint d = tid; d < head_size; d += WG) {
+        float sum = 0.0;
+        for (uint t2 = 0u; t2 <= max_t2; ++t2) {
+            uint v_off = t2 * input_size + h * head_size + 2u * output_size;
+            sum += s_scores[t2] * qkv[v_off + d];
+        }
+        y[out_off + d] = sum;
+    }
+}

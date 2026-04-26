@@ -1,0 +1,59 @@
+// Per-row softmax, matching CPU `ml.softmax`.
+//   x: [count, size]   row-major
+//   y: [count, size]   row-major  (probabilities along the trailing dim)
+//
+// One workgroup per row. Three-pass: max-reduce, sum-of-exp-reduce, divide.
+// exp() is computed twice per element (once to sum, once to write); could
+// stash in shared memory for a 1-pass write but rows are usually small
+// enough that the redundant exp is cheaper than the shared-memory traffic.
+#version 450
+
+#define WG 256
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+} p;
+
+shared float partial[WG];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+    uint off = row * p.size;
+
+    // 1. Row max (numerical stability shift).
+    float m = -3.402823e38;
+    for (uint i = tid; i < p.size; i += WG) m = max(m, x[off + i]);
+    partial[tid] = m;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) partial[tid] = max(partial[tid], partial[tid + stride]);
+        barrier();
+    }
+    float row_max = partial[0];
+    barrier();
+
+    // 2. Sum of exp(x - max).
+    float s = 0.0;
+    for (uint i = tid; i < p.size; i += WG) s += exp(x[off + i] - row_max);
+    partial[tid] = s;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+    float inv = 1.0 / partial[0];
+    barrier();
+
+    // 3. Normalize.
+    for (uint i = tid; i < p.size; i += WG) {
+        y[off + i] = exp(x[off + i] - row_max) * inv;
+    }
+}

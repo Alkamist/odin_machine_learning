@@ -1,0 +1,63 @@
+// Per-row LayerNorm, matching CPU `ml.layernorm`.
+//   x: [count, size]   row-major
+//   w: [size]          per-feature gain (no bias)
+//   y: [count, size]   row-major
+//
+// One workgroup per row. 256 threads cooperatively reduce mean and variance,
+// then write the normalized output.
+#version 450
+
+#define WG 256
+#define EPSILON 1e-5
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly  buffer W { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+} p;
+
+shared float partial[WG];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+    uint off = row * p.size;
+
+    // 1. Mean.
+    float s = 0.0;
+    for (uint i = tid; i < p.size; i += WG) s += x[off + i];
+    partial[tid] = s;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+    float mean = partial[0] / float(p.size);
+    barrier();
+
+    // 2. Variance.
+    float v = 0.0;
+    for (uint i = tid; i < p.size; i += WG) {
+        float d = x[off + i] - mean;
+        v += d * d;
+    }
+    partial[tid] = v;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+    float rstd = inversesqrt(partial[0] / float(p.size) + EPSILON);
+    barrier();
+
+    // 3. Normalize and apply gain.
+    for (uint i = tid; i < p.size; i += WG) {
+        y[off + i] = (x[off + i] - mean) * rstd * w[i];
+    }
+}

@@ -1,0 +1,60 @@
+// Step 3 of attention backward: softmax backward.
+//
+//   pre_grad[t, h, t3] = post[t, h, t3] * (post_grad[t, h, t3] - sum_term[t, h])
+//
+// where sum_term[t, h] = sum_t2 post[t, h, t2] * post_grad[t, h, t2].
+// (The standard "softmax backward = post * (g - <post, g>)" identity.)
+//
+// One workgroup per (t, h); shared-memory reduction over the row to
+// compute sum_term, then per-thread write of pre_grad for the assigned t3.
+#version 450
+
+#define WG 128
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer Post  { float post[];   };
+layout(set = 0, binding = 1) readonly  buffer PG    { float pgrad[];  };
+layout(set = 0, binding = 2) writeonly buffer PreG  { float preg[];   };
+
+layout(push_constant) uniform Params {
+    uint token_count;
+    uint head_count;
+    uint causal;
+} p;
+
+shared float s_reduce[WG];
+
+void main() {
+    uint t   = gl_WorkGroupID.x;
+    uint h   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= p.token_count || h >= p.head_count) return;
+
+    uint max_t2 = (p.causal != 0u) ? t : (p.token_count - 1u);
+    uint row    = t * p.head_count * p.token_count + h * p.token_count;
+
+    // sum_term partial.
+    float local_sum = 0.0;
+    for (uint t2 = tid; t2 <= max_t2; t2 += WG) {
+        local_sum += post[row + t2] * pgrad[row + t2];
+    }
+    s_reduce[tid] = local_sum;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_reduce[tid] += s_reduce[tid + stride];
+        barrier();
+    }
+    float sum_term = s_reduce[0];
+    barrier();
+
+    // Write pre_grad. Positions past max_t2 (causal mask) get 0.
+    for (uint t3 = tid; t3 < p.token_count; t3 += WG) {
+        if (t3 <= max_t2) {
+            float ph = post[row + t3];
+            preg[row + t3] = ph * (pgrad[row + t3] - sum_term);
+        } else {
+            preg[row + t3] = 0.0;
+        }
+    }
+}

@@ -1,0 +1,43 @@
+// Trailing-dim concat of three same-leading-shape tensors.
+//   a, b, c: [leading, t_a], [leading, t_b], [leading, t_c]
+//   out:     [leading, t_a + t_b + t_c]
+// out[r, col] = a[r, col]              if col < t_a
+//             = b[r, col - t_a]        if col < t_a + t_b
+//             = c[r, col - t_a - t_b]  otherwise
+//
+// 3-way is enough for QKV reassembly. Generalizing to N would mean either an
+// indirection-buffer scheme or one shader per N; we'll cross that bridge if
+// another caller turns up.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer A   { float a[]; };
+layout(set = 0, binding = 1) readonly  buffer B   { float b[]; };
+layout(set = 0, binding = 2) readonly  buffer C   { float c[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
+
+layout(push_constant) uniform Params {
+    uint leading;
+    uint t_a;
+    uint t_b;
+    uint t_c;
+} p;
+
+void main() {
+    uint gid          = gl_GlobalInvocationID.x;
+    uint out_trailing = p.t_a + p.t_b + p.t_c;
+    uint total        = p.leading * out_trailing;
+    if (gid >= total) return;
+
+    uint r   = gid / out_trailing;
+    uint col = gid % out_trailing;
+
+    if (col < p.t_a) {
+        o[gid] = a[r * p.t_a + col];
+    } else if (col < p.t_a + p.t_b) {
+        o[gid] = b[r * p.t_b + (col - p.t_a)];
+    } else {
+        o[gid] = c[r * p.t_c + (col - p.t_a - p.t_b)];
+    }
+}

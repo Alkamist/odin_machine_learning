@@ -1,0 +1,22 @@
+// y[i] = 0.5 * x[i] * (1 + tanh(sqrt(2/PI) * (x[i] + 0.044715 * x[i]^3)))
+// Tanh-approx GELU, matching CPU `ml.gelu`.
+#version 450
+
+#define GELU_SCALE 0.7978845608028654
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint n;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    float v = x[i];
+    float cube = 0.044715 * v * v * v;
+    y[i] = 0.5 * v * (1.0 + tanh(GELU_SCALE * (v + cube)));
+}
