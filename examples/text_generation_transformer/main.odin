@@ -27,7 +27,9 @@ SEQUENCE_LENGTH :: 64
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ml.init(1024 * 1024 * 16)
+	ctx := ml.context_create(1024 * 1024 * 16)
+	defer ml.context_destroy(ctx)
+	ml.context_scope(ctx)
 	ml.set_thread_count(24)
 	
 	model := make_model()

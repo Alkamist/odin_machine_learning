@@ -127,36 +127,6 @@ select :: proc(table: GpuTensor, indices: []int, out: GpuTensor, size: int, loc 
 	_queue_destroy_buffer(idx_buf, idx_mem)
 }
 
-// deinterleave: out[i] = in[i * column_count + column]
-deinterleave :: proc(input, out: GpuTensor, column, column_count: int, loc := #caller_location) {
-	fmt.assertf(input.count == out.count * column_count,
-		"deinterleave: input %v != out %v * %v", input.count, out.count, column_count, loc=loc)
-
-	if _deinterleave_pipeline == nil {
-		_deinterleave_pipeline = _make_pipeline(DEINTERLEAVE_SPIRV, 2, size_of(Deinterleave_Params))
-	}
-	params := Deinterleave_Params{
-		n_out        = u32(out.count),
-		column       = u32(column),
-		column_count = u32(column_count),
-	}
-	_dispatch(_deinterleave_pipeline, _buffers(input, out), &params, _div_up(out.count, 256), loc=loc)
-}
-
-// interleave3: out[i*3 + k] = inputs[k][i] for k in 0..2.
-interleave3 :: proc(a, b, c, out: GpuTensor, loc := #caller_location) {
-	fmt.assertf(a.count == b.count && a.count == c.count,
-		"interleave3: input shape mismatch a=%v b=%v c=%v", a.count, b.count, c.count, loc=loc)
-	fmt.assertf(out.count == a.count * 3,
-		"interleave3: out %v != input %v * 3", out.count, a.count, loc=loc)
-
-	if _interleave3_pipeline == nil {
-		_interleave3_pipeline = _make_pipeline(INTERLEAVE3_SPIRV, 4, size_of(Interleave3_Params))
-	}
-	params := Interleave3_Params{ n_in = u32(a.count) }
-	_dispatch(_interleave3_pipeline, _buffers(a, b, c, out), &params, _div_up(a.count, 256), loc=loc)
-}
-
 // rope: rotary position embedding, matches CPU `ml.rope`.
 //   input/out: [token_count, head_count * head_size]
 rope :: proc(input, out: GpuTensor, token_count, head_count, head_size: int, base: f32 = 10000, loc := #caller_location) {
@@ -665,17 +635,29 @@ SOFTMAX_SPIRV   :: #load("shaders/softmax.spv", []u8)
 Softmax_Params :: struct { count, size: u32 }
 _softmax_pipeline: ^Pipeline
 
+SOFTMAX_BACK_SPIRV :: #load("shaders/softmax_back.spv", []u8)
+Softmax_Back_Params :: struct { count, size: u32 }
+_softmax_back_pipeline: ^Pipeline
+
+PERMUTE_SPIRV :: #load("shaders/permute.spv", []u8)
+PERMUTE_BACK_SPIRV :: #load("shaders/permute_back.spv", []u8)
+Permute_Params :: struct {
+	out_d0, out_d1, out_d2: u32,
+	in_d1,  in_d2:          u32,
+	axes_0, axes_1, axes_2: u32,
+}
+_permute_pipeline:      ^Pipeline
+_permute_back_pipeline: ^Pipeline
+
+CAUSAL_MASK_SPIRV      :: #load("shaders/causal_mask.spv", []u8)
+CAUSAL_MASK_BACK_SPIRV :: #load("shaders/causal_mask_back.spv", []u8)
+Causal_Mask_Params :: struct { total, T: u32 }
+_causal_mask_pipeline:      ^Pipeline
+_causal_mask_back_pipeline: ^Pipeline
+
 SELECT_SPIRV :: #load("shaders/select.spv", []u8)
 Select_Params :: struct { n_indices, size: u32 }
 _select_pipeline: ^Pipeline
-
-DEINTERLEAVE_SPIRV :: #load("shaders/deinterleave.spv", []u8)
-Deinterleave_Params :: struct { n_out, column, column_count: u32 }
-_deinterleave_pipeline: ^Pipeline
-
-INTERLEAVE3_SPIRV :: #load("shaders/interleave3.spv", []u8)
-Interleave3_Params :: struct { n_in: u32 }
-_interleave3_pipeline: ^Pipeline
 
 ROPE_SPIRV :: #load("shaders/rope.spv", []u8)
 Rope_Params :: struct {

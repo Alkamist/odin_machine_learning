@@ -33,6 +33,8 @@ Pipeline :: struct {
 // Transient resources (descriptor sets, host-visible scratch buffers like
 // the select-indices buffer) can't be freed until the GPU is done with the
 // batch, so they're queued here and reclaimed in end_batch.
+//
+// Lives on Gpu_Context; one batch in flight per host thread / context.
 Batch :: struct {
 	active:           bool,
 	cmd:              vk.CommandBuffer,
@@ -42,41 +44,42 @@ Batch :: struct {
 	pending_memories: [dynamic]vk.DeviceMemory,
 }
 
-_batch: Batch
-
 // Open a recording batch. All subsequent _dispatch calls record into one
 // command buffer; nothing executes on the GPU until end_batch.
 begin_batch :: proc(loc := #caller_location) {
-	fmt.assertf(_gpu.device != nil, "gpu.init() must be called first", loc=loc)
-	fmt.assertf(!_batch.active, "begin_batch: already in a batch", loc=loc)
+	fmt.assertf(_current_gpu_ctx != nil, "gpu.context_begin / context_scope must be called first", loc=loc)
+	gctx := _current_gpu_ctx
+	fmt.assertf(!gctx.batch.active, "begin_batch: already in a batch", loc=loc)
 
 	alloc_info := vk.CommandBufferAllocateInfo{
 		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
-		commandPool        = _gpu.command_pool,
+		commandPool        = gctx.command_pool,
 		level              = .PRIMARY,
 		commandBufferCount = 1,
 	}
-	res := vk.AllocateCommandBuffers(_gpu.device, &alloc_info, &_batch.cmd)
+	res := vk.AllocateCommandBuffers(_gpu.device, &alloc_info, &gctx.batch.cmd)
 	fmt.assertf(res == .SUCCESS, "vkAllocateCommandBuffers (batch) failed: %v", res, loc=loc)
 
 	begin := vk.CommandBufferBeginInfo{
 		sType = .COMMAND_BUFFER_BEGIN_INFO,
 		flags = {.ONE_TIME_SUBMIT},
 	}
-	res = vk.BeginCommandBuffer(_batch.cmd, &begin)
+	res = vk.BeginCommandBuffer(gctx.batch.cmd, &begin)
 	fmt.assertf(res == .SUCCESS, "vkBeginCommandBuffer (batch) failed: %v", res, loc=loc)
 
-	_batch.active         = true
-	_batch.dispatch_count = 0
+	gctx.batch.active         = true
+	gctx.batch.dispatch_count = 0
 }
 
 // Close the batch: submit, wait, then free everything that was queued
 // during recording. Synchronous on purpose — fits the existing model where
 // callers expect GPU results to be ready when control returns.
 end_batch :: proc(loc := #caller_location) {
-	fmt.assertf(_batch.active, "end_batch: no active batch", loc=loc)
+	fmt.assertf(_current_gpu_ctx != nil, "gpu.context_begin / context_scope must be called first", loc=loc)
+	gctx := _current_gpu_ctx
+	fmt.assertf(gctx.batch.active, "end_batch: no active batch", loc=loc)
 
-	cmd := _batch.cmd
+	cmd := gctx.batch.cmd
 	res := vk.EndCommandBuffer(cmd)
 	fmt.assertf(res == .SUCCESS, "vkEndCommandBuffer (batch) failed: %v", res, loc=loc)
 
@@ -90,33 +93,33 @@ end_batch :: proc(loc := #caller_location) {
 	res = vk.QueueWaitIdle(_gpu.queue)
 	fmt.assertf(res == .SUCCESS, "vkQueueWaitIdle (batch) failed: %v", res, loc=loc)
 
-	vk.FreeCommandBuffers(_gpu.device, _gpu.command_pool, 1, &cmd)
+	vk.FreeCommandBuffers(_gpu.device, gctx.command_pool, 1, &cmd)
 
-	if len(_batch.descriptor_sets) > 0 {
+	if len(gctx.batch.descriptor_sets) > 0 {
 		vk.FreeDescriptorSets(
-			_gpu.device, _gpu.descriptor_pool,
-			u32(len(_batch.descriptor_sets)),
-			raw_data(_batch.descriptor_sets[:]),
+			_gpu.device, gctx.descriptor_pool,
+			u32(len(gctx.batch.descriptor_sets)),
+			raw_data(gctx.batch.descriptor_sets[:]),
 		)
 	}
-	for buf in _batch.pending_buffers  { vk.DestroyBuffer(_gpu.device, buf, nil) }
-	for mem in _batch.pending_memories { vk.FreeMemory(_gpu.device, mem, nil) }
+	for buf in gctx.batch.pending_buffers  { vk.DestroyBuffer(_gpu.device, buf, nil) }
+	for mem in gctx.batch.pending_memories { vk.FreeMemory(_gpu.device, mem, nil) }
 
-	clear(&_batch.descriptor_sets)
-	clear(&_batch.pending_buffers)
-	clear(&_batch.pending_memories)
-	_batch.active         = false
-	_batch.cmd            = nil
-	_batch.dispatch_count = 0
+	clear(&gctx.batch.descriptor_sets)
+	clear(&gctx.batch.pending_buffers)
+	clear(&gctx.batch.pending_memories)
+	gctx.batch.active         = false
+	gctx.batch.cmd            = nil
+	gctx.batch.dispatch_count = 0
 }
 
 // Schedule (buf, mem) for destruction once the current batch finishes. If
 // no batch is active, destroy immediately — callers in that mode have
 // already waited on the GPU via the per-dispatch wait_idle.
 _queue_destroy_buffer :: proc(buf: vk.Buffer, mem: vk.DeviceMemory) {
-	if _batch.active {
-		append(&_batch.pending_buffers,  buf)
-		append(&_batch.pending_memories, mem)
+	if _current_gpu_ctx != nil && _current_gpu_ctx.batch.active {
+		append(&_current_gpu_ctx.batch.pending_buffers,  buf)
+		append(&_current_gpu_ctx.batch.pending_memories, mem)
 	} else {
 		vk.DestroyBuffer(_gpu.device, buf, nil)
 		vk.FreeMemory(_gpu.device, mem, nil)
@@ -223,11 +226,14 @@ _dispatch :: proc(
 	fmt.assertf(u32(len(buffers)) == p.num_buffers,
 		"dispatch: pipeline expects %v buffers, got %v", p.num_buffers, len(buffers), loc=loc)
 
+	gctx := _current_gpu_ctx
+	fmt.assertf(gctx != nil, "no active gpu Context — call gpu.context_begin / context_scope", loc=loc)
+
 	// Allocate descriptor set.
 	dsl := p.descriptor_set_layout
 	ds_alloc := vk.DescriptorSetAllocateInfo{
 		sType              = .DESCRIPTOR_SET_ALLOCATE_INFO,
-		descriptorPool     = _gpu.descriptor_pool,
+		descriptorPool     = gctx.descriptor_pool,
 		descriptorSetCount = 1,
 		pSetLayouts        = &dsl,
 	}
@@ -255,14 +261,14 @@ _dispatch :: proc(
 	}
 	vk.UpdateDescriptorSets(_gpu.device, p.num_buffers, raw_data(writes), 0, nil)
 
-	if _batch.active {
+	if gctx.batch.active {
 		// Record into the open batch. Insert a barrier before every dispatch
 		// after the first so prior shader writes are visible to this one — we
 		// don't track per-buffer dependencies, so a global memory barrier
 		// (SHADER_WRITE → SHADER_READ|SHADER_WRITE on COMPUTE) is what makes
 		// pipelined dispatches correct without per-op metadata.
-		cmd := _batch.cmd
-		if _batch.dispatch_count > 0 {
+		cmd := gctx.batch.cmd
+		if gctx.batch.dispatch_count > 0 {
 			barrier := vk.MemoryBarrier{
 				sType         = .MEMORY_BARRIER,
 				srcAccessMask = {.SHADER_WRITE},
@@ -284,8 +290,8 @@ _dispatch :: proc(
 		}
 		vk.CmdDispatch(cmd, group_count_x, group_count_y, group_count_z)
 
-		append(&_batch.descriptor_sets, set)
-		_batch.dispatch_count += 1
+		append(&gctx.batch.descriptor_sets, set)
+		gctx.batch.dispatch_count += 1
 		return
 	}
 
@@ -300,7 +306,7 @@ _dispatch :: proc(
 	_end_one_shot(cmd, loc)
 
 	set_to_free := set
-	vk.FreeDescriptorSets(_gpu.device, _gpu.descriptor_pool, 1, &set_to_free)
+	vk.FreeDescriptorSets(_gpu.device, gctx.descriptor_pool, 1, &set_to_free)
 }
 
 // Helper: pull each tensor's vk.Buffer into a flat slice for _dispatch.

@@ -25,11 +25,17 @@ SEED            :: 0xC0FFEE
 ABS_TOL :: f32(2e-3)
 
 main :: proc() {
-	ml.init(256 * 1024 * 1024)
+	ctx := ml.context_create(256 * 1024 * 1024)
+	defer ml.context_destroy(ctx)
+	ml.context_scope(ctx)
 	ml.set_thread_count(1)
 
 	gpu.init()
 	defer gpu.destroy()
+
+	gctx := gpu.context_create()
+	defer gpu.context_destroy(gctx)
+	gpu.context_scope(gctx)
 
 	rand.reset(SEED)
 	cpu_model := tfm.make(LAYERS, HEADS, EMBEDDING_SIZE, VOCABULARY)

@@ -20,11 +20,17 @@ WARMUP     :: 5
 ITERATIONS :: 50
 
 main :: proc() {
-	ml.init(256 * 1024 * 1024)
+	ctx := ml.context_create(256 * 1024 * 1024)
+	defer ml.context_destroy(ctx)
+	ml.context_scope(ctx)
 	ml.set_thread_count(1)
 
 	gpu.init()
 	defer gpu.destroy()
+
+	gctx := gpu.context_create()
+	defer gpu.context_destroy(gctx)
+	gpu.context_scope(gctx)
 
 	fmt.println("each row: ms per call (min, mean over", ITERATIONS, "iters)")
 	fmt.printfln("%-28s %12s %12s %12s %12s %10s", "shape", "cpu_st_min", "cpu_st_mean", "gpu_min", "gpu_mean", "speedup")

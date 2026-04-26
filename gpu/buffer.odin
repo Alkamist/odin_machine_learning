@@ -177,9 +177,12 @@ _one_shot_copy :: proc(src, dst: vk.Buffer, size: vk.DeviceSize, loc := #caller_
 }
 
 _begin_one_shot :: proc(loc := #caller_location) -> vk.CommandBuffer {
+	gctx := _current_gpu_ctx
+	fmt.assertf(gctx != nil, "no active gpu Context — call gpu.context_begin / context_scope", loc=loc)
+
 	alloc_info := vk.CommandBufferAllocateInfo{
 		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
-		commandPool        = _gpu.command_pool,
+		commandPool        = gctx.command_pool,
 		level              = .PRIMARY,
 		commandBufferCount = 1,
 	}
@@ -211,5 +214,5 @@ _end_one_shot :: proc(cmd: vk.CommandBuffer, loc := #caller_location) {
 	res = vk.QueueWaitIdle(_gpu.queue)
 	fmt.assertf(res == .SUCCESS, "vkQueueWaitIdle failed: %v", res, loc=loc)
 
-	vk.FreeCommandBuffers(_gpu.device, _gpu.command_pool, 1, &cmd)
+	vk.FreeCommandBuffers(_gpu.device, _current_gpu_ctx.command_pool, 1, &cmd)
 }

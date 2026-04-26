@@ -41,7 +41,9 @@ ENTROPY      :: 0.01 // How much is exploration encouraged.
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ml.init(1024 * 1024)
+	ctx := ml.context_create(1024 * 1024)
+	defer ml.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	train()
 	// play()

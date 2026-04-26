@@ -12,17 +12,16 @@ import "core:fmt"
 import "core:strings"
 import vk "vendor:vulkan"
 
-// Public state. Held in a single file-local global so callers don't have to
-// thread a context handle through every call. Mirrors how ml.odin exposes a
-// single global ML context.
-Gpu :: struct {
+// Device-level state, brought up once by `init` and shared by every
+// Gpu_Context on this process. Vulkan handles in here are either immutable
+// post-init (instance, device, queue family) or thread-safe to use after
+// creation (device, pipelines once compiled).
+Gpu_Device :: struct {
 	instance:           vk.Instance,
 	physical_device:    vk.PhysicalDevice,
 	device:             vk.Device,
 	queue:              vk.Queue,
 	queue_family_index: u32,
-	command_pool:       vk.CommandPool,
-	descriptor_pool:    vk.DescriptorPool,
 	memory_properties:  vk.PhysicalDeviceMemoryProperties,
 
 	// Pipelines created via _make_pipeline register here so destroy() can
@@ -33,25 +32,46 @@ Gpu :: struct {
 	loader:             dynlib.Library,
 }
 
-_gpu: Gpu
+// Per-thread / per-ml-Context Vulkan state. Vulkan command pools and
+// descriptor pools are NOT thread-safe to use from multiple threads at once,
+// so each host thread that wants to issue GPU work owns its own Gpu_Context.
+// The active one is tracked via a thread-local stack analogous to ml.Context.
+//
+// `allocations` tracks every Gpu_Storage created by gpu_alloc on this
+// context; gpu_clear_storage frees them in bulk to mirror CPU's arena
+// reset.
+Gpu_Context :: struct {
+	command_pool:    vk.CommandPool,
+	descriptor_pool: vk.DescriptorPool,
+	batch:           Batch,
+
+	allocations:     [dynamic]^Gpu_Storage,
+
+	previous_ctx: ^Gpu_Context,
+}
+
+_gpu: Gpu_Device
+
+@(thread_local)
+_current_gpu_ctx: ^Gpu_Context
 
 // Bring up Vulkan: load the system loader, create instance, pick a physical
-// device with a compute queue, create the device + command pool. Panics on
-// any failure — the rest of the library assumes a healthy GPU once init
-// returns.
+// device with a compute queue, create the device. Panics on any failure —
+// the rest of the library assumes a healthy GPU once init returns.
+//
+// Per-Context resources (command pool, descriptor pool, batch state) are
+// created by `context_create`, not here.
 init :: proc() {
 	_load_loader()
 	_create_instance()
 	_pick_physical_device()
 	_create_device()
-	_create_command_pool()
-	_create_descriptor_pool()
 
 	fmt.printfln("gpu: %v (queue family %v)", _gpu.device_name, _gpu.queue_family_index)
 }
 
-// Tear down everything init brought up. Safe to call multiple times in a row
-// only if init is called again between them.
+// Tear down everything init brought up. All Gpu_Contexts must already be
+// destroyed before calling this.
 destroy :: proc() {
 	for p in _gpu.pipelines {
 		_destroy_pipeline(p)
@@ -59,19 +79,6 @@ destroy :: proc() {
 	delete(_gpu.pipelines)
 	_gpu.pipelines = nil
 
-	delete(_batch.descriptor_sets)
-	delete(_batch.pending_buffers)
-	delete(_batch.pending_memories)
-	_batch = {}
-
-	if _gpu.descriptor_pool != 0 {
-		vk.DestroyDescriptorPool(_gpu.device, _gpu.descriptor_pool, nil)
-		_gpu.descriptor_pool = 0
-	}
-	if _gpu.command_pool != 0 {
-		vk.DestroyCommandPool(_gpu.device, _gpu.command_pool, nil)
-		_gpu.command_pool = 0
-	}
 	if _gpu.device != nil {
 		vk.DestroyDevice(_gpu.device, nil)
 		_gpu.device = nil
@@ -88,6 +95,59 @@ destroy :: proc() {
 		_ = dynlib.unload_library(_gpu.loader)
 		_gpu.loader = nil
 	}
+}
+
+// Heap-allocate and initialize a Gpu_Context. Pair with `context_destroy`.
+@(require_results)
+context_create :: proc(allocator := context.allocator, loc := #caller_location) -> ^Gpu_Context {
+	fmt.assertf(_gpu.device != nil, "gpu.init() must be called first", loc=loc)
+
+	gctx, err := new(Gpu_Context, allocator=allocator, loc=loc)
+	fmt.assertf(err == nil, "Failed to allocate Gpu_Context: %v", err, loc=loc)
+
+	_create_command_pool(gctx, loc)
+	_create_descriptor_pool(gctx, loc)
+	return gctx
+}
+
+// Destroy and free a Gpu_Context allocated by `context_create`. Must not be
+// on the active stack when destroyed.
+context_destroy :: proc(gctx: ^Gpu_Context, allocator := context.allocator, loc := #caller_location) {
+	fmt.assertf(_current_gpu_ctx != gctx, "gpu.context_destroy called on the active context", loc=loc)
+
+	for storage in gctx.allocations {
+		_destroy_gpu_storage(storage)
+	}
+	delete(gctx.allocations)
+
+	delete(gctx.batch.descriptor_sets)
+	delete(gctx.batch.pending_buffers)
+	delete(gctx.batch.pending_memories)
+
+	if gctx.descriptor_pool != 0 {
+		vk.DestroyDescriptorPool(_gpu.device, gctx.descriptor_pool, nil)
+	}
+	if gctx.command_pool != 0 {
+		vk.DestroyCommandPool(_gpu.device, gctx.command_pool, nil)
+	}
+	free(gctx, allocator=allocator, loc=loc)
+}
+
+// Push a Gpu_Context onto the thread-local stack.
+context_begin :: proc(gctx: ^Gpu_Context) {
+	gctx.previous_ctx = _current_gpu_ctx
+	_current_gpu_ctx = gctx
+}
+
+// Pop the current Gpu_Context off the stack.
+context_end :: proc() {
+	assert(_current_gpu_ctx != nil, "gpu.context_end called with no active context")
+	_current_gpu_ctx = _current_gpu_ctx.previous_ctx
+}
+
+@(deferred_none=context_end)
+context_scope :: proc(gctx: ^Gpu_Context) {
+	context_begin(gctx)
 }
 
 // Read-only accessor; useful for tests/examples that want to print the picked
@@ -220,14 +280,14 @@ _create_device :: proc() {
 	vk.GetDeviceQueue(_gpu.device, _gpu.queue_family_index, 0, &_gpu.queue)
 }
 
-_create_command_pool :: proc() {
+_create_command_pool :: proc(gctx: ^Gpu_Context, loc := #caller_location) {
 	info := vk.CommandPoolCreateInfo{
 		sType            = .COMMAND_POOL_CREATE_INFO,
 		flags            = {.RESET_COMMAND_BUFFER},
 		queueFamilyIndex = _gpu.queue_family_index,
 	}
-	res := vk.CreateCommandPool(_gpu.device, &info, nil, &_gpu.command_pool)
-	fmt.assertf(res == .SUCCESS, "vkCreateCommandPool failed: %v", res)
+	res := vk.CreateCommandPool(_gpu.device, &info, nil, &gctx.command_pool)
+	fmt.assertf(res == .SUCCESS, "vkCreateCommandPool failed: %v", res, loc=loc)
 }
 
 // Sized for many small dispatches, FREE_DESCRIPTOR_SET so we can reclaim
@@ -237,7 +297,7 @@ _create_command_pool :: proc() {
 DESCRIPTOR_POOL_MAX_SETS :: 4096
 DESCRIPTOR_POOL_MAX_STORAGE :: 16384
 
-_create_descriptor_pool :: proc() {
+_create_descriptor_pool :: proc(gctx: ^Gpu_Context, loc := #caller_location) {
 	pool_size := vk.DescriptorPoolSize{
 		type            = .STORAGE_BUFFER,
 		descriptorCount = DESCRIPTOR_POOL_MAX_STORAGE,
@@ -249,6 +309,6 @@ _create_descriptor_pool :: proc() {
 		poolSizeCount = 1,
 		pPoolSizes    = &pool_size,
 	}
-	res := vk.CreateDescriptorPool(_gpu.device, &info, nil, &_gpu.descriptor_pool)
-	fmt.assertf(res == .SUCCESS, "vkCreateDescriptorPool failed: %v", res)
+	res := vk.CreateDescriptorPool(_gpu.device, &info, nil, &gctx.descriptor_pool)
+	fmt.assertf(res == .SUCCESS, "vkCreateDescriptorPool failed: %v", res, loc=loc)
 }

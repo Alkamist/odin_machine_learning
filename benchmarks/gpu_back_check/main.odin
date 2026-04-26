@@ -15,9 +15,15 @@ import gpu "../../gpu"
 PASS_TOL :: 1e-4
 
 main :: proc() {
-	ml.init(64 * 1024 * 1024)
+	ctx := ml.context_create(64 * 1024 * 1024)
+	defer ml.context_destroy(ctx)
+	ml.context_scope(ctx)
 	gpu.init()
 	defer gpu.destroy()
+
+	gctx := gpu.context_create()
+	defer gpu.context_destroy(gctx)
+	gpu.context_scope(gctx)
 
 	any_failed := false
 	any_failed |= !check_zero()

@@ -1,0 +1,42 @@
+// 3-D permute forward.
+//   src: rank-3 tensor with shape (in_d0, in_d1, in_d2) (in_d0 is implicit).
+//   dst: rank-3 tensor with shape (out_d0, out_d1, out_d2).
+//
+// `axes` is the permutation: axes[i] is the source axis for the output's
+// axis i. Equivalent CPU statement:
+//     dst[i0, i1, i2] = src[s0, s1, s2]
+// where s[axes[k]] = i_k.
+//
+// One thread per output element; each thread looks up its source via the
+// axis mapping. Forward overwrites dst.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer Src { float src[]; };
+layout(set = 0, binding = 1) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Params {
+    uint out_d0, out_d1, out_d2;
+    uint in_d1,  in_d2;          // in_d0 not needed; strides are in_d1*in_d2 and in_d2
+    uint axes_0, axes_1, axes_2;
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.out_d0 * p.out_d1 * p.out_d2;
+    if (idx >= total) return;
+
+    uint i2 = idx % p.out_d2;
+    uint t  = idx / p.out_d2;
+    uint i1 = t   % p.out_d1;
+    uint i0 = t   / p.out_d1;
+
+    uint si[3];
+    si[p.axes_0] = i0;
+    si[p.axes_1] = i1;
+    si[p.axes_2] = i2;
+
+    uint src_idx = (si[0] * p.in_d1 + si[1]) * p.in_d2 + si[2];
+    dst[idx] = src[src_idx];
+}

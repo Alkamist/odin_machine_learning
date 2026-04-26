@@ -17,6 +17,10 @@ main :: proc() {
 	gpu.init()
 	defer gpu.destroy()
 
+	gctx := gpu.context_create()
+	defer gpu.context_destroy(gctx)
+	gpu.context_scope(gctx)
+
 	fmt.printfln("device: %v", gpu.device_name())
 
 	// 1+2: round-trip.
@@ -67,7 +71,9 @@ main :: proc() {
 	fmt.println("gpu.add matches CPU reference")
 
 	// 4: gpu.linear vs ml.linear.
-	ml.init(64 * 1024 * 1024)
+	ctx := ml.context_create(64 * 1024 * 1024)
+	defer ml.context_destroy(ctx)
+	ml.context_scope(ctx)
 	ml.set_thread_count(1)
 	test_linear(8, 32, 16)
 	test_linear(64, 128, 512)
@@ -80,9 +86,6 @@ main :: proc() {
 	test_softmax(4, 1024)
 
 	test_select(256, 128, 64)
-	test_deinterleave(64, 384, 0, 3)
-	test_deinterleave(64, 384, 1, 3)
-	test_interleave3(64, 128)
 	test_rope(64, 4, 32)
 
 	test_slice_trailing(64, 384, 0, 128)
@@ -225,61 +228,6 @@ test_select :: proc(vocab, size, n_idx: int) {
 		if d > max_abs { max_abs = d }
 	}
 	fmt.printfln("select (vocab=%v size=%v n=%v): max_abs=%.3e", vocab, size, n_idx, max_abs)
-}
-
-test_deinterleave :: proc(rows, trailing, col, ncol: int) {
-	rand.reset(u64(0xC0FFEE + col))
-	ml.clear()
-	x := ml.zeros(rows, trailing)
-	for i in 0 ..< rows*trailing { x.data[i] = rand.float32_range(-1, 1) }
-	y := ml.deinterleave(x, col, ncol)
-
-	xg := gpu.alloc(rows, trailing);          defer gpu.destroy_tensor(xg)
-	yg := gpu.alloc(rows, trailing / ncol);   defer gpu.destroy_tensor(yg)
-	gpu.upload(x.data, xg)
-	gpu.deinterleave(xg, yg, col, ncol)
-	out := make([]f32, rows * trailing / ncol); defer delete(out)
-	gpu.download(yg, out)
-
-	max_abs: f32
-	for i in 0 ..< rows * trailing / ncol {
-		d := math.abs(out[i] - y.data[i])
-		if d > max_abs { max_abs = d }
-	}
-	fmt.printfln("deinterleave (rows=%v trailing=%v col=%v/%v): max_abs=%.3e",
-		rows, trailing, col, ncol, max_abs)
-}
-
-test_interleave3 :: proc(rows, trailing: int) {
-	rand.reset(0xC0FFEE)
-	ml.clear()
-	a := ml.zeros(rows, trailing)
-	b := ml.zeros(rows, trailing)
-	c := ml.zeros(rows, trailing)
-	for i in 0 ..< rows*trailing {
-		a.data[i] = rand.float32_range(-1, 1)
-		b.data[i] = rand.float32_range(-1, 1)
-		c.data[i] = rand.float32_range(-1, 1)
-	}
-	y := ml.interleave(a, b, c)
-
-	ag := gpu.alloc(rows, trailing);     defer gpu.destroy_tensor(ag)
-	bg := gpu.alloc(rows, trailing);     defer gpu.destroy_tensor(bg)
-	cg := gpu.alloc(rows, trailing);     defer gpu.destroy_tensor(cg)
-	og := gpu.alloc(rows, trailing * 3); defer gpu.destroy_tensor(og)
-	gpu.upload(a.data, ag)
-	gpu.upload(b.data, bg)
-	gpu.upload(c.data, cg)
-	gpu.interleave3(ag, bg, cg, og)
-	out := make([]f32, rows * trailing * 3); defer delete(out)
-	gpu.download(og, out)
-
-	max_abs: f32
-	for i in 0 ..< rows * trailing * 3 {
-		d := math.abs(out[i] - y.data[i])
-		if d > max_abs { max_abs = d }
-	}
-	fmt.printfln("interleave3 (rows=%v trailing=%v): max_abs=%.3e", rows, trailing, max_abs)
 }
 
 test_rope :: proc(tokens, heads, head_size: int) {

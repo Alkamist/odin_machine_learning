@@ -47,7 +47,9 @@ main :: proc() {
 	}
 
 	// 256 MB arena. Plenty for the configs below.
-	ml.init(256 * 1024 * 1024)
+	ctx := ml.context_create(256 * 1024 * 1024)
+	defer ml.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	fmt.printfln("threads=%v warmup=%v iterations=%v", thread_count, WARMUP, ITERATIONS)
 	fmt.println("================================================================")
@@ -255,7 +257,7 @@ bench_attention :: proc() -> Result {
 
 	run :: proc() -> f32 {
 		ml.clear()
-		// Input shape for attention is interleaved [tokens, 3 * embed].
+		// Input shape for attention is stacked QKV [tokens, 3 * embed].
 		qkv := ml.zeros(TOKENS, 3 * EMBED)
 		ml.fill_value(qkv, 0.01)
 		y := ml.attention(qkv, HEADS)

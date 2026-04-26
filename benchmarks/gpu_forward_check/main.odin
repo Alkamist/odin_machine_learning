@@ -23,11 +23,17 @@ SEQUENCE_LENGTH :: 64
 SEED            :: 0xC0FFEE
 
 main :: proc() {
-	ml.init(256 * 1024 * 1024)
+	ctx := ml.context_create(256 * 1024 * 1024)
+	defer ml.context_destroy(ctx)
+	ml.context_scope(ctx)
 	ml.set_thread_count(1)
 
 	gpu.init()
 	defer gpu.destroy()
+
+	gctx := gpu.context_create()
+	defer gpu.context_destroy(gctx)
+	gpu.context_scope(gctx)
 
 	// --- CPU model ---
 	rand.reset(SEED)
