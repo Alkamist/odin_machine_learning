@@ -5,7 +5,6 @@
 package gpu
 
 import "core:fmt"
-import "core:mem"
 import vk "vendor:vulkan"
 
 _create_buffer :: proc(

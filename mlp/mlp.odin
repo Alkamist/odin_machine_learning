@@ -4,8 +4,8 @@ import "base:builtin"
 import ml "../"
 
 Layer :: struct {
-	weight: ml.Parameter,
-	bias:   ml.Parameter,
+	weight: ml.Tensor,
+	bias:   ml.Tensor,
 }
 
 Mlp :: struct {
@@ -13,11 +13,11 @@ Mlp :: struct {
 }
 
 make :: proc(sizes: ..int, allocator := context.allocator) -> (mlp: Mlp) {
-	mlp.layers = builtin.make([]Layer, len(sizes) - 1, allocator=allocator)
+	mlp.layers = builtin.make([]Layer, len(sizes) - 1)
 
 	for i in 0 ..< len(mlp.layers) {
-		mlp.layers[i].weight = ml.make(sizes[i + 1], sizes[i], allocator=allocator)
-		mlp.layers[i].bias   = ml.make(sizes[i + 1],           allocator=allocator)
+		mlp.layers[i].weight = ml.make(sizes[i + 1], sizes[i])
+		mlp.layers[i].bias   = ml.make(sizes[i + 1])
 	}
 
 	randomize(mlp)

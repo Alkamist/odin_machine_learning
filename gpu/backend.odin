@@ -42,15 +42,11 @@ Gpu_Storage :: struct {
 //
 //   ctx := ml.context_create(N, gpu.backend())
 _gpu_backend := ml.Backend{
-	name                    = "gpu",
 	alloc                   = gpu_alloc,
+	free                    = gpu_free,
 	clear_storage           = gpu_clear_storage,
-	persistent_alloc        = gpu_persistent_alloc,
-	persistent_free         = gpu_persistent_free,
 	set_data                = gpu_set_data,
 	get_data                = gpu_get_data,
-	parameter_alloc         = gpu_parameter_alloc,
-	parameter_free          = gpu_parameter_free,
 	parameter_update        = gpu_parameter_update,
 	parameter_copy          = gpu_parameter_copy,
 	context_alloc           = gpu_context_alloc,
@@ -104,57 +100,60 @@ gpu_flush :: proc() {
 	}
 }
 
-gpu_alloc :: proc(t: ^ml.Tensor, n: int) {
-	gctx := _current_gpu_ctx
-	fmt.assertf(gctx != nil, "no active gpu Context — call gpu.context_begin / context_scope before ml ops on a GPU context")
-
-	storage: ^Gpu_Storage
-	if list, ok := &gctx.pool[n]; ok && len(list^) > 0 {
-		// Pop a recycled storage matching this element count.
-		storage = pop(list)
-	} else {
-		storage = new(Gpu_Storage)
-		storage.count = n
-
-		size := vk.DeviceSize(n * size_of(f32))
-		storage.buffer,      storage.memory      = _create_buffer(size, {.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}, {.DEVICE_LOCAL})
-		storage.grad_buffer, storage.grad_memory = _create_buffer(size, {.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}, {.DEVICE_LOCAL})
-	}
-
-	// Match CPU's `zeros` semantics: both data and gradient start at 0.
-	// In a batch the fills record into the open command buffer (free —
-	// no extra submit); outside a batch we fall back to one-shot.
-	size := vk.DeviceSize(n * size_of(f32))
-	_record_fill_zero(storage.buffer,      size)
-	_record_fill_zero(storage.grad_buffer, size)
-
-	append(&gctx.allocations, storage)
-	t.storage = storage
-}
-
 // f32(1.0) bit pattern — vkCmdFillBuffer writes a u32 stamp across the
 // buffer, so we hand it the IEEE 754 representation of 1.0.
 F32_ONE_BITS :: u32(0x3F800000)
 
-// Persistent GPU alloc — same buffer creation as `gpu_alloc`, but DOES NOT
-// register on the active gctx's allocations list, so `ml.clear()` won't
-// free it. Caller is responsible for `gpu_persistent_free` (or letting
-// the device shutdown reclaim).
-gpu_persistent_alloc :: proc(t: ^ml.Tensor, n: int) {
-	storage := new(Gpu_Storage)
-	storage.count = n
+// Allocate `Gpu_Storage` for `t` with `n`-element data + gradient buffers
+// and `extra_buffers` additional same-shape buffers (2 → adam_m + adam_v
+// for parameters). When `persistent=false`, the allocation is also
+// registered on the active gctx's activation list, so `ml.clear()` /
+// `clear_storage` recycles it into the per-context pool. When
+// `persistent=true`, the storage survives clear and the caller frees via
+// `free`.
+gpu_alloc :: proc(t: ^ml.Tensor, n: int, persistent: bool, extra_buffers: int) {
+	gctx := _current_gpu_ctx
+	fmt.assertf(gctx != nil, "no active gpu Context — call gpu.context_begin / context_scope before ml ops on a GPU context")
+	fmt.assertf(t.type == .F32, "gpu_alloc: only F32 is supported (got %v)", t.type)
+	fmt.assertf(extra_buffers == 0 || extra_buffers == 2, "gpu_alloc: extra_buffers must be 0 or 2 (got %v)", extra_buffers)
 
-	size := vk.DeviceSize(n * size_of(f32))
-	storage.buffer,      storage.memory      = _create_buffer(size, {.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}, {.DEVICE_LOCAL})
-	storage.grad_buffer, storage.grad_memory = _create_buffer(size, {.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}, {.DEVICE_LOCAL})
+	size  := vk.DeviceSize(n * size_of(f32))
+	usage := vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
 
+	storage: ^Gpu_Storage
+	if !persistent {
+		// Activation: try to recycle from the pool first. The pool only
+		// holds 2-buffer storages (extra_buffers always 0 for activations).
+		if list, ok := &gctx.pool[n]; ok && len(list^) > 0 {
+			storage = pop(list)
+		}
+	}
+	if storage == nil {
+		storage = new(Gpu_Storage)
+		storage.count = n
+		storage.buffer,      storage.memory      = _create_buffer(size, usage, {.DEVICE_LOCAL})
+		storage.grad_buffer, storage.grad_memory = _create_buffer(size, usage, {.DEVICE_LOCAL})
+		if extra_buffers >= 2 {
+			storage.adam_m_buffer, storage.adam_m_memory = _create_buffer(size, usage, {.DEVICE_LOCAL})
+			storage.adam_v_buffer, storage.adam_v_memory = _create_buffer(size, usage, {.DEVICE_LOCAL})
+		}
+	}
+
+	// Match CPU's `zeros` semantics: every buffer starts at 0. In a batch
+	// the fills record into the open CB (free — no extra submit); outside
+	// a batch they fall back to one-shot.
 	_record_fill_zero(storage.buffer,      size)
 	_record_fill_zero(storage.grad_buffer, size)
+	if storage.adam_m_buffer != 0 do _record_fill_zero(storage.adam_m_buffer, size)
+	if storage.adam_v_buffer != 0 do _record_fill_zero(storage.adam_v_buffer, size)
 
+	if !persistent {
+		append(&gctx.allocations, storage)
+	}
 	t.storage = storage
 }
 
-gpu_persistent_free :: proc(t: ^ml.Tensor) {
+gpu_free :: proc(t: ^ml.Tensor) {
 	if t.storage == nil { return }
 	storage := cast(^Gpu_Storage)t.storage
 	_destroy_gpu_storage(storage)
@@ -169,38 +168,9 @@ gpu_get_data :: proc(t: ^ml.Tensor, dst: []f32) {
 	download_tensor(t^, dst)
 }
 
-// Parameter allocation: 4 DEVICE_LOCAL buffer pairs (data + gradient +
-// adam_m + adam_v). Not registered on the gctx.allocations list — like
-// `gpu_persistent_alloc` — so `ml.clear()` doesn't free them.
-gpu_parameter_alloc :: proc(p: ^ml.Parameter, n: int) {
-	storage := new(Gpu_Storage)
-	storage.count = n
-
-	size := vk.DeviceSize(n * size_of(f32))
-	usage := vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
-	storage.buffer,        storage.memory        = _create_buffer(size, usage, {.DEVICE_LOCAL})
-	storage.grad_buffer,   storage.grad_memory   = _create_buffer(size, usage, {.DEVICE_LOCAL})
-	storage.adam_m_buffer, storage.adam_m_memory = _create_buffer(size, usage, {.DEVICE_LOCAL})
-	storage.adam_v_buffer, storage.adam_v_memory = _create_buffer(size, usage, {.DEVICE_LOCAL})
-
-	_record_fill_zero(storage.buffer,        size)
-	_record_fill_zero(storage.grad_buffer,   size)
-	_record_fill_zero(storage.adam_m_buffer, size)
-	_record_fill_zero(storage.adam_v_buffer, size)
-
-	p.storage = storage
-}
-
-gpu_parameter_free :: proc(p: ^ml.Parameter) {
-	if p.storage == nil { return }
-	storage := cast(^Gpu_Storage)p.storage
-	_destroy_gpu_storage(storage)
-	p.storage = nil
-}
-
 // Adam(W) step + zero gradient on GPU. Push constants pack the optimizer
 // state; the shader does one thread per element.
-gpu_parameter_update :: proc(opt: ml.Optimizer, p: ^ml.Parameter) {
+gpu_parameter_update :: proc(opt: ml.Optimizer, p: ^ml.Tensor) {
 	storage := cast(^Gpu_Storage)p.storage
 	fmt.assertf(storage != nil && storage.adam_m_buffer != 0,
 		"gpu_parameter_update: parameter has no Adam storage — was it allocated by ml.make under a GPU context?")
@@ -228,7 +198,7 @@ gpu_parameter_update :: proc(opt: ml.Optimizer, p: ^ml.Parameter) {
 // Full parameter copy: data + gradient + adam_m + adam_v. Executes as
 // four `CmdCopyBuffer`s recorded into the active batch (or one-shot
 // each if no batch is active).
-gpu_parameter_copy :: proc(dst, src: ^ml.Parameter) {
+gpu_parameter_copy :: proc(dst, src: ^ml.Tensor) {
 	dst_s := cast(^Gpu_Storage)dst.storage
 	src_s := cast(^Gpu_Storage)src.storage
 	fmt.assertf(dst_s.count == src_s.count, "gpu_parameter_copy size mismatch: dst=%v src=%v", dst_s.count, src_s.count)

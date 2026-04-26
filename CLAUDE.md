@@ -87,16 +87,12 @@ run this path end-to-end and match at the fp32 floor (verified by
 
 ## Next steps (where to pick up)
 
-1. **Split the CPU backend out of `ml.odin`.** Move the CPU-only
-   pieces — `cpu_alloc` / `cpu_clear_storage` / `cpu_set_data` /
-   `cpu_fill_gradient_with_ones`, `cpu_forward` / `cpu_backward` and
-   every `cpu_*` op kernel, the SIMD primitives (`_simd_dot_f32`,
-   `_simd_axpy_f32`), and the `parallelize` worker pool — into a
-   separate file (or `cpu/` subpackage), leaving `ml.odin` with the
-   backend-agnostic surface (`Backend`, `Context`, `Tensor`, op
-   variants, public op constructors, autograd tape, optimizer). Keep
-   the CPU backend the default; mirrors how `gpu/` is already its own
-   package.
+1. **Implement non-F32 data types.** `Data_Type` only has `F32` today
+   and every alloc path asserts it. Add `F16` and/or `BF16` (start
+   with one): per-dtype shader variants for the existing ops,
+   conversion kernels, mixed-precision Adam (params in low precision,
+   optimizer state in F32). Big chunk of work — gate it on a real
+   perf motivation.
 
 ## Testing
 
@@ -160,10 +156,18 @@ backends mid-call). One Context is owned by one thread at a time.
 
 ```odin
 Backend :: struct {
-    name:                    string,
-    data:                    rawptr,
-    alloc:                   proc(t: ^Tensor, n: int),
+    alloc:                   proc(t: ^Tensor, n: int, persistent: bool, extra_buffers: int),
+    free:                    proc(t: ^Tensor),
     clear_storage:           proc(),
+    context_alloc:           proc() -> rawptr,
+    context_free:            proc(data: rawptr),
+    context_begin:           proc(data: rawptr),
+    context_end:             proc(),
+    flush:                   proc(),
+    set_data:                proc(t: ^Tensor, src: []f32),
+    get_data:                proc(t: ^Tensor, dst: []f32),
+    parameter_update:        proc(opt: Optimizer, p: ^Tensor),
+    parameter_copy:          proc(dst, src: ^Tensor),
     fill_gradient_with_ones: proc(t: ^Tensor),
     forward:                 proc(op: Operation),
     backward:                proc(op: Operation),
@@ -173,37 +177,46 @@ Backend :: struct {
 Each backend has ONE `forward` and ONE `backward` proc that internally
 `switch _ in op.variant` and call into op-specific kernels. Adding an
 op means adding one variant + one case in each backend's switch — no
-new fields on `Backend`. CPU backend's switch is exhaustive; GPU
-backend's is `#partial`-style (unported variants `panic`).
+new fields on `Backend`.
 
-The decision to use tagged dispatch instead of a vtable was deliberate:
-the switch already existed in `backward()`, dispatch overhead is dwarfed
-by op work, and the variant union gives compile-time exhaustiveness on
-the CPU side without the 60-field Backend struct.
+`alloc` is the single allocation hook; `persistent` controls whether
+the storage outlives `clear_storage` and `extra_buffers` controls how
+many same-shape buffers go alongside `data` + `gradient` (2 for Adam
+parameters → adam_m + adam_v).
 
 ### `Tensor` with backend storage (in `ml.odin`)
 
 ```odin
 Tensor :: struct {
-    backend:  ^Backend,
-    storage:  rawptr,         // backend-specific (CPU: nil; GPU: ^gpu.Gpu_Storage)
-    data:     []f32,          // CPU: real slice. GPU: empty.
-    gradient: []f32,          // CPU: real slice. GPU: empty.
-    shape:    [MAX_TENSOR_RANK]int,
-    rank:     int,
-    count:    int,            // total element count, set at allocation
+    backend: ^Backend,
+    storage: rawptr,         // backend-specific (CPU: ^Cpu_Storage; GPU: ^gpu.Gpu_Storage)
+    type:    Data_Type,      // F32 only for now; future-proofs the API
+    shape:   [MAX_TENSOR_RANK]int,
+    rank:    int,
+    count:   int,            // total element count, set at allocation
+}
+
+Cpu_Storage :: struct {
+    data, gradient, adam_m, adam_v: []f32  // adam_m/adam_v empty unless extra_buffers >= 2
 }
 ```
 
-CPU code reads `t.data[i]` directly. GPU code reads `t.storage` and
-casts it to `^gpu.Gpu_Storage` (which holds `vk.Buffer` + `vk.DeviceMemory`
-for both data and gradient). `len(t)` returns `t.count` — works for both
-backends.
+`Tensor` is opaque w.r.t. backend storage. CPU code goes through the
+package-level accessors `ml.data(t)` / `ml.gradient(t)` (which cast
+`t.storage` to `^Cpu_Storage`). GPU code goes through `set_data` /
+`get_data` (host↔device transfer) or `gpu.upload_tensor` /
+`gpu.download_tensor` for the explicit form. `ml.make` allocates a
+`Tensor` with the Adam-state slots populated (used for trainable
+parameters); `ml.zeros` / `ml.persistent_zeros` allocate without
+them.
 
-Allocation goes through `_current_ctx.backend.alloc(&t, n)`. CPU
-allocates from the context arena. GPU creates two DEVICE_LOCAL buffers
-and tracks them on the active `Gpu_Context` for bulk release on
-`ml.clear()`.
+Allocation goes through `_current_ctx.backend.alloc(&t, n, persistent,
+extra_buffers)`. CPU allocates a `Cpu_Storage` from either the active
+context's arena (`persistent=false`) or the heap (`persistent=true`).
+GPU creates DEVICE_LOCAL buffers and registers activations on the
+active `Gpu_Context` for `clear_storage` recycling; persistent
+allocations skip the registration. `free(t)` frees a persistent
+allocation; activations are bulk-recycled by `clear_storage`.
 
 ### SIMD primitives (in `ml.odin`)
 
@@ -367,10 +380,15 @@ after several Adam updates.
 
 ## Project layout
 
-- `ml.odin`: CPU primitives, autograd tape, `Context` / `Backend` / op
-  procs, Adam optimizer, worker pool, SIMD kernels.
-- `mlp/`, `gru/`, `transformer/`: model implementations (backend-agnostic
-  via the unified API).
+- `ml.odin`: backend-agnostic surface — `Backend`, `Tensor`,
+  `Data_Type`, `Context`, `Operation` and its variants, every public
+  op constructor, autograd walk, Adam optimizer, alloc / data-transfer
+  / accessor procs.
+- `cpu.odin`: CPU backend implementation — `Cpu_Storage`, the
+  `_cpu_backend` instance, every `cpu_*` hook, every `cpu_*_forward` +
+  `*_backward` op kernel, SIMD primitives, persistent worker pool.
+- `mlp/`, `gru/`, `transformer/`: model implementations
+  (backend-agnostic via the unified API).
 - `gpu/`: Vulkan compute backend.
   - `gpu.odin`: instance / device init (lazy via `gpu.backend()`);
     `Gpu_Context` lifecycle (per-`ml.Context` state — command pool,

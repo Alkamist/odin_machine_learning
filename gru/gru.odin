@@ -10,39 +10,39 @@ Gru :: struct {
 
 	state: []f32,
 
-	update_input_weight:  ml.Parameter,
-	update_hidden_weight: ml.Parameter,
-	update_bias:          ml.Parameter,
+	update_input_weight:  ml.Tensor,
+	update_hidden_weight: ml.Tensor,
+	update_bias:          ml.Tensor,
 
-	reset_input_weight:  ml.Parameter,
-	reset_hidden_weight: ml.Parameter,
-	reset_bias:          ml.Parameter,
+	reset_input_weight:  ml.Tensor,
+	reset_hidden_weight: ml.Tensor,
+	reset_bias:          ml.Tensor,
 
-	candidate_input_weight:  ml.Parameter,
-	candidate_hidden_weight: ml.Parameter,
-	candidate_bias:          ml.Parameter,
+	candidate_input_weight:  ml.Tensor,
+	candidate_hidden_weight: ml.Tensor,
+	candidate_bias:          ml.Tensor,
 }
 
 make :: proc(input_size, hidden_size: int, allocator := context.allocator) -> (gru: Gru) {
 	gru.input_size  = input_size
 	gru.hidden_size = hidden_size
 
-	gru.state = builtin.make([]f32, hidden_size, allocator=allocator)
+	gru.state = builtin.make([]f32, hidden_size)
 
 	// Update gate
-	gru.update_input_weight  = ml.make(hidden_size, input_size,  allocator = allocator)
-	gru.update_hidden_weight = ml.make(hidden_size, hidden_size, allocator = allocator)
-	gru.update_bias          = ml.make(hidden_size,              allocator = allocator)
+	gru.update_input_weight  = ml.make(hidden_size, input_size)
+	gru.update_hidden_weight = ml.make(hidden_size, hidden_size)
+	gru.update_bias          = ml.make(hidden_size)
 
 	// Reset gate
-	gru.reset_input_weight  = ml.make(hidden_size, input_size,  allocator = allocator)
-	gru.reset_hidden_weight = ml.make(hidden_size, hidden_size, allocator = allocator)
-	gru.reset_bias          = ml.make(hidden_size,              allocator = allocator)
+	gru.reset_input_weight  = ml.make(hidden_size, input_size)
+	gru.reset_hidden_weight = ml.make(hidden_size, hidden_size)
+	gru.reset_bias          = ml.make(hidden_size)
 
 	// Candidate hidden state
-	gru.candidate_input_weight  = ml.make(hidden_size, input_size,  allocator = allocator)
-	gru.candidate_hidden_weight = ml.make(hidden_size, hidden_size, allocator = allocator)
-	gru.candidate_bias          = ml.make(hidden_size,              allocator = allocator)
+	gru.candidate_input_weight  = ml.make(hidden_size, input_size)
+	gru.candidate_hidden_weight = ml.make(hidden_size, hidden_size)
+	gru.candidate_bias          = ml.make(hidden_size)
 
 	randomize(gru)
 
@@ -135,7 +135,7 @@ forward :: proc(gru: Gru, input: ml.Tensor) -> (state: ml.Tensor) {
 
 	state = new_hidden_state
 
-	builtin.copy(gru.state, state.data)
+	builtin.copy(gru.state, ml.data(state))
 
 	return
 }

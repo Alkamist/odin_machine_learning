@@ -234,12 +234,12 @@ choose_action :: proc(network: Network, embedding: game.Embedding, sample := fal
 	log_probabilities := ml.log_softmax(logits)
 
 	if sample {
-		action = game.Action(utility.sample_probability_distribution(probabilities.data))
+		action = game.Action(utility.sample_probability_distribution(ml.data(probabilities)))
 	} else {
-		action = game.Action(slice.max_index(probabilities.data))
+		action = game.Action(slice.max_index(ml.data(probabilities)))
 	}
 
-	log_probability = log_probabilities.data[action]
+	log_probability = ml.data(log_probabilities)[action]
 
 	return
 }
@@ -254,7 +254,7 @@ record_trajectory :: proc(model: ^Model) {
 
 		frame.embedding = game.embedding(model.game_state)
 
-		frame.value = forward(model.critic, frame.embedding[:]).data[0]
+		frame.value = ml.data(forward(model.critic, frame.embedding[:]))[0]
 
 		frame.action, frame.log_probability = choose_action(model.actor, frame.embedding, sample=true)
 

@@ -82,7 +82,7 @@ destroy_model :: proc(model: Model) {
 
 forward :: proc(model: Model, character: byte) -> ml.Tensor {
 	input := ml.zeros(256)
-	input.data[character] = 1
+	ml.data(input)[character] = 1
 
 	state     := gru.forward(model.gru, input)
 	mlp_input := ml.concat(input, state)
@@ -101,7 +101,7 @@ evaluate :: proc(model: Model, text: []byte) -> (loss: f32) {
 
 		logits := forward(model, character)
 		
-		loss += ml.cross_entropy(logits, {int(target)}).data[0]
+		loss += ml.data(ml.cross_entropy(logits, {int(target)}))[0]
 	}
 
 	loss /= f32(len(text) - 1)
@@ -146,7 +146,7 @@ speak :: proc(model: Model, count: int) {
 		ml.clear()
 
 		logits := forward(model, output)
-		output  = byte(utility.sample_top_p(logits.data, 0.9, 1))
+		output  = byte(utility.sample_top_p(ml.data(logits), 0.9, 1))
 
 		fmt.print(rune(output))
 	}

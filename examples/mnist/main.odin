@@ -94,7 +94,7 @@ predict :: proc(model: Model, input: []f32, predictions: []int) {
 
 	logits             := forward(model, input, count)
 	probabilities      := ml.softmax(logits)
-	probabilities_data := probabilities.data
+	probabilities_data := ml.data(probabilities)
 
 	class_size := len(probabilities_data) / count
 

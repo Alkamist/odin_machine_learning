@@ -5,12 +5,12 @@ import "core:math"
 import ml "../"
 
 Layer :: struct {
-	norm0_weight:    ml.Parameter, // [embedding_size]
-	qkv_weight:      ml.Parameter, // [embedding_size, 3 * embedding_size]
-	proj_weight:     ml.Parameter, // [embedding_size, embedding_size]
-	norm1_weight:    ml.Parameter, // [embedding_size]
-	mlp_up_weight:   ml.Parameter, // [embedding_size, 4 * embedding_size]
-	mlp_down_weight: ml.Parameter, // [4 * embedding_size, embedding_size]
+	norm0_weight:    ml.Tensor, // [embedding_size]
+	qkv_weight:      ml.Tensor, // [embedding_size, 3 * embedding_size]
+	proj_weight:     ml.Tensor, // [embedding_size, embedding_size]
+	norm1_weight:    ml.Tensor, // [embedding_size]
+	mlp_up_weight:   ml.Tensor, // [embedding_size, 4 * embedding_size]
+	mlp_down_weight: ml.Tensor, // [4 * embedding_size, embedding_size]
 }
 
 Transformer :: struct {
@@ -18,12 +18,12 @@ Transformer :: struct {
 	embedding_size:  int,
 	vocabulary_size: int,
 
-	token_embeddings: ml.Parameter, // [vocabulary_size, embedding_size]
+	token_embeddings: ml.Tensor, // [vocabulary_size, embedding_size]
 
 	layers: []Layer,
 
-	norm_weight:   ml.Parameter, // [embedding_size]
-	output_weight: ml.Parameter, // [embedding_size, vocabulary_size]
+	norm_weight:   ml.Tensor, // [embedding_size]
+	output_weight: ml.Tensor, // [embedding_size, vocabulary_size]
 }
 
 make :: proc(layer_count, head_count, embedding_size, vocabulary_size: int, allocator := context.allocator) -> (transformer: Transformer) {
@@ -31,23 +31,23 @@ make :: proc(layer_count, head_count, embedding_size, vocabulary_size: int, allo
 	transformer.embedding_size  = embedding_size
 	transformer.vocabulary_size = vocabulary_size
 
-	transformer.layers = builtin.make([]Layer, layer_count, allocator=allocator)
+	transformer.layers = builtin.make([]Layer, layer_count)
 
-	transformer.token_embeddings = ml.make(vocabulary_size, embedding_size, allocator=allocator)
+	transformer.token_embeddings = ml.make(vocabulary_size, embedding_size)
 
 	for &layer in transformer.layers {
-		layer.norm0_weight = ml.make(embedding_size,                     allocator=allocator)
-		layer.qkv_weight   = ml.make(3 * embedding_size, embedding_size, allocator=allocator)
-		layer.proj_weight  = ml.make(embedding_size,     embedding_size, allocator=allocator)
-		layer.norm1_weight = ml.make(embedding_size,                     allocator=allocator)
+		layer.norm0_weight = ml.make(embedding_size)
+		layer.qkv_weight   = ml.make(3 * embedding_size, embedding_size)
+		layer.proj_weight  = ml.make(embedding_size,     embedding_size)
+		layer.norm1_weight = ml.make(embedding_size)
 
 		hidden_size := 4 * embedding_size
-		layer.mlp_up_weight   = ml.make(hidden_size,    embedding_size, allocator=allocator)
-		layer.mlp_down_weight = ml.make(embedding_size, hidden_size,    allocator=allocator)
+		layer.mlp_up_weight   = ml.make(hidden_size,    embedding_size)
+		layer.mlp_down_weight = ml.make(embedding_size, hidden_size)
 	}
 
-	transformer.norm_weight   = ml.make(embedding_size,                  allocator=allocator)
-	transformer.output_weight = ml.make(vocabulary_size, embedding_size, allocator=allocator)
+	transformer.norm_weight   = ml.make(embedding_size)
+	transformer.output_weight = ml.make(vocabulary_size, embedding_size)
 
 	randomize(transformer)
 

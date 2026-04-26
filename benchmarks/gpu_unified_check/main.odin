@@ -39,8 +39,6 @@ main :: proc() {
 
 		check(a.backend == gpu.backend(),       "phase1: tensor a's backend is GPU",                 &any_failed)
 		check(a.storage != nil,                 "phase1: tensor a has GPU storage",                  &any_failed)
-		check(len(a.data) == 0,                 "phase1: tensor a's CPU data slice is empty",        &any_failed)
-		check(len(a.gradient) == 0,             "phase1: tensor a's CPU gradient slice is empty",    &any_failed)
 
 		storage_a := cast(^gpu.Gpu_Storage)a.storage
 		storage_b := cast(^gpu.Gpu_Storage)b.storage
@@ -79,9 +77,9 @@ main :: proc() {
 			c := ml.add(a, b)
 			ml.backward()
 
-			copy(cpu_out[:],    c.data)
-			copy(cpu_grad_a[:], a.gradient)
-			copy(cpu_grad_b[:], b.gradient)
+			copy(cpu_out[:],    ml.data(c))
+			copy(cpu_grad_a[:], ml.gradient(a))
+			copy(cpu_grad_b[:], ml.gradient(b))
 		}
 
 		// GPU run.
@@ -146,15 +144,15 @@ main :: proc() {
 
 			x := ml.zeros(COUNT, INPUT_SIZE)
 			w := ml.zeros(OUTPUT_SIZE, INPUT_SIZE)
-			copy(x.data, x_data[:])
-			copy(w.data, w_data[:])
+			ml.set_data(x, x_data[:])
+			ml.set_data(w, w_data[:])
 
 			y := ml.linear(x, w)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
-			copy(cpu_dw[:], w.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
+			copy(cpu_dw[:], ml.gradient(w))
 		}
 
 		gpu_y:  [COUNT * OUTPUT_SIZE]f32
@@ -210,8 +208,8 @@ main :: proc() {
 			y := ml.gelu(x)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 
 		gpu_y:  [N]f32
@@ -263,13 +261,13 @@ main :: proc() {
 			ml.context_scope(ctx)
 
 			table := ml.zeros(VOCAB, SIZE)
-			copy(table.data, table_data[:])
+			ml.set_data(table, table_data[:])
 
 			y := ml.select(table, indices[:])
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dt[:], table.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dt[:], ml.gradient(table))
 		}
 
 		gpu_y:  [N * SIZE]f32
@@ -315,13 +313,13 @@ main :: proc() {
 			ml.context_scope(ctx)
 
 			x := ml.zeros(TOKENS, HEADS * HEAD_SIZE)
-			copy(x.data, x_data[:])
+			ml.set_data(x, x_data[:])
 
 			y := ml.rope(x, HEADS)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 
 		gpu_y:  [TOKENS * HEADS * HEAD_SIZE]f32
@@ -368,13 +366,13 @@ main :: proc() {
 			ml.context_scope(ctx)
 
 			x := ml.zeros(ROWS, TRAILING)
-			copy(x.data, x_data[:])
+			ml.set_data(x, x_data[:])
 
 			y := ml.slice_trailing(x, START, END)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 
 		gpu_y:  [ROWS * (END - START)]f32
@@ -430,17 +428,17 @@ main :: proc() {
 			a := ml.zeros(ROWS, T_A)
 			b := ml.zeros(ROWS, T_B)
 			c := ml.zeros(ROWS, T_C)
-			copy(a.data, a_data[:])
-			copy(b.data, b_data[:])
-			copy(c.data, c_data[:])
+			ml.set_data(a, a_data[:])
+			ml.set_data(b, b_data[:])
+			ml.set_data(c, c_data[:])
 
 			y := ml.concat(a, b, c)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_da[:], a.gradient)
-			copy(cpu_db[:], b.gradient)
-			copy(cpu_dc[:], c.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_da[:], ml.gradient(a))
+			copy(cpu_db[:], ml.gradient(b))
+			copy(cpu_dc[:], ml.gradient(c))
 		}
 
 		gpu_y:  [out_size]f32
@@ -497,13 +495,13 @@ main :: proc() {
 			ml.context_scope(ctx)
 
 			x := ml.zeros(COUNT, SIZE)
-			copy(x.data, x_data[:])
+			ml.set_data(x, x_data[:])
 
 			y := ml.softmax(x)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 
 		gpu_y:  [COUNT * SIZE]f32
@@ -548,13 +546,13 @@ main :: proc() {
 			ml.context_scope(ctx)
 
 			x := ml.zeros(D0, D1, D2)
-			copy(x.data, x_data[:])
+			ml.set_data(x, x_data[:])
 
 			y := ml.permute(x, {1, 0, 2})
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 
 		gpu_y:  [D0 * D1 * D2]f32
@@ -598,13 +596,13 @@ main :: proc() {
 			ml.context_scope(ctx)
 
 			x := ml.zeros(H, T, T)
-			copy(x.data, x_data[:])
+			ml.set_data(x, x_data[:])
 
 			y := ml.causal_mask(x)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 
 		gpu_y:  [H * T * T]f32
@@ -656,9 +654,9 @@ main :: proc() {
 				c := ml.mul(a, b)
 				ml.backward()
 
-				copy(cpu_out, c.data)
-				copy(cpu_da,  a.gradient)
-				copy(cpu_db,  b.gradient)
+				copy(cpu_out, ml.data(c))
+				copy(cpu_da,  ml.gradient(a))
+				copy(cpu_db,  ml.gradient(b))
 			}
 			{
 				ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -759,15 +757,15 @@ main :: proc() {
 
 			a := ml.zeros(B, M, K)
 			b := ml.zeros(B, K, N)
-			copy(a.data, a_data[:])
-			copy(b.data, b_data[:])
+			ml.set_data(a, a_data[:])
+			ml.set_data(b, b_data[:])
 
 			y := ml.batched_matmul(a, b)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_da[:], a.gradient)
-			copy(cpu_db[:], b.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_da[:], ml.gradient(a))
+			copy(cpu_db[:], ml.gradient(b))
 		}
 
 		gpu_y:  [B * M * N]f32
@@ -832,8 +830,8 @@ main :: proc() {
 			y := ml.attention(x, HEADS)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 
 		gpu_y:  [TOKENS * EMBED]f32
@@ -885,15 +883,15 @@ main :: proc() {
 
 			x := ml.zeros(COUNT, SIZE)
 			w := ml.zeros(SIZE)
-			copy(x.data, x_data[:])
-			copy(w.data, w_data[:])
+			ml.set_data(x, x_data[:])
+			ml.set_data(w, w_data[:])
 
 			y := ml.layernorm(x, w)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
-			copy(cpu_dw[:], w.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
+			copy(cpu_dw[:], ml.gradient(w))
 		}
 
 		gpu_y:  [COUNT * SIZE]f32
@@ -948,13 +946,13 @@ main :: proc() {
 			ml.context_scope(ctx)
 
 			x := ml.zeros(COUNT, CLASS_SIZE)
-			copy(x.data, x_data[:])
+			ml.set_data(x, x_data[:])
 
 			loss := ml.cross_entropy(x, targets[:])
 			ml.backward()
 
-			copy(cpu_loss[:], loss.data)
-			copy(cpu_dx[:],   x.gradient)
+			copy(cpu_loss[:], ml.data(loss))
+			copy(cpu_dx[:],   ml.gradient(x))
 		}
 
 		gpu_loss: [COUNT]f32
@@ -1000,13 +998,13 @@ main :: proc() {
 			ml.context_scope(ctx)
 
 			x := ml.zeros(COUNT, SIZE)
-			copy(x.data, x_data[:])
+			ml.set_data(x, x_data[:])
 
 			y := ml.mean(x)
 			ml.backward()
 
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 		{
 			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -1072,8 +1070,8 @@ main :: proc() {
 			defer ml.destroy(w1)
 
 			// Seed both backends with identical parameter values via set_data.
-			t0 := w0.tensor; w0.backend.set_data(&t0, w0_init)
-			t1 := w1.tensor; w1.backend.set_data(&t1, w1_init)
+			ml.set_data(w0, w0_init)
+			ml.set_data(w1, w1_init)
 
 			opt: ml.Optimizer
 			for step in 0 ..< STEPS {
@@ -1097,8 +1095,8 @@ main :: proc() {
 			_ = debug_grad_w0
 
 			// Read final parameter values back.
-			tw0 := w0.tensor; w0.backend.get_data(&tw0, out_w0)
-			tw1 := w1.tensor; w1.backend.get_data(&tw1, out_w1)
+			ml.get_data(w0, out_w0)
+			ml.get_data(w1, out_w1)
 		}
 
 		cpu_w0, gpu_w0: [HIDDEN * IN_DIM]f32
@@ -1141,8 +1139,8 @@ main :: proc() {
 				x := ml.tensor(x_data)
 				y := fn(x)
 				ml.backward()
-				copy(cpu_y,  y.data)
-				copy(cpu_dx, x.gradient)
+				copy(cpu_y,  ml.data(y))
+				copy(cpu_dx, ml.gradient(x))
 			}
 			{
 				ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -1202,9 +1200,9 @@ main :: proc() {
 				b := ml.tensor(b_data)
 				y := fn(a, b)
 				ml.backward()
-				copy(cpu_y,  y.data)
-				copy(cpu_da, a.gradient)
-				copy(cpu_db, b.gradient)
+				copy(cpu_y,  ml.data(y))
+				copy(cpu_da, ml.gradient(a))
+				copy(cpu_db, ml.gradient(b))
 			}
 			{
 				ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -1262,9 +1260,9 @@ main :: proc() {
 				a := ml.tensor(a_data); b := ml.tensor(b_data)
 				y := fn(a, b)
 				ml.backward()
-				copy(cpu_y,  y.data)
-				copy(cpu_da, a.gradient)
-				copy(cpu_db, b.gradient)
+				copy(cpu_y,  ml.data(y))
+				copy(cpu_da, ml.gradient(a))
+				copy(cpu_db, ml.gradient(b))
 			}
 			{
 				ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -1311,11 +1309,11 @@ main :: proc() {
 			ctx := ml.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
-			x := ml.zeros(ROWS, COLS); copy(x.data, x_data[:])
+			x := ml.zeros(ROWS, COLS); ml.set_data(x, x_data[:])
 			y := ml.transpose(x)
 			ml.backward()
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 		{
 			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -1352,8 +1350,8 @@ main :: proc() {
 			x := ml.tensor(x_data[:])
 			y := ml.slice(x, START, END)
 			ml.backward()
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 		{
 			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -1386,11 +1384,11 @@ main :: proc() {
 			ctx := ml.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
-			x := ml.zeros(COUNT, SIZE); copy(x.data, x_data[:])
+			x := ml.zeros(COUNT, SIZE); ml.set_data(x, x_data[:])
 			y := ml.log_softmax(x)
 			ml.backward()
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], x.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(x))
 		}
 		{
 			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -1437,11 +1435,11 @@ main :: proc() {
 			ctx := ml.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
-			p := ml.zeros(COUNT, SIZE); copy(p.data, probs[:])
+			p := ml.zeros(COUNT, SIZE); ml.set_data(p, probs[:])
 			y := ml.entropy(p)
 			ml.backward()
-			copy(cpu_y[:],  y.data)
-			copy(cpu_dx[:], p.gradient)
+			copy(cpu_y[:],  ml.data(y))
+			copy(cpu_dx[:], ml.gradient(p))
 		}
 		{
 			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
@@ -1476,12 +1474,12 @@ main :: proc() {
 			ctx := ml.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
-			pred   := ml.zeros(COUNT, SIZE); copy(pred.data,   pred_data[:])
-			target := ml.zeros(COUNT, SIZE); copy(target.data, target_data[:])
+			pred   := ml.zeros(COUNT, SIZE); ml.set_data(pred, pred_data[:])
+			target := ml.zeros(COUNT, SIZE); ml.set_data(target, target_data[:])
 			y := ml.mean_squared_error(pred, target)
 			ml.backward()
-			copy(cpu_y[:],     y.data)
-			copy(cpu_dpred[:], pred.gradient)
+			copy(cpu_y[:],     ml.data(y))
+			copy(cpu_dpred[:], ml.gradient(pred))
 		}
 		{
 			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())

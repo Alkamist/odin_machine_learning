@@ -138,7 +138,7 @@ time_iters :: proc(name: string, run: proc() -> f32) -> Result {
 
 sum :: proc(t: ml.Tensor) -> f32 {
 	s: f32
-	for v in t.data {
+	for v in ml.data(t) {
 		s += v
 	}
 	return s
@@ -146,7 +146,7 @@ sum :: proc(t: ml.Tensor) -> f32 {
 
 sum_grad :: proc(t: ml.Tensor) -> f32 {
 	s: f32
-	for v in t.gradient {
+	for v in ml.gradient(t) {
 		s += v
 	}
 	return s
@@ -329,7 +329,7 @@ bench_adam_update :: proc() -> Result {
 	defer ml.destroy(p)
 	ml.fill_normal(p, 0, 0.02)
 	for i in 0 ..< N {
-		p.gradient[i] = 0.001
+		ml.gradient(p)[i] = 0.001
 	}
 
 	state_w = p
@@ -338,14 +338,14 @@ bench_adam_update :: proc() -> Result {
 		w_state := state_w
 		// Refill gradient since update() zeroes it.
 		for i in 0 ..< N {
-			w_state.gradient[i] = 0.001
+			ml.gradient(w_state)[i] = 0.001
 		}
 		opt: ml.Optimizer
 		if ml.optimize(&opt, period = 1) {
 			ml.update(opt, w_state)
 		}
 		s: f32
-		for v in w_state.data {
+		for v in ml.data(w_state) {
 			s += v
 		}
 		return s
@@ -389,7 +389,7 @@ bench_transformer_step :: proc() -> Result {
 		}
 
 		// Checksum: use a deterministic value from the forward pass.
-		data := logits.data
+		data := ml.data(logits)
 		s: f32
 		for v in data[:math.min(64, len(data))] {
 			s += v
@@ -438,7 +438,7 @@ verify_training_trajectory :: proc() {
 		}
 
 		step_s := fmt.tprintf("%v", step)
-		loss_s := fmt.tprintf("%.6f", loss.data[0])
+		loss_s := fmt.tprintf("%.6f", ml.data(loss)[0])
 		fmt.printfln("%-10s %16s", step_s, loss_s)
 	}
 
@@ -447,7 +447,7 @@ verify_training_trajectory :: proc() {
 	ml.clear()
 	final_logits := tfm.forward(model, tokens)
 	checksum: f32
-	for v in final_logits.data {
+	for v in ml.data(final_logits) {
 		checksum += v
 	}
 	csum_s := fmt.tprintf("%.6f", checksum)
@@ -457,7 +457,7 @@ verify_training_trajectory :: proc() {
 // Module-local globals used to smuggle setup state into the closure-less
 // `proc()` literals required by time_iters. This keeps the timing harness's
 // signature simple at the cost of a couple of file-scope vars.
-@(private="file") state_w:      ml.Parameter
+@(private="file") state_w:      ml.Tensor
 @(private="file") state_model:  tfm.Transformer
 @(private="file") state_tokens: []int
 @(private="file") state_target: []int

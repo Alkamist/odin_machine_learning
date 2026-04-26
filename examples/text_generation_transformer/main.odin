@@ -79,7 +79,7 @@ destroy_model :: proc(model: Model) {
 text_to_tokens :: proc(text: []byte) -> (res: ml.Tensor) {
 	res = ml.zeros(len(text))
 	for i in 0 ..< len(text) {
-		res.data[i] = f32(text[i]) / 255.0
+		ml.data(res)[i] = f32(text[i]) / 255.0
 	}
 	return
 }
@@ -106,7 +106,7 @@ evaluate :: proc(model: Model, text: []byte, target: byte) -> f32 {
 	loss := ml.cross_entropy(logits, targets)
 	loss  = ml.mean(loss)
 
-	return loss.data[0]
+	return ml.data(loss)[0]
 }
 
 learn :: proc(model: ^Model, text: []byte, target: byte) -> bool {
@@ -144,7 +144,7 @@ speak :: proc(model: Model, token_count: int) {
 		ml.clear()
 
 		logits       := forward(model, text[:])
-		logits_data  := logits.data
+		logits_data  := ml.data(logits)
 		token_logits := logits_data[min(i, SEQUENCE_LENGTH - 1) * model.transformer.vocabulary_size:][:model.transformer.vocabulary_size]
 		output       := utility.sample_top_p(token_logits, 0.9, 1)
 

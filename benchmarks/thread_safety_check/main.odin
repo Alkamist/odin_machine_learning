@@ -25,20 +25,20 @@ run_workload :: proc() -> (data_sum, grad_sum: f32) {
 	weight, _ := ml.make(WORKLOAD_OUT, WORKLOAD_IN)
 	defer ml.destroy(weight)
 
-	for i in 0 ..< len(weight.data) {
-		weight.data[i] = f32(i % 257) * 1e-3 - 0.05
+	for i in 0 ..< ml.len(weight) {
+		ml.data(weight)[i] = f32(i % 257) * 1e-3 - 0.05
 	}
 
 	input := ml.zeros(WORKLOAD_BATCH, WORKLOAD_IN)
-	for i in 0 ..< len(input.data) {
-		input.data[i] = f32((i * 13 + 7) % 199) * 1e-3
+	for i in 0 ..< ml.len(input) {
+		ml.data(input)[i] = f32((i * 13 + 7) % 199) * 1e-3
 	}
 
 	output := ml.linear(input, weight)
 	ml.backward()
 
-	for v in output.data    do data_sum += v
-	for g in weight.gradient do grad_sum += g
+	for v in ml.data(output)    do data_sum += v
+	for g in ml.gradient(weight) do grad_sum += g
 	return
 }
 

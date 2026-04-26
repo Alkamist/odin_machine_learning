@@ -109,7 +109,7 @@ choose_action :: proc(model: Model, embedding: game.Embedding) -> (res: game.Act
 	logits        := forward(model, embedding)
 	probabilities := ml.softmax(logits)
 
-	return game.Action(utility.sample_probability_distribution(probabilities.data))
+	return game.Action(utility.sample_probability_distribution(ml.data(probabilities)))
 }
 
 learn :: proc(model: ^Model, frame: Frame) {
