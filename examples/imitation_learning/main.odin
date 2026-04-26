@@ -95,9 +95,10 @@ destroy_model :: proc(model: Model) {
 	mlp.destroy(model.mlp)
 }
 
-forward :: proc(model: Model, embedding: game.Embedding) -> ml.Array {
+forward :: proc(model: Model, embedding: game.Embedding) -> ml.Tensor {
 	embedding := embedding
-	return mlp.forward(model.mlp, ml.array(embedding[:]))
+	x := ml.tensor(embedding[:])
+	return mlp.forward(model.mlp, x)
 }
 
 choose_action :: proc(model: Model, embedding: game.Embedding) -> (res: game.Action) {

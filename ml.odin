@@ -1,16 +1,16 @@
 // This library was designed with the goal of exploring and understanding machine
 // learning. Some of the main goals are simplicity and understandability.
 //
-// The main working units of the library are Arrays, rather than Tensors. Shape
-// information is inferred when possible, and passed in as function arguments
-// when not. Arrays are just slices of data and gradients that are stored in a
-// global thread local arena. Parameters are an extension of Arrays, and are
-// allocated by the user; these are values that can be trained.
+// The main working unit is the Tensor: a contiguous, row-major slice of data
+// and matching gradient buffer, plus an inline shape (rank-N, capped at
+// MAX_TENSOR_RANK). Activations live in a global thread-local arena;
+// Parameters embed a Tensor (via `using`) plus Adam state and own their own
+// buffers, so they pass anywhere a Tensor is expected.
 //
-// Operations that are performed are stored in a global thread local buffer,
-// so that they can be backpropagated to calculate gradients. So basically,
-// the workflow is to call clear, do your calculations, call backward to accumulate
-// the gradients, update parameters, and repeat.
+// Operations that are performed are stored in a global thread-local buffer,
+// so that they can be backpropagated to calculate gradients. The workflow is
+// to call clear, do your calculations, call backward to accumulate the
+// gradients, update parameters, and repeat.
 //
 // One downside to doing all of this from scratch is that this library isn't
 // particularly optimized. Some calculations are parallelized, but they can definitely
@@ -218,15 +218,29 @@ when thread.IS_SUPPORTED {
 	}
 }
 
-// The main working unit of the library.
-Array :: struct {
+// Maximum number of dimensions a Tensor can have. Shapes are stored inline as
+// a fixed-size array so Tensor stays a value type with no extra allocation.
+// Bump this if a future op needs more.
+MAX_TENSOR_RANK :: 6
+
+// The main working unit of the library. Always contiguous, row-major. No
+// views, no strides, no transpose-aliasing — `reshape` is the only operation
+// that shares storage, and it requires the element count to match exactly.
+//
+// `data` and `gradient` are slices into the global thread-local arena (for
+// activations) or into a Parameter's owned buffers (for trainable values).
+Tensor :: struct {
 	data:     []f32,
 	gradient: []f32,
+	shape:    [MAX_TENSOR_RANK]int,
+	rank:     int,
 }
 
-// Trainable values.
+// Trainable values. A Parameter is a Tensor (its data/gradient are
+// user-allocated rather than arena-allocated) plus Adam optimizer state.
+// `using tensor` lets a Parameter pass anywhere a Tensor is expected.
 Parameter :: struct {
-	using array: Array,
+	using tensor: Tensor,
 
 	adam_m: []f32,
 	adam_v: []f32,
@@ -287,59 +301,146 @@ arena_allocator :: proc() -> mem.Allocator {
 	return mem.arena_allocator(&_ctx.arena)
 }
 
-// Get the length of an array.
+// Total element count of a tensor (product of all dims). Equivalent to
+// `builtin.len(t.data)`.
 @(require_results)
-len :: #force_inline proc(arr: Array) -> int {
-	return builtin.len(arr.data)
+len :: #force_inline proc(t: Tensor) -> int {
+	return builtin.len(t.data)
 }
 
-// Allocate an array in the global arena initialized with zeros.
+// Total element count implied by a shape.
 @(require_results)
-zeros :: proc(len: int, loc := #caller_location) -> (arr: Array) {
+shape_element_count :: proc(shape: []int) -> int {
+	n := 1
+	for d in shape {
+		n *= d
+	}
+	return n
+}
+
+// Allocate a tensor in the global arena initialized with zeros. Variadic
+// `shape` gives the dimensions in row-major order (outermost first); a
+// single int produces a 1-D tensor.
+@(require_results)
+zeros :: proc(shape: ..int, loc := #caller_location) -> (t: Tensor) {
 	assert(_ctx.arena.data != nil, "Did you forget to call init?", loc=loc)
-	assert(len > 0, "Length must be at least 1", loc=loc)
+	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
+	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
+
+	n := shape_element_count(shape)
+	assert(n > 0, "Tensor element count must be positive", loc=loc)
 
 	err: mem.Allocator_Error
+	t.data, err = builtin.make([]f32, n, allocator=arena_allocator(), loc=loc)
+	fmt.assertf(err == nil, "Failed to allocate tensor data in global arena: %v", err, loc=loc)
 
-	arr.data, err = builtin.make([]f32, len, allocator=arena_allocator(), loc=loc)
-	fmt.assertf(err == nil, "Failed to allocate array data in global arena: %v", err, loc=loc)
+	t.gradient, err = builtin.make([]f32, n, allocator=arena_allocator(), loc=loc)
+	fmt.assertf(err == nil, "Failed to allocate tensor gradient in global arena: %v", err, loc=loc)
 
-	arr.gradient, err = builtin.make([]f32, len, allocator=arena_allocator(), loc=loc)
-	fmt.assertf(err == nil, "Failed to allocate array gradient in global arena: %v", err, loc=loc)
-
+	t.rank = builtin.len(shape)
+	for d, i in shape {
+		assert(d > 0, "Tensor dimension must be positive", loc=loc)
+		t.shape[i] = d
+	}
 	return
 }
 
-// Copy data to the global arena as an array.
+// Allocate a same-shape zeroed tensor.
 @(require_results)
-array :: proc(data: []f32, loc := #caller_location) -> (arr: Array) {
+zeros_like :: proc(src: Tensor, loc := #caller_location) -> Tensor {
+	shape := src.shape
+	return zeros(..shape[:src.rank], loc=loc)
+}
+
+// Copy data to the global arena as a 1-D tensor.
+@(require_results)
+tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
 
-	arr = zeros(builtin.len(data), loc=loc)
-	for i in 0 ..< len(arr) {
-		arr.data[i] = data[i]
+	t = zeros(builtin.len(data), loc=loc)
+	for v, i in data {
+		t.data[i] = v
 	}
-
 	return
 }
 
-// Copy a single value to the global arena as an array.
+// Single-value 1-D tensor in the global arena.
 @(require_results)
-scalar :: proc(value: f32, loc := #caller_location) -> (arr: Array) {
-	arr = zeros(1, loc=loc)
-	arr.data[0] = value
+scalar :: proc(value: f32, loc := #caller_location) -> (t: Tensor) {
+	t = zeros(1, loc=loc)
+	t.data[0] = value
 	return
 }
 
-// Allocate a parameter initialized with zeros.
+// Allocate a zeroed tensor whose shape is `src.shape` with the trailing dim
+// dropped. If src is rank 1, the output is a 1-D tensor of length 1.
 @(require_results)
-make :: proc(len: int, allocator := context.allocator, loc := #caller_location) -> (parameter: Parameter, err: mem.Allocator_Error) #optional_allocator_error {
-	assert(len > 0, "Length must be at least 1", loc=loc)
+_zeros_drop_last :: proc(src: Tensor, loc := #caller_location) -> Tensor {
+	if src.rank <= 1 {
+		return zeros(1, loc=loc)
+	}
+	shape := src.shape
+	return zeros(..shape[:src.rank - 1], loc=loc)
+}
 
-	parameter.data     = builtin.make([]f32, len, allocator=allocator, loc=loc) or_return
-	parameter.gradient = builtin.make([]f32, len, allocator=allocator, loc=loc) or_return
-	parameter.adam_m   = builtin.make([]f32, len, allocator=allocator, loc=loc) or_return
-	parameter.adam_v   = builtin.make([]f32, len, allocator=allocator, loc=loc) or_return
+// Allocate a zeroed tensor whose shape is `src.shape` with the trailing dim
+// replaced by `new_trailing`.
+@(require_results)
+_zeros_replace_trailing :: proc(src: Tensor, new_trailing: int, loc := #caller_location) -> Tensor {
+	new_shape: [MAX_TENSOR_RANK]int = src.shape
+	new_shape[src.rank - 1] = new_trailing
+	return zeros(..new_shape[:src.rank], loc=loc)
+}
+
+// Product of leading dimensions (rank-1 dims). For rank 1, returns 1.
+@(require_results)
+_leading_count :: proc(t: Tensor) -> int {
+	n := 1
+	for i in 0 ..< t.rank - 1 {
+		n *= t.shape[i]
+	}
+	return n
+}
+
+// Reinterpret a Tensor under a new shape. Pure header change — shares storage
+// with src. The new shape's element count must equal the source's.
+@(require_results)
+reshape :: proc(src: Tensor, shape: ..int, loc := #caller_location) -> (t: Tensor) {
+	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
+	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
+	assert(shape_element_count(shape) == len(src), "Reshape element count mismatch", loc=loc)
+
+	t.data     = src.data
+	t.gradient = src.gradient
+	t.rank     = builtin.len(shape)
+	for d, i in shape {
+		t.shape[i] = d
+	}
+	return
+}
+
+// Allocate a parameter initialized with zeros. Variadic `shape` gives the
+// dimensions in row-major order (outermost first); a single int produces a
+// 1-D parameter. Because `Parameter` embeds `Tensor` via `using`, a Parameter
+// passes anywhere a Tensor is expected — no explicit conversion needed.
+@(require_results)
+make :: proc(shape: ..int, allocator := context.allocator, loc := #caller_location) -> (parameter: Parameter, err: mem.Allocator_Error) #optional_allocator_error {
+	assert(builtin.len(shape) > 0, "Parameter must have at least one dimension", loc=loc)
+	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Parameter rank exceeds MAX_TENSOR_RANK", loc=loc)
+
+	n := shape_element_count(shape)
+	assert(n > 0, "Parameter element count must be positive", loc=loc)
+
+	parameter.data     = builtin.make([]f32, n, allocator=allocator, loc=loc) or_return
+	parameter.gradient = builtin.make([]f32, n, allocator=allocator, loc=loc) or_return
+	parameter.adam_m   = builtin.make([]f32, n, allocator=allocator, loc=loc) or_return
+	parameter.adam_v   = builtin.make([]f32, n, allocator=allocator, loc=loc) or_return
+
+	parameter.rank = builtin.len(shape)
+	for d, i in shape {
+		assert(d > 0, "Parameter dimension must be positive", loc=loc)
+		parameter.shape[i] = d
+	}
 
 	return parameter, nil
 }
@@ -362,28 +463,28 @@ copy :: proc(dst, src: Parameter, loc := #caller_location) {
 	return
 }
 
-// Fill array data with normally distributed random numbers.
-fill_normal :: proc(arr: Array, mean, std: f32) {
-	for &v in arr.data {
+// Fill tensor data with normally distributed random numbers.
+fill_normal :: proc(t: Tensor, mean, std: f32) {
+	for &v in t.data {
 		v = rand.float32_normal(mean, std)
 	}
 }
 
-// Fill array data with a single value.
-fill_value :: proc(arr: Array, value: f32) {
-	for &v in arr.data {
+// Fill tensor data with a single value.
+fill_value :: proc(t: Tensor, value: f32) {
+	for &v in t.data {
 		v = value
 	}
 }
 
-// Perform He initialization on an array.
-he_initialization :: proc(arr: Array, input_features: int) {
-	fill_normal(arr, 0, math.sqrt(2 / f32(input_features)))
+// Perform He initialization.
+he_initialization :: proc(t: Tensor, input_features: int) {
+	fill_normal(t, 0, math.sqrt(2 / f32(input_features)))
 }
 
-// Perform Xavier/Glorot initialization on an array.
-xavier_initialization :: proc(arr: Array, input_features, output_features: int) {
-	fill_normal(arr, 0, math.sqrt(2 / f32(input_features + output_features)))
+// Perform Xavier/Glorot initialization.
+xavier_initialization :: proc(t: Tensor, input_features, output_features: int) {
+	fill_normal(t, 0, math.sqrt(2 / f32(input_features + output_features)))
 }
 
 Optimizer :: struct {
@@ -485,8 +586,8 @@ Operation_Variant :: union {
 }
 
 Operation :: struct {
-	input:   Array,
-	output:  Array,
+	input:   Tensor,
+	output:  Tensor,
 	variant: Operation_Variant,
 }
 
@@ -497,7 +598,7 @@ append_operation :: proc(op: Operation, loc := #caller_location) {
 	_ctx.operation_count += 1
 }
 
-// Iterate backwards through all operations and accumulate gradients through arrays.
+// Iterate backwards through all operations and accumulate gradients through tensors.
 // Only the final operation's output gradient is initialized to 1, which means
 // that gradients flow backward from the final operation. Gradients won't
 // flow properly if you have multiple final operations. I'm not sure of the
@@ -550,16 +651,16 @@ backward :: proc(loc := #caller_location) {
 }
 
 Add :: struct {
-	b:      Array,
+	b:      Tensor,
 	stride: int,
 }
 
-// Add two arrays, b is broadcasted into a if necessary.
+// Add two tensors, b is broadcasted into a if necessary.
 @(require_results)
-add :: proc(a, b: Array, loc := #caller_location) -> (output: Array) {
+add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
 
-	output = zeros(len(a), loc=loc)
+	output = zeros_like(a, loc=loc)
 
 	stride := len(a) / len(b)
 	for i in 0 ..< stride {
@@ -598,16 +699,16 @@ add_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Sub :: struct {
-	b:      Array,
+	b:      Tensor,
 	stride: int,
 }
 
-// Subtract two arrays, b is broadcasted into a if necessary.
+// Subtract two tensors, b is broadcasted into a if necessary.
 @(require_results)
-sub :: proc(a, b: Array, loc := #caller_location) -> (output: Array) {
+sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
 
-	output = zeros(len(a), loc=loc)
+	output = zeros_like(a, loc=loc)
 
 	stride := len(a) / len(b)
 	for i in 0 ..< stride {
@@ -646,16 +747,16 @@ sub_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Mul :: struct {
-	b:      Array,
+	b:      Tensor,
 	stride: int,
 }
 
-// Multiply two arrays, b is broadcasted into a if necessary.
+// Multiply two tensors, b is broadcasted into a if necessary.
 @(require_results)
-mul :: proc(a, b: Array, loc := #caller_location) -> (output: Array) {
+mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
 
-	output = zeros(len(a), loc=loc)
+	output = zeros_like(a, loc=loc)
 
 	stride := len(a) / len(b)
 	for i in 0 ..< stride {
@@ -694,16 +795,16 @@ mul_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Div :: struct {
-	b:      Array,
+	b:      Tensor,
 	stride: int,
 }
 
-// Divide two arrays, b is broadcasted into a if necessary.
+// Divide two tensors, b is broadcasted into a if necessary.
 @(require_results)
-div :: proc(a, b: Array, loc := #caller_location) -> (output: Array) {
+div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
 
-	output = zeros(len(a), loc=loc)
+	output = zeros_like(a, loc=loc)
 
 	stride := len(a) / len(b)
 	for i in 0 ..< stride {
@@ -745,8 +846,8 @@ Exp :: struct {
 }
 
 @(require_results)
-exp :: proc(input: Array, loc := #caller_location) -> (output: Array) {
-	output = zeros(len(input), loc=loc)
+exp :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	output = zeros_like(input, loc=loc)
 
 	for i in 0 ..< len(input) {
 		output.data[i] = math.exp(input.data[i])
@@ -775,10 +876,10 @@ Clamp :: struct {
 }
 
 @(require_results)
-clamp :: proc(input: Array, min_val, max_val: f32, loc := #caller_location) -> (output: Array) {
+clamp :: proc(input: Tensor, min_val, max_val: f32, loc := #caller_location) -> (output: Tensor) {
 	assert(min_val <= max_val, "Requires min_val <= max_val", loc=loc)
 
-	output = zeros(len(input), loc=loc)
+	output = zeros_like(input, loc=loc)
 
 	for i in 0 ..< len(input) {
 		output.data[i] = math.clamp(input.data[i], min_val, max_val)
@@ -811,14 +912,14 @@ clamp_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Min :: struct {
-	b: Array,
+	b: Tensor,
 }
 
 @(require_results)
-min :: proc(a, b: Array, loc := #caller_location) -> (output: Array) {
+min :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) == len(b), "Requires inputs of equal length", loc=loc)
 
-	output = zeros(len(a), loc=loc)
+	output = zeros_like(a, loc=loc)
 
 	for i in 0 ..< len(a) {
 		output.data[i] = math.min(a.data[i], b.data[i])
@@ -851,14 +952,14 @@ min_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Max :: struct {
-	b: Array,
+	b: Tensor,
 }
 
 @(require_results)
-max :: proc(a, b: Array, loc := #caller_location) -> (output: Array) {
+max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) == len(b), "Requires inputs of equal length", loc=loc)
 
-	output = zeros(len(a), loc=loc)
+	output = zeros_like(a, loc=loc)
 
 	for i in 0 ..< len(a) {
 		output.data[i] = math.max(a.data[i], b.data[i])
@@ -896,12 +997,10 @@ Mean :: struct {
 }
 
 @(require_results)
-mean :: proc(input: Array, count := 1, loc := #caller_location) -> (output: Array) {
-	assert(count > 0, "Count must be at least 1", loc=loc)
-	assert(len(input) % count == 0, "Input length must be divisible by count", loc=loc)
-
-	size := len(input) / count
-	output = zeros(count, loc=loc)
+mean :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	count := _leading_count(input)
+	size  := len(input) / count
+	output = _zeros_drop_last(input, loc=loc)
 
 	for sample in 0 ..< count {
 		sum: f32
@@ -945,14 +1044,15 @@ Transpose :: struct {
 	rows: int,
 }
 
-// Transpose the data of an array with the given row count.
+// Transpose a 2-D tensor: [rows, cols] -> [cols, rows].
 @(require_results)
-transpose :: proc(input: Array, rows: int, loc := #caller_location) -> (output: Array) {
-	assert(len(input) % rows == 0, "Input length must be divisible by rows", loc=loc)
+transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank == 2, "transpose requires a 2-D tensor", loc=loc)
 
-	columns := len(input) / rows
+	rows    := input.shape[0]
+	columns := input.shape[1]
 
-	output = zeros(len(input), loc=loc)
+	output = zeros(columns, rows, loc=loc)
 
 	for i in 0 ..< rows {
 		for j in 0 ..< columns {
@@ -991,14 +1091,22 @@ Select :: struct {
 	size:    int,
 }
 
-// Select rows from an array based on indices and size.
+// Select rows from a tensor by index. Input shape [N, ...rest]; output shape
+// [len(indices), ...rest]. The "row size" is the product of trailing dims.
 @(require_results)
-select :: proc(input: Array, indices: []int, size := 1, loc := #caller_location) -> (output: Array) {
-	assert(len(input) % size == 0, "Input length must be divisible by size", loc=loc)
+select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank >= 1, "select input must have rank >= 1", loc=loc)
+
+	size := 1
+	for i in 1 ..< input.rank {
+		size *= input.shape[i]
+	}
 
 	indices_copy := builtin.make([]int, builtin.len(indices), allocator=arena_allocator())
 
-	output = zeros(size * builtin.len(indices), loc=loc)
+	out_shape: [MAX_TENSOR_RANK]int = input.shape
+	out_shape[0] = builtin.len(indices)
+	output = zeros(..out_shape[:input.rank], loc=loc)
 
 	for i in 0 ..< builtin.len(indices) {
 		indices_copy[i] = indices[i]
@@ -1038,9 +1146,9 @@ Slice :: struct {
 	end:   int,
 }
 
-// Slice an input array. Copies the data.
+// Slice an input tensor. Copies the data.
 @(require_results)
-slice :: proc(input: Array, start, end: int, loc := #caller_location) -> (output: Array) {
+slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
 	fmt.assertf(start >= 0 && end <= len(input) && start <= end, "Slice indices out of bounds %v:%v", start, end, loc=loc)
 
 	output = zeros(end - start, loc=loc)
@@ -1071,23 +1179,32 @@ slice_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Concat :: struct {
-	inputs: []Array,
+	inputs: []Tensor,
 }
 
-// Concatenate multiple arrays.
+// Concatenate multiple tensors along the trailing dim. All inputs must share
+// rank and match in every dim except the trailing one. Output shape =
+// inputs[0].shape with the trailing dim replaced by the sum of trailings.
 @(require_results)
-concat :: proc(inputs: ..Array, loc := #caller_location) -> (output: Array) {
+concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(builtin.len(inputs) > 0, "Requires at least one input", loc=loc)
 
-	inputs_copy := builtin.make([]Array, builtin.len(inputs), allocator=arena_allocator())
-
-	output_length := 0
-	for input, i in inputs {
-		inputs_copy[i] = input
-		output_length += len(input)
+	first := inputs[0]
+	trailing_sum := first.shape[first.rank - 1]
+	for i in 1 ..< builtin.len(inputs) {
+		assert(inputs[i].rank == first.rank, "All concat inputs must have the same rank", loc=loc)
+		for d in 0 ..< first.rank - 1 {
+			assert(inputs[i].shape[d] == first.shape[d], "All concat inputs must match in non-trailing dims", loc=loc)
+		}
+		trailing_sum += inputs[i].shape[inputs[i].rank - 1]
 	}
 
-	output = zeros(output_length, loc=loc)
+	inputs_copy := builtin.make([]Tensor, builtin.len(inputs), allocator=arena_allocator())
+	for input, i in inputs {
+		inputs_copy[i] = input
+	}
+
+	output = _zeros_replace_trailing(first, trailing_sum, loc=loc)
 
 	start := 0
 	for input in inputs_copy {
@@ -1122,23 +1239,30 @@ concat_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Interleave :: struct {
-	inputs: []Array,
+	inputs: []Tensor,
 }
 
-// Interleave multiple arrays.
+// Interleave multiple tensors. All inputs must share shape. Output shape =
+// inputs[0].shape with the trailing dim multiplied by len(inputs).
 @(require_results)
-interleave :: proc(inputs: ..Array, loc := #caller_location) -> (output: Array) {
+interleave :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(builtin.len(inputs) > 1, "Must have at least 2 inputs", loc=loc)
 
-	inputs_copy := builtin.make([]Array, builtin.len(inputs), allocator=arena_allocator())
-
-	length := len(inputs[0])
-	for i in 0 ..< builtin.len(inputs) {
-		assert(len(inputs[i]) == length, "All inputs must have the same length", loc=loc)
-		inputs_copy[i] = inputs[i]
+	first := inputs[0]
+	for i in 1 ..< builtin.len(inputs) {
+		assert(inputs[i].rank == first.rank, "All interleave inputs must have the same rank", loc=loc)
+		for d in 0 ..< first.rank {
+			assert(inputs[i].shape[d] == first.shape[d], "All interleave inputs must have the same shape", loc=loc)
+		}
 	}
 
-	output = zeros(length * builtin.len(inputs), loc=loc)
+	inputs_copy := builtin.make([]Tensor, builtin.len(inputs), allocator=arena_allocator())
+	for input, i in inputs {
+		inputs_copy[i] = input
+	}
+
+	length := len(first)
+	output = _zeros_replace_trailing(first, first.shape[first.rank - 1] * builtin.len(inputs), loc=loc)
 
 	for i in 0 ..< length {
 		for j in 0 ..< builtin.len(inputs) {
@@ -1177,12 +1301,15 @@ Deinterleave :: struct {
 	column_count: int,
 }
 
-// Extract the desired column from an interleaved array.
+// Extract one of `column_count` interleaved channels from a tensor's
+// trailing dim. Output shape = input.shape with trailing / column_count.
 @(require_results)
-deinterleave :: proc(input: Array, column, column_count: int, loc := #caller_location) -> (output: Array) {
-	assert(len(input) % column_count == 0, "Input length must be divisible by column count", loc=loc)
+deinterleave :: proc(input: Tensor, column, column_count: int, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank >= 1, "deinterleave input must have rank >= 1", loc=loc)
+	trailing := input.shape[input.rank - 1]
+	assert(trailing % column_count == 0, "Trailing dim must be divisible by column_count", loc=loc)
 
-	output = zeros(len(input) / column_count, loc=loc)
+	output = _zeros_replace_trailing(input, trailing / column_count, loc=loc)
 
 	for i in 0 ..< len(output) {
 		output.data[i] = input.data[i * column_count + column]
@@ -1281,24 +1408,27 @@ when _HAS_AVX {
 }
 
 Linear :: struct {
-	weight:      Array,
+	weight:      Tensor,
 	input_size:  int,
 	output_size: int,
 	count:       int,
 }
 
-// Perform a linear transformation. Basically the matrix vector dot product
-// when count is 1, and matrix multiplication when count is greater than 1.
+// Linear transformation. weight is [output_size, input_size]; input has
+// trailing dim equal to input_size. Output shape = input.shape with the
+// trailing dim replaced by output_size. `count` (the number of input rows
+// to project) is the product of input's leading dims.
 @(require_results)
-linear :: proc(input, weight: Array, count := 1, loc := #caller_location) -> (output: Array) {
-	assert(count > 0, "Count must be at least 1", loc=loc)
-	assert(len(input) % count == 0, "Input length must be divisible by count", loc=loc)
+linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank  >= 1, "Linear input must have rank >= 1",  loc=loc)
+	assert(weight.rank == 2, "Linear weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 
-	input_size := len(input) / count
-	assert(len(weight) % input_size == 0, "Weight length must be divisible by input size", loc=loc)
+	output_size := weight.shape[0]
+	input_size  := weight.shape[1]
+	assert(input.shape[input.rank - 1] == input_size, "Input trailing dim must equal weight's input dim", loc=loc)
 
-	output_size := len(weight) / input_size
-	output = zeros(count * output_size, loc=loc)
+	count := _leading_count(input)
+	output = _zeros_replace_trailing(input, output_size, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -1381,17 +1511,20 @@ Attention :: struct {
 	scale:       f32,
 	causal:      bool,
 
-	pre_attention_scores:  Array,
-	post_attention_scores: Array,
+	pre_attention_scores:  Tensor,
+	post_attention_scores: Tensor,
 }
 
-// Perform multi-head scaled dot product attention. Input is an interleaved qkv array.
+// Multi-head scaled dot product attention. Input is interleaved QKV with
+// shape [token_count, 3 * embedding]. Output shape is [token_count, embedding].
+// `head_count` stays explicit because it isn't derivable from the storage shape.
 @(require_results)
-attention :: proc(input: Array, token_count, head_count: int, causal := true, loc := #caller_location) -> (output: Array) {
-	assert(len(input) % token_count == 0, "Input length must be divisible by token count")
+attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank == 2, "attention requires a 2-D tensor [tokens, 3*embedding]", loc=loc)
 
-	input_size := len(input) / token_count
-	assert(input_size % 3 == 0, "Input size must be divisible by 3 (for Q, K, V)", loc=loc)
+	token_count := input.shape[0]
+	input_size  := input.shape[1]
+	assert(input_size % 3 == 0, "Trailing dim must be divisible by 3 (for Q, K, V)", loc=loc)
 
 	output_size := input_size / 3
 	assert(output_size % head_count == 0, "Output size must be divisible by head count", loc=loc)
@@ -1399,7 +1532,7 @@ attention :: proc(input: Array, token_count, head_count: int, causal := true, lo
 	pre_attention_scores  := zeros(head_count * token_count * token_count, loc=loc)
 	post_attention_scores := zeros(head_count * token_count * token_count, loc=loc)
 
-	output = zeros(token_count * output_size, loc=loc)
+	output = zeros(token_count, output_size, loc=loc)
 
 	head_size := output_size / head_count
 	scale     := 1.0 / math.sqrt(f32(head_size))
@@ -1572,22 +1705,24 @@ Rope :: struct {
 	head_size:   int,
 	base:        f32,
 
-	cos_cache: Array,
-	sin_cache: Array,
+	cos_cache: Tensor,
+	sin_cache: Tensor,
 }
 
-// Perform rotary position embedding.
+// Rotary position embedding. Preserves input shape; reads `token_count` from
+// input.shape[0]. `head_count` stays explicit.
 @(require_results)
-rope :: proc(input: Array, token_count, head_count: int, base: f32 = 10000, loc := #caller_location) -> (output: Array) {
-	assert(len(input) % token_count == 0, "Input length must be divisible by token count", loc=loc)
+rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank >= 2, "rope requires rank >= 2", loc=loc)
 
-	input_size := len(input) / token_count
-	assert(input_size % head_count == 0, "Input size must be divisible by head count", loc=loc)
+	token_count := input.shape[0]
+	input_size  := input.shape[input.rank - 1]
+	assert(input_size % head_count == 0, "Trailing dim must be divisible by head count", loc=loc)
 
 	head_size := input_size / head_count
 	assert(head_size % 2 == 0, "Head size must be even", loc=loc)
 
-	output = zeros(len(input), loc=loc)
+	output = zeros_like(input, loc=loc)
 
 	cos_cache := zeros(token_count * head_size / 2, loc=loc)
 	sin_cache := zeros(token_count * head_size / 2, loc=loc)
@@ -1665,26 +1800,27 @@ rope_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Layernorm :: struct {
-	weight: Array,
-	mean:   Array,
-	rstd:   Array,
+	weight: Tensor,
+	mean:   Tensor,
+	rstd:   Tensor,
 	count:  int,
 	size:   int,
 }
 
 @(require_results)
-layernorm :: proc(input, weight: Array, count := 1, loc := #caller_location) -> (output: Array) {
-	assert(count > 0, "Count must be at least 1", loc=loc)
-	assert(len(input) % count == 0, "Input length must be divisible by count", loc=loc)
+layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(weight.rank == 1, "layernorm weight must be 1-D", loc=loc)
+	assert(weight.shape[0] == input.shape[input.rank - 1], "layernorm weight length must equal input's trailing dim", loc=loc)
 
 	EPSILON :: 1e-5
+
+	count := _leading_count(input)
+	size  := input.shape[input.rank - 1]
 
 	mean := zeros(count, loc=loc)
 	rstd := zeros(count, loc=loc)
 
-	output = zeros(len(input), loc=loc)
-
-	size := len(input) / count
+	output = zeros_like(input, loc=loc)
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1775,13 +1911,11 @@ Softmax :: struct {
 }
 
 @(require_results)
-softmax :: proc(input: Array, count := 1, loc := #caller_location) -> (output: Array) {
-	assert(count > 0, "Count must be at least 1", loc=loc)
-	assert(len(input) % count == 0, "Input length must be divisible by count", loc=loc)
+softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	count := _leading_count(input)
+	size  := input.shape[input.rank - 1]
 
-	output = zeros(len(input), loc=loc)
-
-	size := len(input) / count
+	output = zeros_like(input, loc=loc)
 
 	for sample in 0 ..< count {
 		// Find the maximum value for numerical stability.
@@ -1852,13 +1986,11 @@ Log_Softmax :: struct {
 }
 
 @(require_results)
-log_softmax :: proc(input: Array, count := 1, loc := #caller_location) -> (output: Array) {
-	assert(count > 0, "Count must be at least 1", loc=loc)
-	assert(len(input) % count == 0, "Input length must be divisible by count", loc=loc)
+log_softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	count := _leading_count(input)
+	size  := input.shape[input.rank - 1]
 
-	output = zeros(len(input), loc=loc)
-
-	size := len(input) / count
+	output = zeros_like(input, loc=loc)
 
 	for sample in 0 ..< count {
 		// Find the maximum value for numerical stability.
@@ -1922,13 +2054,11 @@ Entropy :: struct {
 }
 
 @(require_results)
-entropy :: proc(probabilities: Array, count := 1, loc := #caller_location) -> (output: Array) {
-	assert(count > 0, "Count must be at least 1", loc=loc)
-	assert(len(probabilities) % count == 0, "Input length must be divisible by count", loc=loc)
+entropy :: proc(probabilities: Tensor, loc := #caller_location) -> (output: Tensor) {
+	count := _leading_count(probabilities)
+	size  := probabilities.shape[probabilities.rank - 1]
 
-	output = zeros(count, loc=loc)
-
-	size := len(probabilities) / count
+	output = _zeros_drop_last(probabilities, loc=loc)
 
 	for sample in 0 ..< count {
 		entropy_value: f32
@@ -1977,19 +2107,18 @@ entropy_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Mean_Squared_Error :: struct {
-	targets: Array,
+	targets: Tensor,
 	count:   int,
 }
 
 @(require_results)
-mean_squared_error :: proc(predictions, targets: Array, count := 1, loc := #caller_location) -> (output: Array) {
+mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(predictions) == len(targets), "Predictions and targets must have same length", loc=loc)
-	assert(count > 0, "Count must be at least 1", loc=loc)
-	assert(len(predictions) % count == 0, "Input length must be divisible by count", loc=loc)
 
-	sample_size := len(predictions) / count
+	count       := _leading_count(predictions)
+	sample_size := predictions.shape[predictions.rank - 1]
 
-	output = zeros(count, loc=loc)
+	output = _zeros_drop_last(predictions, loc=loc)
 
 	for sample in 0 ..< count {
 		sum_squared_error: f32
@@ -2038,7 +2167,7 @@ mean_squared_error_backward :: proc(op: Operation, loc := #caller_location) {
 }
 
 Cross_Entropy :: struct {
-	probabilities: Array,
+	probabilities: Tensor,
 	targets:       []int,
 	class_size:    int,
 }
@@ -2046,12 +2175,13 @@ Cross_Entropy :: struct {
 // Cross entropy performs softmax internally, so it expects the input
 // to not already be softmaxed.
 @(require_results)
-cross_entropy :: proc(input: Array, targets: []int, loc := #caller_location) -> (output: Array) {
+cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) -> (output: Tensor) {
 	sample_count := builtin.len(targets)
 	assert(sample_count > 0, "Must have at least one target", loc=loc)
-	assert(len(input) % sample_count == 0, "Input length must be divisible by number of targets", loc=loc)
+	assert(input.rank >= 1, "cross_entropy input must have rank >= 1", loc=loc)
+	assert(_leading_count(input) == sample_count, "Input leading-dim product must equal number of targets", loc=loc)
 
-	class_size := len(input) / sample_count
+	class_size := input.shape[input.rank - 1]
 
 	targets_copy := builtin.make([]int, sample_count, allocator=arena_allocator())
 
@@ -2060,8 +2190,8 @@ cross_entropy :: proc(input: Array, targets: []int, loc := #caller_location) -> 
 		targets_copy[i] = target
 	}
 
-	probabilities := zeros(len(input), loc=loc)
-	output         = zeros(sample_count, loc=loc)
+	probabilities := zeros_like(input, loc=loc)
+	output         = _zeros_drop_last(input, loc=loc)
 
 	for sample in 0 ..< sample_count {
 		offset := sample * class_size
@@ -2136,8 +2266,8 @@ Relu :: struct {
 }
 
 @(require_results)
-relu :: proc(input: Array, loc := #caller_location) ->(output: Array) {
-	output = zeros(len(input), loc=loc)
+relu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	output = zeros_like(input, loc=loc)
 
 	for i in 0 ..< len(input) {
 		if input.data[i] < 0 {
@@ -2170,8 +2300,8 @@ Sigmoid :: struct {
 }
 
 @(require_results)
-sigmoid :: proc(input: Array, loc := #caller_location) -> (output: Array) {
-	output = zeros(len(input), loc=loc)
+sigmoid :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	output = zeros_like(input, loc=loc)
 
 	for i in 0 ..< len(input) {
 		output.data[i] = 1.0 / (1.0 + math.exp(-input.data[i]))
@@ -2201,8 +2331,8 @@ Gelu :: struct {
 }
 
 @(require_results)
-gelu :: proc(input: Array, loc := #caller_location) -> (output: Array) {
-	output = zeros(len(input), loc=loc)
+gelu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	output = zeros_like(input, loc=loc)
 
 	for i in 0 ..< len(input) {
 		x    := input.data[i]
@@ -2240,8 +2370,8 @@ Silu :: struct {
 }
 
 @(require_results)
-silu :: proc(input: Array, loc := #caller_location) -> (output: Array) {
-	output = zeros(len(input), loc=loc)
+silu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	output = zeros_like(input, loc=loc)
 
 	for i in 0 ..< len(input) {
 		sigmoid_val := 1.0 / (1.0 + math.exp(-input.data[i]))
@@ -2274,8 +2404,8 @@ Tanh :: struct {
 }
 
 @(require_results)
-tanh :: proc(input: Array, loc := #caller_location) -> (output: Array) {
-	output = zeros(len(input), loc=loc)
+tanh :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	output = zeros_like(input, loc=loc)
 
 	for i in 0 ..< len(input) {
 		output.data[i] = math.tanh(input.data[i])

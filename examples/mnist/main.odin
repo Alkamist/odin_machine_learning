@@ -80,8 +80,9 @@ destroy_model :: proc(model: Model) {
 	mlp.destroy(model.mlp)
 }
 
-forward :: proc(model: Model, input: []f32, batch_size: int) -> ml.Array {
-	return mlp.forward(model.mlp, ml.array(input), batch_size)
+forward :: proc(model: Model, input: []f32, batch_size: int) -> ml.Tensor {
+	x := ml.reshape(ml.tensor(input), batch_size, MNIST_IMAGE_SIZE)
+	return mlp.forward(model.mlp, x)
 }
 
 predict :: proc(model: Model, input: []f32, predictions: []int) {
@@ -90,7 +91,7 @@ predict :: proc(model: Model, input: []f32, predictions: []int) {
 	ml.clear()
 
 	logits             := forward(model, input, count)
-	probabilities      := ml.softmax(logits, count)
+	probabilities      := ml.softmax(logits)
 	probabilities_data := probabilities.data
 
 	class_size := len(probabilities_data) / count

@@ -1,6 +1,6 @@
 ## Intro
 
-This is a machine learning library written completely from scratch, currently designed only for the CPU. The multi-threaded code is not that optimized, and I know from using GGML that it is possible to run a lot faster on the CPU.
+This is a machine learning library written completely from scratch, currently designed only for the CPU.
 
 ## Current Goal
 

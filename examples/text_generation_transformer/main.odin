@@ -74,7 +74,7 @@ destroy_model :: proc(model: Model) {
 	tfm.destroy(model.transformer)
 }
 
-text_to_tokens :: proc(text: []byte) -> (res: ml.Array) {
+text_to_tokens :: proc(text: []byte) -> (res: ml.Tensor) {
 	res = ml.zeros(len(text))
 	for i in 0 ..< len(text) {
 		res.data[i] = f32(text[i]) / 255.0
@@ -82,7 +82,7 @@ text_to_tokens :: proc(text: []byte) -> (res: ml.Array) {
 	return
 }
 
-forward :: proc(model: Model, text: []byte) -> ml.Array {
+forward :: proc(model: Model, text: []byte) -> ml.Tensor {
 	tokens := make([]int, len(text), context.temp_allocator)
 	for i in 0 ..< len(text) {
 		tokens[i] = int(text[i])

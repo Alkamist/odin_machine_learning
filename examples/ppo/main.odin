@@ -128,8 +128,8 @@ destroy_network :: proc(network: Network) {
 	mlp.destroy(network.mlp)
 }
 
-forward :: proc(network: Network, input: []f32) -> ml.Array {
-	return mlp.forward(network.mlp, ml.array(input))
+forward :: proc(network: Network, input: []f32) -> ml.Tensor {
+	return mlp.forward(network.mlp, ml.tensor(input))
 }
 
 update :: proc(opt: ml.Optimizer, network: Network) {

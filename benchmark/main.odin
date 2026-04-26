@@ -126,9 +126,9 @@ time_iters :: proc(name: string, run: proc() -> f32) -> Result {
 	}
 }
 
-sum :: proc(arr: ml.Array) -> f32 {
+sum :: proc(t: ml.Tensor) -> f32 {
 	s: f32
-	for v in arr.data {
+	for v in t.data {
 		s += v
 	}
 	return s
@@ -144,16 +144,16 @@ bench_linear_inference_fwd :: proc() -> Result {
 	OUTPUT :: 2048
 
 	rand.reset(SEED)
-	w := ml.make(INPUT * OUTPUT)
+	w := ml.make(OUTPUT, INPUT)
 	defer ml.destroy(w)
-	ml.fill_normal(w.array, 0, 0.02)
+	ml.fill_normal(w, 0, 0.02)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
 		x := ml.zeros(INPUT)
 		ml.fill_value(x, 0.01)
-		y := ml.linear(x, w_state.array, 1)
+		y := ml.linear(x, w_state)
 		return sum(y)
 	}
 
@@ -166,16 +166,16 @@ bench_linear_inference :: proc() -> Result {
 	OUTPUT :: 2048
 
 	rand.reset(SEED)
-	w := ml.make(INPUT * OUTPUT)
+	w := ml.make(OUTPUT, INPUT)
 	defer ml.destroy(w)
-	ml.fill_normal(w.array, 0, 0.02)
+	ml.fill_normal(w, 0, 0.02)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
 		x := ml.zeros(INPUT)
 		ml.fill_value(x, 0.01)
-		y := ml.linear(x, w_state.array, 1)
+		y := ml.linear(x, w_state)
 		ml.backward()
 		return sum(y)
 	}
@@ -191,16 +191,16 @@ bench_linear_training_fwd :: proc() -> Result {
 	OUTPUT :: 512
 
 	rand.reset(SEED)
-	w := ml.make(INPUT * OUTPUT)
+	w := ml.make(OUTPUT, INPUT)
 	defer ml.destroy(w)
-	ml.fill_normal(w.array, 0, 0.02)
+	ml.fill_normal(w, 0, 0.02)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
-		x := ml.zeros(COUNT * INPUT)
+		x := ml.zeros(COUNT, INPUT)
 		ml.fill_value(x, 0.01)
-		y := ml.linear(x, w_state.array, COUNT)
+		y := ml.linear(x, w_state)
 		return sum(y)
 	}
 
@@ -214,16 +214,16 @@ bench_linear_training :: proc() -> Result {
 	OUTPUT :: 512
 
 	rand.reset(SEED)
-	w := ml.make(INPUT * OUTPUT)
+	w := ml.make(OUTPUT, INPUT)
 	defer ml.destroy(w)
-	ml.fill_normal(w.array, 0, 0.02)
+	ml.fill_normal(w, 0, 0.02)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
-		x := ml.zeros(COUNT * INPUT)
+		x := ml.zeros(COUNT, INPUT)
 		ml.fill_value(x, 0.01)
-		y := ml.linear(x, w_state.array, COUNT)
+		y := ml.linear(x, w_state)
 		ml.backward()
 		return sum(y)
 	}
@@ -240,9 +240,9 @@ bench_attention :: proc() -> Result {
 	run :: proc() -> f32 {
 		ml.clear()
 		// Input shape for attention is interleaved [tokens, 3 * embed].
-		qkv := ml.zeros(TOKENS * 3 * EMBED)
+		qkv := ml.zeros(TOKENS, 3 * EMBED)
 		ml.fill_value(qkv, 0.01)
-		y := ml.attention(qkv, TOKENS, HEADS)
+		y := ml.attention(qkv, HEADS)
 		ml.backward()
 		return sum(y)
 	}
@@ -256,14 +256,14 @@ bench_layernorm :: proc() -> Result {
 
 	w := ml.make(SIZE)
 	defer ml.destroy(w)
-	ml.fill_value(w.array, 1)
+	ml.fill_value(w, 1)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
-		x := ml.zeros(COUNT * SIZE)
+		x := ml.zeros(COUNT, SIZE)
 		ml.fill_value(x, 0.01)
-		y := ml.layernorm(x, w_state.array, COUNT)
+		y := ml.layernorm(x, w_state)
 		ml.backward()
 		return sum(y)
 	}
@@ -278,9 +278,9 @@ bench_softmax :: proc() -> Result {
 
 	run :: proc() -> f32 {
 		ml.clear()
-		x := ml.zeros(COUNT * SIZE)
+		x := ml.zeros(COUNT, SIZE)
 		ml.fill_value(x, 0.01)
-		y := ml.softmax(x, COUNT)
+		y := ml.softmax(x)
 		ml.backward()
 		return sum(y)
 	}
@@ -309,7 +309,7 @@ bench_adam_update :: proc() -> Result {
 	rand.reset(SEED)
 	p := ml.make(N)
 	defer ml.destroy(p)
-	ml.fill_normal(p.array, 0, 0.02)
+	ml.fill_normal(p, 0, 0.02)
 	for i in 0 ..< N {
 		p.gradient[i] = 0.001
 	}
@@ -367,8 +367,9 @@ bench_transformer_step :: proc() -> Result {
 		}
 
 		// Checksum: use a deterministic value from the forward pass.
+		data := logits.data
 		s: f32
-		for v in logits.data[:math.min(64, len(logits.data))] {
+		for v in data[:math.min(64, len(data))] {
 			s += v
 		}
 		return s

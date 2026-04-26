@@ -78,13 +78,13 @@ destroy_model :: proc(model: Model) {
 	mlp.destroy(model.mlp)
 }
 
-forward :: proc(model: Model, character: byte) -> ml.Array {
+forward :: proc(model: Model, character: byte) -> ml.Tensor {
 	input := ml.zeros(256)
 	input.data[character] = 1
 
 	state     := gru.forward(model.gru, input)
 	mlp_input := ml.concat(input, state)
-	
+
 	return mlp.forward(model.mlp, mlp_input)
 }
 

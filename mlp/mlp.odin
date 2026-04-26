@@ -16,8 +16,8 @@ make :: proc(sizes: ..int, allocator := context.allocator) -> (mlp: Mlp) {
 	mlp.layers = builtin.make([]Layer, len(sizes) - 1, allocator=allocator)
 
 	for i in 0 ..< len(mlp.layers) {
-		mlp.layers[i].weight = ml.make(sizes[i] * sizes[i + 1], allocator=allocator)
-		mlp.layers[i].bias   = ml.make(sizes[i + 1], allocator=allocator)
+		mlp.layers[i].weight = ml.make(sizes[i + 1], sizes[i], allocator=allocator)
+		mlp.layers[i].bias   = ml.make(sizes[i + 1],           allocator=allocator)
 	}
 
 	randomize(mlp)
@@ -42,18 +42,18 @@ copy :: proc(dst, src: Mlp) {
 
 randomize :: proc(mlp: Mlp) {
 	for i in 0 ..< len(mlp.layers) {
-		input_size := ml.len(mlp.layers[i].weight) / ml.len(mlp.layers[i].bias)
+		input_size := mlp.layers[i].weight.shape[1]
 		ml.he_initialization(mlp.layers[i].weight, input_size)
 		ml.fill_value(mlp.layers[i].bias, 0)
 	}
 }
 
 @(require_results)
-forward :: proc(mlp: Mlp, input: ml.Array, count := 1) -> (output: ml.Array) {
+forward :: proc(mlp: Mlp, input: ml.Tensor) -> (output: ml.Tensor) {
 	output = input
 
 	for layer, i in mlp.layers {
-		output = ml.linear(output, layer.weight, count)
+		output = ml.linear(output, layer.weight)
 		output = ml.add(output, layer.bias)
 		if i < len(mlp.layers) - 1 {
 			output = ml.relu(output)

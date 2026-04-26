@@ -33,21 +33,21 @@ make :: proc(layer_count, head_count, embedding_size, vocabulary_size: int, allo
 
 	transformer.layers = builtin.make([]Layer, layer_count, allocator=allocator)
 
-	transformer.token_embeddings = ml.make(vocabulary_size * embedding_size, allocator=allocator)
+	transformer.token_embeddings = ml.make(vocabulary_size, embedding_size, allocator=allocator)
 
 	for &layer in transformer.layers {
-		layer.norm0_weight = ml.make(embedding_size,                      allocator=allocator)
-		layer.qkv_weight   = ml.make(embedding_size * 3 * embedding_size, allocator=allocator)
-		layer.proj_weight  = ml.make(embedding_size * embedding_size,     allocator=allocator)
-		layer.norm1_weight = ml.make(embedding_size,                      allocator=allocator)
+		layer.norm0_weight = ml.make(embedding_size,                     allocator=allocator)
+		layer.qkv_weight   = ml.make(3 * embedding_size, embedding_size, allocator=allocator)
+		layer.proj_weight  = ml.make(embedding_size,     embedding_size, allocator=allocator)
+		layer.norm1_weight = ml.make(embedding_size,                     allocator=allocator)
 
 		hidden_size := 4 * embedding_size
-		layer.mlp_up_weight   = ml.make(embedding_size * hidden_size,    allocator=allocator)
-		layer.mlp_down_weight = ml.make(hidden_size    * embedding_size, allocator=allocator)
+		layer.mlp_up_weight   = ml.make(hidden_size,    embedding_size, allocator=allocator)
+		layer.mlp_down_weight = ml.make(embedding_size, hidden_size,    allocator=allocator)
 	}
 
-	transformer.norm_weight   = ml.make(embedding_size,                   allocator=allocator)
-	transformer.output_weight = ml.make(embedding_size * vocabulary_size, allocator=allocator)
+	transformer.norm_weight   = ml.make(embedding_size,                  allocator=allocator)
+	transformer.output_weight = ml.make(vocabulary_size, embedding_size, allocator=allocator)
 
 	randomize(transformer)
 
@@ -110,59 +110,39 @@ randomize :: proc(transformer: Transformer) {
 }
 
 @(require_results)
-forward :: proc(transformer: Transformer, tokens: []int) -> (output: ml.Array) {
-	token_count := len(tokens)
+forward :: proc(transformer: Transformer, tokens: []int) -> (output: ml.Tensor) {
+	output = ml.select(transformer.token_embeddings, tokens)
 
-	// Token embeddings
-	output = ml.select(transformer.token_embeddings, tokens, transformer.embedding_size) // [token_count, embedding_size]
-
-	// Start the residual connection
-	residual := output // [token_count, embedding_size]
+	residual := output
 
 	for layer in transformer.layers {
-		// Layernorm
-		norm_output := ml.layernorm(residual, layer.norm0_weight, token_count) // [token_count, embedding_size]
+		norm_output := ml.layernorm(residual, layer.norm0_weight)
+		qkv         := ml.linear(norm_output, layer.qkv_weight)
 
-		// Linear projection for Q, K, V
-		qkv := ml.linear(norm_output, layer.qkv_weight, token_count) // [token_count, 3 * embedding_size]
+		q := ml.deinterleave(qkv, 0, 3)
+		k := ml.deinterleave(qkv, 1, 3)
+		v := ml.deinterleave(qkv, 2, 3)
 
-		// Deinterleave Q, K, and V into separate arrays
-		q := ml.deinterleave(qkv, 0, 3) // [token_count, embedding_size]
-		k := ml.deinterleave(qkv, 1, 3) // [token_count, embedding_size] 
-		v := ml.deinterleave(qkv, 2, 3) // [token_count, embedding_size]
+		q  = ml.rope(q, transformer.head_count)
+		k  = ml.rope(k, transformer.head_count)
 
-		// Apply rope to Q and K
-		q = ml.rope(q, token_count, transformer.head_count) // [token_count, embedding_size]
-		k = ml.rope(k, token_count, transformer.head_count) // [token_count, embedding_size]
-
-		// Interleave back into qkv
 		qkv = ml.interleave(q, k, v)
 
-		// Self-attention with causal masking
-		attn_output := ml.attention(qkv, token_count, transformer.head_count) // [token_count, embedding_size]
-		attn_output  = ml.linear(attn_output, layer.proj_weight, token_count) // [token_count, embedding_size]
+		attn_output := ml.attention(qkv, transformer.head_count)
+		attn_output  = ml.linear(attn_output, layer.proj_weight)
 
-		// Residual connection
-		residual = ml.add(residual, attn_output) // [token_count, embedding_size]
+		residual = ml.add(residual, attn_output)
 
-		// Layernorm
-		norm_output = ml.layernorm(residual, layer.norm1_weight, token_count) // [token_count, embedding_size]
+		norm_output = ml.layernorm(residual, layer.norm1_weight)
+		mlp_output := ml.linear(norm_output, layer.mlp_up_weight)
+		mlp_output  = ml.gelu(mlp_output)
+		mlp_output  = ml.linear(mlp_output, layer.mlp_down_weight)
 
-		// MLP: up projection -> activation -> down projection
-		mlp_output := ml.linear(norm_output, layer.mlp_up_weight, token_count)  // [token_count, 4 * embedding_size]
-		mlp_output  = ml.gelu(mlp_output)                                       // [token_count, 4 * embedding_size]
-		mlp_output  = ml.linear(mlp_output, layer.mlp_down_weight, token_count) // [token_count, embedding_size]
-
-		// Residual connection
-		residual = ml.add(residual, mlp_output) // [token_count, embedding_size]
+		residual = ml.add(residual, mlp_output)
 	}
 
-	// Layernorm
-	output = ml.layernorm(residual, transformer.norm_weight, token_count) // [token_count, embedding_size]
-
-	// Project to vocabulary size for logits
-	output = ml.linear(output, transformer.output_weight, token_count) // [token_count, vocabulary_size]
-
+	output = ml.layernorm(residual, transformer.norm_weight)
+	output = ml.linear(output, transformer.output_weight)
 	return
 }
 

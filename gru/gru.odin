@@ -30,19 +30,19 @@ make :: proc(input_size, hidden_size: int, allocator := context.allocator) -> (g
 	gru.state = builtin.make([]f32, hidden_size, allocator=allocator)
 
 	// Update gate
-	gru.update_input_weight  = ml.make(input_size  * hidden_size, allocator = allocator)
-	gru.update_hidden_weight = ml.make(hidden_size * hidden_size, allocator = allocator)
-	gru.update_bias          = ml.make(hidden_size,               allocator = allocator)
+	gru.update_input_weight  = ml.make(hidden_size, input_size,  allocator = allocator)
+	gru.update_hidden_weight = ml.make(hidden_size, hidden_size, allocator = allocator)
+	gru.update_bias          = ml.make(hidden_size,              allocator = allocator)
 
 	// Reset gate
-	gru.reset_input_weight  = ml.make(input_size  * hidden_size, allocator = allocator)
-	gru.reset_hidden_weight = ml.make(hidden_size * hidden_size, allocator = allocator)
-	gru.reset_bias          = ml.make(hidden_size,               allocator = allocator)
+	gru.reset_input_weight  = ml.make(hidden_size, input_size,  allocator = allocator)
+	gru.reset_hidden_weight = ml.make(hidden_size, hidden_size, allocator = allocator)
+	gru.reset_bias          = ml.make(hidden_size,              allocator = allocator)
 
 	// Candidate hidden state
-	gru.candidate_input_weight  = ml.make(input_size  * hidden_size, allocator = allocator)
-	gru.candidate_hidden_weight = ml.make(hidden_size * hidden_size, allocator = allocator)
-	gru.candidate_bias          = ml.make(hidden_size,               allocator = allocator)
+	gru.candidate_input_weight  = ml.make(hidden_size, input_size,  allocator = allocator)
+	gru.candidate_hidden_weight = ml.make(hidden_size, hidden_size, allocator = allocator)
+	gru.candidate_bias          = ml.make(hidden_size,              allocator = allocator)
 
 	randomize(gru)
 
@@ -100,32 +100,34 @@ reset_state :: proc(gru: Gru) {
 }
 
 @(require_results)
-forward :: proc(gru: Gru, input: ml.Array, count := 1) -> (state: ml.Array) {
-	state = ml.array(gru.state)
+forward :: proc(gru: Gru, input: ml.Tensor) -> (state: ml.Tensor) {
+	hidden_size := gru.hidden_size
+
+	state = ml.tensor(gru.state)
 
 	// Update gate
-	z        := ml.linear(input, gru.update_input_weight,  count=count)
-	z_hidden := ml.linear(state, gru.update_hidden_weight, count=count)
+	z        := ml.linear(input, gru.update_input_weight)
+	z_hidden := ml.linear(state, gru.update_hidden_weight)
 	z         = ml.add(z, z_hidden)
 	z         = ml.add(z, gru.update_bias)
 	z         = ml.sigmoid(z)
 
 	// Reset gate
-	r        := ml.linear(input, gru.reset_input_weight,  count=count)
-	r_hidden := ml.linear(state, gru.reset_hidden_weight, count=count)
+	r        := ml.linear(input, gru.reset_input_weight)
+	r_hidden := ml.linear(state, gru.reset_hidden_weight)
 	r         = ml.add(r, r_hidden)
 	r         = ml.add(r, gru.reset_bias)
 	r         = ml.sigmoid(r)
 
 	// Candidate hidden state
-	c        := ml.linear(input,            gru.candidate_input_weight,  count=count)
-	c_hidden := ml.linear(ml.mul(r, state), gru.candidate_hidden_weight, count=count)
+	c        := ml.linear(input,            gru.candidate_input_weight)
+	c_hidden := ml.linear(ml.mul(r, state), gru.candidate_hidden_weight)
 	c         = ml.add(c, c_hidden)
 	c         = ml.add(c, gru.candidate_bias)
 	c         = ml.tanh(c)
 
 	// Compute the new hidden state.
-	ones := ml.zeros(ml.len(z))
+	ones := ml.zeros(hidden_size)
 	ml.fill_value(ones, 1)
 
 	one_minus_z      := ml.sub(ones, z)
