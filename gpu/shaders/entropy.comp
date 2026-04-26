@@ -1,0 +1,37 @@
+// y[row] = -sum_i p[row, i] * log(max(p[row, i], 1e-8)). Workgroup per row.
+#version 450
+
+#define BLOCK 256
+
+layout(local_size_x = BLOCK) in;
+
+layout(set = 0, binding = 0) readonly  buffer P { float prob[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { float y[];    };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+} p;
+
+shared float s_sum[BLOCK];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+    uint base = row * p.size;
+
+    float local = 0.0;
+    for (uint i = tid; i < p.size; i += BLOCK) {
+        float pv      = prob[base + i];
+        float p_safe  = max(pv, 1e-8);
+        local        -= pv * log(p_safe);
+    }
+    s_sum[tid] = local;
+    barrier();
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) y[row] = s_sum[0];
+}

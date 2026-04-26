@@ -1,0 +1,12 @@
+// out = a - b with b broadcast across len(a)/n_b chunks.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly  buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float o[]; };
+layout(push_constant) uniform Params { uint n; uint n_b; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    o[i] = a[i] - b[i % p.n_b];
+}

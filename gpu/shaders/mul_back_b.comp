@@ -1,0 +1,27 @@
+// Backward of `mul` w.r.t. b (with broadcast).
+//   b.grad[j] += sum_{i in [0, stride)} dy[i*n_b + j] * a[i*n_b + j]
+// One thread per element of b; reduction walks the broadcast stride
+// in the inner loop. Atomic-free.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer A    { float a[];    };
+layout(set = 0, binding = 1) readonly buffer DY   { float dy[];   };
+layout(set = 0, binding = 2)          buffer DA_B { float da_b[]; };
+
+layout(push_constant) uniform Params {
+    uint n_b;
+    uint stride;
+} p;
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= p.n_b) return;
+    float acc = 0.0;
+    for (uint i = 0; i < p.stride; ++i) {
+        uint o = i * p.n_b + j;
+        acc += dy[o] * a[o];
+    }
+    da_b[j] += acc;
+}

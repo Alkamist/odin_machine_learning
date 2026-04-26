@@ -1,122 +1,12 @@
-// GPU-resident tensors backed by device-local Vulkan buffers.
-//
-// Allocation strategy: every GpuTensor is DEVICE_LOCAL (lives in VRAM on a
-// discrete GPU). Host transfers go through a temporary staging buffer
-// (HOST_VISIBLE | HOST_COHERENT) per call. This is simple and the right
-// shape long-term — once data is on the GPU, kernels read from VRAM at full
-// bandwidth instead of from PCIe-mapped host memory.
-//
-// Per-call staging is fine for setup paths (model upload, occasional readback
-// for checksums). The training hot path won't transfer between host and
-// device at all, so staging-buffer pooling can wait until it shows up in a
-// profile.
+// Vulkan buffer-management helpers shared by the unified `ml.Backend`
+// integration in `backend.odin`. Per-tensor storage is allocated via
+// `Backend.alloc` / `persistent_alloc` / `parameter_alloc`, not here —
+// this file exposes only the low-level primitives.
 package gpu
 
 import "core:fmt"
 import "core:mem"
 import vk "vendor:vulkan"
-
-import ml ".."
-
-GpuTensor :: struct {
-	buffer: vk.Buffer,
-	memory: vk.DeviceMemory,
-
-	// Number of f32 elements (data only — no shadow gradient buffer; that's
-	// a CPU-side concept on the autograd path and will be added separately
-	// once we wire backward passes).
-	count: int,
-
-	shape: [ml.MAX_TENSOR_RANK]int,
-	rank:  int,
-}
-
-// Allocate a GPU tensor with the given shape. STORAGE_BUFFER usage so compute
-// shaders can read/write it; TRANSFER_SRC | TRANSFER_DST so it can participate
-// in upload/download copies.
-alloc :: proc(shape: ..int, loc := #caller_location) -> (t: GpuTensor) {
-	fmt.assertf(_gpu.device != nil, "gpu.init() must be called first", loc=loc)
-	fmt.assertf(len(shape) > 0, "GpuTensor must have at least one dimension", loc=loc)
-	fmt.assertf(len(shape) <= ml.MAX_TENSOR_RANK, "GpuTensor rank exceeds MAX_TENSOR_RANK", loc=loc)
-
-	count := 1
-	for d, i in shape {
-		fmt.assertf(d > 0, "GpuTensor dimension must be positive", loc=loc)
-		count *= d
-		t.shape[i] = d
-	}
-	t.rank  = len(shape)
-	t.count = count
-
-	size := vk.DeviceSize(count * size_of(f32))
-	t.buffer, t.memory = _create_buffer(
-		size,
-		{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST},
-		{.DEVICE_LOCAL},
-	)
-	return
-}
-
-destroy_tensor :: proc(t: GpuTensor) {
-	if t.buffer != 0 {
-		vk.DestroyBuffer(_gpu.device, t.buffer, nil)
-	}
-	if t.memory != 0 {
-		vk.FreeMemory(_gpu.device, t.memory, nil)
-	}
-}
-
-// Copy `src` (CPU) into `dst` (GPU). `len(src)` must equal `dst.count`.
-upload :: proc(src: []f32, dst: GpuTensor, loc := #caller_location) {
-	fmt.assertf(len(src) == dst.count,
-		"upload size mismatch: src=%v dst.count=%v", len(src), dst.count, loc=loc)
-
-	size := vk.DeviceSize(dst.count * size_of(f32))
-	stage_buf, stage_mem := _create_buffer(
-		size,
-		{.TRANSFER_SRC},
-		{.HOST_VISIBLE, .HOST_COHERENT},
-	)
-	defer {
-		vk.DestroyBuffer(_gpu.device, stage_buf, nil)
-		vk.FreeMemory(_gpu.device, stage_mem, nil)
-	}
-
-	mapped: rawptr
-	res := vk.MapMemory(_gpu.device, stage_mem, 0, size, {}, &mapped)
-	fmt.assertf(res == .SUCCESS, "vkMapMemory(staging upload) failed: %v", res)
-	mem.copy(mapped, raw_data(src), int(size))
-	vk.UnmapMemory(_gpu.device, stage_mem)
-
-	_one_shot_copy(stage_buf, dst.buffer, size)
-}
-
-// Copy `src` (GPU) into `dst` (CPU). `len(dst)` must equal `src.count`.
-download :: proc(src: GpuTensor, dst: []f32, loc := #caller_location) {
-	fmt.assertf(len(dst) == src.count,
-		"download size mismatch: src.count=%v dst=%v", src.count, len(dst), loc=loc)
-
-	size := vk.DeviceSize(src.count * size_of(f32))
-	stage_buf, stage_mem := _create_buffer(
-		size,
-		{.TRANSFER_DST},
-		{.HOST_VISIBLE, .HOST_COHERENT},
-	)
-	defer {
-		vk.DestroyBuffer(_gpu.device, stage_buf, nil)
-		vk.FreeMemory(_gpu.device, stage_mem, nil)
-	}
-
-	_one_shot_copy(src.buffer, stage_buf, size)
-
-	mapped: rawptr
-	res := vk.MapMemory(_gpu.device, stage_mem, 0, size, {}, &mapped)
-	fmt.assertf(res == .SUCCESS, "vkMapMemory(staging download) failed: %v", res)
-	mem.copy(raw_data(dst), mapped, int(size))
-	vk.UnmapMemory(_gpu.device, stage_mem)
-}
-
-// --- Internal ---
 
 _create_buffer :: proc(
 	size: vk.DeviceSize,
@@ -167,6 +57,75 @@ _pick_memory_type :: proc(
 // Allocate a transient command buffer, record a single buffer-to-buffer copy,
 // submit it, and wait for completion. Synchronous on purpose — this is the
 // upload/download path, not a hot inner loop.
+// Lazily grow the active gpu Context's persistent staging buffer to
+// hold at least `min_size` bytes. The staging memory is HOST_VISIBLE +
+// HOST_COHERENT and stays persistently mapped, so callers can write or
+// read its contents directly via `gctx.staging.mapped`.
+//
+// Capacity grows by powers of two from a 64KB floor; existing contents
+// are *not* preserved across a regrow, so callers must finish any
+// pending use before triggering one.
+_ensure_staging :: proc(min_size: vk.DeviceSize, loc := #caller_location) {
+	gctx := _current_gpu_ctx
+	fmt.assertf(gctx != nil, "no active gpu Context", loc=loc)
+
+	if gctx.staging.size >= min_size {
+		return
+	}
+
+	// Free old.
+	if gctx.staging.buffer != 0 {
+		if gctx.staging.mapped != nil {
+			vk.UnmapMemory(_gpu.device, gctx.staging.memory)
+			gctx.staging.mapped = nil
+		}
+		vk.DestroyBuffer(_gpu.device, gctx.staging.buffer, nil)
+		vk.FreeMemory(_gpu.device, gctx.staging.memory, nil)
+		gctx.staging.buffer = 0
+		gctx.staging.memory = 0
+	}
+
+	new_size := vk.DeviceSize(64 * 1024)
+	for new_size < min_size do new_size *= 2
+
+	gctx.staging.buffer, gctx.staging.memory = _create_buffer(
+		new_size,
+		{.TRANSFER_SRC, .TRANSFER_DST},
+		{.HOST_VISIBLE, .HOST_COHERENT},
+		loc,
+	)
+	gctx.staging.size = new_size
+
+	res := vk.MapMemory(_gpu.device, gctx.staging.memory, 0, new_size, {}, &gctx.staging.mapped)
+	fmt.assertf(res == .SUCCESS, "vkMapMemory(staging) failed: %v", res, loc=loc)
+}
+
+// Fill a buffer with `value` (a u32 stamp — for f32 fills, pass the
+// IEEE 754 bit pattern). If a batch is active, record the fill into its
+// command buffer (free — no extra submit). Otherwise fall back to a
+// one-shot submit + wait.
+//
+// Critical: when a batch is active, ALL fills must record into the batch
+// CB. A one-shot submit during recording would execute on the queue
+// before the batch is submitted, but the batch CB may contain a later-
+// executing fill of the same buffer (e.g. an alloc-time zero-fill
+// recorded before the one-shot was issued), which would clobber the
+// one-shot's write when the batch finally runs.
+_record_fill :: proc(buf: vk.Buffer, size: vk.DeviceSize, value: u32, loc := #caller_location) {
+	gctx := _current_gpu_ctx
+	if gctx != nil && gctx.batch.active {
+		vk.CmdFillBuffer(gctx.batch.cmd, buf, 0, size, value)
+		return
+	}
+	cmd := _begin_one_shot(loc)
+	vk.CmdFillBuffer(cmd, buf, 0, size, value)
+	_end_one_shot(cmd, loc)
+}
+
+_record_fill_zero :: #force_inline proc(buf: vk.Buffer, size: vk.DeviceSize, loc := #caller_location) {
+	_record_fill(buf, size, 0, loc)
+}
+
 _one_shot_copy :: proc(src, dst: vk.Buffer, size: vk.DeviceSize, loc := #caller_location) {
 	cmd := _begin_one_shot(loc)
 

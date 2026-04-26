@@ -9,74 +9,94 @@ backend. The active backend is held on the active `Context` and
 determines whether `ml.zeros` allocates host memory or a Vulkan buffer,
 and whether `ml.add` dispatches a SIMD CPU loop or a compute shader.
 
-There is also a parallel **legacy** GPU path in `gpu_transformer/` +
-`gpu/ops.odin`'s `GpuTensor`-based procs that pre-dates the unified API.
-It still trains a transformer end-to-end and is used by `gpu_grad_check`
-and friends. It is being retired as ops migrate to the unified path.
 
 ## Current State
 
 **Architecture:** Per-context state with a thread-local linked-list stack.
 Backend abstraction via tagged dispatch (one `forward(op)` and one
-`backward(op)` proc per backend, switching on `op.variant`). `ml.Tensor`
-carries a `backend: ^Backend` and an opaque `storage: rawptr`; CPU stores
-data in host slices, GPU stores it via a `gpu.Gpu_Storage` containing
-`vk.Buffer` handles. Thread-safe: each host thread owns its own Context;
-the shared CPU worker pool serializes `parallelize` fan-outs with a
-mutex.
+`backward(op)` proc per backend, switching on `op.variant`) plus
+hooks for: activation alloc (`alloc`, `clear_storage`), long-lived
+tensors (`persistent_alloc`, `persistent_free`), parameters with Adam
+state (`parameter_alloc`, `parameter_free`, `parameter_update`,
+`parameter_copy`), per-Context backend state (`context_alloc`,
+`context_free`, `context_begin`, `context_end`), in-flight work
+(`flush`), and host↔device copies (`set_data`, `get_data`,
+`fill_gradient_with_ones`). `ml.Tensor` carries a `backend: ^Backend`
+and an opaque `storage: rawptr`; CPU stores data in host slices, GPU
+stores it via a `gpu.Gpu_Storage` containing `vk.Buffer` handles.
+Thread-safe: each host thread owns its own Context; the shared CPU
+worker pool serializes `parallelize` fan-outs with a mutex.
+
+**Switching backends is a one-line change.** CPU and GPU look identical
+at the call site — pick a backend at context creation and forget it:
+
+    // CPU
+    ctx := ml.context_create(size)
+
+    // GPU — `gpu.backend()` lazy-inits Vulkan on first call, and
+    // `ml.context_create` allocates + binds the per-thread Gpu_Context
+    // automatically via Backend.context_alloc.
+    ctx := ml.context_create(size, gpu.backend())
+
+There's no `gpu.init` / `gpu.context_create` / `gpu.context_scope` in
+model code, and no `gpu.begin_batch` / `gpu.end_batch` either — every
+GPU dispatch auto-opens a batch CB, and `ml.clear` / `Backend.get_data`
+flush it implicitly. `ml.sync()` is exposed for cases that need an
+explicit fence (timing benchmarks, etc.).
 
 **Op port status (unified API):**
 
 CPU backend — all 30 ops dispatch through `cpu_forward` / `cpu_backward`.
 
-GPU backend — 10 ops ported and tested via `gpu_unified_check`:
-- `add`, `linear`, `gelu`
-- `select`, `rope`, `slice_trailing`, `concat` (3-input only)
-- `softmax`, `permute`, `causal_mask`
+GPU backend — all 30 ops ported and tested via `gpu_unified_check`:
+- Linear / batched: `add`, `sub`, `mul` (with broadcast), `div`
+  (broadcast), `min`, `max`, `linear`, `batched_matmul`
+- Activations: `gelu`, `relu`, `sigmoid`, `silu`, `tanh`, `exp`, `clamp`
+- Shape: `permute`, `transpose`, `slice`, `slice_trailing`, `concat`
+  (3-input only)
+- Reductions / loss heads: `softmax`, `log_softmax`, `causal_mask`,
+  `layernorm`, `mean`, `entropy`, `mean_squared_error`,
+  `cross_entropy`
+- Embedding / position: `select`, `rope`
 
-GPU backend — not yet ported:
-- `mul` (with broadcast), `batched_matmul`, `layernorm`, `cross_entropy`,
-  most elementwise / reductions / activations.
+**End-to-end GPU training works.** A `tfm.Transformer` allocated under
+a GPU `ml.Context` has its parameters (`data`/`gradient`/`adam_m`/
+`adam_v`) on device. The full training step — forward + backward +
+Adam(W) update — runs as a single batched command buffer per step.
+`gpu_unified_check` phase 18 verifies CPU vs GPU parameter values
+match within the fp32 reduction floor after 3 Adam steps on a small
+network. `examples/gpu_text_generation_transformer` is the working
+demonstration.
+
+**`gpu_transformer_bench` numbers (RTX 3090 Ti):**
+- Small (L=4 H=4 E=128 V=256 T=64): GPU full step 7.2 ms vs CPU
+  10.8 ms (~1.5×).
+- Large (L=12 H=8 E=512 V=256 T=256): GPU full step 342 ms vs CPU
+  1202 ms (~3.5×). GPU forward alone is ~7× faster here. Adam adds
+  essentially zero overhead on GPU (342.3 vs 342.4 ms with vs without).
+
+At the small architecture the per-dispatch driver overhead still
+dominates compute — bigger models pay off more.
 
 **Attention is decomposed.** There is no `Attention` op variant. Both
 backends compute attention as a composition of `slice_trailing` →
 `reshape` → `permute` → `batched_matmul` → `mul` → `causal_mask` →
-`softmax` → `batched_matmul` → `permute` → `reshape`. CPU-side this is
-the only path. GPU-side `ml.attention` will work end-to-end once `mul`
-(broadcast) and `batched_matmul` are ported. The legacy `gpu.attention`
-kernel + 7 `attention_*.spv` shaders still exist for the
-`gpu_transformer/` path and will be deleted when that path is retired.
-
-**Decomposition perf cost.** CPU attention sub-bench is ~3-4× slower
-than the old fused kernel; full transformer step ~10-22% slower across
-thread counts. Acceptable cost for the simpler, composable code.
+`softmax` → `batched_matmul` → `permute` → `reshape`. Both backends
+run this path end-to-end and match at the fp32 floor (verified by
+`gpu_unified_check` phase 14).
 
 ## Next steps (where to pick up)
 
-1. **`mul` with broadcast on GPU.** New shader (forward + backward) that
-   handles `len(a) % len(b) == 0` broadcast. Needed for
-   `mul(scaled_scores, scalar(1/sqrt(D)))` in attention.
-2. **`batched_matmul` on GPU.** New shaders: forward + backward (likely
-   split into back-input and back-weight kernels like `linear`). Most
-   complex remaining op; biggest single port.
-3. **`set_data` backend hook.** `ml.scalar(value)` and `ml.tensor(data)`
-   currently write to `t.data` directly, which is empty for GPU tensors.
-   Add a `Backend.set_data(t, src)` hook: CPU does a slice copy, GPU does
-   `upload_tensor`. Needed before #1/#2 are useful in `attention()`.
-4. **End-to-end attention on GPU through unified API.** Add a phase to
-   `gpu_unified_check` that runs `ml.attention` on GPU and compares to
-   CPU. With #1/#2/#3 done, this should pass at fp32 floor.
-5. **`layernorm` on GPU via unified API.** Forward already has shaders
-   (`layernorm.spv` + `layernorm_stats.spv`); backward has
-   `layernorm_back_input.spv` + `layernorm_back_weight.spv`. Just need
-   the dispatch glue.
-6. **`cross_entropy` on GPU.** Existing `cross_entropy_grad.spv` covers
-   the backward; forward computes the loss CPU-side currently. Plus the
-   internal softmax + NLL — figure out the right decomposition.
-7. **Delete legacy GPU attention path.** Once `ml.attention` runs
-   end-to-end on GPU, delete `attention*.comp/.spv`,
-   `gpu.attention`/`gpu.attention_back`, and (eventually)
-   `gpu_transformer/` once the unified path covers all transformer ops.
+1. **Split the CPU backend out of `ml.odin`.** Move the CPU-only
+   pieces — `cpu_alloc` / `cpu_clear_storage` / `cpu_set_data` /
+   `cpu_fill_gradient_with_ones`, `cpu_forward` / `cpu_backward` and
+   every `cpu_*` op kernel, the SIMD primitives (`_simd_dot_f32`,
+   `_simd_axpy_f32`), and the `parallelize` worker pool — into a
+   separate file (or `cpu/` subpackage), leaving `ml.odin` with the
+   backend-agnostic surface (`Backend`, `Context`, `Tensor`, op
+   variants, public op constructors, autograd tape, optimizer). Keep
+   the CPU backend the default; mirrors how `gpu/` is already its own
+   package.
 
 ## Testing
 
@@ -101,15 +121,9 @@ shared weight rows).
   changes.** Each op has its own phase; tolerances are op-specific (most
   are bit-exact, ops with reductions are at the fp32 floor).
 
-**GPU changes — legacy path** (still relevant while `gpu_transformer/`
-exists):
-- `gpu_back_check`: per-kernel backward correctness against CPU /
-  hand-computed reference.
-- `gpu_grad_check`: end-to-end one-step gradient match (CPU vs GPU)
-  after 3 steps of CPU pretraining. fp32 floor (~1e-8 max abs).
-- `gpu_train_check`: 100-step parallel training comparison.
-- `gpu_forward_check`, `gpu_forward_bench`, `gpu_train_bench`:
-  correctness + perf at L=4 H=4 E=128 V=256 T=64.
+**GPU perf:** `benchmarks/gpu_transformer_bench` runs the same
+transformer step on CPU and GPU at small + large architectures and
+reports forward / forward+backward / full-step (with Adam) timings.
 
 ## Build
 
@@ -236,25 +250,30 @@ rather queue than oversubscribe.
 
 `Gpu_Device` (file-scope `_gpu`): instance, physical_device, device,
 queue, queue_family_index, memory_properties, pipelines list, loader,
-device_name. Created by `gpu.init()`, freed by `gpu.destroy()`. Shared
-across all contexts on the process.
+device_name. Lazy-initialized by `gpu.backend()` on first call (also
+explicitly via `gpu.init()` if needed). The Vulkan instance / device
+live for the rest of the process — there's no shutdown call in the
+public API.
 
 `Gpu_Context` (thread-local stack): command_pool, descriptor_pool,
-batch state, allocations list. One per ml.Context that uses the GPU.
-Vulkan command pools and descriptor pools are NOT thread-safe, so each
-host thread that issues GPU work owns its own `Gpu_Context`.
+batch state, allocations list, per-context buffer pool, persistent
+staging buffer. One per `ml.Context` that uses the GPU. Vulkan command
+pools and descriptor pools are NOT thread-safe, so each host thread
+that issues GPU work owns its own `Gpu_Context`.
+
+The `Gpu_Context` lifecycle is bound to its owning `ml.Context` via
+the `Backend.context_alloc` / `_free` / `_begin` / `_end` hooks. From
+model code that's invisible — same three lines as CPU:
 
 ```odin
-gpu.init()
-defer gpu.destroy()
-gctx := gpu.context_create()
-defer gpu.context_destroy(gctx)
-gpu.context_scope(gctx)
-
 ctx := ml.context_create(N, gpu.backend())
 defer ml.context_destroy(ctx)
 ml.context_scope(ctx)
 ```
+
+`gpu.context_create` / `gpu.context_scope` are still available as a
+power-user escape hatch for code that wants multiple `Gpu_Context`s
+on a single `ml.Context` (rare).
 
 ### `Gpu_Storage` and the `Backend.alloc` hook
 
@@ -265,23 +284,53 @@ allocations list. Both buffers are zeroed via a one-shot
 `vkCmdFillBuffer` on alloc to match CPU's `make([]f32, n)` semantics —
 critical for backward (which `+=` into gradient buffers).
 
-`clear_storage` releases every tracked allocation in bulk; mirrors CPU's
-arena reset. Per-step alloc/free overhead is real (one `_create_buffer`
-call + one `_one_shot_copy` per tensor); a pool will replace this when
-the perf matters.
+**One-shot writes during a recording batch are a footgun.** When a
+batch CB is open, the batch may already have a future-executing
+`CmdFillBuffer` (e.g. an alloc-time zero-fill from `gpu_alloc`)
+queued for a buffer. If something then issues a one-shot
+submit-and-wait that writes the same buffer, the one-shot completes
+*before* the batch is submitted — so when the batch finally runs, its
+earlier-recorded fill clobbers the one-shot's write. All buffer
+writes that need to be ordered against in-batch dispatches must
+record into the batch CB. Use `_record_fill` / `_record_fill_zero`;
+the per-dispatch barrier covers the resulting `TRANSFER_WRITE`s. The
+same goes for any future host→device upload helper that gets called
+mid-batch.
+
+`clear_storage` doesn't actually destroy the GPU storage — it pushes
+every live allocation back onto a per-context **pool keyed by element
+count**. The next `gpu_alloc` for the same `n` pops a recycled buffer
+pair. This is the dominant perf fix on the GPU side: a transformer
+step makes ~30+ activation tensors and prior to pooling each one paid
+a full `vkCreateBuffer` + `vkAllocateMemory` round-trip per step. After
+the first cycle the pool is warm and `gpu_alloc` only runs a
+`CmdFillBuffer` to re-zero the recycled buffers. The fill records into
+the active batch command buffer (free; no extra submit), and the
+per-dispatch global memory barrier covers `TRANSFER_WRITE`s so the
+zeroes are visible to subsequent shader reads. Net effect on
+`gpu_transformer_bench` at L=12 E=512 T=256: GPU forward 268 ms → 31 ms
+(8.7×), GPU forward+backward 553 ms → 346 ms; on the
+`gpu_text_generation_transformer` example, ~10 tok/sec → ~230 tok/sec.
 
 ### Command-buffer batching (in `gpu/pipeline.odin`)
 
-`begin_batch()` / `end_batch()` open a recording context. While active,
-every `_dispatch` call records into a single command buffer with a
-`SHADER_WRITE → SHADER_READ|SHADER_WRITE` global memory barrier between
-dispatches; `end_batch` does one submit + one `vkQueueWaitIdle`.
-Outside a batch, `_dispatch` falls back to one-shot submit per call.
+Every `_dispatch` call records into a single open command buffer with
+a global memory barrier
+(`{SHADER_WRITE, TRANSFER_WRITE} → {SHADER_READ, SHADER_WRITE}` on
+COMPUTE+TRANSFER → COMPUTE) before each dispatch — so successive ops
+see prior writes without per-buffer dependency tracking.
+
+Batches are opened automatically: the first `_dispatch` after a flush
+calls `begin_batch()` itself, and the batch is closed by
+`Backend.flush()` (called from `ml.clear`, `Backend.get_data`, and
+`ml.sync()`). `end_batch` does one queue submit + one `vkQueueWaitIdle`.
+The user-facing API never exposes the open/close points; the explicit
+`gpu.begin_batch` / `gpu.end_batch` calls remain only as a power-user
+escape hatch for code that wants to span multiple `ml.clear`s in one
+batch (rare).
 
 Transient resources (descriptor sets, the `select` indices buffer) are
 queued via `_queue_destroy_buffer` and reclaimed in `end_batch`.
-Outside a batch, they're destroyed immediately (the per-dispatch
-wait_idle has already finished by then).
 
 ### Atomic-free backward kernels
 
@@ -311,11 +360,10 @@ matching reduction orders. Sources of divergence:
 - GLSL implementations may or may not use FMA depending on the compiler;
   CPU `_simd_axpy_f32` always uses FMA.
 
-Verification bar:
-- `gpu_unified_check` proves every ported op matches CPU at fp32 floor
-  (op-specific tolerances, mostly 1e-7 to 1e-8).
-- Legacy `gpu_back_check` / `gpu_grad_check` / `gpu_train_check` cover
-  the `gpu_transformer/` path until it's retired.
+Verification bar: `gpu_unified_check` proves every op matches CPU at
+fp32 floor (op-specific tolerances, mostly 1e-7 to 1e-8) plus a
+multi-step training-loop phase that confirms parameter values agree
+after several Adam updates.
 
 ## Project layout
 
@@ -324,27 +372,36 @@ Verification bar:
 - `mlp/`, `gru/`, `transformer/`: model implementations (backend-agnostic
   via the unified API).
 - `gpu/`: Vulkan compute backend.
-  - `gpu.odin`: instance / device init; `Gpu_Context` lifecycle.
-  - `buffer.odin`: legacy `GpuTensor` allocation, host↔device upload/download.
-  - `pipeline.odin`: pipeline construction, `_dispatch`, command-buffer
-    batching.
-  - `ops.odin`: legacy `GpuTensor`-based op procs + SPIRV constants and
-    Param structs (shared with the new dispatch).
-  - `backend.odin`: unified `ml.Backend` integration — `Gpu_Storage`,
-    `_gpu_backend` instance, `gpu_*_forward` / `gpu_*_backward` dispatch
-    procs, `upload_tensor` / `download_tensor` helpers.
+  - `gpu.odin`: instance / device init (lazy via `gpu.backend()`);
+    `Gpu_Context` lifecycle (per-`ml.Context` state — command pool,
+    descriptor pool, batch state, allocations, buffer pool, staging).
+  - `buffer.odin`: low-level Vulkan buffer helpers (`_create_buffer`,
+    `_one_shot_copy`, `_record_fill`, `_ensure_staging`).
+  - `pipeline.odin`: pipeline construction, `_dispatch` (auto-batches),
+    command-buffer batching.
+  - `backend.odin`: `ml.Backend` integration — `Gpu_Storage`, every
+    backend hook (`gpu_alloc` / `gpu_persistent_alloc` /
+    `gpu_parameter_*` / `gpu_set_data` / `gpu_get_data` /
+    `gpu_context_*` / `gpu_flush`), every op's `gpu_*_forward` /
+    `gpu_*_backward`, and `upload_tensor` / `download_tensor` helpers.
+  - `ops.odin`: SPIRV `#load` constants, push-constant struct
+    definitions, and lazily-bound pipeline pointers.
   - `shaders/`: GLSL compute shaders + compiled `.spv` (checked in).
-- `gpu_transformer/`: legacy GPU transformer using `GpuTensor` directly.
-  To be retired once unified-API ops cover the full transformer.
 - `benchmarks/`:
   - `benchmark`: canonical CPU perf + ST checksums.
   - `thread_safety_check`: 4-host-thread stress test of the worker pool.
-  - `gpu_unified_check`: per-op CPU vs GPU correctness on the unified API.
-  - `gpu_back_check`, `gpu_grad_check`, `gpu_train_check`,
-    `gpu_forward_check`, `gpu_forward_bench`, `gpu_train_bench`,
-    `gpu_bench`, `gpu_hello`: legacy-path tests + perf benches.
+  - `gpu_unified_check`: per-op CPU vs GPU correctness on the unified
+    API plus a multi-step training-loop verification.
+  - `gpu_transformer_bench`: end-to-end transformer per-step timing,
+    CPU vs GPU, at small + large architectures.
 - `examples/`: `mnist`, `imitation_learning`, `ppo`, `text_generation_gru`,
-  `text_generation_transformer`. All on CPU through the unified API.
+  `text_generation_transformer` (CPU), `gpu_text_generation_transformer`
+  (single GPU context — train + generate end-to-end on device).
+- `transformer/`: model definition. `Transformer` is `Parameter`-based
+  and works on either backend — `tfm.make` allocates parameters via
+  whatever backend the active `ml.Context` uses, `tfm.forward` is
+  unified-API ops, `tfm.update` calls `ml.update` which dispatches the
+  backend's `parameter_update` hook.
 
 ## Code style
 
@@ -375,10 +432,8 @@ explicit.
   `update`, `parallelize`, `attention`) keep their existing signatures.
   Optimizations and refactors live behind these signatures.
 - The unified API path (`ml.add(a, b)` etc.) is backend-agnostic. Don't
-  add backend-specific overloads on the public surface.
-- Legacy GPU op procs (`gpu.linear`, `gpu.attention`, etc. on `GpuTensor`)
-  exist transitionally. Don't add new ones — port to the unified API
-  via `Backend` dispatch instead.
+  add backend-specific overloads on the public surface — every new op
+  goes through `Backend.forward` / `Backend.backward` dispatch.
 
 ## Shader build
 

@@ -1,0 +1,40 @@
+// Forward of `mean`: y[row] = (1/size) * sum_i x[row*size + i].
+// One workgroup per row, BLOCK threads, shared-memory reduction.
+#version 450
+
+#define BLOCK 256
+
+layout(local_size_x = BLOCK) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+} p;
+
+shared float partial[BLOCK];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+    uint base = row * p.size;
+
+    float s = 0.0;
+    for (uint i = tid; i < p.size; i += BLOCK) {
+        s += x[base + i];
+    }
+    partial[tid] = s;
+    barrier();
+
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) {
+        y[row] = partial[0] / float(p.size);
+    }
+}

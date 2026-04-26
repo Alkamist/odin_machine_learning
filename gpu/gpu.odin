@@ -45,9 +45,38 @@ Gpu_Context :: struct {
 	descriptor_pool: vk.DescriptorPool,
 	batch:           Batch,
 
+	// Live activation allocations from `gpu_alloc`. Reset by `gpu_clear_storage`,
+	// which pushes each entry into `pool` for reuse instead of destroying it.
 	allocations:     [dynamic]^Gpu_Storage,
 
+	// Free Gpu_Storage buffers keyed by element count. Reused across
+	// `ml.clear` cycles to avoid per-step vkCreateBuffer / vkAllocateMemory.
+	pool: map[int][dynamic]^Gpu_Storage,
+
+	// Persistently-mapped HOST_VISIBLE+HOST_COHERENT staging buffer used
+	// by `upload_tensor` / `download_tensor`. Lazily grown on demand so
+	// downloads in tight loops don't re-create + re-allocate per call.
+	staging: Staging,
+
+	// Recorded "after end_batch, copy staging[off..off+size] to dst"
+	// callbacks. Populated when a download is folded into the active batch
+	// command buffer; flushed after the batch's queueWaitIdle.
+	pending_downloads: [dynamic]Pending_Download,
+
 	previous_ctx: ^Gpu_Context,
+}
+
+Staging :: struct {
+	buffer: vk.Buffer,
+	memory: vk.DeviceMemory,
+	size:   vk.DeviceSize,
+	mapped: rawptr,
+}
+
+Pending_Download :: struct {
+	dst:     []f32,
+	offset:  vk.DeviceSize,
+	size:    vk.DeviceSize,
 }
 
 _gpu: Gpu_Device
@@ -56,12 +85,14 @@ _gpu: Gpu_Device
 _current_gpu_ctx: ^Gpu_Context
 
 // Bring up Vulkan: load the system loader, create instance, pick a physical
-// device with a compute queue, create the device. Panics on any failure —
-// the rest of the library assumes a healthy GPU once init returns.
+// device with a compute queue, create the device. Idempotent — `gpu.backend()`
+// calls this lazily when the first GPU `ml.Context` is created, so most
+// callers don't need to invoke it explicitly. Panics on any failure.
 //
 // Per-Context resources (command pool, descriptor pool, batch state) are
 // created by `context_create`, not here.
 init :: proc() {
+	if _gpu.device != nil { return }
 	_load_loader()
 	_create_instance()
 	_pick_physical_device()
@@ -119,6 +150,23 @@ context_destroy :: proc(gctx: ^Gpu_Context, allocator := context.allocator, loc 
 		_destroy_gpu_storage(storage)
 	}
 	delete(gctx.allocations)
+
+	for _, list in gctx.pool {
+		for storage in list {
+			_destroy_gpu_storage(storage)
+		}
+		delete(list)
+	}
+	delete(gctx.pool)
+
+	if gctx.staging.buffer != 0 {
+		if gctx.staging.mapped != nil {
+			vk.UnmapMemory(_gpu.device, gctx.staging.memory)
+		}
+		vk.DestroyBuffer(_gpu.device, gctx.staging.buffer, nil)
+		vk.FreeMemory(_gpu.device, gctx.staging.memory, nil)
+	}
+	delete(gctx.pending_downloads)
 
 	delete(gctx.batch.descriptor_sets)
 	delete(gctx.batch.pending_buffers)

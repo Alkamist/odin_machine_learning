@@ -13,6 +13,7 @@
 package gpu
 
 import "core:fmt"
+import "core:mem"
 import vk "vendor:vulkan"
 
 Pipeline :: struct {
@@ -42,6 +43,8 @@ Batch :: struct {
 	descriptor_sets:  [dynamic]vk.DescriptorSet,
 	pending_buffers:  [dynamic]vk.Buffer,
 	pending_memories: [dynamic]vk.DeviceMemory,
+	staging_offset:   vk.DeviceSize, // bump-allocator inside the staging
+	                                 // buffer for in-batch downloads.
 }
 
 // Open a recording batch. All subsequent _dispatch calls record into one
@@ -69,6 +72,7 @@ begin_batch :: proc(loc := #caller_location) {
 
 	gctx.batch.active         = true
 	gctx.batch.dispatch_count = 0
+	gctx.batch.staging_offset = 0
 }
 
 // Close the batch: submit, wait, then free everything that was queued
@@ -92,6 +96,18 @@ end_batch :: proc(loc := #caller_location) {
 	fmt.assertf(res == .SUCCESS, "vkQueueSubmit (batch) failed: %v", res, loc=loc)
 	res = vk.QueueWaitIdle(_gpu.queue)
 	fmt.assertf(res == .SUCCESS, "vkQueueWaitIdle (batch) failed: %v", res, loc=loc)
+
+	// Flush any downloads that were folded into the batch: the device→staging
+	// copies executed on the queue, and now that the wait has returned the
+	// staging buffer's HOST_COHERENT contents are valid to memcpy out.
+	if len(gctx.pending_downloads) > 0 {
+		base := uintptr(gctx.staging.mapped)
+		for d in gctx.pending_downloads {
+			src := rawptr(base + uintptr(d.offset))
+			mem.copy(raw_data(d.dst), src, int(d.size))
+		}
+		clear(&gctx.pending_downloads)
+	}
 
 	vk.FreeCommandBuffers(_gpu.device, gctx.command_pool, 1, &cmd)
 
@@ -261,62 +277,44 @@ _dispatch :: proc(
 	}
 	vk.UpdateDescriptorSets(_gpu.device, p.num_buffers, raw_data(writes), 0, nil)
 
-	if gctx.batch.active {
-		// Record into the open batch. Insert a barrier before every dispatch
-		// after the first so prior shader writes are visible to this one — we
-		// don't track per-buffer dependencies, so a global memory barrier
-		// (SHADER_WRITE → SHADER_READ|SHADER_WRITE on COMPUTE) is what makes
-		// pipelined dispatches correct without per-op metadata.
-		cmd := gctx.batch.cmd
-		if gctx.batch.dispatch_count > 0 {
-			barrier := vk.MemoryBarrier{
-				sType         = .MEMORY_BARRIER,
-				srcAccessMask = {.SHADER_WRITE},
-				dstAccessMask = {.SHADER_READ, .SHADER_WRITE},
-			}
-			vk.CmdPipelineBarrier(
-				cmd,
-				{.COMPUTE_SHADER}, {.COMPUTE_SHADER},
-				{},
-				1, &barrier,
-				0, nil,
-				0, nil,
-			)
-		}
-		vk.CmdBindPipeline(cmd, .COMPUTE, p.pipeline)
-		vk.CmdBindDescriptorSets(cmd, .COMPUTE, p.pipeline_layout, 0, 1, &set, 0, nil)
-		if p.push_constant_size > 0 {
-			vk.CmdPushConstants(cmd, p.pipeline_layout, {.COMPUTE}, 0, p.push_constant_size, push_constants)
-		}
-		vk.CmdDispatch(cmd, group_count_x, group_count_y, group_count_z)
-
-		append(&gctx.batch.descriptor_sets, set)
-		gctx.batch.dispatch_count += 1
-		return
+	// Auto-start a batch if one isn't already open. The batch is flushed
+	// implicitly by `ml.clear` (via `Backend.flush`) and by `get_data` /
+	// `download_tensor` before they read host memory, so most callers
+	// never have to think about batches at all.
+	if !gctx.batch.active {
+		begin_batch()
 	}
 
-	// No batch — fall back to one-shot submit + wait per dispatch.
-	cmd := _begin_one_shot(loc)
+	// Record into the open batch. Insert a barrier before every dispatch
+	// so prior writes are visible to this one — we don't track per-buffer
+	// dependencies, so a global memory barrier
+	// ({SHADER_WRITE, TRANSFER_WRITE} → {SHADER_READ, SHADER_WRITE}) on
+	// COMPUTE+TRANSFER → COMPUTE makes both pipelined dispatches and
+	// alloc-time CmdFillBuffer zero-fills (recorded into the same CB)
+	// correct without per-op metadata.
+	cmd := gctx.batch.cmd
+	barrier := vk.MemoryBarrier{
+		sType         = .MEMORY_BARRIER,
+		srcAccessMask = {.SHADER_WRITE, .TRANSFER_WRITE},
+		dstAccessMask = {.SHADER_READ, .SHADER_WRITE},
+	}
+	vk.CmdPipelineBarrier(
+		cmd,
+		{.COMPUTE_SHADER, .TRANSFER}, {.COMPUTE_SHADER},
+		{},
+		1, &barrier,
+		0, nil,
+		0, nil,
+	)
 	vk.CmdBindPipeline(cmd, .COMPUTE, p.pipeline)
 	vk.CmdBindDescriptorSets(cmd, .COMPUTE, p.pipeline_layout, 0, 1, &set, 0, nil)
 	if p.push_constant_size > 0 {
 		vk.CmdPushConstants(cmd, p.pipeline_layout, {.COMPUTE}, 0, p.push_constant_size, push_constants)
 	}
 	vk.CmdDispatch(cmd, group_count_x, group_count_y, group_count_z)
-	_end_one_shot(cmd, loc)
 
-	set_to_free := set
-	vk.FreeDescriptorSets(_gpu.device, gctx.descriptor_pool, 1, &set_to_free)
-}
-
-// Helper: pull each tensor's vk.Buffer into a flat slice for _dispatch.
-// Allocates from temp_allocator — caller doesn't need to free.
-_buffers :: proc(tensors: ..GpuTensor) -> []vk.Buffer {
-	out := make([]vk.Buffer, len(tensors), context.temp_allocator)
-	for t, i in tensors {
-		out[i] = t.buffer
-	}
-	return out
+	append(&gctx.batch.descriptor_sets, set)
+	gctx.batch.dispatch_count += 1
 }
 
 // Convenience: ceiling-divide for picking workgroup counts.

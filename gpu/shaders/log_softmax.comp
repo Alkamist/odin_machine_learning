@@ -1,0 +1,55 @@
+// y[row, i] = x[row, i] - log_sum_exp(x[row, :]). Workgroup per row,
+// shared-memory reduction (max → sum → write).
+#version 450
+
+#define BLOCK 256
+
+layout(local_size_x = BLOCK) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+} p;
+
+shared float s_max[BLOCK];
+shared float s_sum[BLOCK];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+    uint base = row * p.size;
+
+    float local_max = -3.402823e38;
+    for (uint i = tid; i < p.size; i += BLOCK) {
+        float v = x[base + i];
+        if (v > local_max) local_max = v;
+    }
+    s_max[tid] = local_max;
+    barrier();
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_max[tid] = max(s_max[tid], s_max[tid + stride]);
+        barrier();
+    }
+    float max_v = s_max[0];
+    barrier();
+
+    float local_sum = 0.0;
+    for (uint i = tid; i < p.size; i += BLOCK) {
+        local_sum += exp(x[base + i] - max_v);
+    }
+    s_sum[tid] = local_sum;
+    barrier();
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        barrier();
+    }
+    float log_sum_exp = log(s_sum[0]) + max_v;
+
+    for (uint i = tid; i < p.size; i += BLOCK) {
+        y[base + i] = x[base + i] - log_sum_exp;
+    }
+}

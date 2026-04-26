@@ -1,0 +1,12 @@
+// 2-D transpose: out[j, i] = in[i, j]. Thread per output element.
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Params { uint rows; uint cols; } p;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint i = gl_GlobalInvocationID.y;
+    if (j >= p.cols || i >= p.rows) return;
+    y[j * p.rows + i] = x[i * p.cols + j];
+}

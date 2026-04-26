@@ -1,0 +1,12 @@
+// dx[i, j] += dy[j, i]. Thread per input element (= per output element of fwd).
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) readonly buffer DY { float dy[]; };
+layout(set = 0, binding = 1)          buffer DX { float dx[]; };
+layout(push_constant) uniform Params { uint rows; uint cols; } p;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint i = gl_GlobalInvocationID.y;
+    if (j >= p.cols || i >= p.rows) return;
+    dx[i * p.cols + j] += dy[j * p.rows + i];
+}

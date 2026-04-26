@@ -1,0 +1,21 @@
+// b.grad[j] += sum_i dy[i*n_b + j] * (-a[i*n_b + j] / b[j]^2). Thread per
+// b element, reduces over stride.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer A    { float a[];    };
+layout(set = 0, binding = 1) readonly buffer B    { float b[];    };
+layout(set = 0, binding = 2) readonly buffer DY   { float dy[];   };
+layout(set = 0, binding = 3)          buffer DA_B { float da_b[]; };
+layout(push_constant) uniform Params { uint n_b; uint stride; } p;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= p.n_b) return;
+    float bj    = b[j];
+    float bj_sq = bj * bj;
+    float acc   = 0.0;
+    for (uint i = 0; i < p.stride; ++i) {
+        uint o = i * p.n_b + j;
+        acc += dy[o] * (-a[o] / bj_sq);
+    }
+    da_b[j] += acc;
+}

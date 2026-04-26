@@ -1,0 +1,11 @@
+// dx[start + i] += dy[i]. Thread per output element.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer DY { float dy[]; };
+layout(set = 0, binding = 1)          buffer DX { float dx[]; };
+layout(push_constant) uniform Params { uint n; uint start; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    dx[p.start + i] += dy[i];
+}

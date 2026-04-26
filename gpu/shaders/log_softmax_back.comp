@@ -1,0 +1,42 @@
+// dx[row, i] += dy[row, i] - exp(y[row, i]) * sum_dy_row.
+// Workgroup per row: reduce dy across the row to get sum_dy_row, then
+// per-element write.
+#version 450
+
+#define BLOCK 256
+
+layout(local_size_x = BLOCK) in;
+
+layout(set = 0, binding = 0) readonly buffer Y  { float y[];  };
+layout(set = 0, binding = 1) readonly buffer DY { float dy[]; };
+layout(set = 0, binding = 2)          buffer DX { float dx[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+} p;
+
+shared float s_sum[BLOCK];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+    uint base = row * p.size;
+
+    float local = 0.0;
+    for (uint i = tid; i < p.size; i += BLOCK) {
+        local += dy[base + i];
+    }
+    s_sum[tid] = local;
+    barrier();
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        barrier();
+    }
+    float sum_dy = s_sum[0];
+
+    for (uint i = tid; i < p.size; i += BLOCK) {
+        dx[base + i] += dy[base + i] - exp(y[base + i]) * sum_dy;
+    }
+}

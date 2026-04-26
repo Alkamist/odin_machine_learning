@@ -1,0 +1,38 @@
+// y[row] = (1/sample_size) * sum_i (pred[row,i] - target[row,i])^2.
+// Workgroup per row, shared-memory reduction.
+#version 450
+
+#define BLOCK 256
+
+layout(local_size_x = BLOCK) in;
+
+layout(set = 0, binding = 0) readonly  buffer P { float pred[];   };
+layout(set = 0, binding = 1) readonly  buffer T { float target[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[];      };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+} p;
+
+shared float s_sum[BLOCK];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+    uint base = row * p.size;
+
+    float local = 0.0;
+    for (uint i = tid; i < p.size; i += BLOCK) {
+        float d = pred[base + i] - target[base + i];
+        local  += d * d;
+    }
+    s_sum[tid] = local;
+    barrier();
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) y[row] = s_sum[0] / float(p.size);
+}

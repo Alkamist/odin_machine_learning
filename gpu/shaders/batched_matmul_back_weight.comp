@@ -1,0 +1,32 @@
+// Backward of `batched_matmul` w.r.t. B.
+//   dB[bi, k, j] += sum_i A[bi, i, k] * dC[bi, i, j]
+// One thread per (bi, k, j); i-reduction in the inner loop. Atomic-free.
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer A  { float a[];  };
+layout(set = 0, binding = 1) readonly buffer DC { float dc[]; };
+layout(set = 0, binding = 2)          buffer DB { float db[]; };
+
+layout(push_constant) uniform Params {
+    uint batch_count;
+    uint m;
+    uint k;
+    uint n;
+} p;
+
+void main() {
+    uint kk = gl_GlobalInvocationID.x;
+    uint j  = gl_GlobalInvocationID.y;
+    uint bi = gl_GlobalInvocationID.z;
+    if (kk >= p.k || j >= p.n || bi >= p.batch_count) return;
+
+    float acc = 0.0;
+    for (uint ii = 0; ii < p.m; ++ii) {
+        float a_ik = a[bi * p.m * p.k + ii * p.k + kk];
+        float dc_ij = dc[bi * p.m * p.n + ii * p.n + j];
+        acc += a_ik * dc_ij;
+    }
+    db[bi * p.k * p.n + kk * p.n + j] += acc;
+}

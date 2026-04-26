@@ -286,19 +286,73 @@ Parameter :: struct {
 // `clear_storage` is called by `clear` to release activation storage in
 // bulk (CPU resets the arena; GPU resets the activation pool).
 Backend :: struct {
-	name:          string,
-	data:          rawptr,
+	name: string,
+	data: rawptr,
 
 	alloc:         proc(t: ^Tensor, n: int),
 	clear_storage: proc(),
+
+	// Per-Context backend-specific state. `context_alloc` is called by
+	// `ml.context_create` and the result is stashed on the Context as
+	// `backend_data`; `context_free` is called by `ml.context_destroy`.
+	// `context_begin` / `context_end` mirror `ml.context_begin` /
+	// `ml.context_end` so backends with their own per-thread stack
+	// (e.g. the GPU's `Gpu_Context`) can keep it in sync.
+	//
+	// CPU leaves all four nil. GPU implements them so a single
+	// `ml.context_create(..., gpu.backend())` is enough — callers don't
+	// have to touch `gpu.context_create` / `gpu.context_scope` directly.
+	context_alloc: proc() -> rawptr,
+	context_free:  proc(data: rawptr),
+	context_begin: proc(data: rawptr),
+	context_end:   proc(),
+
+	// Synchronize any pending GPU work and release transient resources.
+	// Called by `ml.clear` before activation storage is recycled, and
+	// before any host read of tensor data, so callers don't need to
+	// open / close batches manually. CPU leaves it nil.
+	flush: proc(),
+
+	// Allocate a tensor whose lifetime is NOT tied to the active context's
+	// activation pool — `clear_storage` won't free it. CPU uses
+	// `context.allocator` (heap), GPU creates a Gpu_Storage that isn't
+	// tracked on the gctx allocations list. Pair with `persistent_free`.
+	// This is the path for long-lived weights (parameters, inference
+	// models, etc.) that need to survive `ml.clear()`.
+	persistent_alloc: proc(t: ^Tensor, n: int),
+	persistent_free:  proc(t: ^Tensor),
+
+	// Copy `src` into `t`'s data storage. CPU does a slice copy; GPU does
+	// a host-visible-stage upload. Used by `tensor` / `scalar` so callers
+	// don't need a backend-specific path to seed inputs.
+	set_data: proc(t: ^Tensor, src: []f32),
+
+	// Read `t`'s data storage into `dst`. CPU does a slice copy; GPU does
+	// a host-visible-stage download.
+	get_data: proc(t: ^Tensor, dst: []f32),
+
+	// Allocate the four buffers that back a Parameter (data + gradient +
+	// adam_m + adam_v). CPU heap-allocates four []f32 slices; GPU creates
+	// four DEVICE_LOCAL buffers and hangs them off the embedded Tensor's
+	// storage. Pair with `parameter_free`.
+	parameter_alloc: proc(p: ^Parameter, n: int),
+	parameter_free:  proc(p: ^Parameter),
+
+	// Apply one Adam(W) step + zero gradient on `p`. CPU does the scalar
+	// loop; GPU dispatches `opt_step_adam.spv`.
+	parameter_update: proc(opt: Optimizer, p: ^Parameter),
+
+	// Copy data + gradient + adam_m + adam_v from `src` to `dst`. Used by
+	// algorithms that snapshot weights (e.g. PPO target networks).
+	parameter_copy: proc(dst, src: ^Parameter),
 
 	// Fill `t`'s gradient with 1.0 for every element. Called by `backward`
 	// to seed the final op's output gradient before the reverse walk; CPU
 	// writes to the slice, GPU dispatches a CmdFillBuffer.
 	fill_gradient_with_ones: proc(t: ^Tensor),
 
-	forward:       proc(op: Operation),
-	backward:      proc(op: Operation),
+	forward:  proc(op: Operation),
+	backward: proc(op: Operation),
 }
 
 // Per-thread state for tensor allocation, the autograd tape, and the current
@@ -312,6 +366,12 @@ Backend :: struct {
 // that can return while the Context is still pushed.
 Context :: struct {
 	backend: ^Backend,
+
+	// Opaque backend-owned state allocated by `Backend.context_alloc` in
+	// `context_create`. CPU leaves it nil. GPU stores a `^Gpu_Context`
+	// here so the GPU's per-thread context lifecycle is bound to this
+	// `ml.Context`'s lifecycle — one `ml.context_create` is enough.
+	backend_data: rawptr,
 
 	arena: mem.Arena,
 
@@ -335,6 +395,14 @@ _cpu_backend := Backend{
 	name                    = "cpu",
 	alloc                   = cpu_alloc,
 	clear_storage           = cpu_clear_storage,
+	persistent_alloc        = cpu_persistent_alloc,
+	persistent_free         = cpu_persistent_free,
+	set_data                = cpu_set_data,
+	get_data                = cpu_get_data,
+	parameter_alloc         = cpu_parameter_alloc,
+	parameter_free          = cpu_parameter_free,
+	parameter_update        = cpu_parameter_update,
+	parameter_copy          = cpu_parameter_copy,
 	fill_gradient_with_ones = cpu_fill_gradient_with_ones,
 	forward                 = cpu_forward,
 	backward                = cpu_backward,
@@ -355,6 +423,79 @@ cpu_alloc :: proc(t: ^Tensor, n: int) {
 // CPU activation reset: free everything the arena holds.
 cpu_clear_storage :: proc() {
 	mem.arena_free_all(&_current_ctx.arena)
+}
+
+// Heap-allocate persistent CPU storage. Mirrors `ml.make`'s alloc path —
+// `context.allocator` so the slice lives until explicitly freed.
+cpu_persistent_alloc :: proc(t: ^Tensor, n: int) {
+	derr: mem.Allocator_Error
+	t.data, derr = builtin.make([]f32, n)
+	fmt.assertf(derr == nil, "Failed to allocate persistent tensor data: %v", derr)
+
+	gerr: mem.Allocator_Error
+	t.gradient, gerr = builtin.make([]f32, n)
+	fmt.assertf(gerr == nil, "Failed to allocate persistent tensor gradient: %v", gerr)
+}
+
+cpu_persistent_free :: proc(t: ^Tensor) {
+	builtin.delete(t.data)
+	builtin.delete(t.gradient)
+	t.data     = nil
+	t.gradient = nil
+}
+
+cpu_set_data :: proc(t: ^Tensor, src: []f32) {
+	fmt.assertf(builtin.len(src) == builtin.len(t.data), "cpu_set_data size mismatch: src=%v t.data=%v", builtin.len(src), builtin.len(t.data))
+	builtin.copy(t.data, src)
+}
+
+cpu_get_data :: proc(t: ^Tensor, dst: []f32) {
+	fmt.assertf(builtin.len(dst) == builtin.len(t.data), "cpu_get_data size mismatch: dst=%v t.data=%v", builtin.len(dst), builtin.len(t.data))
+	builtin.copy(dst, t.data)
+}
+
+cpu_parameter_alloc :: proc(p: ^Parameter, n: int) {
+	derr1, derr2, derr3, derr4: mem.Allocator_Error
+	p.data,     derr1 = builtin.make([]f32, n)
+	p.gradient, derr2 = builtin.make([]f32, n)
+	p.adam_m,   derr3 = builtin.make([]f32, n)
+	p.adam_v,   derr4 = builtin.make([]f32, n)
+	fmt.assertf(derr1 == nil && derr2 == nil && derr3 == nil && derr4 == nil,
+		"Failed to allocate parameter: %v %v %v %v", derr1, derr2, derr3, derr4)
+}
+
+cpu_parameter_free :: proc(p: ^Parameter) {
+	builtin.delete(p.data)
+	builtin.delete(p.gradient)
+	builtin.delete(p.adam_m)
+	builtin.delete(p.adam_v)
+	p.data     = nil
+	p.gradient = nil
+	p.adam_m   = nil
+	p.adam_v   = nil
+}
+
+cpu_parameter_update :: proc(opt: Optimizer, p: ^Parameter) {
+	for i in 0 ..< len(p^) {
+		grad := p.gradient[i]
+
+		p.adam_m[i] = opt.beta1 * p.adam_m[i] + (1 - opt.beta1) * grad
+		p.adam_v[i] = opt.beta2 * p.adam_v[i] + (1 - opt.beta2) * grad * grad
+
+		m_hat := p.adam_m[i] / opt.bias_correction1
+		v_hat := p.adam_v[i] / opt.bias_correction2
+
+		p.data[i] = p.data[i] * (1 - opt.learning_rate * opt.weight_decay) - opt.learning_rate * m_hat / (math.sqrt(v_hat) + opt.epsilon)
+
+		p.gradient[i] = 0
+	}
+}
+
+cpu_parameter_copy :: proc(dst, src: ^Parameter) {
+	builtin.copy(dst.data,     src.data)
+	builtin.copy(dst.gradient, src.gradient)
+	builtin.copy(dst.adam_m,   src.adam_m)
+	builtin.copy(dst.adam_v,   src.adam_v)
 }
 
 cpu_fill_gradient_with_ones :: proc(t: ^Tensor) {
@@ -383,6 +524,9 @@ context_create :: proc(size: int, backend: ^Backend = nil, allocator := context.
 	mem.arena_init(&ctx.arena, data)
 
 	ctx.backend = backend != nil ? backend : &_cpu_backend
+	if ctx.backend.context_alloc != nil {
+		ctx.backend_data = ctx.backend.context_alloc()
+	}
 
 	return ctx
 }
@@ -391,6 +535,10 @@ context_create :: proc(size: int, backend: ^Backend = nil, allocator := context.
 // not be on the active stack when destroyed.
 context_destroy :: proc(ctx: ^Context, allocator := context.allocator, loc := #caller_location) {
 	assert(_current_ctx != ctx, "context_destroy called on the active context", loc=loc)
+	if ctx.backend.context_free != nil && ctx.backend_data != nil {
+		ctx.backend.context_free(ctx.backend_data)
+		ctx.backend_data = nil
+	}
 	if ctx.arena.data != nil {
 		builtin.delete(ctx.arena.data, allocator=allocator, loc=loc)
 	}
@@ -401,11 +549,17 @@ context_destroy :: proc(ctx: ^Context, allocator := context.allocator, loc := #c
 context_begin :: proc(ctx: ^Context) {
 	ctx.previous_ctx = _current_ctx
 	_current_ctx = ctx
+	if ctx.backend.context_begin != nil {
+		ctx.backend.context_begin(ctx.backend_data)
+	}
 }
 
 // Pop the current context off the stack.
 context_end :: proc() {
 	assert(_current_ctx != nil, "context_end called with no active context")
+	if _current_ctx.backend.context_end != nil {
+		_current_ctx.backend.context_end()
+	}
 	_current_ctx = _current_ctx.previous_ctx
 }
 
@@ -427,8 +581,23 @@ current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
 // arena; GPU would reset the activation pool).
 clear :: proc(loc := #caller_location) {
 	assert(_current_ctx != nil && _current_ctx.backend != nil, "Did you forget to call context_create / context_scope?", loc=loc)
+	if _current_ctx.backend.flush != nil {
+		_current_ctx.backend.flush()
+	}
 	_current_ctx.backend.clear_storage()
 	_current_ctx.operation_count = 0
+}
+
+// Force the active backend to finish all queued work. CPU is synchronous
+// already so this is a no-op; GPU submits + waits any open command-buffer
+// batch. `ml.clear` calls this internally before recycling activations,
+// and `Backend.get_data` calls it before reading host memory, so most
+// callers don't need it. Use it explicitly when you need to time a
+// single step on GPU without rolling its completion into the next
+// iteration's `ml.clear`.
+sync :: proc() {
+	if _current_ctx == nil || _current_ctx.backend.flush == nil { return }
+	_current_ctx.backend.flush()
 }
 
 // Get the active context's arena allocator.
@@ -476,6 +645,41 @@ zeros :: proc(shape: ..int, loc := #caller_location) -> (t: Tensor) {
 	return
 }
 
+// Allocate a tensor whose storage survives `ml.clear()`. Use this for
+// long-lived weights / inference models that are reused across many
+// activation cycles. Pair with `persistent_destroy`.
+//
+// Counterpart of `zeros` for the persistent lifetime path. Routes
+// through `Backend.persistent_alloc` so it works on either backend.
+@(require_results)
+persistent_zeros :: proc(shape: ..int, loc := #caller_location) -> (t: Tensor) {
+	assert(_current_ctx != nil && _current_ctx.backend != nil, "Did you forget to call context_create / context_scope?", loc=loc)
+	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
+	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
+
+	n := shape_element_count(shape)
+	assert(n > 0, "Tensor element count must be positive", loc=loc)
+
+	t.backend = _current_ctx.backend
+	t.backend.persistent_alloc(&t, n)
+
+	t.count = n
+	t.rank  = builtin.len(shape)
+	for d, i in shape {
+		assert(d > 0, "Tensor dimension must be positive", loc=loc)
+		t.shape[i] = d
+	}
+	return
+}
+
+// Free a tensor allocated by `persistent_zeros`. Safe to call regardless
+// of the active context's backend, as long as `t.backend` matches.
+persistent_destroy :: proc(t: Tensor) {
+	if t.backend == nil { return }
+	tt := t
+	t.backend.persistent_free(&tt)
+}
+
 // Allocate a same-shape zeroed tensor.
 @(require_results)
 zeros_like :: proc(src: Tensor, loc := #caller_location) -> Tensor {
@@ -489,9 +693,7 @@ tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
 
 	t = zeros(builtin.len(data), loc=loc)
-	for v, i in data {
-		t.data[i] = v
-	}
+	t.backend.set_data(&t, data)
 	return
 }
 
@@ -499,7 +701,8 @@ tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 @(require_results)
 scalar :: proc(value: f32, loc := #caller_location) -> (t: Tensor) {
 	t = zeros(1, loc=loc)
-	t.data[0] = value
+	src := [1]f32{value}
+	t.backend.set_data(&t, src[:])
 	return
 }
 
@@ -566,11 +769,7 @@ make :: proc(shape: ..int, allocator := context.allocator, loc := #caller_locati
 	assert(n > 0, "Parameter element count must be positive", loc=loc)
 
 	parameter.backend = _current_ctx != nil ? _current_ctx.backend : &_cpu_backend
-
-	parameter.data     = builtin.make([]f32, n, allocator=allocator, loc=loc) or_return
-	parameter.gradient = builtin.make([]f32, n, allocator=allocator, loc=loc) or_return
-	parameter.adam_m   = builtin.make([]f32, n, allocator=allocator, loc=loc) or_return
-	parameter.adam_v   = builtin.make([]f32, n, allocator=allocator, loc=loc) or_return
+	parameter.backend.parameter_alloc(&parameter, n)
 
 	parameter.count = n
 	parameter.rank  = builtin.len(shape)
@@ -584,34 +783,53 @@ make :: proc(shape: ..int, allocator := context.allocator, loc := #caller_locati
 
 // Destroy an allocated parameter.
 destroy :: proc(parameter: Parameter, loc := #caller_location) {
-	builtin.delete(parameter.data,     loc=loc)
-	builtin.delete(parameter.gradient, loc=loc)
-	builtin.delete(parameter.adam_m,   loc=loc)
-	builtin.delete(parameter.adam_v,   loc=loc)
+	if parameter.backend == nil { return }
+	p := parameter
+	parameter.backend.parameter_free(&p)
 }
 
 // Copy parameter data from src to dst.
 copy :: proc(dst, src: Parameter, loc := #caller_location) {
 	assert(len(dst) == len(src), "Parameter lengths need to be equal", loc=loc)
-	builtin.copy(dst.data,     src.data)
-	builtin.copy(dst.gradient, src.gradient)
-	builtin.copy(dst.adam_m,   src.adam_m)
-	builtin.copy(dst.adam_v,   src.adam_v)
-	return
+	assert(dst.backend == src.backend, "Parameter copy across backends not supported", loc=loc)
+	d, s := dst, src
+	dst.backend.parameter_copy(&d, &s)
 }
 
-// Fill tensor data with normally distributed random numbers.
+// Fill tensor data with normally distributed random numbers. Works on
+// either backend — for non-CPU backends we fill into a temp_allocator
+// host buffer and upload via `Backend.set_data`.
 fill_normal :: proc(t: Tensor, mean, std: f32) {
-	for &v in t.data {
-		v = rand.float32_normal(mean, std)
+	if t.backend == nil || t.backend == &_cpu_backend {
+		for &v in t.data {
+			v = rand.float32_normal(mean, std)
+		}
+		return
 	}
+	n := len(t)
+	buf := builtin.make([]f32, n, allocator=context.temp_allocator)
+	for i in 0 ..< n {
+		buf[i] = rand.float32_normal(mean, std)
+	}
+	tt := t
+	t.backend.set_data(&tt, buf)
 }
 
-// Fill tensor data with a single value.
+// Fill tensor data with a single value. Backend-aware.
 fill_value :: proc(t: Tensor, value: f32) {
-	for &v in t.data {
-		v = value
+	if t.backend == nil || t.backend == &_cpu_backend {
+		for &v in t.data {
+			v = value
+		}
+		return
 	}
+	n := len(t)
+	buf := builtin.make([]f32, n, allocator=context.temp_allocator)
+	for i in 0 ..< n {
+		buf[i] = value
+	}
+	tt := t
+	t.backend.set_data(&tt, buf)
 }
 
 // Perform He initialization.
@@ -675,19 +893,8 @@ optimize :: proc(
 // Update a parameter's data and zero its gradients.
 // This is meant to be called inside the scope of optimize.
 update :: proc(opt: Optimizer, parameter: Parameter) {
-	for i in 0 ..< len(parameter) {
-		grad := parameter.gradient[i]
-
-		parameter.adam_m[i] = opt.beta1 * parameter.adam_m[i] + (1 - opt.beta1) * grad
-		parameter.adam_v[i] = opt.beta2 * parameter.adam_v[i] + (1 - opt.beta2) * grad * grad
-
-		m_hat := parameter.adam_m[i] / opt.bias_correction1
-		v_hat := parameter.adam_v[i] / opt.bias_correction2
-
-		parameter.data[i] = parameter.data[i] * (1 - opt.learning_rate * opt.weight_decay) - opt.learning_rate * m_hat / (math.sqrt(v_hat) + opt.epsilon)
-
-		parameter.gradient[i] = 0
-	}
+	p := parameter
+	parameter.backend.parameter_update(opt, &p)
 }
 
 Operation_Variant :: union {
