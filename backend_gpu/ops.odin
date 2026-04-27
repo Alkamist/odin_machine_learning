@@ -1,10 +1,4 @@
-// SPIR-V op modules + the matching push-constant struct + a file-local
-// pipeline pointer per kernel. Pipelines are lazy-built on first dispatch
-// in `gpu/backend.odin` and cached here.
-//
-// SPIR-V is embedded at compile time via `#load` so the binary doesn't
-// depend on the shader files at runtime.
-package gpu
+package machine_learning_backend_gpu
 
 ADD_SPIRV :: #load("shaders/add.spv", []u8)
 ADD_LOCAL_SIZE :: 256
@@ -16,9 +10,8 @@ Add_Back_Params :: struct { n: u32 }
 _add_back_pipeline: ^Pipeline
 
 LINEAR_SPIRV :: #load("shaders/linear.spv", []u8)
-// Tile sizes — must match #defines in linear.comp.
-LINEAR_LOCAL_X :: 64  // TILE_M (output rows per workgroup)
-LINEAR_LOCAL_Y :: 64  // TILE_N (output cols per workgroup)
+LINEAR_LOCAL_X :: 64
+LINEAR_LOCAL_Y :: 64
 Linear_Params :: struct { count, input_size, output_size: u32 }
 _linear_pipeline: ^Pipeline
 
@@ -125,8 +118,6 @@ Mean_Params :: struct { count, size: u32 }
 _mean_pipeline:      ^Pipeline
 _mean_back_pipeline: ^Pipeline
 
-// --- Elementwise activations (single-input, thread-per-element) ---
-
 RELU_SPIRV         :: #load("shaders/relu.spv",         []u8)
 RELU_BACK_SPIRV    :: #load("shaders/relu_back.spv",    []u8)
 SIGMOID_SPIRV      :: #load("shaders/sigmoid.spv",      []u8)
@@ -150,8 +141,6 @@ Clamp_Params :: struct { n: u32, min_val, max_val: f32 }
 _clamp_pipeline:      ^Pipeline
 _clamp_back_pipeline: ^Pipeline
 
-// --- Same-shape elementwise binary ---
-
 MIN_SPIRV      :: #load("shaders/min.spv",      []u8)
 MIN_BACK_SPIRV :: #load("shaders/min_back.spv", []u8)
 MAX_SPIRV      :: #load("shaders/max.spv",      []u8)
@@ -159,8 +148,6 @@ MAX_BACK_SPIRV :: #load("shaders/max_back.spv", []u8)
 MinMax_Params :: struct { n: u32 }
 _min_pipeline, _min_back_pipeline: ^Pipeline
 _max_pipeline, _max_back_pipeline: ^Pipeline
-
-// --- Broadcast elementwise binary (sub, div) ---
 
 SUB_SPIRV        :: #load("shaders/sub.spv",        []u8)
 SUB_BACK_A_SPIRV :: #load("shaders/sub_back_a.spv", []u8)
@@ -177,8 +164,6 @@ Div_Back_B_Params :: struct { n_b, stride: u32 }
 _sub_pipeline, _sub_back_a_pipeline, _sub_back_b_pipeline: ^Pipeline
 _div_pipeline, _div_back_a_pipeline, _div_back_b_pipeline: ^Pipeline
 
-// --- Shape ops ---
-
 TRANSPOSE_SPIRV      :: #load("shaders/transpose.spv",      []u8)
 TRANSPOSE_BACK_SPIRV :: #load("shaders/transpose_back.spv", []u8)
 Transpose_Params :: struct { rows, cols: u32 }
@@ -188,8 +173,6 @@ SLICE_SPIRV      :: #load("shaders/slice.spv",      []u8)
 SLICE_BACK_SPIRV :: #load("shaders/slice_back.spv", []u8)
 Slice_Params :: struct { n, start: u32 }
 _slice_pipeline, _slice_back_pipeline: ^Pipeline
-
-// --- Row-reductions ---
 
 LOG_SOFTMAX_SPIRV      :: #load("shaders/log_softmax.spv",      []u8)
 LOG_SOFTMAX_BACK_SPIRV :: #load("shaders/log_softmax_back.spv", []u8)
@@ -211,8 +194,6 @@ CROSS_ENTROPY_BACK_SPIRV :: #load("shaders/cross_entropy_back.spv", []u8)
 Cross_Entropy_Params :: struct { count, class_size: u32 }
 _cross_entropy_pipeline:      ^Pipeline
 _cross_entropy_back_pipeline: ^Pipeline
-
-// --- Optimizer ---
 
 ADAM_STEP_SPIRV :: #load("shaders/opt_step_adam.spv", []u8)
 Adam_Params :: struct {

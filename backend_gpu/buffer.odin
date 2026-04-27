@@ -1,11 +1,19 @@
-// Vulkan buffer-management helpers shared by the unified `ml.Backend`
-// integration in `backend.odin`. Per-tensor storage is allocated via
-// `Backend.alloc` / `persistent_alloc` / `parameter_alloc`, not here —
-// this file exposes only the low-level primitives.
-package gpu
+package machine_learning_backend_gpu
 
 import "core:fmt"
+import "core:mem"
+
 import vk "vendor:vulkan"
+
+Gpu_Buffer :: struct {
+	buffer: vk.Buffer,
+	memory: vk.DeviceMemory,
+}
+
+#assert(size_of(Gpu_Buffer) == 16)
+
+// f32(1.0) bit pattern for vkCmdFillBuffer's u32 stamp.
+F32_ONE_BITS :: u32(0x3F800000)
 
 _create_buffer :: proc(
 	size: vk.DeviceSize,
@@ -38,11 +46,7 @@ _create_buffer :: proc(
 	return
 }
 
-_pick_memory_type :: proc(
-	type_bits: u32,
-	required: vk.MemoryPropertyFlags,
-	loc := #caller_location,
-) -> u32 {
+_pick_memory_type :: proc(type_bits: u32, required: vk.MemoryPropertyFlags, loc := #caller_location) -> u32 {
 	mp := &_gpu.memory_properties
 	for i in 0 ..< mp.memoryTypeCount {
 		if (type_bits & (1 << i)) == 0 { continue }
@@ -53,26 +57,16 @@ _pick_memory_type :: proc(
 	fmt.panicf("no memory type matches type_bits=0x%x required=%v", type_bits, required, loc=loc)
 }
 
-// Allocate a transient command buffer, record a single buffer-to-buffer copy,
-// submit it, and wait for completion. Synchronous on purpose — this is the
-// upload/download path, not a hot inner loop.
-// Lazily grow the active gpu Context's persistent staging buffer to
-// hold at least `min_size` bytes. The staging memory is HOST_VISIBLE +
-// HOST_COHERENT and stays persistently mapped, so callers can write or
-// read its contents directly via `gctx.staging.mapped`.
-//
-// Capacity grows by powers of two from a 64KB floor; existing contents
-// are *not* preserved across a regrow, so callers must finish any
-// pending use before triggering one.
+// Lazily grow the active gctx's persistently-mapped staging buffer to hold
+// at least min_size bytes. Existing contents are NOT preserved across regrow,
+// so callers must finish any pending use before triggering one.
 _ensure_staging :: proc(min_size: vk.DeviceSize, loc := #caller_location) {
-	gctx := _current_gpu_ctx
-	fmt.assertf(gctx != nil, "no active gpu Context", loc=loc)
+	gctx := _gctx(loc)
 
 	if gctx.staging.size >= min_size {
 		return
 	}
 
-	// Free old.
 	if gctx.staging.buffer != 0 {
 		if gctx.staging.mapped != nil {
 			vk.UnmapMemory(_gpu.device, gctx.staging.memory)
@@ -99,20 +93,12 @@ _ensure_staging :: proc(min_size: vk.DeviceSize, loc := #caller_location) {
 	fmt.assertf(res == .SUCCESS, "vkMapMemory(staging) failed: %v", res, loc=loc)
 }
 
-// Fill a buffer with `value` (a u32 stamp — for f32 fills, pass the
-// IEEE 754 bit pattern). If a batch is active, record the fill into its
-// command buffer (free — no extra submit). Otherwise fall back to a
-// one-shot submit + wait.
-//
-// Critical: when a batch is active, ALL fills must record into the batch
-// CB. A one-shot submit during recording would execute on the queue
-// before the batch is submitted, but the batch CB may contain a later-
-// executing fill of the same buffer (e.g. an alloc-time zero-fill
-// recorded before the one-shot was issued), which would clobber the
-// one-shot's write when the batch finally runs.
+// Fill `buf` with `value` (u32 stamp). When a batch is active, ALL fills
+// must record into the batch CB — a one-shot during recording would execute
+// on the queue before later-recorded work in the batch, clobbering writes.
 _record_fill :: proc(buf: vk.Buffer, size: vk.DeviceSize, value: u32, loc := #caller_location) {
-	gctx := _current_gpu_ctx
-	if gctx != nil && gctx.batch.active {
+	gctx := _gctx(loc)
+	if gctx.batch.active {
 		vk.CmdFillBuffer(gctx.batch.cmd, buf, 0, size, value)
 		return
 	}
@@ -127,16 +113,13 @@ _record_fill_zero :: #force_inline proc(buf: vk.Buffer, size: vk.DeviceSize, loc
 
 _one_shot_copy :: proc(src, dst: vk.Buffer, size: vk.DeviceSize, loc := #caller_location) {
 	cmd := _begin_one_shot(loc)
-
-	region := vk.BufferCopy{ srcOffset = 0, dstOffset = 0, size = size }
+	region := vk.BufferCopy{srcOffset = 0, dstOffset = 0, size = size}
 	vk.CmdCopyBuffer(cmd, src, dst, 1, &region)
-
 	_end_one_shot(cmd, loc)
 }
 
 _begin_one_shot :: proc(loc := #caller_location) -> vk.CommandBuffer {
-	gctx := _current_gpu_ctx
-	fmt.assertf(gctx != nil, "no active gpu Context — call gpu.context_begin / context_scope", loc=loc)
+	gctx := _gctx(loc)
 
 	alloc_info := vk.CommandBufferAllocateInfo{
 		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
@@ -172,5 +155,84 @@ _end_one_shot :: proc(cmd: vk.CommandBuffer, loc := #caller_location) {
 	res = vk.QueueWaitIdle(_gpu.queue)
 	fmt.assertf(res == .SUCCESS, "vkQueueWaitIdle failed: %v", res, loc=loc)
 
-	vk.FreeCommandBuffers(_gpu.device, _current_gpu_ctx.command_pool, 1, &cmd)
+	vk.FreeCommandBuffers(_gpu.device, _gctx(loc).command_pool, 1, &cmd)
+}
+
+// Copy host data → device buffer via the staging buffer. Synchronous on
+// purpose; uploads are not on the hot path. Flushes any active batch first
+// so prior queued writes to the buffer don't clobber the upload.
+_upload :: proc(dst: vk.Buffer, src: []f32, loc := #caller_location) {
+	if len(src) == 0 { return }
+
+	gctx := _gctx(loc)
+	if gctx.batch.active {
+		end_batch(loc)
+	}
+
+	size := vk.DeviceSize(len(src) * size_of(f32))
+	_ensure_staging(size, loc)
+
+	mem.copy(gctx.staging.mapped, raw_data(src), int(size))
+
+	cmd := _begin_one_shot(loc)
+	region := vk.BufferCopy{srcOffset = 0, dstOffset = 0, size = size}
+	vk.CmdCopyBuffer(cmd, gctx.staging.buffer, dst, 1, &region)
+	_end_one_shot(cmd, loc)
+}
+
+// Copy device buffer → host data. Synchronous — when this returns, dst
+// holds the GPU's contents. If a batch is active, fold the device →
+// staging copy into it and end the batch so the deferred host memcpy
+// runs (one submit total instead of two).
+_download :: proc(src: vk.Buffer, dst: []f32, loc := #caller_location) {
+	if len(dst) == 0 { return }
+
+	gctx := _gctx(loc)
+	size := vk.DeviceSize(len(dst) * size_of(f32))
+
+	if gctx.batch.active {
+		needed := gctx.batch.staging_offset + size
+		if needed > gctx.staging.size {
+			end_batch(loc)
+		}
+	}
+
+	if gctx.batch.active {
+		offset := gctx.batch.staging_offset
+		barrier := vk.MemoryBarrier{
+			sType         = .MEMORY_BARRIER,
+			srcAccessMask = {.SHADER_WRITE},
+			dstAccessMask = {.TRANSFER_READ},
+		}
+		vk.CmdPipelineBarrier(
+			gctx.batch.cmd,
+			{.COMPUTE_SHADER}, {.TRANSFER},
+			{}, 1, &barrier, 0, nil, 0, nil,
+		)
+		region := vk.BufferCopy{srcOffset = 0, dstOffset = offset, size = size}
+		vk.CmdCopyBuffer(gctx.batch.cmd, src, gctx.staging.buffer, 1, &region)
+		gctx.batch.staging_offset += size
+		append(&gctx.pending_downloads, Pending_Download{dst = dst, offset = offset, size = size})
+		end_batch(loc)
+		return
+	}
+
+	_ensure_staging(size, loc)
+
+	cmd := _begin_one_shot(loc)
+	region := vk.BufferCopy{srcOffset = 0, dstOffset = 0, size = size}
+	vk.CmdCopyBuffer(cmd, src, gctx.staging.buffer, 1, &region)
+	_end_one_shot(cmd, loc)
+
+	mem.copy(raw_data(dst), gctx.staging.mapped, int(size))
+}
+
+_copy :: proc(dst, src: vk.Buffer, size: vk.DeviceSize, loc := #caller_location) {
+	gctx := _gctx(loc)
+	if gctx.batch.active {
+		region := vk.BufferCopy{srcOffset = 0, dstOffset = 0, size = size}
+		vk.CmdCopyBuffer(gctx.batch.cmd, src, dst, 1, &region)
+		return
+	}
+	_one_shot_copy(src, dst, size, loc)
 }

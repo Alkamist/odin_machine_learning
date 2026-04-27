@@ -11,7 +11,6 @@ import "core:math/rand"
 MAX_OPERATIONS          :: 4096
 MAX_TENSOR_RANK         :: 6
 BACKEND_BUFFER_MAX_SIZE :: 16
-
 OP_ARENA_DEFAULT_SIZE   :: 1 * 1024 * 1024
 
 Data_Type :: enum u8 {
@@ -281,6 +280,14 @@ copy :: proc(dst, src: Tensor, loc := #caller_location) {
 
 get_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
 	t.vtable.buffer_get(t.buffers[.Data], data, loc)
+}
+
+set_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
+	t.vtable.buffer_set(t.buffers[.Data], data, loc)
+}
+
+get_gradient :: proc(t: Tensor, data: []f32, loc := #caller_location) {
+	t.vtable.buffer_get(t.buffers[.Gradient], data, loc)
 }
 
 fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {

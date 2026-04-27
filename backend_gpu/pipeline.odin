@@ -1,19 +1,10 @@
-// Compute-pipeline plumbing.
-//
-// Most kernels we'll ship have the same shape: N storage buffers (the input
-// and output tensors) plus a small push-constant block (sizes, strides,
-// scale factors). _make_pipeline takes those two parameters and returns a
-// fully-built pipeline. Ops in ops.odin lazy-init their pipeline on first
-// use and cache it as a file-local var.
-//
-// Per-dispatch descriptor sets are allocated from the global descriptor pool
-// and freed at the end of the dispatch. This keeps the design simple while
-// kernel counts are small; if descriptor allocation ever shows up in a
-// profile we can switch to a per-pipeline cached set.
-package gpu
+package machine_learning_backend_gpu
+
+import "base:builtin"
 
 import "core:fmt"
 import "core:mem"
+
 import vk "vendor:vulkan"
 
 Pipeline :: struct {
@@ -21,21 +12,12 @@ Pipeline :: struct {
 	pipeline_layout:       vk.PipelineLayout,
 	pipeline:              vk.Pipeline,
 	shader_module:         vk.ShaderModule,
-
 	num_buffers:           u32,
 	push_constant_size:    u32,
 }
 
 // Batched-dispatch state. While active, _dispatch records into a single
-// command buffer instead of submitting each call individually. end_batch
-// inserts one submit + one wait_idle for the entire batch, eliminating the
-// per-dispatch drain that dominates forward-pass time.
-//
-// Transient resources (descriptor sets, host-visible scratch buffers like
-// the select-indices buffer) can't be freed until the GPU is done with the
-// batch, so they're queued here and reclaimed in end_batch.
-//
-// Lives on Gpu_Context; one batch in flight per host thread / context.
+// command buffer; nothing executes on the GPU until end_batch.
 Batch :: struct {
 	active:           bool,
 	cmd:              vk.CommandBuffer,
@@ -43,15 +25,18 @@ Batch :: struct {
 	descriptor_sets:  [dynamic]vk.DescriptorSet,
 	pending_buffers:  [dynamic]vk.Buffer,
 	pending_memories: [dynamic]vk.DeviceMemory,
-	staging_offset:   vk.DeviceSize, // bump-allocator inside the staging
-	                                 // buffer for in-batch downloads.
+	staging_offset:   vk.DeviceSize,
 }
 
-// Open a recording batch. All subsequent _dispatch calls record into one
-// command buffer; nothing executes on the GPU until end_batch.
+flush :: proc(loc := #caller_location) {
+	gctx := _gctx(loc)
+	if gctx.batch.active {
+		end_batch(loc)
+	}
+}
+
 begin_batch :: proc(loc := #caller_location) {
-	fmt.assertf(_current_gpu_ctx != nil, "gpu.context_begin / context_scope must be called first", loc=loc)
-	gctx := _current_gpu_ctx
+	gctx := _gctx(loc)
 	fmt.assertf(!gctx.batch.active, "begin_batch: already in a batch", loc=loc)
 
 	alloc_info := vk.CommandBufferAllocateInfo{
@@ -75,12 +60,8 @@ begin_batch :: proc(loc := #caller_location) {
 	gctx.batch.staging_offset = 0
 }
 
-// Close the batch: submit, wait, then free everything that was queued
-// during recording. Synchronous on purpose — fits the existing model where
-// callers expect GPU results to be ready when control returns.
 end_batch :: proc(loc := #caller_location) {
-	fmt.assertf(_current_gpu_ctx != nil, "gpu.context_begin / context_scope must be called first", loc=loc)
-	gctx := _current_gpu_ctx
+	gctx := _gctx(loc)
 	fmt.assertf(gctx.batch.active, "end_batch: no active batch", loc=loc)
 
 	cmd := gctx.batch.cmd
@@ -97,65 +78,54 @@ end_batch :: proc(loc := #caller_location) {
 	res = vk.QueueWaitIdle(_gpu.queue)
 	fmt.assertf(res == .SUCCESS, "vkQueueWaitIdle (batch) failed: %v", res, loc=loc)
 
-	// Flush any downloads that were folded into the batch: the device→staging
-	// copies executed on the queue, and now that the wait has returned the
-	// staging buffer's HOST_COHERENT contents are valid to memcpy out.
 	if len(gctx.pending_downloads) > 0 {
 		base := uintptr(gctx.staging.mapped)
 		for d in gctx.pending_downloads {
 			src := rawptr(base + uintptr(d.offset))
 			mem.copy(raw_data(d.dst), src, int(d.size))
 		}
-		clear(&gctx.pending_downloads)
+		builtin.clear(&gctx.pending_downloads)
 	}
 
 	vk.FreeCommandBuffers(_gpu.device, gctx.command_pool, 1, &cmd)
 
-	if len(gctx.batch.descriptor_sets) > 0 {
+	if builtin.len(gctx.batch.descriptor_sets) > 0 {
 		vk.FreeDescriptorSets(
 			_gpu.device, gctx.descriptor_pool,
-			u32(len(gctx.batch.descriptor_sets)),
+			u32(builtin.len(gctx.batch.descriptor_sets)),
 			raw_data(gctx.batch.descriptor_sets[:]),
 		)
 	}
 	for buf in gctx.batch.pending_buffers  { vk.DestroyBuffer(_gpu.device, buf, nil) }
-	for mem in gctx.batch.pending_memories { vk.FreeMemory(_gpu.device, mem, nil) }
+	for m   in gctx.batch.pending_memories { vk.FreeMemory(_gpu.device, m, nil)      }
 
-	clear(&gctx.batch.descriptor_sets)
-	clear(&gctx.batch.pending_buffers)
-	clear(&gctx.batch.pending_memories)
+	builtin.clear(&gctx.batch.descriptor_sets)
+	builtin.clear(&gctx.batch.pending_buffers)
+	builtin.clear(&gctx.batch.pending_memories)
 	gctx.batch.active         = false
 	gctx.batch.cmd            = nil
 	gctx.batch.dispatch_count = 0
 }
 
-// Schedule (buf, mem) for destruction once the current batch finishes. If
-// no batch is active, destroy immediately — callers in that mode have
-// already waited on the GPU via the per-dispatch wait_idle.
-_queue_destroy_buffer :: proc(buf: vk.Buffer, mem: vk.DeviceMemory) {
-	if _current_gpu_ctx != nil && _current_gpu_ctx.batch.active {
-		append(&_current_gpu_ctx.batch.pending_buffers,  buf)
-		append(&_current_gpu_ctx.batch.pending_memories, mem)
+_queue_destroy_buffer :: proc(buf: vk.Buffer, m: vk.DeviceMemory) {
+	gctx := _gctx()
+	if gctx.batch.active {
+		append(&gctx.batch.pending_buffers,  buf)
+		append(&gctx.batch.pending_memories, m)
 	} else {
 		vk.DestroyBuffer(_gpu.device, buf, nil)
-		vk.FreeMemory(_gpu.device, mem, nil)
+		vk.FreeMemory(_gpu.device, m, nil)
 	}
 }
 
-// Build a compute pipeline from SPIR-V bytes. `num_buffers` is the count of
-// `layout(set=0, binding=N) buffer ...` entries declared in the shader (all
-// STORAGE_BUFFER on the COMPUTE stage). `push_constant_size` matches the
-// shader's `layout(push_constant) uniform { ... };` block size in bytes;
-// pass 0 if the kernel has none.
 _make_pipeline :: proc(spirv: []u8, num_buffers: u32, push_constant_size: u32, loc := #caller_location) -> ^Pipeline {
-	fmt.assertf(_gpu.device != nil, "gpu.init() must be called first", loc=loc)
+	fmt.assertf(_gpu.device != nil, "device_init must be called first", loc=loc)
 	fmt.assertf(len(spirv) % 4 == 0, "SPIR-V byte length must be a multiple of 4", loc=loc)
 
-	p := new(Pipeline)
+	p := builtin.new(Pipeline)
 	p.num_buffers        = num_buffers
 	p.push_constant_size = push_constant_size
 
-	// Shader module.
 	module_info := vk.ShaderModuleCreateInfo{
 		sType    = .SHADER_MODULE_CREATE_INFO,
 		codeSize = len(spirv),
@@ -164,8 +134,7 @@ _make_pipeline :: proc(spirv: []u8, num_buffers: u32, push_constant_size: u32, l
 	res := vk.CreateShaderModule(_gpu.device, &module_info, nil, &p.shader_module)
 	fmt.assertf(res == .SUCCESS, "vkCreateShaderModule failed: %v", res, loc=loc)
 
-	// Descriptor set layout: one STORAGE_BUFFER per buffer, all on COMPUTE.
-	bindings := make([]vk.DescriptorSetLayoutBinding, num_buffers, context.temp_allocator)
+	bindings := builtin.make([]vk.DescriptorSetLayoutBinding, num_buffers, context.temp_allocator)
 	for i in 0 ..< num_buffers {
 		bindings[i] = vk.DescriptorSetLayoutBinding{
 			binding         = i,
@@ -182,7 +151,6 @@ _make_pipeline :: proc(spirv: []u8, num_buffers: u32, push_constant_size: u32, l
 	res = vk.CreateDescriptorSetLayout(_gpu.device, &dsl_info, nil, &p.descriptor_set_layout)
 	fmt.assertf(res == .SUCCESS, "vkCreateDescriptorSetLayout failed: %v", res, loc=loc)
 
-	// Pipeline layout (descriptor set + optional push constants).
 	pcr := vk.PushConstantRange{
 		stageFlags = {.COMPUTE},
 		offset     = 0,
@@ -198,7 +166,6 @@ _make_pipeline :: proc(spirv: []u8, num_buffers: u32, push_constant_size: u32, l
 	res = vk.CreatePipelineLayout(_gpu.device, &pl_info, nil, &p.pipeline_layout)
 	fmt.assertf(res == .SUCCESS, "vkCreatePipelineLayout failed: %v", res, loc=loc)
 
-	// Compute pipeline.
 	stage := vk.PipelineShaderStageCreateInfo{
 		sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
 		stage  = {.COMPUTE},
@@ -218,18 +185,13 @@ _make_pipeline :: proc(spirv: []u8, num_buffers: u32, push_constant_size: u32, l
 }
 
 _destroy_pipeline :: proc(p: ^Pipeline) {
-	if p.pipeline != 0              { vk.DestroyPipeline(_gpu.device, p.pipeline, nil) }
-	if p.pipeline_layout != 0       { vk.DestroyPipelineLayout(_gpu.device, p.pipeline_layout, nil) }
-	if p.descriptor_set_layout != 0 { vk.DestroyDescriptorSetLayout(_gpu.device, p.descriptor_set_layout, nil) }
-	if p.shader_module != 0         { vk.DestroyShaderModule(_gpu.device, p.shader_module, nil) }
-	free(p)
+	if p.pipeline != 0              { vk.DestroyPipeline(_gpu.device, p.pipeline, nil)                           }
+	if p.pipeline_layout != 0       { vk.DestroyPipelineLayout(_gpu.device, p.pipeline_layout, nil)              }
+	if p.descriptor_set_layout != 0 { vk.DestroyDescriptorSetLayout(_gpu.device, p.descriptor_set_layout, nil)   }
+	if p.shader_module != 0         { vk.DestroyShaderModule(_gpu.device, p.shader_module, nil)                  }
+	builtin.free(p)
 }
 
-// Run a kernel synchronously: allocate a descriptor set, bind buffers + push
-// constants, dispatch `group_count_x` workgroups, wait, free the set. Caller
-// supplies workgroup count along X only — that covers every elementwise /
-// row-parallel kernel we'll need short-term. 2D dispatches will get their
-// own helper when the first 2D kernel lands.
 _dispatch :: proc(
 	p: ^Pipeline,
 	buffers: []vk.Buffer,
@@ -242,10 +204,8 @@ _dispatch :: proc(
 	fmt.assertf(u32(len(buffers)) == p.num_buffers,
 		"dispatch: pipeline expects %v buffers, got %v", p.num_buffers, len(buffers), loc=loc)
 
-	gctx := _current_gpu_ctx
-	fmt.assertf(gctx != nil, "no active gpu Context — call gpu.context_begin / context_scope", loc=loc)
+	gctx := _gctx(loc)
 
-	// Allocate descriptor set.
 	dsl := p.descriptor_set_layout
 	ds_alloc := vk.DescriptorSetAllocateInfo{
 		sType              = .DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -257,9 +217,8 @@ _dispatch :: proc(
 	res := vk.AllocateDescriptorSets(_gpu.device, &ds_alloc, &set)
 	fmt.assertf(res == .SUCCESS, "vkAllocateDescriptorSets failed: %v", res, loc=loc)
 
-	// Write buffer bindings.
-	buf_infos := make([]vk.DescriptorBufferInfo, p.num_buffers, context.temp_allocator)
-	writes    := make([]vk.WriteDescriptorSet,   p.num_buffers, context.temp_allocator)
+	buf_infos := builtin.make([]vk.DescriptorBufferInfo, p.num_buffers, context.temp_allocator)
+	writes    := builtin.make([]vk.WriteDescriptorSet,   p.num_buffers, context.temp_allocator)
 	for i in 0 ..< p.num_buffers {
 		buf_infos[i] = vk.DescriptorBufferInfo{
 			buffer = buffers[i],
@@ -277,21 +236,14 @@ _dispatch :: proc(
 	}
 	vk.UpdateDescriptorSets(_gpu.device, p.num_buffers, raw_data(writes), 0, nil)
 
-	// Auto-start a batch if one isn't already open. The batch is flushed
-	// implicitly by `ml.clear` (via `Backend.flush`) and by `get_data` /
-	// `download_tensor` before they read host memory, so most callers
-	// never have to think about batches at all.
 	if !gctx.batch.active {
-		begin_batch()
+		begin_batch(loc)
 	}
 
-	// Record into the open batch. Insert a barrier before every dispatch
-	// so prior writes are visible to this one — we don't track per-buffer
-	// dependencies, so a global memory barrier
-	// ({SHADER_WRITE, TRANSFER_WRITE} → {SHADER_READ, SHADER_WRITE}) on
-	// COMPUTE+TRANSFER → COMPUTE makes both pipelined dispatches and
-	// alloc-time CmdFillBuffer zero-fills (recorded into the same CB)
-	// correct without per-op metadata.
+	// Insert a memory barrier before every dispatch so prior shader writes
+	// and CmdFillBuffer zero-fills are visible. Per-buffer dependencies
+	// aren't tracked, so a global SHADER+TRANSFER → SHADER barrier covers
+	// both pipelined dispatches and alloc-time fills in the same CB.
 	cmd := gctx.batch.cmd
 	barrier := vk.MemoryBarrier{
 		sType         = .MEMORY_BARRIER,
@@ -317,7 +269,6 @@ _dispatch :: proc(
 	gctx.batch.dispatch_count += 1
 }
 
-// Convenience: ceiling-divide for picking workgroup counts.
-_div_up :: proc(a, b: int) -> u32 {
+_div_up :: #force_inline proc(a, b: int) -> u32 {
 	return u32((a + b - 1) / b)
 }

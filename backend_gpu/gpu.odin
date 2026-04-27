@@ -1,21 +1,15 @@
-// Vulkan compute backend.
-//
-// First milestone: bring up an instance, pick a compute-capable physical
-// device, create a logical device with one compute queue, and a command pool.
-// No buffers / shaders / dispatch yet — that lands in follow-up files.
-//
-// Run examples/gpu_hello to verify the device init path on this machine.
-package gpu
+package machine_learning_backend_gpu
+
+import "base:builtin"
 
 import "core:dynlib"
 import "core:fmt"
 import "core:strings"
+
 import vk "vendor:vulkan"
 
-// Device-level state, brought up once by `init` and shared by every
-// Gpu_Context on this process. Vulkan handles in here are either immutable
-// post-init (instance, device, queue family) or thread-safe to use after
-// creation (device, pipelines once compiled).
+import ml ".."
+
 Gpu_Device :: struct {
 	instance:           vk.Instance,
 	physical_device:    vk.PhysicalDevice,
@@ -24,46 +18,28 @@ Gpu_Device :: struct {
 	queue_family_index: u32,
 	memory_properties:  vk.PhysicalDeviceMemoryProperties,
 
-	// Pipelines created via _make_pipeline register here so destroy() can
-	// tear them down without each op needing its own cleanup hook.
 	pipelines:          [dynamic]^Pipeline,
 
-	device_name:        string, // owned, freed in destroy
+	device_name:        string,
 	loader:             dynlib.Library,
 }
 
-// Per-thread / per-ml-Context Vulkan state. Vulkan command pools and
-// descriptor pools are NOT thread-safe to use from multiple threads at once,
-// so each host thread that wants to issue GPU work owns its own Gpu_Context.
-// The active one is tracked via a thread-local stack analogous to ml.Context.
-//
-// `allocations` tracks every Gpu_Storage created by gpu_alloc on this
-// context; gpu_clear_storage frees them in bulk to mirror CPU's arena
-// reset.
 Gpu_Context :: struct {
 	command_pool:    vk.CommandPool,
 	descriptor_pool: vk.DescriptorPool,
 	batch:           Batch,
 
-	// Live activation allocations from `gpu_alloc`. Reset by `gpu_clear_storage`,
-	// which pushes each entry into `pool` for reuse instead of destroying it.
-	allocations:     [dynamic]^Gpu_Storage,
+	activations: [dynamic]Gpu_Buffer,
+	pool:        map[int][dynamic]Gpu_Buffer,
 
-	// Free Gpu_Storage buffers keyed by element count. Reused across
-	// `ml.clear` cycles to avoid per-step vkCreateBuffer / vkAllocateMemory.
-	pool: map[int][dynamic]^Gpu_Storage,
+	// Bytes-per-buffer side table. Backend_Buffer is exactly 16 bytes
+	// (vk.Buffer + vk.DeviceMemory) with no room for the size, but
+	// buffer_copy and the activation pool both need it. Map lookup beats
+	// a per-call vkGetBufferMemoryRequirements.
+	sizes: map[vk.Buffer]int,
 
-	// Persistently-mapped HOST_VISIBLE+HOST_COHERENT staging buffer used
-	// by `upload_tensor` / `download_tensor`. Lazily grown on demand so
-	// downloads in tight loops don't re-create + re-allocate per call.
-	staging: Staging,
-
-	// Recorded "after end_batch, copy staging[off..off+size] to dst"
-	// callbacks. Populated when a download is folded into the active batch
-	// command buffer; flushed after the batch's queueWaitIdle.
+	staging:           Staging,
 	pending_downloads: [dynamic]Pending_Download,
-
-	previous_ctx: ^Gpu_Context,
 }
 
 Staging :: struct {
@@ -74,24 +50,19 @@ Staging :: struct {
 }
 
 Pending_Download :: struct {
-	dst:     []f32,
-	offset:  vk.DeviceSize,
-	size:    vk.DeviceSize,
+	dst:    []f32,
+	offset: vk.DeviceSize,
+	size:   vk.DeviceSize,
 }
 
 _gpu: Gpu_Device
 
-@(thread_local)
-_current_gpu_ctx: ^Gpu_Context
+@(require_results)
+_gctx :: #force_inline proc(loc := #caller_location) -> ^Gpu_Context {
+	return cast(^Gpu_Context)ml.current_context(loc=loc).backend_data
+}
 
-// Bring up Vulkan: load the system loader, create instance, pick a physical
-// device with a compute queue, create the device. Idempotent — `gpu.backend()`
-// calls this lazily when the first GPU `ml.Context` is created, so most
-// callers don't need to invoke it explicitly. Panics on any failure.
-//
-// Per-Context resources (command pool, descriptor pool, batch state) are
-// created by `context_create`, not here.
-init :: proc() {
+device_init :: proc() {
 	if _gpu.device != nil { return }
 	_load_loader()
 	_create_instance()
@@ -101,13 +72,11 @@ init :: proc() {
 	fmt.printfln("gpu: %v (queue family %v)", _gpu.device_name, _gpu.queue_family_index)
 }
 
-// Tear down everything init brought up. All Gpu_Contexts must already be
-// destroyed before calling this.
-destroy :: proc() {
+device_destroy :: proc() {
 	for p in _gpu.pipelines {
 		_destroy_pipeline(p)
 	}
-	delete(_gpu.pipelines)
+	builtin.delete(_gpu.pipelines)
 	_gpu.pipelines = nil
 
 	if _gpu.device != nil {
@@ -119,7 +88,7 @@ destroy :: proc() {
 		_gpu.instance = nil
 	}
 	if _gpu.device_name != "" {
-		delete(_gpu.device_name)
+		builtin.delete(_gpu.device_name)
 		_gpu.device_name = ""
 	}
 	if _gpu.loader != nil {
@@ -128,91 +97,17 @@ destroy :: proc() {
 	}
 }
 
-// Heap-allocate and initialize a Gpu_Context. Pair with `context_destroy`.
-@(require_results)
-context_create :: proc(allocator := context.allocator, loc := #caller_location) -> ^Gpu_Context {
-	fmt.assertf(_gpu.device != nil, "gpu.init() must be called first", loc=loc)
-
-	gctx, err := new(Gpu_Context, allocator=allocator, loc=loc)
-	fmt.assertf(err == nil, "Failed to allocate Gpu_Context: %v", err, loc=loc)
-
-	_create_command_pool(gctx, loc)
-	_create_descriptor_pool(gctx, loc)
-	return gctx
-}
-
-// Destroy and free a Gpu_Context allocated by `context_create`. Must not be
-// on the active stack when destroyed.
-context_destroy :: proc(gctx: ^Gpu_Context, allocator := context.allocator, loc := #caller_location) {
-	fmt.assertf(_current_gpu_ctx != gctx, "gpu.context_destroy called on the active context", loc=loc)
-
-	for storage in gctx.allocations {
-		_destroy_gpu_storage(storage)
-	}
-	delete(gctx.allocations)
-
-	for _, list in gctx.pool {
-		for storage in list {
-			_destroy_gpu_storage(storage)
-		}
-		delete(list)
-	}
-	delete(gctx.pool)
-
-	if gctx.staging.buffer != 0 {
-		if gctx.staging.mapped != nil {
-			vk.UnmapMemory(_gpu.device, gctx.staging.memory)
-		}
-		vk.DestroyBuffer(_gpu.device, gctx.staging.buffer, nil)
-		vk.FreeMemory(_gpu.device, gctx.staging.memory, nil)
-	}
-	delete(gctx.pending_downloads)
-
-	delete(gctx.batch.descriptor_sets)
-	delete(gctx.batch.pending_buffers)
-	delete(gctx.batch.pending_memories)
-
-	if gctx.descriptor_pool != 0 {
-		vk.DestroyDescriptorPool(_gpu.device, gctx.descriptor_pool, nil)
-	}
-	if gctx.command_pool != 0 {
-		vk.DestroyCommandPool(_gpu.device, gctx.command_pool, nil)
-	}
-	free(gctx, allocator=allocator, loc=loc)
-}
-
-// Push a Gpu_Context onto the thread-local stack.
-context_begin :: proc(gctx: ^Gpu_Context) {
-	gctx.previous_ctx = _current_gpu_ctx
-	_current_gpu_ctx = gctx
-}
-
-// Pop the current Gpu_Context off the stack.
-context_end :: proc() {
-	assert(_current_gpu_ctx != nil, "gpu.context_end called with no active context")
-	_current_gpu_ctx = _current_gpu_ctx.previous_ctx
-}
-
-@(deferred_none=context_end)
-context_scope :: proc(gctx: ^Gpu_Context) {
-	context_begin(gctx)
-}
-
-// Read-only accessor; useful for tests/examples that want to print the picked
-// device without poking at the global directly.
 device_name :: proc() -> string {
 	return _gpu.device_name
 }
 
-// --- Internal ---
-
 LOADER_NAME :: "vulkan-1.dll" when ODIN_OS == .Windows else
-                "libvulkan.so.1" when ODIN_OS == .Linux else
-                "libvulkan.dylib"
+	"libvulkan.so.1" when ODIN_OS == .Linux else
+	"libvulkan.dylib"
 
 _load_loader :: proc() {
 	lib, ok := dynlib.load_library(LOADER_NAME)
-	fmt.assertf(ok, "failed to load Vulkan loader %q — is the Vulkan runtime installed?", LOADER_NAME)
+	fmt.assertf(ok, "failed to load Vulkan loader %q", LOADER_NAME)
 	_gpu.loader = lib
 
 	get_instance_proc_addr, found := dynlib.symbol_address(lib, "vkGetInstanceProcAddr")
@@ -249,14 +144,10 @@ _pick_physical_device :: proc() {
 	fmt.assertf(res == .SUCCESS, "vkEnumeratePhysicalDevices count failed: %v", res)
 	fmt.assertf(count > 0, "no Vulkan-capable physical devices found")
 
-	devices := make([]vk.PhysicalDevice, count, context.temp_allocator)
+	devices := builtin.make([]vk.PhysicalDevice, count, context.temp_allocator)
 	res = vk.EnumeratePhysicalDevices(_gpu.instance, &count, raw_data(devices))
 	fmt.assertf(res == .SUCCESS, "vkEnumeratePhysicalDevices fetch failed: %v", res)
 
-	// Pick the first discrete GPU with a compute queue, otherwise fall back
-	// to the first device with a compute queue. Discrete is preferred because
-	// integrated GPUs share memory bandwidth with the CPU and that's what
-	// the existing CPU path already optimizes against.
 	best:        vk.PhysicalDevice
 	best_family: u32 = ~u32(0)
 	best_score:  int = -1
@@ -270,7 +161,7 @@ _pick_physical_device :: proc() {
 
 		score: int = 1
 		if props.deviceType == .DISCRETE_GPU   { score = 100 }
-		if props.deviceType == .INTEGRATED_GPU { score = 50 }
+		if props.deviceType == .INTEGRATED_GPU { score = 50  }
 
 		if score > best_score {
 			best        = pd
@@ -295,7 +186,7 @@ _find_compute_queue_family :: proc(pd: vk.PhysicalDevice) -> (family: u32, ok: b
 	vk.GetPhysicalDeviceQueueFamilyProperties(pd, &count, nil)
 	if count == 0 { return 0, false }
 
-	families := make([]vk.QueueFamilyProperties, count, context.temp_allocator)
+	families := builtin.make([]vk.QueueFamilyProperties, count, context.temp_allocator)
 	vk.GetPhysicalDeviceQueueFamilyProperties(pd, &count, raw_data(families))
 
 	for fam, i in families {
@@ -328,6 +219,9 @@ _create_device :: proc() {
 	vk.GetDeviceQueue(_gpu.device, _gpu.queue_family_index, 0, &_gpu.queue)
 }
 
+DESCRIPTOR_POOL_MAX_SETS    :: 4096
+DESCRIPTOR_POOL_MAX_STORAGE :: 16384
+
 _create_command_pool :: proc(gctx: ^Gpu_Context, loc := #caller_location) {
 	info := vk.CommandPoolCreateInfo{
 		sType            = .COMMAND_POOL_CREATE_INFO,
@@ -337,13 +231,6 @@ _create_command_pool :: proc(gctx: ^Gpu_Context, loc := #caller_location) {
 	res := vk.CreateCommandPool(_gpu.device, &info, nil, &gctx.command_pool)
 	fmt.assertf(res == .SUCCESS, "vkCreateCommandPool failed: %v", res, loc=loc)
 }
-
-// Sized for many small dispatches, FREE_DESCRIPTOR_SET so we can reclaim
-// per-dispatch sets. Generous storage-buffer count: most ML kernels bind 2-4
-// buffers, but matmul backwards can hit 6+. Numbers are rough; if we ever
-// exhaust the pool we'll grow it.
-DESCRIPTOR_POOL_MAX_SETS :: 4096
-DESCRIPTOR_POOL_MAX_STORAGE :: 16384
 
 _create_descriptor_pool :: proc(gctx: ^Gpu_Context, loc := #caller_location) {
 	pool_size := vk.DescriptorPoolSize{
