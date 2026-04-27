@@ -10,6 +10,7 @@ import "core:fmt"
 import "core:math/rand"
 import "../utility"
 import ml "../../"
+import cpu "../../backend_cpu"
 import "../../mlp"
 import "../../gru"
 
@@ -28,12 +29,12 @@ SEQUENCE_LENGTH :: 1024 * 16
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ctx := ml.context_create(1024 * 1024)
+	ctx := ml.context_create(1024 * 1024, &cpu.backend)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	model := make_model()
-	defer destroy_model(model)
+	model := model_make()
+	defer model_destroy(model)
 
 	text, text_err := os.read_entire_file(FILE_NAME, context.allocator)
 	if text_err != nil {
@@ -49,13 +50,13 @@ main :: proc() {
 	for _ in 0 ..< STEPS {
 		defer free_all(context.temp_allocator)
 
-		learn(&model, random_sample(training_text, SEQUENCE_LENGTH))
+		model_learn(&model, random_sample(training_text, SEQUENCE_LENGTH))
 
-		loss := evaluate(model, random_sample(validation_text, SEQUENCE_LENGTH))
+		loss := model_evaluate(model, random_sample(validation_text, SEQUENCE_LENGTH))
 		fmt.printfln("%v, Validation Loss: %v", model.step, loss)
 
 		if model.step % 10 == 0 {
-			speak(model, 1024)
+			model_speak(model, 1024)
 		}
 	}
 }
@@ -63,34 +64,35 @@ main :: proc() {
 Model :: struct {
 	gru: gru.Gru,
 	mlp: mlp.Mlp,
-	
+
 	step: int,
 
 	opt: ml.Optimizer,
 }
 
-make_model :: proc(allocator := context.allocator) -> (res: Model) {
-	res.gru = gru.make(VOCABULARY,               MEMORY_SIZE,             allocator=allocator)
-	res.mlp = mlp.make(VOCABULARY + MEMORY_SIZE, HIDDEN_SIZE, VOCABULARY, allocator=allocator)
-    return
+model_make :: proc(allocator := context.allocator) -> (model: Model) {
+	model.gru = gru.make(VOCABULARY,               MEMORY_SIZE,             allocator=allocator)
+	model.mlp = mlp.make(VOCABULARY + MEMORY_SIZE, HIDDEN_SIZE, VOCABULARY, allocator=allocator)
+	return
 }
 
-destroy_model :: proc(model: Model) {
+model_destroy :: proc(model: Model) {
 	gru.destroy(model.gru)
 	mlp.destroy(model.mlp)
 }
 
-forward :: proc(model: Model, character: byte) -> ml.Tensor {
-	input := ml.zeros(256)
-	ml.data(input)[character] = 1
+model_forward :: proc(model: Model, character: byte) -> ml.Tensor {
+	one_hot := make([]f32, VOCABULARY, allocator=context.temp_allocator)
+	one_hot[character] = 1
 
+	input     := ml.tensor(one_hot)
 	state     := gru.forward(model.gru, input)
 	mlp_input := ml.concat(input, state)
 
 	return mlp.forward(model.mlp, mlp_input)
 }
 
-evaluate :: proc(model: Model, text: []byte) -> (loss: f32) {
+model_evaluate :: proc(model: Model, text: []byte) -> (loss: f32) {
 	gru.reset_state(model.gru)
 
 	for i in 0 ..< len(text) - 1 {
@@ -99,9 +101,11 @@ evaluate :: proc(model: Model, text: []byte) -> (loss: f32) {
 		character := text[i]
 		target    := text[i + 1]
 
-		logits := forward(model, character)
-		
-		loss += ml.data(ml.cross_entropy(logits, {int(target)}))[0]
+		logits := model_forward(model, character)
+
+		sample_loss: [1]f32
+		ml.get_data(ml.cross_entropy(logits, {int(target)}), sample_loss[:])
+		loss += sample_loss[0]
 	}
 
 	loss /= f32(len(text) - 1)
@@ -109,7 +113,7 @@ evaluate :: proc(model: Model, text: []byte) -> (loss: f32) {
 	return
 }
 
-learn :: proc(model: ^Model, text: []byte) {
+model_learn :: proc(model: ^Model, text: []byte) {
 	lr := utility.linear_learning_rate(LEARNING_RATE, 0, model.step, STEPS)
 
 	gru.reset_state(model.gru)
@@ -120,7 +124,7 @@ learn :: proc(model: ^Model, text: []byte) {
 		character := text[i]
 		target    := text[i + 1]
 
-		logits := forward(model^, character)
+		logits := model_forward(model^, character)
 
 		_ = ml.cross_entropy(logits, {int(target)})
 
@@ -135,18 +139,22 @@ learn :: proc(model: ^Model, text: []byte) {
 	model.step += 1
 }
 
-speak :: proc(model: Model, count: int) {
+model_speak :: proc(model: Model, count: int) {
 	gru.reset_state(model.gru)
 
 	fmt.print("==============================================================\n\n")
+
+	logits_data := make([]f32, VOCABULARY, allocator=context.temp_allocator)
 
 	output: byte
 
 	for i in 0 ..< count {
 		ml.clear()
 
-		logits := forward(model, output)
-		output  = byte(utility.sample_top_p(ml.data(logits), 0.9, 1))
+		logits := model_forward(model, output)
+		ml.get_data(logits, logits_data)
+
+		output = byte(utility.sample_top_p(logits_data, 0.9, 1))
 
 		fmt.print(rune(output))
 	}
@@ -154,7 +162,7 @@ speak :: proc(model: Model, count: int) {
 	fmt.print("\n\n==============================================================\n")
 }
 
-random_sample :: proc(text: []byte, length: int) -> (res: []byte) {
+random_sample :: proc(text: []byte, length: int) -> []byte {
 	i := rand.int_max(len(text) - length)
 	return text[i:][:length]
 }

@@ -33,21 +33,21 @@ make :: proc(layer_count, head_count, embedding_size, vocabulary_size: int, allo
 
 	transformer.layers = builtin.make([]Layer, layer_count)
 
-	transformer.token_embeddings = ml.make(vocabulary_size, embedding_size)
+	transformer.token_embeddings = ml.make({vocabulary_size, embedding_size})
 
 	for &layer in transformer.layers {
-		layer.norm0_weight = ml.make(embedding_size)
-		layer.qkv_weight   = ml.make(3 * embedding_size, embedding_size)
-		layer.proj_weight  = ml.make(embedding_size,     embedding_size)
-		layer.norm1_weight = ml.make(embedding_size)
+		layer.norm0_weight = ml.make({embedding_size})
+		layer.qkv_weight   = ml.make({3 * embedding_size, embedding_size})
+		layer.proj_weight  = ml.make({embedding_size,     embedding_size})
+		layer.norm1_weight = ml.make({embedding_size})
 
 		hidden_size := 4 * embedding_size
-		layer.mlp_up_weight   = ml.make(hidden_size,    embedding_size)
-		layer.mlp_down_weight = ml.make(embedding_size, hidden_size)
+		layer.mlp_up_weight   = ml.make({hidden_size,    embedding_size})
+		layer.mlp_down_weight = ml.make({embedding_size, hidden_size})
 	}
 
-	transformer.norm_weight   = ml.make(embedding_size)
-	transformer.output_weight = ml.make(vocabulary_size, embedding_size)
+	transformer.norm_weight   = ml.make({embedding_size})
+	transformer.output_weight = ml.make({vocabulary_size, embedding_size})
 
 	randomize(transformer)
 

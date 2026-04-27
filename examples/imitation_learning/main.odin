@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:math/rand"
 import "../utility"
 import ml "../../"
+import cpu "../../backend_cpu"
 import "../../mlp"
 
 import game "../cartpole"
@@ -15,12 +16,12 @@ import game "../cartpole"
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ctx := ml.context_create(1024 * 1024)
+	ctx := ml.context_create(1024 * 1024, &cpu.backend)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	model := make_model()
-	defer destroy_model(model)
+	model := model_make()
+	defer model_destroy(model)
 
 	// The replay buffer is too big for the stack because
 	// it is statically holding the frames.
@@ -49,7 +50,7 @@ main :: proc() {
 		if replay_buffer.len >= 60 * 10 {
 			for _ in 0 ..< 128 {
 				i := rand.int_max(replay_buffer.len)
-				learn(&model, replay_buffer.frames[i])
+				model_learn(&model, replay_buffer.frames[i])
 			}
 		}
 
@@ -64,10 +65,9 @@ main :: proc() {
 			_, human_done := game.step(&human_game_state, human_action, game.FIXED_DELTA)
 
 			// Sample the agent's action and step the agent's game state.
-			agent_action  := choose_action(model, game.embedding(agent_game_state))
+			agent_action  := model_choose_action(model, game.embedding(agent_game_state))
 			_, agent_done := game.step(&agent_game_state, agent_action, game.FIXED_DELTA)
 
-			// Reset game states when done.
 			if human_done {
 				game.reset(&human_game_state)
 			}
@@ -88,34 +88,36 @@ Model :: struct {
 	opt: ml.Optimizer,
 }
 
-make_model :: proc(allocator := context.allocator) -> (res: Model) {
-	res.mlp = mlp.make(len(game.Embedding), 128, len(game.Action))
+model_make :: proc(allocator := context.allocator) -> (model: Model) {
+	model.mlp = mlp.make(len(game.Embedding), 128, len(game.Action), allocator=allocator)
 	return
 }
 
-destroy_model :: proc(model: Model) {
+model_destroy :: proc(model: Model) {
 	mlp.destroy(model.mlp)
 }
 
-forward :: proc(model: Model, embedding: game.Embedding) -> ml.Tensor {
+model_forward :: proc(model: Model, embedding: game.Embedding) -> ml.Tensor {
 	embedding := embedding
-	x := ml.tensor(embedding[:])
-	return mlp.forward(model.mlp, x)
+	return mlp.forward(model.mlp, ml.tensor(embedding[:]))
 }
 
-choose_action :: proc(model: Model, embedding: game.Embedding) -> (res: game.Action) {
+model_choose_action :: proc(model: Model, embedding: game.Embedding) -> game.Action {
 	ml.clear()
 
-	logits        := forward(model, embedding)
+	logits        := model_forward(model, embedding)
 	probabilities := ml.softmax(logits)
 
-	return game.Action(utility.sample_probability_distribution(ml.data(probabilities)))
+	probabilities_data := make([]f32, ml.len(probabilities), allocator=context.temp_allocator)
+	ml.get_data(probabilities, probabilities_data)
+
+	return game.Action(utility.sample_probability_distribution(probabilities_data))
 }
 
-learn :: proc(model: ^Model, frame: Frame) {
+model_learn :: proc(model: ^Model, frame: Frame) {
 	ml.clear()
 
-	logits := forward(model^, frame.embedding)
+	logits := model_forward(model^, frame.embedding)
 	_       = ml.cross_entropy(logits, {int(frame.action)})
 
 	ml.backward()

@@ -16,6 +16,7 @@ import "core:slice"
 import "core:encoding/json"
 import "../utility"
 import ml "../../"
+import cpu "../../backend_cpu"
 import "../../mlp"
 
 import game "../cartpole"
@@ -41,7 +42,7 @@ ENTROPY      :: 0.01 // How much is exploration encouraged.
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ctx := ml.context_create(1024 * 1024)
+	ctx := ml.context_create(1024 * 1024, &cpu.backend)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 
@@ -50,8 +51,8 @@ main :: proc() {
 }
 
 train :: proc() {
-	model := make_model()
-	defer destroy_model(&model)
+	model := model_make()
+	defer model_destroy(&model)
 
 	for {
 		defer free_all(context.temp_allocator)
@@ -75,8 +76,8 @@ train :: proc() {
 }
 
 play :: proc() {
-	model := load_model(MODEL_FILE)
-	defer destroy_model(&model)
+	model := model_load(MODEL_FILE)
+	defer model_destroy(&model)
 
 	timestep: utility.Fixed_Timestep
 
@@ -121,20 +122,20 @@ Network :: struct {
 	mlp: mlp.Mlp,
 }
 
-make_network :: proc(output_size: int, allocator := context.allocator) -> (network: Network) {
+network_make :: proc(output_size: int, allocator := context.allocator) -> (network: Network) {
 	network.mlp = mlp.make(len(game.Embedding), HIDDEN_SIZE, output_size, allocator=allocator)
 	return
 }
 
-destroy_network :: proc(network: Network) {
+network_destroy :: proc(network: Network) {
 	mlp.destroy(network.mlp)
 }
 
-forward :: proc(network: Network, input: []f32) -> ml.Tensor {
+network_forward :: proc(network: Network, input: []f32) -> ml.Tensor {
 	return mlp.forward(network.mlp, ml.tensor(input))
 }
 
-update :: proc(opt: ml.Optimizer, network: Network) {
+network_update :: proc(opt: ml.Optimizer, network: Network) {
 	mlp.update(opt, network.mlp)
 }
 
@@ -161,9 +162,9 @@ Model :: struct {
 	frames:     [dynamic]Frame,
 }
 
-make_model :: proc(allocator := context.allocator) -> (model: Model) {
-	model.actor  = make_network(len(game.Action), allocator=allocator)
-	model.critic = make_network(1,                allocator=allocator)
+model_make :: proc(allocator := context.allocator) -> (model: Model) {
+	model.actor  = network_make(len(game.Action), allocator=allocator)
+	model.critic = network_make(1,                allocator=allocator)
 
 	model.frames = make([dynamic]Frame, 0, 60 * 60 * TRAJECTORIES, allocator=allocator)
 
@@ -172,18 +173,18 @@ make_model :: proc(allocator := context.allocator) -> (model: Model) {
 	return
 }
 
-load_model :: proc(file_name: string, allocator := context.allocator) -> (model: Model) {
+model_load :: proc(file_name: string, allocator := context.allocator) -> (model: Model) {
 	data, file_err := os.read_entire_file(file_name, allocator=context.temp_allocator)
-	if file_err != nil{
+	if file_err != nil {
 		fmt.println("Failed to load model file")
-		return make_model()
+		return model_make()
 	}
 
 	checkpoint: Checkpoint
 	json_err := json.unmarshal(data, &checkpoint, allocator=allocator)
 	if json_err != nil {
 		fmt.println("Failed to unmarshal model from JSON")
-		return make_model()
+		return model_make()
 	}
 
 	model.actor      = checkpoint.actor
@@ -199,16 +200,16 @@ load_model :: proc(file_name: string, allocator := context.allocator) -> (model:
 	return
 }
 
-destroy_model :: proc(model: ^Model) {
-	destroy_network(model.actor)
-	destroy_network(model.critic)
+model_destroy :: proc(model: ^Model) {
+	network_destroy(model.actor)
+	network_destroy(model.critic)
 
 	delete(model.frames)
 
 	game.destroy(&model.game_state)
 }
 
-save_model :: proc(model: Model, file_name: string) {
+model_save :: proc(model: Model, file_name: string) {
 	checkpoint := Checkpoint{
 		actor      = model.actor,
 		critic     = model.critic,
@@ -229,19 +230,33 @@ choose_action :: proc(network: Network, embedding: game.Embedding, sample := fal
 	ml.clear()
 
 	embedding         := embedding
-	logits            := forward(network, embedding[:])
+	logits            := network_forward(network, embedding[:])
 	probabilities     := ml.softmax(logits)
 	log_probabilities := ml.log_softmax(logits)
 
+	probabilities_data     := make([]f32, ml.len(probabilities),     allocator=context.temp_allocator)
+	log_probabilities_data := make([]f32, ml.len(log_probabilities), allocator=context.temp_allocator)
+	ml.get_data(probabilities,     probabilities_data)
+	ml.get_data(log_probabilities, log_probabilities_data)
+
 	if sample {
-		action = game.Action(utility.sample_probability_distribution(ml.data(probabilities)))
+		action = game.Action(utility.sample_probability_distribution(probabilities_data))
 	} else {
-		action = game.Action(slice.max_index(ml.data(probabilities)))
+		action = game.Action(slice.max_index(probabilities_data))
 	}
 
-	log_probability = ml.data(log_probabilities)[action]
+	log_probability = log_probabilities_data[action]
 
 	return
+}
+
+predict_value :: proc(network: Network, embedding: game.Embedding) -> f32 {
+	embedding := embedding
+	output    := network_forward(network, embedding[:])
+
+	value: [1]f32
+	ml.get_data(output, value[:])
+	return value[0]
 }
 
 record_trajectory :: proc(model: ^Model) {
@@ -254,7 +269,8 @@ record_trajectory :: proc(model: ^Model) {
 
 		frame.embedding = game.embedding(model.game_state)
 
-		frame.value = ml.data(forward(model.critic, frame.embedding[:]))[0]
+		ml.clear()
+		frame.value = predict_value(model.critic, frame.embedding)
 
 		frame.action, frame.log_probability = choose_action(model.actor, frame.embedding, sample=true)
 
@@ -283,7 +299,6 @@ record_trajectory :: proc(model: ^Model) {
 }
 
 normalize_advantages :: proc(model: Model) {
-	// Calculate mean advantage.
 	mean:  f32
 	count: int
 	for frame in model.frames {
@@ -292,7 +307,6 @@ normalize_advantages :: proc(model: Model) {
 	}
 	mean /= f32(count)
 
-	// Calculate advantage standard deviation.
 	sum: f32
 	for frame in model.frames {
 		diff := frame.advantage - mean
@@ -300,7 +314,7 @@ normalize_advantages :: proc(model: Model) {
 	}
 	std := math.sqrt(sum / f32(count))
 
-	// Normalize advantages with a small epsilon to prevent division by zero.
+	// Small epsilon to prevent division by zero.
 	if std > 1e-8 {
 		for &frame in model.frames {
 			frame.advantage = (frame.advantage - mean) / std
@@ -331,7 +345,7 @@ evaluate :: proc(model: ^Model, save_file: string) -> (score: f32) {
 
 	if score > model.best_score {
 		model.best_score = score
-		save_model(model^, save_file)
+		model_save(model^, save_file)
 	}
 
 	return
@@ -355,7 +369,7 @@ improve :: proc(model: ^Model) {
 			// Calculate actor gradients.
 			ml.clear()
 
-			logits            := forward(model.actor, frame.embedding[:])
+			logits            := network_forward(model.actor, frame.embedding[:])
 			log_probabilities := ml.log_softmax(logits)
 			log_probability   := ml.select(log_probabilities, {int(frame.action)})
 
@@ -380,7 +394,7 @@ improve :: proc(model: ^Model) {
 			// Calculate critic gradients.
 			ml.clear()
 
-			value         := forward(model.critic, frame.embedding[:])
+			value         := network_forward(model.critic, frame.embedding[:])
 			clipped_value := ml.clamp(value, frame.value - CLIP_EPSILON, frame.value + CLIP_EPSILON)
 
 			target := ml.scalar(frame.discounted_return)
@@ -392,10 +406,9 @@ improve :: proc(model: ^Model) {
 
 			ml.backward()
 
-			// Do an optimizer step.
 			if ml.optimize(&model.opt, period=PERIOD, learning_rate=lr) {
-				update(model.opt, model.actor)
-				update(model.opt, model.critic)
+				network_update(model.opt, model.actor)
+				network_update(model.opt, model.critic)
 			}
 		}
 	}

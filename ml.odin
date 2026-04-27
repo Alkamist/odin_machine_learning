@@ -1,69 +1,21 @@
-// This library is a from-scratch machine learning library focused on
-// simplicity. The main working unit is the `Tensor`: a contiguous,
-// row-major value with an inline shape (rank-N, capped at
-// `MAX_TENSOR_RANK`) and an opaque `storage` pointer that the active
-// `Backend` interprets. CPU stores the data + gradient (and optional
-// Adam state) as f32 slices in a `Cpu_Storage` struct; GPU stores them
-// as `vk.Buffer` handles in a `Gpu_Storage`. Activations live in a
-// per-context arena (CPU) or pool (GPU); trainable tensors allocated
-// via `make` survive `clear` and carry Adam state.
-//
-// Operations are recorded onto a thread-local autograd tape during
-// forward; `backward` walks the tape in reverse to accumulate
-// gradients. Workflow: `clear`, run forward ops, `backward`,
-// `optimize` + `update`, repeat.
-//
-// This file holds the backend-agnostic surface — `Tensor`, `Backend`,
-// `Context`, `Operation` and its variants, every public op
-// constructor, the autograd walk, the Adam optimizer, and the public
-// alloc / data-transfer / accessor procs. The CPU backend
-// implementation (kernels, SIMD, worker pool, `cpu_*` hooks) lives in
-// `cpu.odin`. The GPU backend lives in `gpu/`.
-
 package machine_learning
 
 import "base:builtin"
+import "base:runtime"
+
 import "core:fmt"
 import "core:mem"
 import "core:math"
 import "core:math/rand"
 
-MAX_OPERATIONS :: 4096
+MAX_OPERATIONS          :: 4096
+MAX_TENSOR_RANK         :: 6
+BACKEND_BUFFER_MAX_SIZE :: 16
 
-
-// Maximum number of dimensions a Tensor can have. Shapes are stored inline as
-// a fixed-size array so Tensor stays a value type with no extra allocation.
-// Bump this if a future op needs more.
-MAX_TENSOR_RANK :: 6
-
-// The main working unit of the library. Always contiguous, row-major. No
-// views, no strides, no transpose-aliasing — `reshape` is the only operation
-// that shares storage, and it requires the element count to match exactly.
-//
-// `backend` identifies which Backend owns this tensor's storage.
-// `storage` is an opaque pointer the backend casts to its own struct
-// (CPU: ^Cpu_Storage holding f32 slices; GPU: ^Gpu_Storage holding
-// vk.Buffer handles). `data(t)` / `gradient(t)` return slices for CPU
-// callers; GPU code goes through `set_data` / `get_data` instead.
-//
-// `type` is the element type. Currently only F32 is implemented and
-// asserted at allocation; the field exists so future precisions
-// (F16, BF16, etc.) plug in without breaking the API.
-//
-// `count` is the total element count (product of shape dims). Cached so
-// `len(t)` doesn't have to scan `shape`.
-Tensor :: struct {
-	backend: ^Backend,
-	storage: rawptr,
-
-	type:    Data_Type,
-	shape:   [MAX_TENSOR_RANK]int,
-	rank:    int,
-	count:   int,
-}
+OP_ARENA_DEFAULT_SIZE   :: 1 * 1024 * 1024
 
 Data_Type :: enum u8 {
-	F32 = 0,
+	F32,
 }
 
 @(require_results)
@@ -74,110 +26,47 @@ data_type_size :: #force_inline proc(t: Data_Type) -> int {
 	return 0
 }
 
-
-// Backend-agnostic host-data transfer. CPU does a slice copy; GPU does
-// a host-visible-stage upload / download.
-set_data :: #force_inline proc(t: Tensor, src: []f32) {
-	tt := t
-	t.backend.set_data(&tt, src)
+Buffer_Kind :: enum u8 {
+	Data,
+	Gradient,
+	Adam_M,
+	Adam_V,
 }
-get_data :: #force_inline proc(t: Tensor, dst: []f32) {
-	tt := t
-	t.backend.get_data(&tt, dst)
-}
+Buffer_Set :: bit_set[Buffer_Kind; u8]
 
-// Op execution interface. Each Backend has one `forward` proc that runs the
-// math for a freshly built Operation, and one `backward` proc that runs its
-// gradient computation. Both procs are expected to switch on `op.variant`
-// internally and call into backend-specific kernels. Adding a new op means
-// adding a variant to Operation_Variant and one case to each backend's
-// dispatch switch — no new field on Backend.
-//
-// Allocation hooks. Two parameters control all variants:
-//
-//   `persistent`: false → tracked in the active context's activation
-//                         pool, freed in bulk by `clear_storage`.
-//                 true  → survives `clear_storage`; explicit `free`.
-//
-//   `extra_buffers`: count of additional same-shape buffers allocated
-//                    alongside data + gradient. 0 for activations and
-//                    most persistent tensors; 2 for Adam parameters
-//                    (adam_m + adam_v).
-//
-// `clear_storage` is called by `clear` to bulk-reset the activation pool
-// (CPU resets the arena; GPU recycles into the per-context buffer pool).
-Backend :: struct {
-	alloc:         proc(t: ^Tensor, n: int, persistent: bool, extra_buffers: int),
-	free:          proc(t: ^Tensor),
-	clear_storage: proc(),
+Backend_Buffer :: [BACKEND_BUFFER_MAX_SIZE]byte
 
-	// Per-Context backend-specific state. `context_alloc` is called by
-	// `ml.context_create` and the result is stashed on the Context as
-	// `backend_data`; `context_free` is called by `ml.context_destroy`.
-	// `context_begin` / `context_end` mirror `ml.context_begin` /
-	// `ml.context_end` so backends with their own per-thread stack
-	// (e.g. the GPU's `Gpu_Context`) can keep it in sync.
-	//
-	// CPU leaves all four nil. GPU implements them so a single
-	// `ml.context_create(..., gpu.backend())` is enough — callers don't
-	// have to touch `gpu.context_create` / `gpu.context_scope` directly.
-	context_alloc: proc() -> rawptr,
-	context_free:  proc(data: rawptr),
-	context_begin: proc(data: rawptr),
-	context_end:   proc(),
-
-	// Synchronize any pending GPU work and release transient resources.
-	// Called by `ml.clear` before activation storage is recycled, and
-	// before any host read of tensor data, so callers don't need to
-	// open / close batches manually. CPU leaves it nil.
-	flush: proc(),
-
-	// Copy `src` into `t`'s data storage. CPU does a slice copy; GPU does
-	// a host-visible-stage upload. Used by `tensor` / `scalar` so callers
-	// don't need a backend-specific path to seed inputs.
-	set_data: proc(t: ^Tensor, src: []f32),
-
-	// Read `t`'s data storage into `dst`. CPU does a slice copy; GPU does
-	// a host-visible-stage download.
-	get_data: proc(t: ^Tensor, dst: []f32),
-
-	// Apply one Adam(W) step + zero gradient on `p`. CPU does the scalar
-	// loop; GPU dispatches `opt_step_adam.spv`. `p` must have been
-	// allocated with extra_buffers=2.
-	parameter_update: proc(opt: Optimizer, p: ^Tensor),
-
-	// Copy data + gradient + adam_m + adam_v from `src` to `dst`. Both
-	// must have been allocated with extra_buffers=2.
-	parameter_copy: proc(dst, src: ^Tensor),
-
-	// Fill `t`'s gradient with 1.0 for every element. Called by `backward`
-	// to seed the final op's output gradient before the reverse walk; CPU
-	// writes to the slice, GPU dispatches a CmdFillBuffer.
-	fill_gradient_with_ones: proc(t: ^Tensor),
-
-	forward:  proc(op: Operation),
-	backward: proc(op: Operation),
+Tensor :: struct {
+	vtable:  ^Backend_VTable,
+	buffers: [Buffer_Kind]Backend_Buffer,
+	type:    Data_Type,
+	shape:   [MAX_TENSOR_RANK]int,
+	rank:    int,
+	count:   int,
 }
 
-// Per-thread state for tensor allocation, the autograd tape, and the current
-// op-execution backend. Multiple Contexts can be active on a thread; the
-// current one is tracked via a thread-local stack threaded through
-// `previous_ctx`.
-//
-// A Context's address must stay stable while it is on the stack (the linked
-// list stores it by pointer), so always heap-allocate via `context_create`
-// or embed it in a long-lived struct. Don't put a Context on a stack frame
-// that can return while the Context is still pushed.
+Backend_VTable :: struct {
+	init:     proc(ctx: ^Context, size: int, loc: runtime.Source_Code_Location),
+	destroy:  proc(ctx: ^Context, loc: runtime.Source_Code_Location),
+
+	clear:    proc(loc: runtime.Source_Code_Location),
+	forward:  proc(op: Operation, loc: runtime.Source_Code_Location),
+	backward: proc(op: Operation, loc: runtime.Source_Code_Location),
+	update:   proc(opt: Optimizer, t: ^Tensor, loc: runtime.Source_Code_Location),
+
+	buffer_alloc: proc(len: int, persist: bool, loc: runtime.Source_Code_Location) -> Backend_Buffer,
+	buffer_free:  proc(buffer: Backend_Buffer, loc: runtime.Source_Code_Location),
+	buffer_get:   proc(buffer: Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location),
+	buffer_set:   proc(buffer: Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location),
+	buffer_copy:  proc(dst, src: Backend_Buffer, loc: runtime.Source_Code_Location),
+}
+
 Context :: struct {
-	backend: ^Backend,
-
-	// Opaque backend-owned state allocated by `Backend.context_alloc` in
-	// `context_create`. CPU leaves it nil. GPU stores a `^Gpu_Context`
-	// here so the GPU's per-thread context lifecycle is bound to this
-	// `ml.Context`'s lifecycle — one `ml.context_create` is enough.
+	vtable:       ^Backend_VTable,
 	backend_data: rawptr,
 
-	arena: mem.Arena,
+	op_arena:      mem.Arena,
+	_op_arena_buf: []byte,
 
 	operation_count: int,
 	operations:      [MAX_OPERATIONS]Operation,
@@ -185,112 +74,79 @@ Context :: struct {
 	previous_ctx: ^Context,
 }
 
-// Top of the thread-local context stack. nil means no active context.
 @(thread_local)
 _current_ctx: ^Context
 
-
-// Heap-allocate and initialize a Context. Pair with `context_destroy`. The
-// Context's backend is the CPU backend by default; pass an explicit
-// `backend` (e.g. from `gpu.backend()`) to run ops on a different one.
 @(require_results)
-context_create :: proc(size: int, backend: ^Backend = nil, allocator := context.allocator, loc := #caller_location) -> ^Context {
-	ctx, cerr := builtin.new(Context, allocator=allocator, loc=loc)
-	assert(cerr == nil, "Failed to allocate Context", loc=loc)
+context_create :: proc(size: int, vtable: ^Backend_VTable, allocator := context.allocator, loc := #caller_location) -> ^Context {
+	assert(vtable != nil, "Backend vtable must not be nil", loc=loc)
 
-	data, derr := builtin.make([]byte, size, allocator=allocator, loc=loc)
-	assert(derr == nil, "Failed to allocate context arena data", loc=loc)
-	mem.arena_init(&ctx.arena, data)
+	ctx, ctx_err := builtin.new(Context, allocator=allocator, loc=loc)
+	assert(ctx_err == nil, "Failed to allocate Context", loc=loc)
 
-	ctx.backend = backend != nil ? backend : &_cpu_backend
-	if ctx.backend.context_alloc != nil {
-		ctx.backend_data = ctx.backend.context_alloc()
-	}
+	ctx.vtable = vtable
+
+	op_arena_buf, op_arena_err := builtin.make([]byte, OP_ARENA_DEFAULT_SIZE, allocator=allocator, loc=loc)
+	assert(op_arena_err == nil, "Failed to allocate op-metadata arena", loc=loc)
+	ctx._op_arena_buf = op_arena_buf
+	mem.arena_init(&ctx.op_arena, op_arena_buf)
+
+	vtable.init(ctx, size, loc)
 
 	return ctx
 }
 
-// Destroy and free a Context allocated by `context_create`. The Context must
-// not be on the active stack when destroyed.
 context_destroy :: proc(ctx: ^Context, allocator := context.allocator, loc := #caller_location) {
 	assert(_current_ctx != ctx, "context_destroy called on the active context", loc=loc)
-	if ctx.backend.context_free != nil && ctx.backend_data != nil {
-		ctx.backend.context_free(ctx.backend_data)
-		ctx.backend_data = nil
+
+	if ctx.vtable != nil && ctx.vtable.destroy != nil {
+		ctx.vtable.destroy(ctx, loc)
 	}
-	if ctx.arena.data != nil {
-		builtin.delete(ctx.arena.data, allocator=allocator, loc=loc)
+
+	if ctx._op_arena_buf != nil {
+		builtin.delete(ctx._op_arena_buf, allocator=allocator, loc=loc)
 	}
 	builtin.free(ctx, allocator=allocator, loc=loc)
 }
 
-// Push a user-owned context onto the thread-local stack.
 context_begin :: proc(ctx: ^Context) {
 	ctx.previous_ctx = _current_ctx
-	_current_ctx = ctx
-	if ctx.backend.context_begin != nil {
-		ctx.backend.context_begin(ctx.backend_data)
-	}
+	_current_ctx     = ctx
 }
 
-// Pop the current context off the stack.
 context_end :: proc() {
 	assert(_current_ctx != nil, "context_end called with no active context")
-	if _current_ctx.backend.context_end != nil {
-		_current_ctx.backend.context_end()
-	}
 	_current_ctx = _current_ctx.previous_ctx
 }
 
-// Scoped push: paired with `defer`-style pop on scope exit via `deferred_none`.
 @(deferred_none=context_end)
 context_scope :: proc(ctx: ^Context) {
 	context_begin(ctx)
 }
 
-// Get the active thread-local context. Asserts one is active.
 @(require_results)
 current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
-	assert(_current_ctx != nil, "no active context — call init or context_begin", loc=loc)
+	assert(_current_ctx != nil, "Called current_context with no active context", loc=loc)
 	return _current_ctx
 }
 
-// Clear the active context's activation storage and operation tape.
-// Activation storage release is delegated to the backend (CPU resets the
-// arena; GPU would reset the activation pool).
 clear :: proc(loc := #caller_location) {
-	assert(_current_ctx != nil && _current_ctx.backend != nil, "Did you forget to call context_create / context_scope?", loc=loc)
-	if _current_ctx.backend.flush != nil {
-		_current_ctx.backend.flush()
-	}
-	_current_ctx.backend.clear_storage()
+	assert(_current_ctx != nil && _current_ctx.vtable != nil, "Did you forget to call context_create or context_scope?", loc=loc)
+
+	_current_ctx.vtable.clear(loc)
+	mem.arena_free_all(&_current_ctx.op_arena)
 	_current_ctx.operation_count = 0
 }
 
-// Force the active backend to finish all queued work. CPU is synchronous
-// already so this is a no-op; GPU submits + waits any open command-buffer
-// batch. `ml.clear` calls this internally before recycling activations,
-// and `Backend.get_data` calls it before reading host memory, so most
-// callers don't need it. Use it explicitly when you need to time a
-// single step on GPU without rolling its completion into the next
-// iteration's `ml.clear`.
-sync :: proc() {
-	if _current_ctx == nil || _current_ctx.backend.flush == nil { return }
-	_current_ctx.backend.flush()
+op_arena_allocator :: proc() -> mem.Allocator {
+	return mem.arena_allocator(&_current_ctx.op_arena)
 }
 
-// Get the active context's arena allocator.
-arena_allocator :: proc() -> mem.Allocator {
-	return mem.arena_allocator(&_current_ctx.arena)
-}
-
-// Total element count of a tensor (product of all dims).
 @(require_results)
 len :: #force_inline proc(t: Tensor) -> int {
 	return t.count
 }
 
-// Total element count implied by a shape.
 @(require_results)
 shape_element_count :: proc(shape: []int) -> int {
 	n := 1
@@ -300,97 +156,82 @@ shape_element_count :: proc(shape: []int) -> int {
 	return n
 }
 
-// Allocate a tensor in the global arena initialized with zeros. Variadic
-// `shape` gives the dimensions in row-major order (outermost first); a
-// single int produces a 1-D tensor.
+DEFAULT_ACTIVATION_BUFFERS :: Buffer_Set{.Data, .Gradient}
+DEFAULT_PARAMETER_BUFFERS  :: Buffer_Set{.Data, .Gradient, .Adam_M, .Adam_V}
+
 @(require_results)
-zeros :: proc(shape: ..int, loc := #caller_location) -> (t: Tensor) {
-	return _alloc_tensor(shape, persistent=false, extra_buffers=0, loc=loc)
-}
-
-// Allocate a tensor whose storage survives `ml.clear()`. Use this for
-// long-lived inputs / lookup tables / etc. that are reused across many
-// activation cycles. Pair with `persistent_destroy`.
-@(require_results)
-persistent_zeros :: proc(shape: ..int, loc := #caller_location) -> (t: Tensor) {
-	return _alloc_tensor(shape, persistent=true, extra_buffers=0, loc=loc)
-}
-
-// Free a tensor allocated by `persistent_zeros` or `make`.
-persistent_destroy :: proc(t: Tensor) {
-	if t.backend == nil { return }
-	tt := t
-	t.backend.free(&tt)
-}
-
-@(require_results, private)
-_alloc_tensor :: proc(shape: []int, persistent: bool, extra_buffers: int, loc := #caller_location) -> (t: Tensor) {
-	assert(_current_ctx != nil && _current_ctx.backend != nil, "Did you forget to call context_create / context_scope?", loc=loc)
+alloc :: proc(shape: []int, persistent: bool, buffers: Buffer_Set, loc := #caller_location) -> (t: Tensor) {
+	assert(_current_ctx != nil && _current_ctx.vtable != nil, "Did you forget to call context_create / context_scope?", loc=loc)
 	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
 	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
 
-	n := shape_element_count(shape)
-	assert(n > 0, "Tensor element count must be positive", loc=loc)
+	element_count := shape_element_count(shape)
+	assert(element_count > 0, "Tensor element count must be positive", loc=loc)
 
-	t.backend = _current_ctx.backend
-	t.type    = .F32
-	t.count   = n
-	t.rank    = builtin.len(shape)
+	t.vtable = _current_ctx.vtable
+	t.type   = .F32
+	t.count  = element_count
+	t.rank   = builtin.len(shape)
 	for d, i in shape {
 		assert(d > 0, "Tensor dimension must be positive", loc=loc)
 		t.shape[i] = d
 	}
-	t.backend.alloc(&t, n, persistent, extra_buffers)
+
+	for kind in Buffer_Kind {
+		if kind in buffers {
+			t.buffers[kind] = t.vtable.buffer_alloc(element_count, persistent, loc)
+		}
+	}
+
 	return
 }
 
-// Allocate a same-shape zeroed tensor.
+@(require_results)
+zeros :: proc(shape: []int, loc := #caller_location) -> (t: Tensor) {
+	return alloc(shape, persistent=false, buffers=DEFAULT_ACTIVATION_BUFFERS, loc=loc)
+}
+
 @(require_results)
 zeros_like :: proc(src: Tensor, loc := #caller_location) -> Tensor {
 	shape := src.shape
-	return zeros(..shape[:src.rank], loc=loc)
+	return zeros(shape[:src.rank], loc=loc)
 }
 
-// Copy data to the global arena as a 1-D tensor.
 @(require_results)
 tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
-
-	t = zeros(builtin.len(data), loc=loc)
-	t.backend.set_data(&t, data)
+	shape := [1]int{builtin.len(data)}
+	t = zeros(shape[:], loc=loc)
+	t.vtable.buffer_set(t.buffers[.Data], data, loc)
 	return
 }
 
-// Single-value 1-D tensor in the global arena.
 @(require_results)
 scalar :: proc(value: f32, loc := #caller_location) -> (t: Tensor) {
-	t = zeros(1, loc=loc)
+	shape := [1]int{1}
+	t = zeros(shape[:], loc=loc)
 	src := [1]f32{value}
-	t.backend.set_data(&t, src[:])
+	t.vtable.buffer_set(t.buffers[.Data], src[:], loc)
 	return
 }
 
-// Allocate a zeroed tensor whose shape is `src.shape` with the trailing dim
-// dropped. If src is rank 1, the output is a 1-D tensor of length 1.
 @(require_results)
 _zeros_drop_last :: proc(src: Tensor, loc := #caller_location) -> Tensor {
 	if src.rank <= 1 {
-		return zeros(1, loc=loc)
+		shape := [1]int{1}
+		return zeros(shape[:], loc=loc)
 	}
 	shape := src.shape
-	return zeros(..shape[:src.rank - 1], loc=loc)
+	return zeros(shape[:src.rank - 1], loc=loc)
 }
 
-// Allocate a zeroed tensor whose shape is `src.shape` with the trailing dim
-// replaced by `new_trailing`.
 @(require_results)
 _zeros_replace_trailing :: proc(src: Tensor, new_trailing: int, loc := #caller_location) -> Tensor {
 	new_shape: [MAX_TENSOR_RANK]int = src.shape
 	new_shape[src.rank - 1] = new_trailing
-	return zeros(..new_shape[:src.rank], loc=loc)
+	return zeros(new_shape[:src.rank], loc=loc)
 }
 
-// Product of leading dimensions (rank-1 dims). For rank 1, returns 1.
 @(require_results)
 _leading_count :: proc(t: Tensor) -> int {
 	n := 1
@@ -400,16 +241,14 @@ _leading_count :: proc(t: Tensor) -> int {
 	return n
 }
 
-// Reinterpret a Tensor under a new shape. Pure header change — shares storage
-// with src. The new shape's element count must equal the source's.
 @(require_results)
-reshape :: proc(src: Tensor, shape: ..int, loc := #caller_location) -> (t: Tensor) {
+reshape :: proc(src: Tensor, shape: []int, loc := #caller_location) -> (t: Tensor) {
 	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
 	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
 	assert(shape_element_count(shape) == len(src), "Reshape element count mismatch", loc=loc)
 
-	t.backend = src.backend
-	t.storage = src.storage
+	t.vtable  = src.vtable
+	t.buffers = src.buffers
 	t.type    = src.type
 	t.count   = src.count
 	t.rank    = builtin.len(shape)
@@ -419,75 +258,53 @@ reshape :: proc(src: Tensor, shape: ..int, loc := #caller_location) -> (t: Tenso
 	return
 }
 
-// Allocate a trainable tensor — a `Tensor` with the Adam optimizer
-// state slots populated (`extra_buffers=2` on the alloc hook). Survives
-// `ml.clear()`. Pair with `destroy`.
 @(require_results)
-make :: proc(shape: ..int, loc := #caller_location) -> (t: Tensor, err: mem.Allocator_Error) #optional_allocator_error {
-	t = _alloc_tensor(shape, persistent=true, extra_buffers=2, loc=loc)
+make :: proc(shape: []int, loc := #caller_location) -> (t: Tensor, err: mem.Allocator_Error) #optional_allocator_error {
+	t = alloc(shape, persistent=true, buffers=DEFAULT_PARAMETER_BUFFERS, loc=loc)
 	return t, nil
 }
 
-// Destroy a tensor allocated by `make`.
 destroy :: proc(t: Tensor, loc := #caller_location) {
-	if t.backend == nil { return }
-	tt := t
-	t.backend.free(&tt)
+	if t.vtable == nil { return }
+	for kind in Buffer_Kind {
+		t.vtable.buffer_free(t.buffers[kind], loc)
+	}
 }
 
-// Copy data + gradient + adam_m + adam_v from `src` to `dst`. Both must
-// have been allocated with `make`.
 copy :: proc(dst, src: Tensor, loc := #caller_location) {
 	assert(len(dst) == len(src), "Tensor lengths must be equal", loc=loc)
-	assert(dst.backend == src.backend, "Tensor copy across backends not supported", loc=loc)
-	d, s := dst, src
-	dst.backend.parameter_copy(&d, &s)
+	assert(dst.vtable == src.vtable, "Tensor copy across backends not supported", loc=loc)
+	for kind in Buffer_Kind {
+		dst.vtable.buffer_copy(dst.buffers[kind], src.buffers[kind], loc)
+	}
 }
 
-// Fill tensor data with normally distributed random numbers. Works on
-// either backend — for non-CPU backends we fill into a temp_allocator
-// host buffer and upload via `Backend.set_data`.
-fill_normal :: proc(t: Tensor, mean, std: f32) {
-	n := len(t)
-	if t.backend == &_cpu_backend {
-		d := data(t)
-		for &v in d {
-			v = rand.float32_normal(mean, std)
-		}
-		return
-	}
+get_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
+	t.vtable.buffer_get(t.buffers[.Data], data, loc)
+}
+
+fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
+	n   := len(t)
 	buf := builtin.make([]f32, n, allocator=context.temp_allocator)
 	for i in 0 ..< n {
 		buf[i] = rand.float32_normal(mean, std)
 	}
-	tt := t
-	t.backend.set_data(&tt, buf)
+	t.vtable.buffer_set(t.buffers[.Data], buf, loc)
 }
 
-// Fill tensor data with a single value. Backend-aware.
-fill_value :: proc(t: Tensor, value: f32) {
-	n := len(t)
-	if t.backend == &_cpu_backend {
-		d := data(t)
-		for &v in d {
-			v = value
-		}
-		return
-	}
+fill_value :: proc(t: Tensor, value: f32, loc := #caller_location) {
+	n   := len(t)
 	buf := builtin.make([]f32, n, allocator=context.temp_allocator)
 	for i in 0 ..< n {
 		buf[i] = value
 	}
-	tt := t
-	t.backend.set_data(&tt, buf)
+	t.vtable.buffer_set(t.buffers[.Data], buf, loc)
 }
 
-// Perform He initialization.
 he_initialization :: proc(t: Tensor, input_features: int) {
 	fill_normal(t, 0, math.sqrt(2 / f32(input_features)))
 }
 
-// Perform Xavier/Glorot initialization.
 xavier_initialization :: proc(t: Tensor, input_features, output_features: int) {
 	fill_normal(t, 0, math.sqrt(2 / f32(input_features + output_features)))
 }
@@ -506,10 +323,6 @@ Optimizer :: struct {
 	bias_correction2: f32,
 }
 
-// Check to see if an optimizer step should occur based on the period,
-// then set the optimizer hyperparameters and increment the iteration.
-// This is meant to be used in an if statement with parameter updates
-// inside the scope.
 @(require_results)
 optimize :: proc(
 	opt:           ^Optimizer,
@@ -540,12 +353,9 @@ optimize :: proc(
 	return true
 }
 
-// Apply one Adam(W) step to `t` and zero its gradient. `t` must have
-// been allocated with `make`. This is meant to be called inside the
-// scope of `optimize`.
-update :: proc(opt: Optimizer, t: Tensor) {
-	tt := t
-	t.backend.parameter_update(opt, &tt)
+update :: proc(opt: Optimizer, t: Tensor, loc := #caller_location) {
+	t := t
+	t.vtable.update(opt, &t, loc)
 }
 
 Operation_Variant :: union {
@@ -587,43 +397,76 @@ Operation :: struct {
 	variant: Operation_Variant,
 }
 
-// Append an operation to the global context for backpropagation.
 append_operation :: proc(op: Operation, loc := #caller_location) {
 	assert(_current_ctx.operation_count < MAX_OPERATIONS, "Maximum operations exceeded, did you forget to call clear?", loc=loc)
 	_current_ctx.operations[_current_ctx.operation_count] = op
 	_current_ctx.operation_count += 1
 }
 
-// Iterate backwards through all operations and accumulate gradients through
-// tensors. Only the final operation's output gradient is initialized to 1,
-// which means gradients flow backward from the final operation. Gradients
-// won't flow properly if you have multiple final operations. I'm not sure
-// of the best way to solve that problem.
 backward :: proc(loc := #caller_location) {
 	if _current_ctx == nil || _current_ctx.operation_count <= 0 {
 		return
 	}
 
-	backend := _current_ctx.backend
+	vtable := _current_ctx.vtable
 
-	// Seed the final op's output gradient with all 1.0s. Backend-specific
-	// because the gradient lives on host memory (CPU) or in a Vulkan buffer
-	// (GPU).
 	final_op := &_current_ctx.operations[_current_ctx.operation_count - 1]
-	backend.fill_gradient_with_ones(&final_op.output)
+
+	ones := builtin.make([]f32, final_op.output.count, allocator=context.temp_allocator)
+	for &v in ones {
+		v = 1
+	}
+	vtable.buffer_set(final_op.output.buffers[.Gradient], ones, loc)
 
 	for i := _current_ctx.operation_count - 1; i >= 0; i -= 1 {
-		backend.backward(_current_ctx.operations[i])
+		vtable.backward(_current_ctx.operations[i], loc)
 	}
 }
 
+@(require_results)
+attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank == 2, "attention requires a 2-D tensor [tokens, 3 * embedding]", loc=loc)
+
+	token_count := input.shape[0]
+	input_size  := input.shape[1]
+	assert(input_size % 3 == 0, "Trailing dim must be divisible by 3 (for Q, K, V)", loc=loc)
+
+	output_size := input_size / 3
+	assert(output_size % head_count == 0, "Output size must be divisible by head count", loc=loc)
+
+	head_size := output_size / head_count
+
+	q_flat := slice_trailing(input, 0,               output_size,     loc=loc)
+	k_flat := slice_trailing(input, output_size,     output_size * 2, loc=loc)
+	v_flat := slice_trailing(input, output_size * 2, output_size * 3, loc=loc)
+
+	q := reshape(q_flat, {token_count, head_count, head_size}, loc=loc)
+	k := reshape(k_flat, {token_count, head_count, head_size}, loc=loc)
+	v := reshape(v_flat, {token_count, head_count, head_size}, loc=loc)
+
+	q_t := permute(q, {1, 0, 2}, loc=loc)
+	k_t := permute(k, {1, 0, 2}, loc=loc)
+	v_t := permute(v, {1, 0, 2}, loc=loc)
+
+	k_t_T  := permute(k_t, {0, 2, 1}, loc=loc)
+	raw    := batched_matmul(q_t, k_t_T, loc=loc)
+	scaled := mul(raw, scalar(1.0 / math.sqrt(f32(head_size)), loc=loc), loc=loc)
+
+	masked := causal ? causal_mask(scaled, loc=loc) : scaled
+	attn   := softmax(masked, loc=loc)
+
+	out_per_head := batched_matmul(attn, v_t, loc=loc)
+	out          := permute(out_per_head, {1, 0, 2}, loc=loc)
+	output        = reshape(out, {token_count, output_size}, loc=loc)
+
+	return
+}
 
 Add :: struct {
 	b:      Tensor,
 	stride: int,
 }
 
-// Add two tensors, b is broadcasted into a if necessary.
 @(require_results)
 add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
@@ -638,7 +481,7 @@ add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			stride = len(a) / len(b),
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -649,7 +492,6 @@ Sub :: struct {
 	stride: int,
 }
 
-// Subtract two tensors, b is broadcasted into a if necessary.
 @(require_results)
 sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
@@ -664,7 +506,7 @@ sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			stride = len(a) / len(b),
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -675,7 +517,6 @@ Mul :: struct {
 	stride: int,
 }
 
-// Multiply two tensors, b is broadcasted into a if necessary.
 @(require_results)
 mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
@@ -690,7 +531,7 @@ mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			stride = len(a) / len(b),
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -701,7 +542,6 @@ Div :: struct {
 	stride: int,
 }
 
-// Divide two tensors, b is broadcasted into a if necessary.
 @(require_results)
 div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
@@ -716,7 +556,7 @@ div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			stride = len(a) / len(b),
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -734,7 +574,7 @@ exp :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Exp{},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -759,7 +599,7 @@ clamp :: proc(input: Tensor, min_val, max_val: f32, loc := #caller_location) -> 
 			max_val = max_val,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -782,7 +622,7 @@ min :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			b = b,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -805,7 +645,7 @@ max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			b = b,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -830,7 +670,7 @@ mean :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 			count = count,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -840,7 +680,6 @@ Transpose :: struct {
 	rows: int,
 }
 
-// Transpose a 2-D tensor: [rows, cols] -> [cols, rows].
 @(require_results)
 transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank == 2, "transpose requires a 2-D tensor", loc=loc)
@@ -848,7 +687,7 @@ transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 	rows    := input.shape[0]
 	columns := input.shape[1]
 
-	output = zeros(columns, rows, loc=loc)
+	output = zeros({columns, rows}, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -857,7 +696,7 @@ transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 			rows = rows,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -868,8 +707,6 @@ Select :: struct {
 	size:    int,
 }
 
-// Select rows from a tensor by index. Input shape [N, ...rest]; output shape
-// [len(indices), ...rest]. The "row size" is the product of trailing dims.
 @(require_results)
 select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 1, "select input must have rank >= 1", loc=loc)
@@ -879,14 +716,14 @@ select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (outpu
 		size *= input.shape[i]
 	}
 
-	indices_copy := builtin.make([]int, builtin.len(indices), allocator=arena_allocator())
+	indices_copy := builtin.make([]int, builtin.len(indices), allocator=op_arena_allocator())
 	for i in 0 ..< builtin.len(indices) {
 		indices_copy[i] = indices[i]
 	}
 
 	out_shape: [MAX_TENSOR_RANK]int = input.shape
 	out_shape[0] = builtin.len(indices)
-	output = zeros(..out_shape[:input.rank], loc=loc)
+	output = zeros(out_shape[:input.rank], loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -896,7 +733,7 @@ select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (outpu
 			size     = size,
 		}
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -907,12 +744,11 @@ Slice :: struct {
 	end:   int,
 }
 
-// Slice an input tensor. Copies the data.
 @(require_results)
 slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
 	fmt.assertf(start >= 0 && end <= len(input) && start <= end, "Slice indices out of bounds %v:%v", start, end, loc=loc)
 
-	output = zeros(end - start, loc=loc)
+	output = zeros({end - start}, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -922,7 +758,7 @@ slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (outpu
 			end   = end,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -932,8 +768,6 @@ Slice_Trailing :: struct {
 	start, end: int,
 }
 
-// Slice along the trailing dim, preserving rank. Output shape =
-// input.shape with the trailing dim replaced by (end - start).
 @(require_results)
 slice_trailing :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 1, "slice_trailing input must have rank >= 1", loc=loc)
@@ -951,7 +785,7 @@ slice_trailing :: proc(input: Tensor, start, end: int, loc := #caller_location) 
 			end   = end,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -961,9 +795,6 @@ Concat :: struct {
 	inputs: []Tensor,
 }
 
-// Concatenate multiple tensors along the trailing dim. All inputs must share
-// rank and match in every dim except the trailing one. Output shape =
-// inputs[0].shape with the trailing dim replaced by the sum of trailings.
 @(require_results)
 concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(builtin.len(inputs) > 0, "Requires at least one input", loc=loc)
@@ -978,7 +809,7 @@ concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 		trailing_sum += inputs[i].shape[inputs[i].rank - 1]
 	}
 
-	inputs_copy := builtin.make([]Tensor, builtin.len(inputs), allocator=arena_allocator())
+	inputs_copy := builtin.make([]Tensor, builtin.len(inputs), allocator=op_arena_allocator())
 	for input, i in inputs {
 		inputs_copy[i] = input
 	}
@@ -992,7 +823,7 @@ concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 			inputs = inputs_copy,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1005,10 +836,6 @@ Linear :: struct {
 	count:       int,
 }
 
-// Linear transformation. weight is [output_size, input_size]; input has
-// trailing dim equal to input_size. Output shape = input.shape with the
-// trailing dim replaced by output_size. `count` (the number of input rows
-// to project) is the product of input's leading dims.
 @(require_results)
 linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank  >= 1, "Linear input must have rank >= 1",  loc=loc)
@@ -1031,7 +858,7 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 			count       = count,
 		}
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1047,8 +874,6 @@ Rope :: struct {
 	sin_cache: Tensor,
 }
 
-// Rotary position embedding. Preserves input shape; reads `token_count` from
-// input.shape[0]. `head_count` stays explicit.
 @(require_results)
 rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 2, "rope requires rank >= 2", loc=loc)
@@ -1062,8 +887,8 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_l
 
 	output = zeros_like(input, loc=loc)
 
-	cos_cache := zeros(token_count * head_size / 2, loc=loc)
-	sin_cache := zeros(token_count * head_size / 2, loc=loc)
+	cos_cache := zeros({token_count * head_size / 2}, loc=loc)
+	sin_cache := zeros({token_count * head_size / 2}, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -1077,7 +902,7 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_l
 			sin_cache   = sin_cache,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1099,8 +924,8 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 	count := _leading_count(input)
 	size  := input.shape[input.rank - 1]
 
-	mean := zeros(count, loc=loc)
-	rstd := zeros(count, loc=loc)
+	mean := zeros({count}, loc=loc)
+	rstd := zeros({count}, loc=loc)
 
 	output = zeros_like(input, loc=loc)
 
@@ -1115,7 +940,7 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 			size   = size,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1141,7 +966,7 @@ softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 			count = count,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1167,7 +992,7 @@ log_softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 			count = count,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1193,7 +1018,7 @@ entropy :: proc(probabilities: Tensor, loc := #caller_location) -> (output: Tens
 			count = count,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1220,7 +1045,7 @@ mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location
 			count   = count,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1243,7 +1068,7 @@ cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) ->
 
 	class_size := input.shape[input.rank - 1]
 
-	targets_copy := builtin.make([]int, sample_count, allocator=arena_allocator())
+	targets_copy := builtin.make([]int, sample_count, allocator=op_arena_allocator())
 	for target, i in targets {
 		assert(target >= 0 && target < class_size, "Target is out of bounds", loc=loc)
 		targets_copy[i] = target
@@ -1261,7 +1086,7 @@ cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) ->
 			class_size    = class_size,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1279,7 +1104,7 @@ relu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Relu{},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1297,7 +1122,7 @@ sigmoid :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Sigmoid{},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1315,7 +1140,7 @@ gelu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Gelu{},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1333,7 +1158,7 @@ silu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Silu{},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1351,7 +1176,7 @@ tanh :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Tanh{},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1376,7 +1201,7 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 	k           := a.shape[2]
 	n           := b.shape[2]
 
-	output = zeros(batch_count, m, n, loc=loc)
+	output = zeros({batch_count, m, n}, loc=loc)
 
 	op := Operation{
 		input   = a,
@@ -1389,8 +1214,9 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 			n           = n,
 		},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
+
 	return
 }
 
@@ -1413,15 +1239,16 @@ permute :: proc(input: Tensor, axes: [3]int, loc := #caller_location) -> (output
 		input.shape[axes[1]],
 		input.shape[axes[2]],
 	}
-	output = zeros(out_shape[0], out_shape[1], out_shape[2], loc=loc)
+	output = zeros({out_shape[0], out_shape[1], out_shape[2]}, loc=loc)
 
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Permute{ axes = axes },
+		variant = Permute{axes = axes},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
+
 	return
 }
 
@@ -1440,8 +1267,8 @@ causal_mask :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 		output  = output,
 		variant = Causal_Mask{},
 	}
-	_current_ctx.backend.forward(op)
+	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
+
 	return
 }
-

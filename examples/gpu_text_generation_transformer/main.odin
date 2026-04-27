@@ -118,7 +118,7 @@ evaluate :: proc(model: Model, text: []byte, target: byte) -> f32 {
 	// `get_data` flushes the auto-batch and reads the scalar back.
 	scalar: [1]f32
 	loss_t := loss
-	loss_t.backend.get_data(&loss_t, scalar[:])
+	loss_t.vtable.get_data(&loss_t, scalar[:])
 	return scalar[0]
 }
 
@@ -165,7 +165,7 @@ speak :: proc(model: Model, token_count: int) {
 		logits := forward(model, text[:])
 
 		logits_t := logits
-		logits_t.backend.get_data(&logits_t, full_logits)
+		logits_t.vtable.get_data(&logits_t, full_logits)
 
 		row := min(i, SEQUENCE_LENGTH - 1)
 		for k in 0 ..< VOCABULARY do vocab_logits[k] = full_logits[row * VOCABULARY + k]

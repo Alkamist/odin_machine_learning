@@ -1,6 +1,6 @@
-// In this example, a Transformer looks at random snippets of 
-// text from the file and learns how to predict the next byte. 
-// You can then predict the next byte and feed the result back 
+// In this example, a Transformer looks at random snippets of
+// text from the file and learns how to predict the next byte.
+// You can then predict the next byte and feed the result back
 // into the network to generate text.
 
 package main
@@ -10,6 +10,7 @@ import "core:fmt"
 import "core:math/rand"
 import "../utility"
 import ml "../../"
+import cpu "../../backend_cpu"
 import tfm "../../transformer"
 
 FILE_NAME :: "../data/stories_short.txt"
@@ -27,13 +28,13 @@ SEQUENCE_LENGTH :: 64
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ctx := ml.context_create(1024 * 1024 * 16)
+	ctx := ml.context_create(1024 * 1024 * 16, &cpu.backend)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
-	ml.set_thread_count(24)
-	
-	model := make_model()
-	defer destroy_model(model)
+	cpu.set_thread_count(24)
+
+	model := model_make()
+	defer model_destroy(model)
 
 	text, text_err := os.read_entire_file(FILE_NAME, context.allocator)
 	if text_err != nil {
@@ -49,14 +50,14 @@ main :: proc() {
 	for {
 		defer free_all(context.temp_allocator)
 
-		if learn(&model, random_sample(training_text, SEQUENCE_LENGTH)) {
+		if model_learn(&model, random_sample(training_text, SEQUENCE_LENGTH)) {
 			if model.opt.iteration % 100 == 0 {
-				loss := evaluate(model, random_sample(validation_text, SEQUENCE_LENGTH))
+				loss := model_evaluate(model, random_sample(validation_text, SEQUENCE_LENGTH))
 				fmt.printfln("%v, Validation Loss: %v", model.opt.iteration, loss)
 			}
 
 			if model.opt.iteration % 500 == 0 {
-				speak(model, 1024)
+				model_speak(model, 1024)
 			}
 		}
 	}
@@ -67,24 +68,16 @@ Model :: struct {
 	opt:         ml.Optimizer,
 }
 
-make_model :: proc(allocator := context.allocator) -> (res: Model) {
-	res.transformer = tfm.make(LAYERS, ATTENTION_HEADS, EMBEDDING_SIZE, VOCABULARY)
-    return
-}
-
-destroy_model :: proc(model: Model) {
-	tfm.destroy(model.transformer)
-}
-
-text_to_tokens :: proc(text: []byte) -> (res: ml.Tensor) {
-	res = ml.zeros(len(text))
-	for i in 0 ..< len(text) {
-		ml.data(res)[i] = f32(text[i]) / 255.0
-	}
+model_make :: proc(allocator := context.allocator) -> (model: Model) {
+	model.transformer = tfm.make(LAYERS, ATTENTION_HEADS, EMBEDDING_SIZE, VOCABULARY, allocator=allocator)
 	return
 }
 
-forward :: proc(model: Model, text: []byte) -> ml.Tensor {
+model_destroy :: proc(model: Model) {
+	tfm.destroy(model.transformer)
+}
+
+model_forward :: proc(model: Model, text: []byte) -> ml.Tensor {
 	tokens := make([]int, len(text), context.temp_allocator)
 	for i in 0 ..< len(text) {
 		tokens[i] = int(text[i])
@@ -92,24 +85,26 @@ forward :: proc(model: Model, text: []byte) -> ml.Tensor {
 	return tfm.forward(model.transformer, tokens)
 }
 
-evaluate :: proc(model: Model, text: []byte, target: byte) -> f32 {
+model_evaluate :: proc(model: Model, text: []byte, target: byte) -> f32 {
 	targets := make([]int, len(text), context.temp_allocator)
 	for i in 0 ..< len(text) - 1 {
 		targets[i] = int(text[i + 1])
 	}
 	targets[len(targets) - 1] = int(target)
-	
+
 	ml.clear()
 
-	logits := forward(model, text)
+	logits := model_forward(model, text)
 
 	loss := ml.cross_entropy(logits, targets)
 	loss  = ml.mean(loss)
 
-	return ml.data(loss)[0]
+	scalar: [1]f32
+	ml.get_data(loss, scalar[:])
+	return scalar[0]
 }
 
-learn :: proc(model: ^Model, text: []byte, target: byte) -> bool {
+model_learn :: proc(model: ^Model, text: []byte, target: byte) -> bool {
 	targets := make([]int, len(text), context.temp_allocator)
 	for i in 0 ..< len(text) - 1 {
 		targets[i] = int(text[i + 1])
@@ -118,7 +113,7 @@ learn :: proc(model: ^Model, text: []byte, target: byte) -> bool {
 
 	ml.clear()
 
-	logits := forward(model^, text)
+	logits := model_forward(model^, text)
 
 	loss := ml.cross_entropy(logits, targets)
 	loss  = ml.mean(loss)
@@ -135,17 +130,20 @@ learn :: proc(model: ^Model, text: []byte, target: byte) -> bool {
 	return false
 }
 
-speak :: proc(model: Model, token_count: int) {
+model_speak :: proc(model: Model, token_count: int) {
 	fmt.print("==============================================================\n\n")
 
-	text: [SEQUENCE_LENGTH]byte
+	text:         [SEQUENCE_LENGTH]byte
+	logits_data := make([]f32, SEQUENCE_LENGTH * VOCABULARY, context.temp_allocator)
 
 	for i in 0 ..< token_count {
 		ml.clear()
 
-		logits       := forward(model, text[:])
-		logits_data  := ml.data(logits)
-		token_logits := logits_data[min(i, SEQUENCE_LENGTH - 1) * model.transformer.vocabulary_size:][:model.transformer.vocabulary_size]
+		logits := model_forward(model, text[:])
+		ml.get_data(logits, logits_data)
+
+		row          := min(i, SEQUENCE_LENGTH - 1)
+		token_logits := logits_data[row * VOCABULARY:][:VOCABULARY]
 		output       := utility.sample_top_p(token_logits, 0.9, 1)
 
 		fmt.print(rune(output))

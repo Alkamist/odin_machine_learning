@@ -30,19 +30,19 @@ make :: proc(input_size, hidden_size: int, allocator := context.allocator) -> (g
 	gru.state = builtin.make([]f32, hidden_size)
 
 	// Update gate
-	gru.update_input_weight  = ml.make(hidden_size, input_size)
-	gru.update_hidden_weight = ml.make(hidden_size, hidden_size)
-	gru.update_bias          = ml.make(hidden_size)
+	gru.update_input_weight  = ml.make({hidden_size, input_size})
+	gru.update_hidden_weight = ml.make({hidden_size, hidden_size})
+	gru.update_bias          = ml.make({hidden_size})
 
 	// Reset gate
-	gru.reset_input_weight  = ml.make(hidden_size, input_size)
-	gru.reset_hidden_weight = ml.make(hidden_size, hidden_size)
-	gru.reset_bias          = ml.make(hidden_size)
+	gru.reset_input_weight  = ml.make({hidden_size, input_size})
+	gru.reset_hidden_weight = ml.make({hidden_size, hidden_size})
+	gru.reset_bias          = ml.make({hidden_size})
 
 	// Candidate hidden state
-	gru.candidate_input_weight  = ml.make(hidden_size, input_size)
-	gru.candidate_hidden_weight = ml.make(hidden_size, hidden_size)
-	gru.candidate_bias          = ml.make(hidden_size)
+	gru.candidate_input_weight  = ml.make({hidden_size, input_size})
+	gru.candidate_hidden_weight = ml.make({hidden_size, hidden_size})
+	gru.candidate_bias          = ml.make({hidden_size})
 
 	randomize(gru)
 
@@ -127,7 +127,7 @@ forward :: proc(gru: Gru, input: ml.Tensor) -> (state: ml.Tensor) {
 	c         = ml.tanh(c)
 
 	// Compute the new hidden state.
-	ones := ml.zeros(hidden_size)
+	ones := ml.zeros({hidden_size})
 	ml.fill_value(ones, 1)
 
 	one_minus_z      := ml.sub(ones, z)
@@ -135,7 +135,7 @@ forward :: proc(gru: Gru, input: ml.Tensor) -> (state: ml.Tensor) {
 
 	state = new_hidden_state
 
-	builtin.copy(gru.state, ml.data(state))
+	ml.get_data(state, gru.state)
 
 	return
 }

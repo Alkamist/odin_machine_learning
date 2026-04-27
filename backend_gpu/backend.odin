@@ -150,14 +150,14 @@ gpu_alloc :: proc(t: ^ml.Tensor, n: int, persistent: bool, extra_buffers: int) {
 	if !persistent {
 		append(&gctx.allocations, storage)
 	}
-	t.storage = storage
+	t.data = storage
 }
 
 gpu_free :: proc(t: ^ml.Tensor) {
-	if t.storage == nil { return }
-	storage := cast(^Gpu_Storage)t.storage
+	if t.data == nil { return }
+	storage := cast(^Gpu_Storage)t.data
 	_destroy_gpu_storage(storage)
-	t.storage = nil
+	t.data = nil
 }
 
 gpu_set_data :: proc(t: ^ml.Tensor, src: []f32) {
@@ -171,7 +171,7 @@ gpu_get_data :: proc(t: ^ml.Tensor, dst: []f32) {
 // Adam(W) step + zero gradient on GPU. Push constants pack the optimizer
 // state; the shader does one thread per element.
 gpu_parameter_update :: proc(opt: ml.Optimizer, p: ^ml.Tensor) {
-	storage := cast(^Gpu_Storage)p.storage
+	storage := cast(^Gpu_Storage)p.data
 	fmt.assertf(storage != nil && storage.adam_m_buffer != 0,
 		"gpu_parameter_update: parameter has no Adam storage — was it allocated by ml.make under a GPU context?")
 
@@ -199,8 +199,8 @@ gpu_parameter_update :: proc(opt: ml.Optimizer, p: ^ml.Tensor) {
 // four `CmdCopyBuffer`s recorded into the active batch (or one-shot
 // each if no batch is active).
 gpu_parameter_copy :: proc(dst, src: ^ml.Tensor) {
-	dst_s := cast(^Gpu_Storage)dst.storage
-	src_s := cast(^Gpu_Storage)src.storage
+	dst_s := cast(^Gpu_Storage)dst.data
+	src_s := cast(^Gpu_Storage)src.data
 	fmt.assertf(dst_s.count == src_s.count, "gpu_parameter_copy size mismatch: dst=%v src=%v", dst_s.count, src_s.count)
 	size := vk.DeviceSize(dst_s.count * size_of(f32))
 
@@ -1411,7 +1411,7 @@ _upload_indices :: proc(indices: []int, loc := #caller_location) -> (buf: vk.Buf
 // later-recorded zero-fill on the same buffer would otherwise clobber
 // the upload). Outside a batch, falls back to one-shot.
 upload_tensor :: proc(t: ml.Tensor, src: []f32, loc := #caller_location) {
-	fmt.assertf(t.backend == &_gpu_backend, "upload_tensor: tensor is not on the GPU backend", loc=loc)
+	fmt.assertf(t.vtable == &_gpu_backend, "upload_tensor: tensor is not on the GPU backend", loc=loc)
 	storage := _storage(t)
 	fmt.assertf(len(src) == storage.count, "upload_tensor size mismatch: src=%v storage.count=%v", len(src), storage.count, loc=loc)
 
@@ -1457,7 +1457,7 @@ download_tensor_gradient :: proc(t: ml.Tensor, dst: []f32, loc := #caller_locati
 }
 
 _download_buffer :: proc(t: ml.Tensor, src: vk.Buffer, dst: []f32, loc := #caller_location) {
-	fmt.assertf(t.backend == &_gpu_backend, "download_tensor: tensor is not on the GPU backend", loc=loc)
+	fmt.assertf(t.vtable == &_gpu_backend, "download_tensor: tensor is not on the GPU backend", loc=loc)
 	storage := _storage(t)
 	fmt.assertf(len(dst) == storage.count, "download size mismatch: dst=%v storage.count=%v", len(dst), storage.count, loc=loc)
 
@@ -1501,7 +1501,7 @@ _download_buffer :: proc(t: ml.Tensor, src: vk.Buffer, dst: []f32, loc := #calle
 }
 
 _storage :: #force_inline proc(t: ml.Tensor) -> ^Gpu_Storage {
-	return cast(^Gpu_Storage)t.storage
+	return cast(^Gpu_Storage)t.data
 }
 
 _destroy_gpu_storage :: proc(storage: ^Gpu_Storage) {

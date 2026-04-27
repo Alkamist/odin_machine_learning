@@ -37,11 +37,11 @@ main :: proc() {
 		a := ml.zeros(128, 128)
 		b := ml.zeros(64, 32)
 
-		check(a.backend == gpu.backend(),       "phase1: tensor a's backend is GPU",                 &any_failed)
-		check(a.storage != nil,                 "phase1: tensor a has GPU storage",                  &any_failed)
+		check(a.vtable == gpu.backend(),       "phase1: tensor a's backend is GPU",                 &any_failed)
+		check(a.data != nil,                 "phase1: tensor a has GPU storage",                  &any_failed)
 
-		storage_a := cast(^gpu.Gpu_Storage)a.storage
-		storage_b := cast(^gpu.Gpu_Storage)b.storage
+		storage_a := cast(^gpu.Gpu_Storage)a.data
+		storage_b := cast(^gpu.Gpu_Storage)b.data
 		check(storage_a.count == 128 * 128,     "phase1: storage_a count matches",                   &any_failed)
 		check(storage_a.buffer != 0,            "phase1: storage_a.buffer valid",                    &any_failed)
 		check(storage_a.grad_buffer != 0,       "phase1: storage_a.grad_buffer valid",               &any_failed)
