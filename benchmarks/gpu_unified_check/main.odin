@@ -1272,8 +1272,10 @@ main :: proc() {
 			check(max_db <= tol_db,   fmt.tprintf("phase21: ml.%v backward db matches CPU", name), any_failed)
 		}
 
+		add_w :: proc(a, b: ml.Tensor) -> ml.Tensor { return ml.add(a, b) }
 		sub_w :: proc(a, b: ml.Tensor) -> ml.Tensor { return ml.sub(a, b) }
 		div_w :: proc(a, b: ml.Tensor) -> ml.Tensor { return ml.div(a, b) }
+		check_broadcast("add", a_data[:], b_data[:], add_w, 1e-5, &any_failed)
 		check_broadcast("sub", a_data[:], b_data[:], sub_w, 1e-5, &any_failed)
 		check_broadcast("div", a_data[:], b_data[:], div_w, 1e-3, &any_failed) // db has 1/b^2 which can amplify error
 	}

@@ -15,14 +15,16 @@ import "core:encoding/csv"
 
 import ml "../../"
 import cpu "../../backend_cpu"
+import gpu "../../backend_gpu"
 import "../../mlp"
 
-BATCH_SIZE :: 100
+BATCH_SIZE :: 1000
 
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ctx := ml.context_create(1024 * 1024, &cpu.backend)
+	ctx := ml.context_create(1024 * 1024 * 16, &cpu.backend)
+	// ctx := ml.context_create(1024 * 1024, gpu.backend())
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 	cpu.set_thread_count(24)

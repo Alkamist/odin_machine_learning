@@ -1,13 +1,13 @@
 package machine_learning_backend_gpu
 
-ADD_SPIRV :: #load("shaders/add.spv", []u8)
+ADD_SPIRV        :: #load("shaders/add.spv",        []u8)
+ADD_BACK_A_SPIRV :: #load("shaders/add_back_a.spv", []u8)
+ADD_BACK_B_SPIRV :: #load("shaders/add_back_b.spv", []u8)
 ADD_LOCAL_SIZE :: 256
-Add_Params :: struct { n: u32 }
-_add_pipeline: ^Pipeline
-
-ADD_BACK_SPIRV :: #load("shaders/add_back.spv", []u8)
-Add_Back_Params :: struct { n: u32 }
-_add_back_pipeline: ^Pipeline
+Add_Params        :: struct { n,   n_b:    u32 }
+Add_Back_A_Params :: struct { n: u32 }
+Add_Back_B_Params :: struct { n_b, stride: u32 }
+_add_pipeline, _add_back_a_pipeline, _add_back_b_pipeline: ^Pipeline
 
 LINEAR_SPIRV :: #load("shaders/linear.spv", []u8)
 LINEAR_LOCAL_X :: 64

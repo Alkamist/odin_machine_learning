@@ -296,12 +296,10 @@ add_forward :: proc(op: ml.Operation) {
 	variant := op.variant.(ml.Add)
 	b       := variant.b
 
-	fmt.assertf(variant.stride == 1, "gpu add: broadcasting (stride=%v) not supported", variant.stride)
-
 	if _add_pipeline == nil {
 		_add_pipeline = _make_pipeline(ADD_SPIRV, 3, size_of(Add_Params))
 	}
-	params := Add_Params{n = u32(ml.len(a))}
+	params := Add_Params{n = u32(ml.len(a)), n_b = u32(ml.len(b))}
 	bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
 	_dispatch(_add_pipeline, bufs[:], &params, _div_up(ml.len(a), ADD_LOCAL_SIZE))
 }
@@ -312,14 +310,19 @@ add_backward :: proc(op: ml.Operation) {
 	variant := op.variant.(ml.Add)
 	b       := variant.b
 
-	fmt.assertf(variant.stride == 1, "gpu add backward: broadcasting (stride=%v) not supported", variant.stride)
-
-	if _add_back_pipeline == nil {
-		_add_back_pipeline = _make_pipeline(ADD_BACK_SPIRV, 3, size_of(Add_Back_Params))
+	if _add_back_a_pipeline == nil {
+		_add_back_a_pipeline = _make_pipeline(ADD_BACK_A_SPIRV, 2, size_of(Add_Back_A_Params))
 	}
-	params := Add_Back_Params{n = u32(ml.len(output))}
-	bufs   := [3]vk.Buffer{gradient(a).buffer, gradient(b).buffer, gradient(output).buffer}
-	_dispatch(_add_back_pipeline, bufs[:], &params, _div_up(ml.len(output), 256))
+	a_params := Add_Back_A_Params{n = u32(ml.len(a))}
+	a_bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(a).buffer}
+	_dispatch(_add_back_a_pipeline, a_bufs[:], &a_params, _div_up(ml.len(a), 256))
+
+	if _add_back_b_pipeline == nil {
+		_add_back_b_pipeline = _make_pipeline(ADD_BACK_B_SPIRV, 2, size_of(Add_Back_B_Params))
+	}
+	b_params := Add_Back_B_Params{n_b = u32(ml.len(b)), stride = u32(variant.stride)}
+	b_bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(b).buffer}
+	_dispatch(_add_back_b_pipeline, b_bufs[:], &b_params, _div_up(ml.len(b), 256))
 }
 
 sub_forward :: proc(op: ml.Operation) {
