@@ -11,3 +11,7 @@ ols.json
 ggml/
 
 .claude/
+
+__pycache__
+
+tests/pytorch_parity/artifacts

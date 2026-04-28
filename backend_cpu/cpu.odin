@@ -885,36 +885,50 @@ linear_forward :: proc(op: ml.Operation) {
 }
 
 linear_backward :: proc(op: ml.Operation) {
-	count := op.variant.(ml.Linear).count
+	variant     := op.variant.(ml.Linear)
+	count       := variant.count
+	output_size := variant.output_size
 
-	parallelize(count, count, op, proc(index: int, op: ml.Operation) {
+	parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
 		input, output := op.input, op.output
+		variant     := op.variant.(ml.Linear)
+		weight      := variant.weight
+		input_size  := variant.input_size
+		output_size := variant.output_size
+		count       := variant.count
 
+		input_data_ptr  := ([^]f32)(raw_data(data(input)))
+		output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
+		weight_grad_ptr := ([^]f32)(raw_data(gradient(weight)))
+
+		w_grad := weight_grad_ptr[o * input_size:]
+
+		for b in 0 ..< count {
+			dout := output_grad_ptr[b * output_size + o]
+			if dout == 0 do continue
+			x := input_data_ptr[b * input_size:]
+			_simd_axpy_f32(w_grad, x, dout, input_size)
+		}
+	})
+
+	parallelize(count, count, op, proc(b: int, op: ml.Operation) {
+		input, output := op.input, op.output
 		variant     := op.variant.(ml.Linear)
 		weight      := variant.weight
 		input_size  := variant.input_size
 		output_size := variant.output_size
 
-		input_data_ptr  := ([^]f32)(raw_data(data(input)))
 		input_grad_ptr  := ([^]f32)(raw_data(gradient(input)))
 		output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
 		weight_data_ptr := ([^]f32)(raw_data(data(weight)))
-		weight_grad_ptr := ([^]f32)(raw_data(gradient(weight)))
 
-		x      := input_data_ptr [index * input_size:]
-		dx     := input_grad_ptr [index * input_size:]
-		dy     := output_grad_ptr[index * output_size:]
+		dx := input_grad_ptr [b * input_size:]
+		dy := output_grad_ptr[b * output_size:]
 
 		for o in 0 ..< output_size {
 			dout := dy[o]
 			if dout == 0 do continue
-
 			w_data := weight_data_ptr[o * input_size:]
-			w_grad := weight_grad_ptr[o * input_size:]
-
-			// gradient(weight)[o, :] += x * dout
-			_simd_axpy_f32(w_grad, x, dout, input_size)
-			// gradient(input)[c, :] += weight[o, :] * dout
 			_simd_axpy_f32(dx, w_data, dout, input_size)
 		}
 	})
@@ -1102,30 +1116,26 @@ softmax_forward :: proc(op: ml.Operation) {
 }
 
 softmax_backward :: proc(op: ml.Operation) {
-	input, output := op.input, op.output
+	count := op.variant.(ml.Softmax).count
 
-	variant := op.variant.(ml.Softmax)
-	size    := variant.size
-	count   := variant.count
+	parallelize(count, count, op, proc(index: int, op: ml.Operation) {
+		input, output := op.input, op.output
+		size  := op.variant.(ml.Softmax).size
+		base  := index * size
 
-	for sample in 0 ..< count {
+		out_data := data(output)    [base:base + size]
+		out_grad := gradient(output)[base:base + size]
+		in_grad  := gradient(input) [base:base + size]
+
+		dot: f32
 		for i in 0 ..< size {
-			input_index := sample * size + i
-
-			gradient_sum: f32
-
-			for j in 0 ..< size {
-				output_index := sample * size + j
-				if i == j {
-					gradient_sum += gradient(output)[output_index] * data(output)[input_index] * (1 - data(output)[input_index])
-				} else {
-					gradient_sum += gradient(output)[output_index] * (-data(output)[input_index] * data(output)[output_index])
-				}
-			}
-
-			gradient(input)[input_index] += gradient_sum
+			dot += out_grad[i] * out_data[i]
 		}
-	}
+
+		for i in 0 ..< size {
+			in_grad[i] += out_data[i] * (out_grad[i] - dot)
+		}
+	})
 }
 
 log_softmax_forward :: proc(op: ml.Operation) {

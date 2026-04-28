@@ -342,6 +342,7 @@ bench_transformer_step :: proc() -> Result {
 	state_model  = model
 	state_tokens = tokens
 	state_target = targets
+	state_opt    = {}
 
 	run :: proc() -> f32 {
 		m  := state_model
@@ -354,9 +355,8 @@ bench_transformer_step :: proc() -> Result {
 		_       = ml.mean(loss)
 		ml.backward()
 
-		opt: ml.Optimizer
-		if ml.optimize(&opt, period = 1) {
-			tfm.update(opt, m)
+		if ml.optimize(&state_opt, period = 1) {
+			tfm.update(state_opt, m)
 		}
 
 		data := cpu.data(logits)
@@ -389,6 +389,7 @@ verify_training_trajectory :: proc() {
 	fmt.println("--- training trajectory (single-threaded, fresh model) ---")
 	fmt.printfln("%-10s %16s", "step", "loss")
 
+	opt: ml.Optimizer
 	for step in 0 ..< TRAJECTORY_STEPS {
 		ml.clear()
 		logits := tfm.forward(model, tokens)
@@ -396,7 +397,6 @@ verify_training_trajectory :: proc() {
 		loss   := ml.mean(ce)
 		ml.backward()
 
-		opt: ml.Optimizer
 		if ml.optimize(&opt, period = 1) {
 			tfm.update(opt, model)
 		}
@@ -420,3 +420,4 @@ verify_training_trajectory :: proc() {
 @(private="file") state_model:  tfm.Transformer
 @(private="file") state_tokens: []int
 @(private="file") state_target: []int
+@(private="file") state_opt:    ml.Optimizer
