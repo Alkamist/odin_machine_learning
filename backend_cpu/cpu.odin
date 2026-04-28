@@ -259,17 +259,17 @@ when intrinsics.has_target_feature("avx") {
 }
 
 backend := ml.Backend_VTable{
-	init            = init,
-	destroy         = destroy,
-	clear           = clear,
-	forward         = forward,
-	backward        = backward,
-	update          = update,
-	buffer_alloc    = buffer_alloc,
-	buffer_free     = buffer_free,
-	buffer_get      = buffer_get,
-	buffer_set      = buffer_set,
-	buffer_copy     = buffer_copy,
+	init         = init,
+	destroy      = destroy,
+	clear        = clear,
+	forward      = forward,
+	backward     = backward,
+	update       = update,
+	buffer_alloc = buffer_alloc,
+	buffer_free  = buffer_free,
+	buffer_get   = buffer_get,
+	buffer_set   = buffer_set,
+	buffer_copy  = buffer_copy,
 }
 
 Backend_Data :: struct {
@@ -449,11 +449,10 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 }
 
 add_forward :: proc(op: ml.Operation) {
-	a       := op.input
-	output  := op.output
-	variant := op.variant.(ml.Add)
-	b       := variant.b
-	stride  := variant.stride
+	a      := op.input
+	output := op.output
+	b      := op.variant.(ml.Add).b
+	stride := ml.len(a) / ml.len(b)
 
 	for i in 0 ..< stride {
 		for j in 0 ..< ml.len(b) {
@@ -465,11 +464,9 @@ add_forward :: proc(op: ml.Operation) {
 
 add_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
-
-	variant := op.variant.(ml.Add)
-	b       := variant.b
-
+	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
+
 	for i in 0 ..< stride {
 		for j in 0 ..< ml.len(b) {
 			o := i * ml.len(b) + j
@@ -480,11 +477,10 @@ add_backward :: proc(op: ml.Operation) {
 }
 
 sub_forward :: proc(op: ml.Operation) {
-	a       := op.input
-	output  := op.output
-	variant := op.variant.(ml.Sub)
-	b       := variant.b
-	stride  := variant.stride
+	a      := op.input
+	output := op.output
+	b      := op.variant.(ml.Sub).b
+	stride := ml.len(a) / ml.len(b)
 
 	for i in 0 ..< stride {
 		for j in 0 ..< ml.len(b) {
@@ -496,11 +492,9 @@ sub_forward :: proc(op: ml.Operation) {
 
 sub_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
-
-	variant := op.variant.(ml.Sub)
-	b       := variant.b
-
+	b      := op.variant.(ml.Sub).b
 	stride := ml.len(a) / ml.len(b)
+
 	for i in 0 ..< stride {
 		for j in 0 ..< ml.len(b) {
 			o := i * ml.len(b) + j
@@ -511,11 +505,10 @@ sub_backward :: proc(op: ml.Operation) {
 }
 
 mul_forward :: proc(op: ml.Operation) {
-	a       := op.input
-	output  := op.output
-	variant := op.variant.(ml.Mul)
-	b       := variant.b
-	stride  := variant.stride
+	a      := op.input
+	output := op.output
+	b      := op.variant.(ml.Mul).b
+	stride := ml.len(a) / ml.len(b)
 
 	for i in 0 ..< stride {
 		for j in 0 ..< ml.len(b) {
@@ -527,11 +520,9 @@ mul_forward :: proc(op: ml.Operation) {
 
 mul_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
-
-	variant := op.variant.(ml.Mul)
-	b       := variant.b
-
+	b      := op.variant.(ml.Mul).b
 	stride := ml.len(a) / ml.len(b)
+
 	for i in 0 ..< stride {
 		for j in 0 ..< ml.len(b) {
 			o := i * ml.len(b) + j
@@ -542,11 +533,10 @@ mul_backward :: proc(op: ml.Operation) {
 }
 
 div_forward :: proc(op: ml.Operation) {
-	a       := op.input
-	output  := op.output
-	variant := op.variant.(ml.Div)
-	b       := variant.b
-	stride  := variant.stride
+	a      := op.input
+	output := op.output
+	b      := op.variant.(ml.Div).b
+	stride := ml.len(a) / ml.len(b)
 
 	for i in 0 ..< stride {
 		for j in 0 ..< ml.len(b) {
@@ -558,11 +548,9 @@ div_forward :: proc(op: ml.Operation) {
 
 div_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
-
-	variant := op.variant.(ml.Div)
-	b       := variant.b
-
+	b      := op.variant.(ml.Div).b
 	stride := ml.len(a) / ml.len(b)
+
 	for i in 0 ..< stride {
 		for j in 0 ..< ml.len(b) {
 			o := i * ml.len(b) + j
@@ -668,11 +656,10 @@ max_backward :: proc(op: ml.Operation) {
 }
 
 mean_forward :: proc(op: ml.Operation) {
-	input   := op.input
-	output  := op.output
-	variant := op.variant.(ml.Mean)
-	size    := variant.size
-	count   := variant.count
+	input  := op.input
+	output := op.output
+	count  := ml.len(output)
+	size   := ml.len(input) / count
 
 	for sample in 0 ..< count {
 		sum: f32
@@ -686,10 +673,8 @@ mean_forward :: proc(op: ml.Operation) {
 
 mean_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
-
-	variant := op.variant.(ml.Mean)
-	size    := variant.size
-	count   := variant.count
+	count := ml.len(output)
+	size  := ml.len(input) / count
 
 	for sample in 0 ..< count {
 		gradient_per_element := gradient(output)[sample] / f32(size)
@@ -704,9 +689,8 @@ mean_backward :: proc(op: ml.Operation) {
 transpose_forward :: proc(op: ml.Operation) {
 	input   := op.input
 	output  := op.output
-	variant := op.variant.(ml.Transpose)
-	rows    := variant.rows
-	columns := ml.len(input) / rows
+	rows    := input.shape[0]
+	columns := input.shape[1]
 
 	for i in 0 ..< rows {
 		for j in 0 ..< columns {
@@ -717,11 +701,8 @@ transpose_forward :: proc(op: ml.Operation) {
 
 transpose_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
-
-	variant := op.variant.(ml.Transpose)
-	rows    := variant.rows
-
-	columns := ml.len(input) / rows
+	rows    := input.shape[0]
+	columns := input.shape[1]
 
 	for i in 0 ..< rows {
 		for j in 0 ..< columns {
@@ -733,9 +714,8 @@ transpose_backward :: proc(op: ml.Operation) {
 select_forward :: proc(op: ml.Operation) {
 	input   := op.input
 	output  := op.output
-	variant := op.variant.(ml.Select)
-	indices := variant.indices
-	size    := variant.size
+	indices := op.variant.(ml.Select).indices
+	size    := ml.len(output) / builtin.len(indices)
 
 	for i in 0 ..< builtin.len(indices) {
 		for j in 0 ..< size {
@@ -746,10 +726,8 @@ select_forward :: proc(op: ml.Operation) {
 
 select_backward :: proc(op: ml.Operation) {
 	weight, output := op.input, op.output
-
-	variant := op.variant.(ml.Select)
-	indices := variant.indices
-	size    := variant.size
+	indices := op.variant.(ml.Select).indices
+	size    := ml.len(output) / builtin.len(indices)
 
 	for i in 0 ..< builtin.len(indices) {
 		for j in 0 ..< size {
@@ -863,15 +841,14 @@ concat_backward :: proc(op: ml.Operation) {
 }
 
 linear_forward :: proc(op: ml.Operation) {
-	count := op.variant.(ml.Linear).count
+	weight := op.variant.(ml.Linear).weight
+	count  := ml.len(op.input) / weight.shape[1]
 
 	parallelize(count, count, op, proc(index: int, op: ml.Operation) {
 		input, output := op.input, op.output
-
-		variant     := op.variant.(ml.Linear)
-		weight      := variant.weight
-		input_size  := variant.input_size
-		output_size := variant.output_size
+		weight      := op.variant.(ml.Linear).weight
+		output_size := weight.shape[0]
+		input_size  := weight.shape[1]
 
 		input_ptr  := ([^]f32)(raw_data(data(input)))
 		output_ptr := ([^]f32)(raw_data(data(output)))
@@ -887,17 +864,17 @@ linear_forward :: proc(op: ml.Operation) {
 }
 
 linear_backward :: proc(op: ml.Operation) {
-	variant     := op.variant.(ml.Linear)
-	count       := variant.count
-	output_size := variant.output_size
+	weight      := op.variant.(ml.Linear).weight
+	output_size := weight.shape[0]
+	input_size  := weight.shape[1]
+	count       := ml.len(op.input) / input_size
 
 	parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
 		input, output := op.input, op.output
-		variant     := op.variant.(ml.Linear)
-		weight      := variant.weight
-		input_size  := variant.input_size
-		output_size := variant.output_size
-		count       := variant.count
+		weight      := op.variant.(ml.Linear).weight
+		output_size := weight.shape[0]
+		input_size  := weight.shape[1]
+		count       := ml.len(input) / input_size
 
 		input_data_ptr  := ([^]f32)(raw_data(data(input)))
 		output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
@@ -915,10 +892,9 @@ linear_backward :: proc(op: ml.Operation) {
 
 	parallelize(count, count, op, proc(b: int, op: ml.Operation) {
 		input, output := op.input, op.output
-		variant     := op.variant.(ml.Linear)
-		weight      := variant.weight
-		input_size  := variant.input_size
-		output_size := variant.output_size
+		weight      := op.variant.(ml.Linear).weight
+		output_size := weight.shape[0]
+		input_size  := weight.shape[1]
 
 		input_grad_ptr  := ([^]f32)(raw_data(gradient(input)))
 		output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
@@ -940,12 +916,12 @@ rope_forward :: proc(op: ml.Operation) {
 	input       := op.input
 	output      := op.output
 	variant     := op.variant.(ml.Rope)
-	token_count := variant.token_count
 	head_count  := variant.head_count
-	head_size   := variant.head_size
 	base        := variant.base
 	cos_cache   := variant.cos_cache
 	sin_cache   := variant.sin_cache
+	token_count := input.shape[0]
+	head_size   := input.shape[input.rank - 1] / head_count
 
 	for pos in 0 ..< token_count {
 		for i in 0 ..< head_size / 2 {
@@ -979,11 +955,11 @@ rope_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
 	variant     := op.variant.(ml.Rope)
-	token_count := variant.token_count
 	head_count  := variant.head_count
-	head_size   := variant.head_size
 	cos_cache   := variant.cos_cache
 	sin_cache   := variant.sin_cache
+	token_count := input.shape[0]
+	head_size   := input.shape[input.rank - 1] / head_count
 
 	for t in 0 ..< token_count {
 		for h in 0 ..< head_count {
@@ -1013,8 +989,8 @@ layernorm_forward :: proc(op: ml.Operation) {
 	weight  := variant.weight
 	mean    := variant.mean
 	rstd    := variant.rstd
-	count   := variant.count
-	size    := variant.size
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1051,8 +1027,8 @@ layernorm_backward :: proc(op: ml.Operation) {
 	weight  := variant.weight
 	mean    := variant.mean
 	rstd    := variant.rstd
-	count   := variant.count
-	size    := variant.size
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1086,11 +1062,10 @@ layernorm_backward :: proc(op: ml.Operation) {
 }
 
 softmax_forward :: proc(op: ml.Operation) {
-	input   := op.input
-	output  := op.output
-	variant := op.variant.(ml.Softmax)
-	size    := variant.size
-	count   := variant.count
+	input  := op.input
+	output := op.output
+	size   := input.shape[input.rank - 1]
+	count  := ml.len(input) / size
 
 	for sample in 0 ..< count {
 		// Find the maximum value for numerical stability.
@@ -1118,11 +1093,12 @@ softmax_forward :: proc(op: ml.Operation) {
 }
 
 softmax_backward :: proc(op: ml.Operation) {
-	count := op.variant.(ml.Softmax).count
+	size  := op.input.shape[op.input.rank - 1]
+	count := ml.len(op.input) / size
 
 	parallelize(count, count, op, proc(index: int, op: ml.Operation) {
 		input, output := op.input, op.output
-		size  := op.variant.(ml.Softmax).size
+		size  := input.shape[input.rank - 1]
 		base  := index * size
 
 		out_data := data(output)    [base:base + size]
@@ -1141,11 +1117,10 @@ softmax_backward :: proc(op: ml.Operation) {
 }
 
 log_softmax_forward :: proc(op: ml.Operation) {
-	input   := op.input
-	output  := op.output
-	variant := op.variant.(ml.Log_Softmax)
-	size    := variant.size
-	count   := variant.count
+	input  := op.input
+	output := op.output
+	size   := input.shape[input.rank - 1]
+	count  := ml.len(input) / size
 
 	for sample in 0 ..< count {
 		// Find the maximum value for numerical stability.
@@ -1173,10 +1148,8 @@ log_softmax_forward :: proc(op: ml.Operation) {
 
 log_softmax_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
-
-	variant := op.variant.(ml.Log_Softmax)
-	size    := variant.size
-	count   := variant.count
+	size  := input.shape[input.rank - 1]
+	count := ml.len(input) / size
 
 	for sample in 0 ..< count {
 		gradient_sum: f32
@@ -1195,9 +1168,8 @@ log_softmax_backward :: proc(op: ml.Operation) {
 entropy_forward :: proc(op: ml.Operation) {
 	probabilities := op.input
 	output        := op.output
-	variant       := op.variant.(ml.Entropy)
-	size          := variant.size
-	count         := variant.count
+	size          := probabilities.shape[probabilities.rank - 1]
+	count         := ml.len(probabilities) / size
 
 	for sample in 0 ..< count {
 		entropy_value: f32
@@ -1216,10 +1188,8 @@ entropy_forward :: proc(op: ml.Operation) {
 
 entropy_backward :: proc(op: ml.Operation) {
 	probabilities, output := op.input, op.output
-
-	variant := op.variant.(ml.Entropy)
-	size    := variant.size
-	count   := variant.count
+	size  := probabilities.shape[probabilities.rank - 1]
+	count := ml.len(probabilities) / size
 
 	for sample in 0 ..< count {
 		for i in 0 ..< size {
@@ -1237,9 +1207,8 @@ entropy_backward :: proc(op: ml.Operation) {
 mean_squared_error_forward :: proc(op: ml.Operation) {
 	predictions := op.input
 	output      := op.output
-	variant     := op.variant.(ml.Mean_Squared_Error)
-	targets     := variant.targets
-	count       := variant.count
+	targets     := op.variant.(ml.Mean_Squared_Error).targets
+	count       := ml.len(output)
 	sample_size := ml.len(predictions) / count
 
 	for sample in 0 ..< count {
@@ -1257,11 +1226,8 @@ mean_squared_error_forward :: proc(op: ml.Operation) {
 
 mean_squared_error_backward :: proc(op: ml.Operation) {
 	predictions, output := op.input, op.output
-
-	variant := op.variant.(ml.Mean_Squared_Error)
-	targets := variant.targets
-	count   := variant.count
-
+	targets := op.variant.(ml.Mean_Squared_Error).targets
+	count   := ml.len(output)
 	sample_size := ml.len(predictions) / count
 
 	for sample in 0 ..< count {
@@ -1283,7 +1249,7 @@ cross_entropy_forward :: proc(op: ml.Operation) {
 	variant       := op.variant.(ml.Cross_Entropy)
 	probabilities := variant.probabilities
 	targets       := variant.targets
-	class_size    := variant.class_size
+	class_size    := input.shape[input.rank - 1]
 
 	for sample in 0 ..< builtin.len(targets) {
 		offset := sample * class_size
@@ -1323,7 +1289,7 @@ cross_entropy_backward :: proc(op: ml.Operation) {
 	variant       := op.variant.(ml.Cross_Entropy)
 	probabilities := variant.probabilities
 	targets       := variant.targets
-	class_size    := variant.class_size
+	class_size    := input.shape[input.rank - 1]
 
 	for sample in 0 ..< builtin.len(targets) {
 		offset := sample * class_size
@@ -1455,17 +1421,18 @@ tanh_backward :: proc(op: ml.Operation) {
 }
 
 batched_matmul_forward :: proc(op: ml.Operation) {
-	variant := op.variant.(ml.Batched_Matmul)
+	a := op.input
+	batch_count := a.shape[0]
+	m := a.shape[1]
 
-	parallelize(variant.batch_count * variant.m, variant.batch_count * variant.m, op, proc(idx: int, op: ml.Operation) {
+	parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
 		a       := op.input
 		output  := op.output
-		variant := op.variant.(ml.Batched_Matmul)
-		bt      := variant.b
+		bt      := op.variant.(ml.Batched_Matmul).b
 
-		m := variant.m
-		kk_count := variant.k
-		n := variant.n
+		m        := a.shape[1]
+		kk_count := a.shape[2]
+		n        := bt.shape[2]
 
 		bi := idx / m
 		i  := idx % m
@@ -1485,17 +1452,19 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 }
 
 batched_matmul_backward :: proc(op: ml.Operation) {
-	variant := op.variant.(ml.Batched_Matmul)
+	a := op.input
+	batch_count := a.shape[0]
+	m := a.shape[1]
+	k := a.shape[2]
 
-	parallelize(variant.batch_count * variant.m, variant.batch_count * variant.m, op, proc(idx: int, op: ml.Operation) {
+	parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
 		a       := op.input
 		output  := op.output
-		variant := op.variant.(ml.Batched_Matmul)
-		bt      := variant.b
+		bt      := op.variant.(ml.Batched_Matmul).b
 
-		m := variant.m
-		kk_count := variant.k
-		n := variant.n
+		m        := a.shape[1]
+		kk_count := a.shape[2]
+		n        := bt.shape[2]
 
 		bi := idx / m
 		i  := idx % m
@@ -1513,15 +1482,14 @@ batched_matmul_backward :: proc(op: ml.Operation) {
 		}
 	})
 
-	parallelize(variant.batch_count * variant.k, variant.batch_count * variant.k, op, proc(idx: int, op: ml.Operation) {
+	parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
 		a       := op.input
 		output  := op.output
-		variant := op.variant.(ml.Batched_Matmul)
-		bt      := variant.b
+		bt      := op.variant.(ml.Batched_Matmul).b
 
-		m := variant.m
-		kk_count := variant.k
-		n := variant.n
+		m        := a.shape[1]
+		kk_count := a.shape[2]
+		n        := bt.shape[2]
 
 		bi := idx / kk_count
 		kk := idx % kk_count
@@ -1640,9 +1608,9 @@ attention_forward :: proc(op: ml.Operation) {
 	parallelize(head_count, head_count, op, proc(h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
-		head_size    := v.head_size
-		token_count  := v.token_count
-		embed_size   := v.embed_size
+		token_count  := op.input.shape[0]
+		embed_size   := op.output.shape[1]
+		head_size    := embed_size / v.head_count
 		causal       := v.causal
 		input_stride := 3 * embed_size
 		inv_sqrt_d   := 1.0 / math.sqrt(f32(head_size))
@@ -1702,9 +1670,9 @@ attention_backward :: proc(op: ml.Operation) {
 	parallelize(head_count, head_count, op, proc(h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
-		head_size    := v.head_size
-		token_count  := v.token_count
-		embed_size   := v.embed_size
+		token_count  := op.input.shape[0]
+		embed_size   := op.output.shape[1]
+		head_size    := embed_size / v.head_count
 		causal       := v.causal
 		input_stride := 3 * embed_size
 		inv_sqrt_d   := 1.0 / math.sqrt(f32(head_size))

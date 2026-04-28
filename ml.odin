@@ -433,9 +433,6 @@ backward :: proc(loc := #caller_location) {
 
 Attention :: struct {
 	head_count:      int,
-	head_size:       int,
-	token_count:     int,
-	embed_size:      int,
 	causal:          bool,
 	softmax_outputs: Tensor,
 	d_p_scratch:     Tensor,
@@ -454,8 +451,6 @@ attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller
 	embed_size := input_size / 3
 	assert(embed_size % head_count == 0, "Output size must be divisible by head count", loc=loc)
 
-	head_size := embed_size / head_count
-
 	output           = zeros({token_count, embed_size}, loc=loc)
 	softmax_outputs := zeros({head_count, token_count, token_count}, loc=loc)
 	d_p_scratch     := zeros({head_count, token_count}, loc=loc)
@@ -467,9 +462,6 @@ attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller
 		output  = output,
 		variant = Attention{
 			head_count      = head_count,
-			head_size       = head_size,
-			token_count     = token_count,
-			embed_size      = embed_size,
 			causal          = causal,
 			softmax_outputs = softmax_outputs,
 			d_p_scratch     = d_p_scratch,
@@ -484,8 +476,7 @@ attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller
 }
 
 Add :: struct {
-	b:      Tensor,
-	stride: int,
+	b: Tensor,
 }
 
 @(require_results)
@@ -497,10 +488,7 @@ add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Add{
-			b      = b,
-			stride = len(a) / len(b),
-		},
+		variant = Add{b = b},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -509,8 +497,7 @@ add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 }
 
 Sub :: struct {
-	b:      Tensor,
-	stride: int,
+	b: Tensor,
 }
 
 @(require_results)
@@ -522,10 +509,7 @@ sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Sub{
-			b      = b,
-			stride = len(a) / len(b),
-		},
+		variant = Sub{b = b},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -534,8 +518,7 @@ sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 }
 
 Mul :: struct {
-	b:      Tensor,
-	stride: int,
+	b: Tensor,
 }
 
 @(require_results)
@@ -547,10 +530,7 @@ mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Mul{
-			b      = b,
-			stride = len(a) / len(b),
-		},
+		variant = Mul{b = b},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -559,8 +539,7 @@ mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 }
 
 Div :: struct {
-	b:      Tensor,
-	stride: int,
+	b: Tensor,
 }
 
 @(require_results)
@@ -572,10 +551,7 @@ div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Div{
-			b      = b,
-			stride = len(a) / len(b),
-		},
+		variant = Div{b = b},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -672,24 +648,16 @@ max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	return
 }
 
-Mean :: struct {
-	size:  int,
-	count: int,
-}
+Mean :: struct {}
 
 @(require_results)
 mean :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
-	count := _leading_count(input)
-	size  := len(input) / count
 	output = _zeros_drop_last(input, loc=loc)
 
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Mean{
-			size  = size,
-			count = count,
-		},
+		variant = Mean{},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -697,9 +665,7 @@ mean :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 	return
 }
 
-Transpose :: struct {
-	rows: int,
-}
+Transpose :: struct {}
 
 @(require_results)
 transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
@@ -713,9 +679,7 @@ transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Transpose{
-			rows = rows,
-		},
+		variant = Transpose{},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -725,17 +689,11 @@ transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 
 Select :: struct {
 	indices: []int,
-	size:    int,
 }
 
 @(require_results)
 select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 1, "select input must have rank >= 1", loc=loc)
-
-	size := 1
-	for i in 1 ..< input.rank {
-		size *= input.shape[i]
-	}
 
 	indices_copy := builtin.make([]int, builtin.len(indices), allocator=op_arena_allocator())
 	for i in 0 ..< builtin.len(indices) {
@@ -750,8 +708,7 @@ select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (outpu
 		input   = input,
 		output  = output,
 		variant = Select{
-			indices  = indices_copy,
-			size     = size,
+			indices = indices_copy,
 		}
 	}
 	_current_ctx.vtable.forward(op, loc)
@@ -851,10 +808,7 @@ concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 }
 
 Linear :: struct {
-	weight:      Tensor,
-	input_size:  int,
-	output_size: int,
-	count:       int,
+	weight: Tensor,
 }
 
 @(require_results)
@@ -866,17 +820,13 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 	input_size  := weight.shape[1]
 	assert(input.shape[input.rank - 1] == input_size, "Input trailing dim must equal weight's input dim", loc=loc)
 
-	count := _leading_count(input)
 	output = _zeros_replace_trailing(input, output_size, loc=loc)
 
 	op := Operation{
 		input   = input,
 		output  = output,
 		variant = Linear{
-			weight      = weight,
-			input_size  = input_size,
-			output_size = output_size,
-			count       = count,
+			weight = weight,
 		}
 	}
 	_current_ctx.vtable.forward(op, loc)
@@ -886,10 +836,8 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 }
 
 Rope :: struct {
-	token_count: int,
-	head_count:  int,
-	head_size:   int,
-	base:        f32,
+	head_count: int,
+	base:       f32,
 
 	cos_cache: Tensor,
 	sin_cache: Tensor,
@@ -915,12 +863,10 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_l
 		input   = input,
 		output  = output,
 		variant = Rope{
-			token_count = token_count,
-			head_count  = head_count,
-			head_size   = head_size,
-			base        = base,
-			cos_cache   = cos_cache,
-			sin_cache   = sin_cache,
+			head_count = head_count,
+			base       = base,
+			cos_cache  = cos_cache,
+			sin_cache  = sin_cache,
 		},
 	}
 	_current_ctx.vtable.forward(op, loc)
@@ -933,8 +879,6 @@ Layernorm :: struct {
 	weight: Tensor,
 	mean:   Tensor,
 	rstd:   Tensor,
-	count:  int,
-	size:   int,
 }
 
 @(require_results)
@@ -943,7 +887,6 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 	assert(weight.shape[0] == input.shape[input.rank - 1], "layernorm weight length must equal input's trailing dim", loc=loc)
 
 	count := _leading_count(input)
-	size  := input.shape[input.rank - 1]
 
 	mean := zeros({count}, loc=loc)
 	rstd := zeros({count}, loc=loc)
@@ -957,8 +900,6 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 			weight = weight,
 			mean   = mean,
 			rstd   = rstd,
-			count  = count,
-			size   = size,
 		},
 	}
 	_current_ctx.vtable.forward(op, loc)
@@ -967,25 +908,16 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 	return
 }
 
-Softmax :: struct {
-	size:  int,
-	count: int,
-}
+Softmax :: struct {}
 
 @(require_results)
 softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
-	count := _leading_count(input)
-	size  := input.shape[input.rank - 1]
-
 	output = zeros_like(input, loc=loc)
 
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Softmax{
-			size  = size,
-			count = count,
-		},
+		variant = Softmax{},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -993,25 +925,16 @@ softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 	return
 }
 
-Log_Softmax :: struct {
-	size:  int,
-	count: int,
-}
+Log_Softmax :: struct {}
 
 @(require_results)
 log_softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
-	count := _leading_count(input)
-	size  := input.shape[input.rank - 1]
-
 	output = zeros_like(input, loc=loc)
 
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Log_Softmax{
-			size  = size,
-			count = count,
-		},
+		variant = Log_Softmax{},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -1019,25 +942,16 @@ log_softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 	return
 }
 
-Entropy :: struct {
-	size:  int,
-	count: int,
-}
+Entropy :: struct {}
 
 @(require_results)
 entropy :: proc(probabilities: Tensor, loc := #caller_location) -> (output: Tensor) {
-	count := _leading_count(probabilities)
-	size  := probabilities.shape[probabilities.rank - 1]
-
 	output = _zeros_drop_last(probabilities, loc=loc)
 
 	op := Operation{
 		input   = probabilities,
 		output  = output,
-		variant = Entropy{
-			size  = size,
-			count = count,
-		},
+		variant = Entropy{},
 	}
 	_current_ctx.vtable.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -1047,14 +961,11 @@ entropy :: proc(probabilities: Tensor, loc := #caller_location) -> (output: Tens
 
 Mean_Squared_Error :: struct {
 	targets: Tensor,
-	count:   int,
 }
 
 @(require_results)
 mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(predictions) == len(targets), "Predictions and targets must have same length", loc=loc)
-
-	count := _leading_count(predictions)
 
 	output = _zeros_drop_last(predictions, loc=loc)
 
@@ -1063,7 +974,6 @@ mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location
 		output  = output,
 		variant = Mean_Squared_Error{
 			targets = targets,
-			count   = count,
 		},
 	}
 	_current_ctx.vtable.forward(op, loc)
@@ -1075,7 +985,6 @@ mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location
 Cross_Entropy :: struct {
 	probabilities: Tensor,
 	targets:       []int,
-	class_size:    int,
 }
 
 // Cross entropy performs softmax internally, so it expects the input
@@ -1104,7 +1013,6 @@ cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) ->
 		variant = Cross_Entropy{
 			probabilities = probabilities,
 			targets       = targets_copy,
-			class_size    = class_size,
 		},
 	}
 	_current_ctx.vtable.forward(op, loc)
@@ -1204,11 +1112,7 @@ tanh :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 }
 
 Batched_Matmul :: struct {
-	b:           Tensor,
-	batch_count: int,
-	m:           int,
-	k:           int,
-	n:           int,
+	b: Tensor,
 }
 
 @(require_results)
@@ -1219,7 +1123,6 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 
 	batch_count := a.shape[0]
 	m           := a.shape[1]
-	k           := a.shape[2]
 	n           := b.shape[2]
 
 	output = zeros({batch_count, m, n}, loc=loc)
@@ -1228,11 +1131,7 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 		input   = a,
 		output  = output,
 		variant = Batched_Matmul{
-			b           = b,
-			batch_count = batch_count,
-			m           = m,
-			k           = k,
-			n           = n,
+			b = b,
 		},
 	}
 	_current_ctx.vtable.forward(op, loc)
