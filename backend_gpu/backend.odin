@@ -10,17 +10,17 @@ import vk "vendor:vulkan"
 import ml ".."
 
 _backend := ml.Backend_VTable{
-	init         = init,
-	destroy      = destroy,
-	clear        = clear,
-	forward      = forward,
-	backward     = backward,
-	update       = update,
-	buffer_alloc = buffer_alloc,
-	buffer_free  = buffer_free,
-	buffer_get   = buffer_get,
-	buffer_set   = buffer_set,
-	buffer_copy  = buffer_copy,
+	init            = init,
+	destroy         = destroy,
+	clear           = clear,
+	forward         = forward,
+	backward        = backward,
+	update          = update,
+	buffer_alloc    = buffer_alloc,
+	buffer_free     = buffer_free,
+	buffer_get      = buffer_get,
+	buffer_set      = buffer_set,
+	buffer_copy     = buffer_copy,
 }
 
 // Lazy-init Vulkan and return the vtable. Wire into ml via:
@@ -252,6 +252,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Batched_Matmul:     batched_matmul_forward     (op)
 	case ml.Permute:            permute_forward            (op)
 	case ml.Causal_Mask:        causal_mask_forward        (op)
+	case ml.Attention:          attention_forward          (op)
 	}
 }
 
@@ -287,6 +288,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Batched_Matmul:     batched_matmul_backward    (op)
 	case ml.Permute:            permute_backward           (op)
 	case ml.Causal_Mask:        causal_mask_backward       (op)
+	case ml.Attention:          attention_backward         (op)
 	}
 }
 
@@ -1183,6 +1185,68 @@ causal_mask_backward :: proc(op: ml.Operation) {
 	params := Causal_Mask_Params{total = u32(ml.len(x)), T = u32(T)}
 	bufs   := [2]vk.Buffer{gradient(x).buffer, gradient(y).buffer}
 	_dispatch(_causal_mask_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+}
+
+attention_forward :: proc(op: ml.Operation) {
+	x := op.input; y := op.output
+	v := op.variant.(ml.Attention)
+	fmt.assertf(v.head_size <= 256, "GPU attention currently caps head_size at 256 (got %v)", v.head_size)
+
+	if _attention_pipeline == nil {
+		_attention_pipeline = _make_pipeline(ATTENTION_SPIRV, 3, size_of(Attention_Params))
+	}
+	params := Attention_Params{
+		head_count  = u32(v.head_count),
+		head_size   = u32(v.head_size),
+		token_count = u32(v.token_count),
+		embed_size  = u32(v.embed_size),
+		causal      = v.causal ? 1 : 0,
+	}
+	bufs := [3]vk.Buffer{data(x).buffer, data(y).buffer, data(v.lse).buffer}
+	_dispatch(_attention_pipeline, bufs[:], &params, u32(v.head_count), u32(v.token_count))
+}
+
+attention_backward :: proc(op: ml.Operation) {
+	x := op.input; y := op.output
+	v := op.variant.(ml.Attention)
+
+	if _attention_back_d_pipeline == nil {
+		_attention_back_d_pipeline = _make_pipeline(ATTENTION_BACK_D_SPIRV, 3, size_of(Attention_Back_D_Params))
+	}
+	if _attention_back_kv_pipeline == nil {
+		_attention_back_kv_pipeline = _make_pipeline(ATTENTION_BACK_KV_SPIRV, 5, size_of(Attention_Params))
+	}
+	if _attention_back_q_pipeline == nil {
+		_attention_back_q_pipeline = _make_pipeline(ATTENTION_BACK_Q_SPIRV, 5, size_of(Attention_Params))
+	}
+
+	d_params := Attention_Back_D_Params{
+		head_count  = u32(v.head_count),
+		head_size   = u32(v.head_size),
+		token_count = u32(v.token_count),
+		embed_size  = u32(v.embed_size),
+	}
+	d_bufs := [3]vk.Buffer{data(y).buffer, gradient(y).buffer, data(v.d_acc).buffer}
+	_dispatch(_attention_back_d_pipeline, d_bufs[:], &d_params, u32(v.head_count), u32(v.token_count))
+
+	bk_params := Attention_Params{
+		head_count  = u32(v.head_count),
+		head_size   = u32(v.head_size),
+		token_count = u32(v.token_count),
+		embed_size  = u32(v.embed_size),
+		causal      = v.causal ? 1 : 0,
+	}
+	kv_bufs := [5]vk.Buffer{
+		data(x).buffer, gradient(y).buffer, data(v.lse).buffer,
+		data(v.d_acc).buffer, gradient(x).buffer,
+	}
+	_dispatch(_attention_back_kv_pipeline, kv_bufs[:], &bk_params, u32(v.head_count), u32(v.token_count))
+
+	q_bufs := [5]vk.Buffer{
+		data(x).buffer, gradient(y).buffer, data(v.lse).buffer,
+		data(v.d_acc).buffer, gradient(x).buffer,
+	}
+	_dispatch(_attention_back_q_pipeline, q_bufs[:], &bk_params, u32(v.head_count), u32(v.token_count))
 }
 
 _upload_indices :: proc(indices: []int, loc := #caller_location) -> (buf: vk.Buffer, m: vk.DeviceMemory) {

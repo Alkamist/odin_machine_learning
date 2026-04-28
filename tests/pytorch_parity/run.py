@@ -57,9 +57,9 @@ def assert_close(name: str, actual: np.ndarray, expected: np.ndarray) -> None:
         )
 
 
-def run_runner(test_name: str, test_dir: Path, threads: int = 1) -> None:
+def run_runner(test_name: str, test_dir: Path, *, backend: str = "cpu", threads: int = 1) -> None:
     result = subprocess.run(
-        [str(RUNNER_EXE), test_name, str(test_dir), str(threads)],
+        [str(RUNNER_EXE), backend, test_name, str(test_dir), str(threads)],
         capture_output=True,
         text=True,
     )
@@ -403,23 +403,27 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--threads", type=int, nargs="+", default=[1, 8])
+    parser.add_argument("--backends", nargs="+", default=["cpu"], choices=["cpu", "gpu"])
     args = parser.parse_args()
 
     fails = 0
     total = 0
-    for thread_count in args.threads:
-        print(f"--- thread_count = {thread_count} ---")
-        for name, gen, verify in TESTS:
-            total += 1
-            try:
-                test_dir, refs = gen()
-                run_runner(name, test_dir, threads=thread_count)
-                verify(test_dir, refs)
-                print(f"  PASS  {name}")
-            except Exception as e:
-                print(f"  FAIL  {name}: {e}")
-                fails += 1
-        print()
+    for backend in args.backends:
+        thread_counts = args.threads if backend == "cpu" else [1]
+        for thread_count in thread_counts:
+            label = f"backend={backend}" if backend == "gpu" else f"backend={backend} threads={thread_count}"
+            print(f"--- {label} ---")
+            for name, gen, verify in TESTS:
+                total += 1
+                try:
+                    test_dir, refs = gen()
+                    run_runner(name, test_dir, backend=backend, threads=thread_count)
+                    verify(test_dir, refs)
+                    print(f"  PASS  {name}")
+                except Exception as e:
+                    print(f"  FAIL  {name}: {e}")
+                    fails += 1
+            print()
 
     print(f"{total - fails}/{total} passed")
     return 1 if fails else 0

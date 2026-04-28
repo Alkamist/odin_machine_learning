@@ -408,6 +408,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Batched_Matmul:     batched_matmul_forward     (op)
 	case ml.Permute:            permute_forward            (op)
 	case ml.Causal_Mask:        causal_mask_forward        (op)
+	case ml.Attention:          attention_forward          (op)
 	}
 }
 
@@ -443,6 +444,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Batched_Matmul:     batched_matmul_backward    (op)
 	case ml.Permute:            permute_backward           (op)
 	case ml.Causal_Mask:        causal_mask_backward       (op)
+	case ml.Attention:          attention_backward         (op)
 	}
 }
 
@@ -1630,4 +1632,125 @@ causal_mask_backward :: proc(op: ml.Operation) {
 			}
 		}
 	}
+}
+
+attention_forward :: proc(op: ml.Operation) {
+	head_count := op.variant.(ml.Attention).head_count
+
+	parallelize(head_count, head_count, op, proc(h: int, op: ml.Operation) {
+		v := op.variant.(ml.Attention)
+
+		head_size    := v.head_size
+		token_count  := v.token_count
+		embed_size   := v.embed_size
+		causal       := v.causal
+		input_stride := 3 * embed_size
+		inv_sqrt_d   := 1.0 / math.sqrt(f32(head_size))
+
+		in_ptr  := ([^]f32)(raw_data(data(op.input)))
+		out_ptr := ([^]f32)(raw_data(data(op.output)))
+		sm_ptr  := ([^]f32)(raw_data(data(v.softmax_outputs)))
+
+		for t_q in 0 ..< token_count {
+			q_offset := t_q * input_stride + h * head_size
+			q := in_ptr[q_offset:]
+
+			sm_row_offset := h * token_count * token_count + t_q * token_count
+			sm_row := sm_ptr[sm_row_offset:]
+
+			t_k_max := token_count
+			if causal { t_k_max = t_q + 1 }
+
+			max_score := math.NEG_INF_F32
+			for t_k in 0 ..< t_k_max {
+				k_offset := t_k * input_stride + embed_size + h * head_size
+				k := in_ptr[k_offset:]
+				score := _simd_dot_f32(q, k, head_size) * inv_sqrt_d
+				sm_row[t_k] = score
+				if score > max_score { max_score = score }
+			}
+
+			sum_exp: f32
+			for t_k in 0 ..< t_k_max {
+				e := math.exp(sm_row[t_k] - max_score)
+				sm_row[t_k] = e
+				sum_exp += e
+			}
+			inv_sum := 1.0 / sum_exp
+			for t_k in 0 ..< t_k_max {
+				sm_row[t_k] *= inv_sum
+			}
+			for t_k in t_k_max ..< token_count {
+				sm_row[t_k] = 0
+			}
+
+			out_offset := t_q * embed_size + h * head_size
+			for d in 0 ..< head_size {
+				out_ptr[out_offset + d] = 0
+			}
+			for t_k in 0 ..< t_k_max {
+				v_offset := t_k * input_stride + 2 * embed_size + h * head_size
+				_simd_axpy_f32(out_ptr[out_offset:], in_ptr[v_offset:], sm_row[t_k], head_size)
+			}
+		}
+	})
+}
+
+attention_backward :: proc(op: ml.Operation) {
+	head_count := op.variant.(ml.Attention).head_count
+
+	parallelize(head_count, head_count, op, proc(h: int, op: ml.Operation) {
+		v := op.variant.(ml.Attention)
+
+		head_size    := v.head_size
+		token_count  := v.token_count
+		embed_size   := v.embed_size
+		causal       := v.causal
+		input_stride := 3 * embed_size
+		inv_sqrt_d   := 1.0 / math.sqrt(f32(head_size))
+
+		in_data_ptr  := ([^]f32)(raw_data(data(op.input)))
+		in_grad_ptr  := ([^]f32)(raw_data(gradient(op.input)))
+		out_grad_ptr := ([^]f32)(raw_data(gradient(op.output)))
+		sm_ptr       := ([^]f32)(raw_data(data(v.softmax_outputs)))
+		dp_ptr       := ([^]f32)(raw_data(data(v.d_p_scratch)))
+
+		dp_base := h * token_count
+		d_p     := dp_ptr[dp_base:]
+
+		for t_q in 0 ..< token_count {
+			t_k_max := token_count
+			if causal { t_k_max = t_q + 1 }
+
+			d_out_offset := t_q * embed_size + h * head_size
+			d_out := out_grad_ptr[d_out_offset:]
+
+			sm_row_offset := h * token_count * token_count + t_q * token_count
+			sm_row := sm_ptr[sm_row_offset:]
+
+			for t_k in 0 ..< t_k_max {
+				v_offset := t_k * input_stride + 2 * embed_size + h * head_size
+				d_p[t_k] = _simd_dot_f32(d_out, in_data_ptr[v_offset:], head_size)
+				_simd_axpy_f32(in_grad_ptr[v_offset:], d_out, sm_row[t_k], head_size)
+			}
+
+			dot_dp_p: f32
+			for t_k in 0 ..< t_k_max {
+				dot_dp_p += d_p[t_k] * sm_row[t_k]
+			}
+			for t_k in 0 ..< t_k_max {
+				d_p[t_k] = sm_row[t_k] * (d_p[t_k] - dot_dp_p) * inv_sqrt_d
+			}
+
+			q_offset := t_q * input_stride + h * head_size
+			d_q_vec  := in_grad_ptr[q_offset:]
+			q_vec    := in_data_ptr[q_offset:]
+
+			for t_k in 0 ..< t_k_max {
+				k_offset := t_k * input_stride + embed_size + h * head_size
+				_simd_axpy_f32(d_q_vec, in_data_ptr[k_offset:], d_p[t_k], head_size)
+				_simd_axpy_f32(in_grad_ptr[k_offset:], q_vec,  d_p[t_k], head_size)
+			}
+		}
+	})
 }

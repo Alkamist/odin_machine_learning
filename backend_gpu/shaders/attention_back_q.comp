@@ -1,0 +1,108 @@
+// Backward for Q (per query position).
+//   x:     [T, 3*E]    forward input (Q | K | V)
+//   d_o:   [T, E]      upstream gradient on output
+//   lse:   [H, T]      saved log-sum-exp from forward
+//   d_acc: [H, T]      precomputed dot(d_O, O) per (head, query)
+//   d_x:   [T, 3*E]    accumulating input gradient (we touch the Q slab)
+//
+// One workgroup per (head, query). For each key t_k in the valid range
+// (causal: t_k <= t_q), recompute the score, derive p and d_S, and
+// accumulate d_Q[t_q].
+#version 450
+
+#define WG 64
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly buffer X  { float x[]; };
+layout(set = 0, binding = 1) readonly buffer DO { float dout[]; };
+layout(set = 0, binding = 2) readonly buffer L  { float lse[]; };
+layout(set = 0, binding = 3) readonly buffer DA { float d_acc[]; };
+layout(set = 0, binding = 4)          buffer DX { float dx[]; };
+
+layout(push_constant) uniform Params {
+    uint head_count;
+    uint head_size;
+    uint token_count;
+    uint embed_size;
+    uint causal;
+} p;
+
+shared float q_shared[256];
+shared float do_shared[256];
+shared float partial[WG];
+shared float scratch[2];
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint t_q  = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+
+    uint D      = p.head_size;
+    uint T      = p.token_count;
+    uint E      = p.embed_size;
+    uint stride = 3u * E;
+    float inv_sqrt_d = inversesqrt(float(D));
+
+    uint q_base  = t_q * stride + h * D;
+    uint do_base = t_q * E + h * D;
+
+    for (uint d = tid; d < D; d += WG) {
+        q_shared[d]  = x[q_base + d];
+        do_shared[d] = dout[do_base + d];
+    }
+    barrier();
+
+    float lse_q = lse[h * T + t_q];
+    float dac_q = d_acc[h * T + t_q];
+
+    float d_q_acc = 0.0;
+    uint  my_d    = tid;
+
+    uint t_k_max = (p.causal != 0u) ? (t_q + 1u) : T;
+    for (uint t_k = 0u; t_k < t_k_max; t_k += 1u) {
+        uint k_base = t_k * stride + E + h * D;
+        uint v_base = t_k * stride + 2u * E + h * D;
+
+        float s_part = 0.0;
+        for (uint d = tid; d < D; d += WG) {
+            s_part += q_shared[d] * x[k_base + d];
+        }
+        partial[tid] = s_part;
+        barrier();
+        for (uint st = WG / 2u; st > 0u; st >>= 1) {
+            if (tid < st) partial[tid] += partial[tid + st];
+            barrier();
+        }
+        if (tid == 0u) scratch[0] = partial[0];
+        barrier();
+        float raw_score = scratch[0];
+        barrier();
+
+        float dp_part = 0.0;
+        for (uint d = tid; d < D; d += WG) {
+            dp_part += do_shared[d] * x[v_base + d];
+        }
+        partial[tid] = dp_part;
+        barrier();
+        for (uint st = WG / 2u; st > 0u; st >>= 1) {
+            if (tid < st) partial[tid] += partial[tid + st];
+            barrier();
+        }
+        if (tid == 0u) scratch[1] = partial[0];
+        barrier();
+        float d_P = scratch[1];
+
+        float p_val   = exp(raw_score * inv_sqrt_d - lse_q);
+        float d_S_inv = p_val * (d_P - dac_q) * inv_sqrt_d;
+
+        if (my_d < D) {
+            d_q_acc += d_S_inv * x[k_base + my_d];
+        }
+        barrier();
+    }
+
+    if (my_d < D) {
+        dx[q_base + my_d] += d_q_acc;
+    }
+}

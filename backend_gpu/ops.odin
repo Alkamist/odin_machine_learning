@@ -84,6 +84,21 @@ Causal_Mask_Params :: struct { total, T: u32 }
 _causal_mask_pipeline:      ^Pipeline
 _causal_mask_back_pipeline: ^Pipeline
 
+ATTENTION_SPIRV         :: #load("shaders/attention.spv",         []u8)
+ATTENTION_BACK_D_SPIRV  :: #load("shaders/attention_back_d.spv",  []u8)
+ATTENTION_BACK_KV_SPIRV :: #load("shaders/attention_back_kv.spv", []u8)
+ATTENTION_BACK_Q_SPIRV  :: #load("shaders/attention_back_q.spv",  []u8)
+Attention_Params :: struct {
+	head_count, head_size, token_count, embed_size, causal: u32,
+}
+Attention_Back_D_Params :: struct {
+	head_count, head_size, token_count, embed_size: u32,
+}
+_attention_pipeline:         ^Pipeline
+_attention_back_d_pipeline:  ^Pipeline
+_attention_back_kv_pipeline: ^Pipeline
+_attention_back_q_pipeline:  ^Pipeline
+
 SELECT_SPIRV      :: #load("shaders/select.spv",      []u8)
 SELECT_BACK_SPIRV :: #load("shaders/select_back.spv", []u8)
 Select_Params      :: struct { n_indices, size: u32 }

@@ -10,30 +10,45 @@ import "core:path/filepath"
 
 import ml  "../../.."
 import cpu "../../../backend_cpu"
+import gpu "../../../backend_gpu"
 import mlp "../../../mlp"
 
 MAGIC :: "TNSR"
 
 main :: proc() {
-	if builtin.len(os.args) < 3 || builtin.len(os.args) > 4 {
-		fmt.eprintln("usage: runner <test_name> <artifacts_dir> [thread_count]")
+	if builtin.len(os.args) < 4 || builtin.len(os.args) > 5 {
+		fmt.eprintln("usage: runner <backend:cpu|gpu> <test_name> <artifacts_dir> [thread_count]")
 		os.exit(1)
 	}
-	test_name     := os.args[1]
-	artifacts_dir := os.args[2]
+	backend_name  := os.args[1]
+	test_name     := os.args[2]
+	artifacts_dir := os.args[3]
 	thread_count  := 1
-	if builtin.len(os.args) == 4 {
-		parsed, ok := strconv.parse_int(os.args[3])
+	if builtin.len(os.args) == 5 {
+		parsed, ok := strconv.parse_int(os.args[4])
 		if ok {
 			thread_count = parsed
 		}
 	}
 
-	ctx := ml.context_create(64 * 1024 * 1024, &cpu.backend)
+	vtable: ^ml.Backend_VTable
+	switch backend_name {
+	case "cpu":
+		vtable = &cpu.backend
+	case "gpu":
+		vtable = gpu.backend()
+	case:
+		fmt.eprintfln("unknown backend: %v (expected cpu or gpu)", backend_name)
+		os.exit(1)
+	}
+
+	ctx := ml.context_create(64 * 1024 * 1024, vtable)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	cpu.set_thread_count(thread_count)
+	if backend_name == "cpu" {
+		cpu.set_thread_count(thread_count)
+	}
 
 	switch test_name {
 	case "add_equal":      run_binary_op(artifacts_dir, .Add)

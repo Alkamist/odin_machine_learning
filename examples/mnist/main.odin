@@ -27,6 +27,7 @@ main :: proc() {
 	// ctx := ml.context_create(1024 * 1024, gpu.backend())
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
+
 	cpu.set_thread_count(24)
 
 	model := model_make()

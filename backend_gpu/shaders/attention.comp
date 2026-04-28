@@ -1,0 +1,104 @@
+// Fused single-head attention forward, matching CPU `attention_forward`.
+//   x:   [T, 3*E]  packed [Q | K | V] on trailing dim
+//   o:   [T, E]    output
+//   lse: [H, T]    log-sum-exp per (head, query), saved for backward
+//
+// One workgroup per (head, query). Threads parallelize over the head dim
+// for the final O = softmax @ V accumulation; per-key score reduction
+// is done collaboratively. Scores live in shared memory (size MAX_T)
+// and are never written to global, so the [T, T] matrix is never
+// materialized.
+#version 450
+
+#define WG    64
+#define MAX_T 4096
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(set = 0, binding = 2) writeonly buffer L { float lse[]; };
+
+layout(push_constant) uniform Params {
+    uint head_count;
+    uint head_size;
+    uint token_count;
+    uint embed_size;
+    uint causal;
+} p;
+
+shared float scores[MAX_T];
+shared float partial[WG];
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint t_q  = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+
+    uint D      = p.head_size;
+    uint T      = p.token_count;
+    uint E      = p.embed_size;
+    uint stride = 3u * E;
+    float inv_sqrt_d = inversesqrt(float(D));
+    uint t_k_max = (p.causal != 0u) ? (t_q + 1u) : T;
+
+    uint q_base = t_q * stride + h * D;
+
+    // Pass 1: scores[t_k] = Q . K[t_k] / sqrt(D), and per-thread max.
+    float my_max = -3.402823e38;
+    for (uint t_k = tid; t_k < t_k_max; t_k += WG) {
+        uint k_base = t_k * stride + E + h * D;
+        float dot = 0.0;
+        for (uint d = 0u; d < D; d += 1u) {
+            dot += x[q_base + d] * x[k_base + d];
+        }
+        float s = dot * inv_sqrt_d;
+        scores[t_k] = s;
+        my_max = max(my_max, s);
+    }
+    partial[tid] = my_max;
+    barrier();
+    for (uint stride2 = WG / 2u; stride2 > 0u; stride2 >>= 1) {
+        if (tid < stride2) partial[tid] = max(partial[tid], partial[tid + stride2]);
+        barrier();
+    }
+    float row_max = partial[0];
+    barrier();
+
+    // Pass 2: exp(scores - max), per-thread sum, in-place rewrite to softmax probs.
+    float my_sum = 0.0;
+    for (uint t_k = tid; t_k < t_k_max; t_k += WG) {
+        float e = exp(scores[t_k] - row_max);
+        scores[t_k] = e;
+        my_sum += e;
+    }
+    partial[tid] = my_sum;
+    barrier();
+    for (uint stride2 = WG / 2u; stride2 > 0u; stride2 >>= 1) {
+        if (tid < stride2) partial[tid] += partial[tid + stride2];
+        barrier();
+    }
+    float row_sum = partial[0];
+    float inv_sum = 1.0 / row_sum;
+    barrier();
+
+    for (uint t_k = tid; t_k < t_k_max; t_k += WG) {
+        scores[t_k] *= inv_sum;
+    }
+    barrier();
+
+    // Pass 3: O[d] = sum_t_k softmax[t_k] * V[t_k][d]
+    uint o_base = t_q * E + h * D;
+    for (uint d = tid; d < D; d += WG) {
+        float acc = 0.0;
+        for (uint t_k = 0u; t_k < t_k_max; t_k += 1u) {
+            uint v_base = t_k * stride + 2u * E + h * D;
+            acc += scores[t_k] * x[v_base + d];
+        }
+        o[o_base + d] = acc;
+    }
+
+    if (tid == 0u) {
+        lse[h * T + t_q] = log(row_sum) + row_max;
+    }
+}

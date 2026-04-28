@@ -396,6 +396,7 @@ Operation_Variant :: union {
 	Batched_Matmul,
 	Permute,
 	Causal_Mask,
+	Attention,
 }
 
 Operation :: struct {
@@ -430,6 +431,18 @@ backward :: proc(loc := #caller_location) {
 	}
 }
 
+Attention :: struct {
+	head_count:      int,
+	head_size:       int,
+	token_count:     int,
+	embed_size:      int,
+	causal:          bool,
+	softmax_outputs: Tensor,
+	d_p_scratch:     Tensor,
+	lse:             Tensor,
+	d_acc:           Tensor,
+}
+
 @(require_results)
 attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank == 2, "attention requires a 2-D tensor [tokens, 3 * embedding]", loc=loc)
@@ -438,33 +451,34 @@ attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller
 	input_size  := input.shape[1]
 	assert(input_size % 3 == 0, "Trailing dim must be divisible by 3 (for Q, K, V)", loc=loc)
 
-	output_size := input_size / 3
-	assert(output_size % head_count == 0, "Output size must be divisible by head count", loc=loc)
+	embed_size := input_size / 3
+	assert(embed_size % head_count == 0, "Output size must be divisible by head count", loc=loc)
 
-	head_size := output_size / head_count
+	head_size := embed_size / head_count
 
-	q_flat := slice_trailing(input, 0,               output_size,     loc=loc)
-	k_flat := slice_trailing(input, output_size,     output_size * 2, loc=loc)
-	v_flat := slice_trailing(input, output_size * 2, output_size * 3, loc=loc)
+	output           = zeros({token_count, embed_size}, loc=loc)
+	softmax_outputs := zeros({head_count, token_count, token_count}, loc=loc)
+	d_p_scratch     := zeros({head_count, token_count}, loc=loc)
+	lse             := zeros({head_count, token_count}, loc=loc)
+	d_acc           := zeros({head_count, token_count}, loc=loc)
 
-	q := reshape(q_flat, {token_count, head_count, head_size}, loc=loc)
-	k := reshape(k_flat, {token_count, head_count, head_size}, loc=loc)
-	v := reshape(v_flat, {token_count, head_count, head_size}, loc=loc)
-
-	q_t := permute(q, {1, 0, 2}, loc=loc)
-	k_t := permute(k, {1, 0, 2}, loc=loc)
-	v_t := permute(v, {1, 0, 2}, loc=loc)
-
-	k_t_T  := permute(k_t, {0, 2, 1}, loc=loc)
-	raw    := batched_matmul(q_t, k_t_T, loc=loc)
-	scaled := mul(raw, scalar(1.0 / math.sqrt(f32(head_size)), loc=loc), loc=loc)
-
-	masked := causal ? causal_mask(scaled, loc=loc) : scaled
-	attn   := softmax(masked, loc=loc)
-
-	out_per_head := batched_matmul(attn, v_t, loc=loc)
-	out          := permute(out_per_head, {1, 0, 2}, loc=loc)
-	output        = reshape(out, {token_count, output_size}, loc=loc)
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Attention{
+			head_count      = head_count,
+			head_size       = head_size,
+			token_count     = token_count,
+			embed_size      = embed_size,
+			causal          = causal,
+			softmax_outputs = softmax_outputs,
+			d_p_scratch     = d_p_scratch,
+			lse             = lse,
+			d_acc           = d_acc,
+		},
+	}
+	_current_ctx.vtable.forward(op, loc)
+	append_operation(op, loc=loc)
 
 	return
 }

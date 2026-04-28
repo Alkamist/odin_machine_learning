@@ -10,26 +10,48 @@ import "core:math/rand"
 
 import ml  "../../.."
 import cpu "../../../backend_cpu"
+import gpu "../../../backend_gpu"
 import mlp "../../../mlp"
 
 SEED       :: 0xC0FFEE
 WARMUP     :: 3
 ITERATIONS :: 30
 
+_is_gpu: bool
+
 main :: proc() {
+	if builtin.len(os.args) < 2 {
+		fmt.eprintln("usage: speed_runner <cpu|gpu> [thread_count]")
+		os.exit(1)
+	}
+	backend_name := os.args[1]
 	thread_count := 1
-	if builtin.len(os.args) >= 2 {
-		parsed, ok := strconv.parse_int(os.args[1])
+	if builtin.len(os.args) >= 3 {
+		parsed, ok := strconv.parse_int(os.args[2])
 		if ok {
 			thread_count = parsed
 		}
 	}
 
-	ctx := ml.context_create(256 * 1024 * 1024, &cpu.backend)
+	vtable: ^ml.Backend_VTable
+	switch backend_name {
+	case "cpu":
+		vtable = &cpu.backend
+	case "gpu":
+		vtable  = gpu.backend()
+		_is_gpu = true
+	case:
+		fmt.eprintfln("unknown backend: %v (expected cpu or gpu)", backend_name)
+		os.exit(1)
+	}
+
+	ctx := ml.context_create(256 * 1024 * 1024, vtable)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	cpu.set_thread_count(thread_count)
+	if !_is_gpu {
+		cpu.set_thread_count(thread_count)
+	}
 
 	rand.reset(SEED)
 
@@ -177,6 +199,15 @@ bench_mlp_step :: proc() -> f32 {
 }
 
 _checksum :: proc(t: ml.Tensor) -> f32 {
+	if _is_gpu {
+		buf := builtin.make([]f32, ml.len(t), context.temp_allocator)
+		ml.get_data(t, buf)
+		s: f32
+		for v in buf {
+			s += v
+		}
+		return s
+	}
 	s: f32
 	for v in cpu.data(t) {
 		s += v
