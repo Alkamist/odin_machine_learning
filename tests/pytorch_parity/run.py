@@ -284,7 +284,7 @@ class TorchMlp(torch.nn.Module):
         return x
 
 
-def gen_mlp_train(name: str, sizes, sample_count: int, step_count: int, learning_rate: float):
+def gen_mlp_train(name: str, sizes, sample_count: int, step_count: int, learning_rate: float, period: int = 1):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
 
@@ -296,7 +296,7 @@ def gen_mlp_train(name: str, sizes, sample_count: int, step_count: int, learning
 
     write_tensor(test_dir / "input_x.bin", x_np)
     write_tensor(test_dir / "input_y.bin", y_np)
-    write_int_array(test_dir / "config.bin", [step_count, *sizes])
+    write_int_array(test_dir / "config.bin", [step_count, period, *sizes])
 
     torch.manual_seed(SEED)
     model = TorchMlp(sizes)
@@ -316,14 +316,19 @@ def gen_mlp_train(name: str, sizes, sample_count: int, step_count: int, learning
     x = torch.tensor(x_np)
     y = torch.tensor(y_np)
 
+    # The library accumulates `period` backward passes into the gradient
+    # buffers, then applies one Adam step. Mirror that here: PyTorch's
+    # autograd already sums grads across multiple backward calls when
+    # zero_grad isn't called between them.
     losses = np.zeros(step_count, dtype=np.float32)
     for step in range(step_count):
-        optimizer.zero_grad()
         pred = model(x)
         loss = ((pred - y) ** 2).mean()
         losses[step] = loss.item()
         loss.backward()
-        optimizer.step()
+        if (step + 1) % period == 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
     return test_dir, {"losses": losses}
 
@@ -341,6 +346,125 @@ def verify_mlp_train(test_dir: Path, refs: dict) -> None:
             f"loss curve diverged: max abs {diff.max():.3e} at step {worst} "
             f"(odin={odin_losses[worst]:.6f}, torch={torch_losses[worst]:.6f})"
         )
+
+
+def gen_select(name: str, vocab: int, embed: int, n_indices: int):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    x_np       = rng.standard_normal((vocab, embed)).astype(np.float32)
+    indices_np = rng.integers(0, vocab, size=n_indices).astype(np.int64)
+
+    write_tensor(test_dir / "input_x.bin", x_np)
+    write_int_array(test_dir / "indices.bin", indices_np)
+
+    x = torch.tensor(x_np, requires_grad=True)
+    out = x[torch.tensor(indices_np)]
+    out.sum().backward()
+    return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
+
+
+def gen_slice_trailing(name: str, x_shape, start: int, end: int):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    x_np = rng.standard_normal(x_shape).astype(np.float32)
+    write_tensor(test_dir / "input_x.bin", x_np)
+    write_int_array(test_dir / "config.bin", [start, end])
+
+    x = torch.tensor(x_np, requires_grad=True)
+    out = x[..., start:end].contiguous()
+    out.sum().backward()
+    return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
+
+
+def gen_concat3(name: str, shapes):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    a_np = rng.standard_normal(shapes[0]).astype(np.float32)
+    b_np = rng.standard_normal(shapes[1]).astype(np.float32)
+    c_np = rng.standard_normal(shapes[2]).astype(np.float32)
+    write_tensor(test_dir / "input_a.bin", a_np)
+    write_tensor(test_dir / "input_b.bin", b_np)
+    write_tensor(test_dir / "input_c.bin", c_np)
+
+    a = torch.tensor(a_np, requires_grad=True)
+    b = torch.tensor(b_np, requires_grad=True)
+    c = torch.tensor(c_np, requires_grad=True)
+    out = torch.cat([a, b, c], dim=-1)
+    out.sum().backward()
+    return test_dir, {
+        "out":    out.detach().numpy(),
+        "grad_a": a.grad.numpy(),
+        "grad_b": b.grad.numpy(),
+        "grad_c": c.grad.numpy(),
+    }
+
+
+def verify_concat3(test_dir: Path, refs: dict) -> None:
+    assert_close("out",    read_tensor(test_dir / "odin_out.bin"),    refs["out"])
+    assert_close("grad_a", read_tensor(test_dir / "odin_grad_a.bin"), refs["grad_a"])
+    assert_close("grad_b", read_tensor(test_dir / "odin_grad_b.bin"), refs["grad_b"])
+    assert_close("grad_c", read_tensor(test_dir / "odin_grad_c.bin"), refs["grad_c"])
+
+
+def gen_activation(name: str, op_name: str, x_shape):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    x_np = rng.standard_normal(x_shape).astype(np.float32)
+    write_tensor(test_dir / "input_x.bin", x_np)
+
+    x = torch.tensor(x_np, requires_grad=True)
+    if op_name == "gelu":
+        out = torch.nn.functional.gelu(x, approximate="tanh")
+    elif op_name == "relu":
+        out = torch.nn.functional.relu(x)
+    elif op_name == "silu":
+        out = torch.nn.functional.silu(x)
+    elif op_name == "tanh":
+        out = torch.tanh(x)
+    elif op_name == "sigmoid":
+        out = torch.sigmoid(x)
+    else:
+        raise ValueError(op_name)
+
+    out.sum().backward()
+    return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
+
+
+def gen_rope(name: str, tokens: int, head_count: int, head_size: int, base: float = 10000.0):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    embed = head_count * head_size
+    x_np = rng.standard_normal((tokens, embed)).astype(np.float32)
+    write_tensor(test_dir / "input_x.bin", x_np)
+    write_int_array(test_dir / "config.bin", [head_count])
+
+    x = torch.tensor(x_np, requires_grad=True)
+    # Match the library's RoPE: pair (x_{2i}, x_{2i+1}), theta = pos / base^(2i/D),
+    # rotation (x, y) -> (x*cos - y*sin, x*sin + y*cos). Same theta across heads.
+    half = head_size // 2
+    pos = torch.arange(tokens, dtype=torch.float32).unsqueeze(1)              # (T, 1)
+    inv = 1.0 / (base ** (torch.arange(half, dtype=torch.float32) * 2.0 / head_size))  # (half,)
+    theta = pos * inv                                                          # (T, half)
+    cos = torch.cos(theta)                                                     # (T, half)
+    sin = torch.sin(theta)                                                     # (T, half)
+
+    x_view = x.reshape(tokens, head_count, half, 2)
+    even = x_view[..., 0]
+    odd  = x_view[..., 1]
+    cos_b = cos.unsqueeze(1)  # (T, 1, half)
+    sin_b = sin.unsqueeze(1)
+    out_even = even * cos_b - odd  * sin_b
+    out_odd  = even * sin_b + odd  * cos_b
+    out_view = torch.stack([out_even, out_odd], dim=-1)
+    out      = out_view.reshape(tokens, embed)
+
+    out.sum().backward()
+    return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
 
 
 def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: bool):
@@ -382,6 +506,7 @@ TESTS = [
     ("div_broadcast", lambda: gen_binary_op("div_broadcast", "div", (4, 8), (8,), b_offset=2.0), verify_binary_op),
     ("linear_1d",     lambda: gen_linear("linear_1d", (16,),    (32, 16)), verify_linear),
     ("linear_2d",     lambda: gen_linear("linear_2d", (8, 16),  (32, 16)), verify_linear),
+    ("linear_big",    lambda: gen_linear("linear_big", (64, 128), (256, 128)), verify_linear),
     ("mean",          lambda: gen_unary("mean",        "mean",        (4, 8)),  verify_unary),
     ("softmax",       lambda: gen_unary("softmax",     "softmax",     (4, 8)),  verify_unary),
     ("log_softmax",   lambda: gen_unary("log_softmax", "log_softmax", (4, 8)),  verify_unary),
@@ -392,6 +517,18 @@ TESTS = [
     ("attention_causal",   lambda: gen_attention("attention_causal",   tokens=8, embed=16, head_count=2, causal=True),  verify_unary),
     ("attention_acausal",  lambda: gen_attention("attention_acausal",  tokens=8, embed=16, head_count=2, causal=False), verify_unary),
     ("mlp_train", lambda: gen_mlp_train("mlp_train", sizes=[4, 8, 8, 1], sample_count=16, step_count=50, learning_rate=0.01), verify_mlp_train),
+    ("select",         lambda: gen_select("select", vocab=32, embed=16, n_indices=8),         verify_unary),
+    ("slice_trailing", lambda: gen_slice_trailing("slice_trailing", (4, 16), start=4, end=12), verify_unary),
+    ("concat3",        lambda: gen_concat3("concat3", [(4, 6), (4, 8), (4, 5)]),               verify_concat3),
+    ("gelu",    lambda: gen_activation("gelu",    "gelu",    (4, 8)), verify_unary),
+    ("relu",    lambda: gen_activation("relu",    "relu",    (4, 8)), verify_unary),
+    ("silu",    lambda: gen_activation("silu",    "silu",    (4, 8)), verify_unary),
+    ("tanh",    lambda: gen_activation("tanh",    "tanh",    (4, 8)), verify_unary),
+    ("sigmoid", lambda: gen_activation("sigmoid", "sigmoid", (4, 8)), verify_unary),
+    ("rope",    lambda: gen_rope("rope", tokens=8, head_count=2, head_size=8), verify_unary),
+    ("rope_xfmr",          lambda: gen_rope("rope_xfmr", tokens=64, head_count=4, head_size=32), verify_unary),
+    ("attention_xfmr",     lambda: gen_attention("attention_xfmr", tokens=64, embed=128, head_count=4, causal=True), verify_unary),
+    ("mlp_train_period12", lambda: gen_mlp_train("mlp_train_period12", sizes=[4, 8, 8, 1], sample_count=16, step_count=60, learning_rate=0.01, period=12), verify_mlp_train),
 ]
 
 

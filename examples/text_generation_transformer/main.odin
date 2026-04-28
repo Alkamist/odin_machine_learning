@@ -11,6 +11,7 @@ import "core:math/rand"
 import "../utility"
 import ml "../../"
 import cpu "../../backend_cpu"
+import gpu "../../backend_gpu"
 import tfm "../../transformer"
 
 FILE_NAME :: "../data/stories_short.txt"
@@ -28,10 +29,11 @@ SEQUENCE_LENGTH :: 64
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ctx := ml.context_create(1024 * 1024 * 16, &cpu.backend)
+	// ctx := ml.context_create(1024 * 1024 * 16, &cpu.backend)
+	ctx := ml.context_create(1024 * 1024, gpu.backend())
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
-	cpu.set_thread_count(24)
+	// cpu.set_thread_count(24)
 
 	model := model_make()
 	defer model_destroy(model)

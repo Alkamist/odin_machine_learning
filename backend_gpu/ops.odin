@@ -10,8 +10,8 @@ Add_Back_B_Params :: struct { n_b, stride: u32 }
 _add_pipeline, _add_back_a_pipeline, _add_back_b_pipeline: ^Pipeline
 
 LINEAR_SPIRV :: #load("shaders/linear.spv", []u8)
-LINEAR_LOCAL_X :: 64
-LINEAR_LOCAL_Y :: 64
+LINEAR_LOCAL_X :: 32   // must match TILE_M in shaders/linear.comp
+LINEAR_LOCAL_Y :: 64   // must match TILE_N in shaders/linear.comp
 Linear_Params :: struct { count, input_size, output_size: u32 }
 _linear_pipeline: ^Pipeline
 

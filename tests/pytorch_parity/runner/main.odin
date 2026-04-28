@@ -58,6 +58,7 @@ main :: proc() {
 	case "div_broadcast":  run_binary_op(artifacts_dir, .Div)
 	case "linear_1d":      run_linear(artifacts_dir)
 	case "linear_2d":      run_linear(artifacts_dir)
+	case "linear_big":     run_linear(artifacts_dir)
 	case "mean":           run_unary(artifacts_dir, .Mean)
 	case "softmax":        run_unary(artifacts_dir, .Softmax)
 	case "log_softmax":    run_unary(artifacts_dir, .Log_Softmax)
@@ -67,7 +68,19 @@ main :: proc() {
 	case "permute":        run_permute(artifacts_dir)
 	case "attention_causal":  run_attention(artifacts_dir)
 	case "attention_acausal": run_attention(artifacts_dir)
+	case "attention_xfmr":    run_attention(artifacts_dir)
 	case "mlp_train":         run_mlp_train(artifacts_dir)
+	case "mlp_train_period12":run_mlp_train(artifacts_dir)
+	case "select":            run_select(artifacts_dir)
+	case "slice_trailing":    run_slice_trailing(artifacts_dir)
+	case "concat3":           run_concat3(artifacts_dir)
+	case "gelu":              run_unary(artifacts_dir, .Gelu)
+	case "relu":              run_unary(artifacts_dir, .Relu)
+	case "silu":              run_unary(artifacts_dir, .Silu)
+	case "tanh":              run_unary(artifacts_dir, .Tanh)
+	case "sigmoid":           run_unary(artifacts_dir, .Sigmoid)
+	case "rope":              run_rope(artifacts_dir)
+	case "rope_xfmr":         run_rope(artifacts_dir)
 	case:
 		fmt.eprintfln("unknown test: %v", test_name)
 		os.exit(1)
@@ -143,7 +156,7 @@ run_linear :: proc(dir: string) {
 	save_tensor(_path(dir, "odin_grad_w.bin"), w_shape,   w_grad)
 }
 
-Unary_Op :: enum { Mean, Softmax, Log_Softmax }
+Unary_Op :: enum { Mean, Softmax, Log_Softmax, Gelu, Relu, Silu, Tanh, Sigmoid }
 
 run_unary :: proc(dir: string, op: Unary_Op) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
@@ -157,6 +170,11 @@ run_unary :: proc(dir: string, op: Unary_Op) {
 	case .Mean:        out = ml.mean       (x)
 	case .Softmax:     out = ml.softmax    (x)
 	case .Log_Softmax: out = ml.log_softmax(x)
+	case .Gelu:        out = ml.gelu       (x)
+	case .Relu:        out = ml.relu       (x)
+	case .Silu:        out = ml.silu       (x)
+	case .Tanh:        out = ml.tanh       (x)
+	case .Sigmoid:     out = ml.sigmoid    (x)
 	}
 	ml.backward()
 
@@ -304,11 +322,12 @@ run_mlp_train :: proc(dir: string) {
 	y_shape, y_data := load_tensor(_path(dir, "input_y.bin"))
 	config          := load_int_array(_path(dir, "config.bin"))
 
-	step_count := config[0]
-	layer_count := builtin.len(config) - 1 - 1
+	step_count  := config[0]
+	period      := config[1]
+	layer_count := builtin.len(config) - 2 - 1
 	sizes := builtin.make([]int, layer_count + 1, context.temp_allocator)
 	for i in 0 ..< layer_count + 1 {
-		sizes[i] = config[1 + i]
+		sizes[i] = config[2 + i]
 	}
 
 	model := mlp.make(..sizes)
@@ -340,7 +359,7 @@ run_mlp_train :: proc(dir: string) {
 		loss        := ml.mean(per_sample)
 		ml.backward()
 
-		if ml.optimize(&opt, period=1, learning_rate=0.01) {
+		if ml.optimize(&opt, period=period, learning_rate=0.01) {
 			mlp.update(opt, model)
 		}
 
@@ -351,6 +370,110 @@ run_mlp_train :: proc(dir: string) {
 
 	losses_shape := []int{step_count}
 	save_tensor(_path(dir, "odin_losses.bin"), losses_shape, losses)
+}
+
+run_select :: proc(dir: string) {
+	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
+	indices         := load_int_array(_path(dir, "indices.bin"))
+
+	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(x)
+	ml.set_data(x, x_data)
+
+	out := ml.select(x, indices)
+	ml.backward()
+
+	out_shape := _shape_slice(out)
+	out_data  := builtin.make([]f32, ml.len(out), context.temp_allocator)
+	ml.get_data(out, out_data)
+
+	x_grad := builtin.make([]f32, ml.len(x), context.temp_allocator)
+	ml.get_gradient(x, x_grad)
+
+	save_tensor(_path(dir, "odin_out.bin"),    out_shape, out_data)
+	save_tensor(_path(dir, "odin_grad_x.bin"), x_shape,   x_grad)
+}
+
+run_slice_trailing :: proc(dir: string) {
+	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
+	config          := load_int_array(_path(dir, "config.bin"))
+	start := config[0]
+	end   := config[1]
+
+	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(x)
+	ml.set_data(x, x_data)
+
+	out := ml.slice_trailing(x, start, end)
+	ml.backward()
+
+	out_shape := _shape_slice(out)
+	out_data  := builtin.make([]f32, ml.len(out), context.temp_allocator)
+	ml.get_data(out, out_data)
+
+	x_grad := builtin.make([]f32, ml.len(x), context.temp_allocator)
+	ml.get_gradient(x, x_grad)
+
+	save_tensor(_path(dir, "odin_out.bin"),    out_shape, out_data)
+	save_tensor(_path(dir, "odin_grad_x.bin"), x_shape,   x_grad)
+}
+
+run_concat3 :: proc(dir: string) {
+	a_shape, a_data := load_tensor(_path(dir, "input_a.bin"))
+	b_shape, b_data := load_tensor(_path(dir, "input_b.bin"))
+	c_shape, c_data := load_tensor(_path(dir, "input_c.bin"))
+
+	a := ml.alloc(a_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(a)
+	b := ml.alloc(b_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(b)
+	c := ml.alloc(c_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(c)
+	ml.set_data(a, a_data)
+	ml.set_data(b, b_data)
+	ml.set_data(c, c_data)
+
+	out := ml.concat(a, b, c)
+	ml.backward()
+
+	out_shape := _shape_slice(out)
+	out_data  := builtin.make([]f32, ml.len(out), context.temp_allocator)
+	ml.get_data(out, out_data)
+
+	a_grad := builtin.make([]f32, ml.len(a), context.temp_allocator)
+	b_grad := builtin.make([]f32, ml.len(b), context.temp_allocator)
+	c_grad := builtin.make([]f32, ml.len(c), context.temp_allocator)
+	ml.get_gradient(a, a_grad)
+	ml.get_gradient(b, b_grad)
+	ml.get_gradient(c, c_grad)
+
+	save_tensor(_path(dir, "odin_out.bin"),    out_shape, out_data)
+	save_tensor(_path(dir, "odin_grad_a.bin"), a_shape,   a_grad)
+	save_tensor(_path(dir, "odin_grad_b.bin"), b_shape,   b_grad)
+	save_tensor(_path(dir, "odin_grad_c.bin"), c_shape,   c_grad)
+}
+
+run_rope :: proc(dir: string) {
+	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
+	config          := load_int_array(_path(dir, "config.bin"))
+
+	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(x)
+	ml.set_data(x, x_data)
+
+	head_count := config[0]
+	out := ml.rope(x, head_count)
+	ml.backward()
+
+	out_shape := _shape_slice(out)
+	out_data  := builtin.make([]f32, ml.len(out), context.temp_allocator)
+	ml.get_data(out, out_data)
+
+	x_grad := builtin.make([]f32, ml.len(x), context.temp_allocator)
+	ml.get_gradient(x, x_grad)
+
+	save_tensor(_path(dir, "odin_out.bin"),    out_shape, out_data)
+	save_tensor(_path(dir, "odin_grad_x.bin"), x_shape,   x_grad)
 }
 
 _shape_slice :: proc(t: ml.Tensor) -> []int {

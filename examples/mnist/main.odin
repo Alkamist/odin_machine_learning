@@ -23,12 +23,12 @@ BATCH_SIZE :: 1000
 main :: proc() {
 	defer fmt.println("Finished")
 
-	ctx := ml.context_create(1024 * 1024 * 16, &cpu.backend)
-	// ctx := ml.context_create(1024 * 1024, gpu.backend())
+	// ctx := ml.context_create(1024 * 1024 * 16, &cpu.backend)
+	ctx := ml.context_create(1024 * 1024, gpu.backend())
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	cpu.set_thread_count(24)
+	// cpu.set_thread_count(24)
 
 	model := model_make()
 	defer model_destroy(model)

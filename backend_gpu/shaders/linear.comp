@@ -15,14 +15,14 @@
 // which is the win over the naive kernel.
 #version 450
 
-#define TILE_M 64
+#define TILE_M 32
 #define TILE_N 64
 #define TILE_K 16
 #define TM     4
 #define TN     4
-#define WG_X   16   // = TILE_M / TM
+#define WG_X   8    // = TILE_M / TM
 #define WG_Y   16   // = TILE_N / TN
-#define WG     256  // = WG_X * WG_Y
+#define WG     128  // = WG_X * WG_Y
 
 layout(local_size_x = WG_X, local_size_y = WG_Y) in;
 
@@ -36,8 +36,10 @@ layout(push_constant) uniform Params {
     uint N;  // output_size
 } p;
 
-shared float sx[TILE_M][TILE_K];
-shared float sw[TILE_N][TILE_K];
+// +1 padding on the K dim breaks the 32-way bank conflict on the inner
+// reads `sx[tx*TM + a][kk]` and `sw[ty*TN + b][kk]`.
+shared float sx[TILE_M][TILE_K + 1];
+shared float sw[TILE_N][TILE_K + 1];
 
 void main() {
     uint wg_i = gl_WorkGroupID.x;

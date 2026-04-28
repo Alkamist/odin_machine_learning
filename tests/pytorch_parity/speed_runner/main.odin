@@ -109,35 +109,34 @@ MLP_IN    :: 256
 MLP_HID   :: 256
 MLP_OUT   :: 64
 
-@(thread_local) _linear_w:    ml.Tensor
-@(thread_local) _layernorm_w: ml.Tensor
-@(thread_local) _mlp_x:       ml.Tensor
-@(thread_local) _mlp_y:       ml.Tensor
-@(thread_local) _mlp_model:   mlp.Mlp
+@(thread_local) _linear_w, _linear_x:        ml.Tensor
+@(thread_local) _layernorm_w, _layernorm_x:  ml.Tensor
+@(thread_local) _softmax_x:                  ml.Tensor
+@(thread_local) _attention_x:                ml.Tensor
+@(thread_local) _mlp_x, _mlp_y:              ml.Tensor
+@(thread_local) _mlp_model:                  mlp.Mlp
 
 bench_linear_fwd :: proc() -> f32 {
 	if _linear_w.vtable == nil {
 		_linear_w = ml.make({LINEAR_OUTPUT, LINEAR_INPUT})
+		_linear_x = ml.make({LINEAR_BATCH,  LINEAR_INPUT})
 		ml.fill_normal(_linear_w, 0, 0.02)
+		ml.fill_value (_linear_x, 0.01)
 	}
-	w := _linear_w
 	ml.clear()
-	x := ml.zeros({LINEAR_BATCH, LINEAR_INPUT})
-	ml.fill_value(x, 0.01)
-	y := ml.linear(x, w)
+	y := ml.linear(_linear_x, _linear_w)
 	return _checksum(y)
 }
 
 bench_linear_fwdbwd :: proc() -> f32 {
 	if _linear_w.vtable == nil {
 		_linear_w = ml.make({LINEAR_OUTPUT, LINEAR_INPUT})
+		_linear_x = ml.make({LINEAR_BATCH,  LINEAR_INPUT})
 		ml.fill_normal(_linear_w, 0, 0.02)
+		ml.fill_value (_linear_x, 0.01)
 	}
-	w := _linear_w
 	ml.clear()
-	x := ml.zeros({LINEAR_BATCH, LINEAR_INPUT})
-	ml.fill_value(x, 0.01)
-	y := ml.linear(x, w)
+	y := ml.linear(_linear_x, _linear_w)
 	ml.backward()
 	return _checksum(y)
 }
@@ -145,31 +144,34 @@ bench_linear_fwdbwd :: proc() -> f32 {
 bench_layernorm :: proc() -> f32 {
 	if _layernorm_w.vtable == nil {
 		_layernorm_w = ml.make({LAYERNORM_SIZE})
+		_layernorm_x = ml.make({LAYERNORM_BATCH, LAYERNORM_SIZE})
 		ml.fill_value(_layernorm_w, 1)
+		ml.fill_value(_layernorm_x, 0.01)
 	}
-	w := _layernorm_w
 	ml.clear()
-	x := ml.zeros({LAYERNORM_BATCH, LAYERNORM_SIZE})
-	ml.fill_value(x, 0.01)
-	y := ml.layernorm(x, w)
+	y := ml.layernorm(_layernorm_x, _layernorm_w)
 	ml.backward()
 	return _checksum(y)
 }
 
 bench_softmax :: proc() -> f32 {
+	if _softmax_x.vtable == nil {
+		_softmax_x = ml.make({SOFTMAX_BATCH, SOFTMAX_SIZE})
+		ml.fill_value(_softmax_x, 0.01)
+	}
 	ml.clear()
-	x := ml.zeros({SOFTMAX_BATCH, SOFTMAX_SIZE})
-	ml.fill_value(x, 0.01)
-	y := ml.softmax(x)
+	y := ml.softmax(_softmax_x)
 	ml.backward()
 	return _checksum(y)
 }
 
 bench_attention :: proc() -> f32 {
+	if _attention_x.vtable == nil {
+		_attention_x = ml.make({ATTN_TOKENS, 3 * ATTN_EMBED})
+		ml.fill_value(_attention_x, 0.01)
+	}
 	ml.clear()
-	x := ml.zeros({ATTN_TOKENS, 3 * ATTN_EMBED})
-	ml.fill_value(x, 0.01)
-	y := ml.attention(x, ATTN_HEADS, causal=true)
+	y := ml.attention(_attention_x, ATTN_HEADS, causal=true)
 	ml.backward()
 	return _checksum(y)
 }
@@ -200,13 +202,12 @@ bench_mlp_step :: proc() -> f32 {
 
 _checksum :: proc(t: ml.Tensor) -> f32 {
 	if _is_gpu {
-		buf := builtin.make([]f32, ml.len(t), context.temp_allocator)
-		ml.get_data(t, buf)
-		s: f32
-		for v in buf {
-			s += v
-		}
-		return s
+		// One float is enough to force batch submit + WaitIdle on the
+		// GPU side; downloading the full tensor would dominate the
+		// timing for large outputs.
+		buf: [1]f32
+		ml.get_data(t, buf[:])
+		return buf[0]
 	}
 	s: f32
 	for v in cpu.data(t) {
