@@ -3,21 +3,94 @@
 Notes accumulated during the PyTorch-parity / GPU-optimization session.
 Ordered roughly by leverage, not by difficulty.
 
+## Multi-dtype foundation (precondition for serious LLM work)
+
+The project goal is to infer and train Gemma-class LLMs. That requires BF16
+(or at minimum FP16) tensors end-to-end: BF16 weights and activations,
+FP32 master weights for the optimizer, and tensor-core matmul on top.
+Without dtype support the project caps at "small models in FP32," and the
+coopmat shader work below would need to be redone once buffers gain types.
+
+**Existing scaffolding (`ml.odin`):**
+
+- `Data_Type :: enum u8 { F32 }` and `data_type_size`. Single-variant
+  today, ready to extend.
+- `Tensor.type: Data_Type` is on every tensor. `alloc` hardcodes `.F32`.
+- `Backend.buffer_alloc(len, ...)` takes element count, not bytes.
+- `Backend.buffer_get/set` take `[]f32` — only FP32 round-trips today.
+
+**Recommended rollout (do in this order, one phase per session):**
+
+1. **Foundations.** Extend the enum to `{F32, F16, BF16}`. Switch
+   `buffer_alloc` to bytes (or `(len, type)`), and `buffer_get/set` to
+   `[]byte` with thin `tensor_set_f32`-style helpers on top. Add `type`
+   parameter to `alloc`/`zeros`/`zeros_like`. Verify a BF16 tensor
+   allocates and round-trips on both CPU and GPU backends with no ops
+   defined yet.
+
+2. **`cast` op.** Forward + backward, both backends. Smallest non-trivial
+   dtype-aware op; proves the dispatch shape. Backward casts the gradient
+   back to the source dtype. Trivial in CPU, one shader on GPU per
+   `(src, dst)` pair (or one shader with a push-constant for type).
+
+3. **First coopmat shader: BF16 `linear` forward.** Use
+   `GL_KHR_cooperative_matrix` + `GL_EXT_shader_explicit_arithmetic_types_float16`
+   compiled with `--target-env=vulkan1.2`. Backend dispatches based on
+   `op.input.type`: F32 → existing FP32 SIMT shader, BF16 → coopmat
+   shader. RTX 30+ exposes `cooperativeMatrix = true` and
+   `shaderBFloat16CooperativeMatrix = true` already; query
+   `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` at init to confirm
+   a usable `(M,N,K,types)` config and fall back gracefully on
+   unsupported devices. Update Vulkan device init to enable
+   `VK_KHR_cooperative_matrix`, `shaderFloat16` / `shaderBFloat16`,
+   `storageBuffer16BitAccess`.
+
+4. **Roll out coopmat to the rest.** `linear` backward (input + weight),
+   then `batched_matmul` forward + backward, then attention (which uses
+   `batched_matmul` internally — coopmat there is the real win). Then
+   the simple element-wise ops (`add`, `mul`, `gelu`, `layernorm`,
+   activations) become dtype-generic — these don't need coopmat, they
+   just need to read/write the right number of bytes per element.
+
+5. **Mixed-precision recipe in `examples/`.** Show the standard "FP32
+   master weights, BF16 forward/backward, FP32 optimizer state" pattern
+   end-to-end on a small transformer. This is what every modern LLM
+   training stack does and is the actual deliverable for "serious ML
+   work."
+
+**Design decisions to lock in at phase 1:**
+
+- **Op dtype mixing.** When `linear(x: F32, w: BF16)` is called: error,
+  not auto-cast. Forces explicit `cast` ops, keeps optimization tractable.
+- **Output dtype.** Compute ops (`linear`, `add`, etc.) preserve input
+  dtype. Internal accumulators in shaders are FP32 regardless (this is
+  what tensor cores do anyway).
+- **Optimizer state dtype.** Adam M/V stay FP32 even when the parameter
+  is BF16. Hardcode in the optimizer; don't try to make `Buffer_Kind`
+  per-buffer-typed.
+- **Mixed precision (master weights).** Don't build this into the core
+  Tensor — handle it at the example level by keeping two tensors
+  (FP32 master, BF16 compute view) and casting each step. Simpler
+  primitives, same end result.
+
 ## GPU performance
 
-- **Flash Attention v2 proper.** Current attention shader is one workgroup per
-  `(head, query)` with a sequential loop over keys, and the backward is split
-  into 3 kernels (D-precompute, dKV, dQ). Real FA2 tiles both Q and K with
-  online softmax inside the tile, fuses backward into 1-2 kernels, and uses
-  shared memory more aggressively. Should pull `attention_causal` from
-  ~3x off cuDNN toward ~1.5x. Reference: ggml's
+- **Flash Attention v2 — Q-tiled forward and tiled backward.** Forward now
+  uses online softmax with K streamed in tiles of `BC=64`, removing the
+  `MAX_T=4096` cap and the `scores[MAX_T]` shared array, but still runs one
+  workgroup per `(head, query)` (BR=1). Real FA2 also tiles Q (BR>1) so K and
+  V are reused across the whole BR×BC score block. Backward is still 3
+  kernels (D-precompute, dKV, dQ) with no Q/K tiling. Tiling both should
+  pull `attention_causal` from ~3x off cuDNN toward ~1.5x. Reference: ggml's
   `flash_attn.comp` and the Tri Dao FA2 paper.
 
 - **Tensor-core matmul via VK_KHR_cooperative_matrix.** The current `linear`
-  shader is FP32 SIMT. RTX 30+ tensor cores (TF32, FP16) deliver 4-8x more
+  shader is FP32 SIMT. RTX 30+ tensor cores (BF16, FP16) deliver 4-8x more
   FLOPs and `cooperative_matrix` is the Vulkan path to them. Closes the
-  remaining `linear_fwd` gap (~5x off cuBLAS). Reference: ggml's
-  `mul_mm_cm2.comp`.
+  remaining `linear_fwd` gap (~5x off cuBLAS). **Blocked on the multi-dtype
+  foundation above** — coopmat needs BF16 buffers to be the natural input
+  type; doing it on FP32 buffers means writing the conversion shim twice.
+  Reference: ggml's `mul_mm_cm2.comp`.
 
 - **Larger-shape GPU bench coverage.** Current speed bench uses small shapes
   where Vulkan's per-dispatch overhead dominates. Add benches at training-
@@ -41,9 +114,6 @@ Ordered roughly by leverage, not by difficulty.
   memory caches (`k_shared`, `v_shared`, `q_shared`, `do_shared`) are fixed
   `float[256]`. Asserted at dispatch time but should either grow dynamically
   via specialization constants or auto-fall-back to a tiled variant.
-
-- **Hardcoded `MAX_T = 4096` in attention forward.** Larger sequences crash
-  silently (or worse). True FA2 tiling would remove this cap entirely.
 
 - **`head_size > WG=64` in attention backward kernels.** Per-thread d_K/d_V
   accumulators only handle one `d` element each. Heads larger than 64 would
