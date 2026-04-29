@@ -10,9 +10,9 @@ import "core:fmt"
 import "core:math/rand"
 import "../utility"
 import ml "../../"
-import cpu "../../backend_cpu"
-import "../../mlp"
-import "../../gru"
+import cpu "../../backends/cpu"
+import "../../networks/mlp"
+import "../../networks/gru"
 
 FILE_NAME :: "../data/stories_short.txt"
 
@@ -30,7 +30,7 @@ main :: proc() {
 	defer fmt.println("Finished")
 
 	ctx := cpu.context_create(1024 * 1024)
-	defer ml.context_destroy(ctx)
+	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
 	model := model_make()

@@ -1,8 +1,9 @@
-package machine_learning_gru
+package machine_learning_network_gru
 
 import "base:builtin"
 import "core:slice"
-import ml "../"
+
+import ml "../../"
 
 Gru :: struct {
 	input_size:  int,

@@ -10,9 +10,9 @@ import "core:fmt"
 import "core:math/rand"
 import "../utility"
 import ml "../../"
-import cpu "../../backend_cpu"
-import gpu "../../backend_gpu"
-import tfm "../../transformer"
+import cpu "../../backends/cpu"
+import gpu "../../backends/gpu"
+import tfm "../../networks/transformer"
 
 FILE_NAME :: "../data/stories_short.txt"
 
@@ -31,7 +31,7 @@ main :: proc() {
 
 	// ctx := cpu.context_create(1024 * 1024 * 16)
 	ctx := gpu.context_create()
-	defer ml.context_destroy(ctx)
+	defer gpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 	// cpu.set_thread_count(24)
 

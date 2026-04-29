@@ -7,8 +7,8 @@ import "core:math"
 import "core:math/rand"
 
 import ml  "../.."
-import cpu "../../backend_cpu"
-import tfm "../../transformer"
+import cpu "../../backends/cpu"
+import tfm "../../networks/transformer"
 
 SEED :: 0xC0FFEE
 
@@ -36,7 +36,7 @@ main :: proc() {
 	}
 
 	ctx := cpu.context_create(256 * 1024 * 1024)
-	defer ml.context_destroy(ctx)
+	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
 	fmt.printfln("threads=%v warmup=%v iterations=%v", thread_count, WARMUP, ITERATIONS)

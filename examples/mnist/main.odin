@@ -14,9 +14,9 @@ import "core:strconv"
 import "core:encoding/csv"
 
 import ml "../../"
-import cpu "../../backend_cpu"
+import cpu "../../backends/cpu"
 // import gpu "../../backend_gpu"
-import "../../mlp"
+import "../../networks/mlp"
 
 BATCH_SIZE :: 1000
 

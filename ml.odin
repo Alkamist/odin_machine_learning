@@ -87,7 +87,6 @@ _context_destroy :: proc(ctx: ^Context, loc: runtime.Source_Code_Location) {
 	if ctx._op_arena_buf != nil {
 		builtin.delete(ctx._op_arena_buf, loc=loc)
 	}
-	builtin.free(ctx, loc=loc)
 }
 
 context_begin :: proc(ctx: ^Context) {

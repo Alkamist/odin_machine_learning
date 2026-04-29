@@ -4,9 +4,9 @@ import "core:fmt"
 import "core:time"
 
 import ml  "../.."
-import cpu "../../backend_cpu"
-import gpu "../../backend_gpu"
-import tfm "../../transformer"
+import cpu "../../backends/cpu"
+import gpu "../../backends/gpu"
+import tfm "../../networks/transformer"
 
 SMALL :: Arch{layers = 4,  heads = 4, embed = 128, vocab = 256, seq = 64 }
 LARGE :: Arch{layers = 12, heads = 8, embed = 512, vocab = 256, seq = 256}
@@ -38,7 +38,7 @@ bench_arch :: proc(arch: Arch) {
 		cpu.set_thread_count(24)
 
 		ctx := cpu.context_create(2 * 1024 * 1024 * 1024)
-		defer ml.context_destroy(ctx)
+		defer cpu.context_destroy(ctx)
 		ml.context_scope(ctx)
 
 		model := tfm.make(arch.layers, arch.heads, arch.embed, arch.vocab)
@@ -56,7 +56,7 @@ bench_arch :: proc(arch: Arch) {
 
 	{
 		ctx := gpu.context_create()
-		defer ml.context_destroy(ctx)
+		defer gpu.context_destroy(ctx)
 		ml.context_scope(ctx)
 
 		model := tfm.make(arch.layers, arch.heads, arch.embed, arch.vocab)

@@ -9,9 +9,9 @@ import "core:time"
 import "core:math/rand"
 
 import ml  "../../.."
-import cpu "../../../backend_cpu"
-import gpu "../../../backend_gpu"
-import mlp "../../../mlp"
+import cpu "../../../backends/cpu"
+import gpu "../../../backends/gpu"
+import mlp "../../../networks/mlp"
 
 SEED       :: 0xC0FFEE
 WARMUP     :: 3
@@ -44,7 +44,9 @@ main :: proc() {
 		fmt.eprintfln("unknown backend: %v (expected cpu or gpu)", backend_name)
 		os.exit(1)
 	}
-	defer ml.context_destroy(ctx)
+	defer {
+		if _is_gpu { gpu.context_destroy(ctx) } else { cpu.context_destroy(ctx) }
+	}
 	ml.context_scope(ctx)
 
 	if !_is_gpu {
@@ -115,7 +117,7 @@ MLP_OUT   :: 64
 @(thread_local) _mlp_model:                  mlp.Mlp
 
 bench_linear_fwd :: proc() -> f32 {
-	if _linear_w.vtable == nil {
+	if _linear_w.backend == nil {
 		_linear_w = ml.make({LINEAR_OUTPUT, LINEAR_INPUT})
 		_linear_x = ml.make({LINEAR_BATCH,  LINEAR_INPUT})
 		ml.fill_normal(_linear_w, 0, 0.02)
@@ -127,7 +129,7 @@ bench_linear_fwd :: proc() -> f32 {
 }
 
 bench_linear_fwdbwd :: proc() -> f32 {
-	if _linear_w.vtable == nil {
+	if _linear_w.backend == nil {
 		_linear_w = ml.make({LINEAR_OUTPUT, LINEAR_INPUT})
 		_linear_x = ml.make({LINEAR_BATCH,  LINEAR_INPUT})
 		ml.fill_normal(_linear_w, 0, 0.02)
@@ -140,7 +142,7 @@ bench_linear_fwdbwd :: proc() -> f32 {
 }
 
 bench_layernorm :: proc() -> f32 {
-	if _layernorm_w.vtable == nil {
+	if _layernorm_w.backend == nil {
 		_layernorm_w = ml.make({LAYERNORM_SIZE})
 		_layernorm_x = ml.make({LAYERNORM_BATCH, LAYERNORM_SIZE})
 		ml.fill_value(_layernorm_w, 1)
@@ -153,7 +155,7 @@ bench_layernorm :: proc() -> f32 {
 }
 
 bench_softmax :: proc() -> f32 {
-	if _softmax_x.vtable == nil {
+	if _softmax_x.backend == nil {
 		_softmax_x = ml.make({SOFTMAX_BATCH, SOFTMAX_SIZE})
 		ml.fill_value(_softmax_x, 0.01)
 	}
@@ -164,7 +166,7 @@ bench_softmax :: proc() -> f32 {
 }
 
 bench_attention :: proc() -> f32 {
-	if _attention_x.vtable == nil {
+	if _attention_x.backend == nil {
 		_attention_x = ml.make({ATTN_TOKENS, 3 * ATTN_EMBED})
 		ml.fill_value(_attention_x, 0.01)
 	}

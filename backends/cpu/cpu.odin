@@ -11,7 +11,7 @@ import "core:simd"
 import "core:sync"
 import "core:thread"
 
-import ml "../"
+import ml "../../"
 
 @(thread_local)
 _global_odin_context: runtime.Context
@@ -294,7 +294,7 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	ctx := cast(^Context)ctx
 	ml._context_destroy(ctx, loc)
 	builtin.delete(ctx.arena.data, loc=loc)
-	builtin.free(ctx, loc=loc)
+	builtin.free(ctx, allocator=allocator, loc=loc)
 }
 
 clear :: proc(loc: runtime.Source_Code_Location) {

@@ -8,26 +8,7 @@ import "core:sync"
 
 import vk "vendor:vulkan"
 
-import ml ".."
-
-_backend := ml.Backend{
-	destroy      = destroy,
-	clear        = clear,
-	forward      = forward,
-	backward     = backward,
-	update       = update,
-	buffer_alloc = buffer_alloc,
-	buffer_free  = buffer_free,
-	buffer_get   = buffer_get,
-	buffer_set   = buffer_set,
-	buffer_copy  = buffer_copy,
-}
-
-@(require_results)
-backend :: proc() -> ^ml.Backend {
-	device_init()
-	return &_backend
-}
+import ml "../../"
 
 @(require_results)
 context_create :: proc(allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
@@ -36,29 +17,37 @@ context_create :: proc(allocator := context.allocator, loc := #caller_location) 
 
 	_device_init_locked()
 
-	ctx := ml.context_create(&_backend, allocator=allocator, loc=loc)
-
-	gctx, err := builtin.new(Gpu_Context, allocator=allocator, loc=loc)
-	fmt.assertf(err == nil, "Failed to allocate Gpu_Context: %v", err, loc=loc)
+	gctx, err := builtin.new(Context, allocator=allocator, loc=loc)
+	fmt.assertf(err == nil, "Failed to allocate Context: %v", err, loc=loc)
 
 	_create_command_pool(gctx, loc)
 	_create_descriptor_pool(gctx, loc)
 
-	ctx.backend_data = gctx
-	return ctx
+	ml._context_init(gctx, {
+		clear        = clear,
+		forward      = forward,
+		backward     = backward,
+		update       = update,
+		buffer_alloc = buffer_alloc,
+		buffer_free  = buffer_free,
+		buffer_get   = buffer_get,
+		buffer_set   = buffer_set,
+		buffer_copy  = buffer_copy,
+	}, allocator, loc)
+
+	return gctx
 }
 
-destroy :: proc(ctx: ^ml.Context, loc: runtime.Source_Code_Location) {
+context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc := #caller_location) {
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 
-	gctx := cast(^Gpu_Context)ctx.backend_data
-	if gctx == nil { return }
+	gctx := cast(^Context)ctx
 
 	// Any pending GPU work is flushed by clear() and by the synchronous
 	// buffer_get / buffer_set / buffer_copy paths, so the batch must not
 	// be active here. If it is, the user dropped state on the floor.
-	fmt.assertf(!gctx.batch.active, "gpu.destroy called with an active batch; missed a flush?", loc=loc)
+	fmt.assertf(!gctx.batch.active, "context_destroy called with an active batch; missed a flush?", loc=loc)
 
 	for buffer in gctx.activations {
 		_destroy_gpu_buffer(buffer)
@@ -94,8 +83,9 @@ destroy :: proc(ctx: ^ml.Context, loc: runtime.Source_Code_Location) {
 	if gctx.command_pool != 0 {
 		vk.DestroyCommandPool(_gpu.device, gctx.command_pool, nil)
 	}
-	builtin.free(gctx, allocator=context.allocator, loc=loc)
-	ctx.backend_data = nil
+
+	ml._context_destroy(ctx, loc)
+	builtin.free(gctx, allocator=allocator, loc=loc)
 }
 
 clear :: proc(loc: runtime.Source_Code_Location) {
@@ -1399,13 +1389,13 @@ _upload_indices :: proc(indices: []int, loc := #caller_location) -> (buffer: vk.
 }
 
 upload_tensor :: proc(t: ml.Tensor, src: []f32, loc := #caller_location) {
-	t.vtable.buffer_set(t.buffers[.Data], src, loc)
+	t.backend.buffer_set(t.buffers[.Data], src, loc)
 }
 
 download_tensor :: proc(t: ml.Tensor, dst: []f32, loc := #caller_location) {
-	t.vtable.buffer_get(t.buffers[.Data], dst, loc)
+	t.backend.buffer_get(t.buffers[.Data], dst, loc)
 }
 
 download_tensor_gradient :: proc(t: ml.Tensor, dst: []f32, loc := #caller_location) {
-	t.vtable.buffer_get(t.buffers[.Gradient], dst, loc)
+	t.backend.buffer_get(t.buffers[.Gradient], dst, loc)
 }

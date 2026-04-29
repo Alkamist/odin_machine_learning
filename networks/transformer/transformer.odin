@@ -1,8 +1,9 @@
-package machine_learning_transformer
+package machine_learning_network_transformer
 
 import "base:builtin"
 import "core:math"
-import ml "../"
+
+import ml "../../"
 
 Layer :: struct {
 	norm0_weight:    ml.Tensor, // [embedding_size]

@@ -1,7 +1,8 @@
-package machine_learning_mlp
+package machine_learning_network_mlp
 
 import "base:builtin"
-import ml "../"
+
+import ml "../../"
 
 Layer :: struct {
 	weight: ml.Tensor,

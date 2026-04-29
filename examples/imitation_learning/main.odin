@@ -8,8 +8,8 @@ import "core:fmt"
 import "core:math/rand"
 import "../utility"
 import ml "../../"
-import cpu "../../backend_cpu"
-import "../../mlp"
+import cpu "../../backends/cpu"
+import "../../networks/mlp"
 
 import game "../cartpole"
 
@@ -17,7 +17,7 @@ main :: proc() {
 	defer fmt.println("Finished")
 
 	ctx := cpu.context_create(1024 * 1024)
-	defer ml.context_destroy(ctx)
+	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
 	model := model_make()

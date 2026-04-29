@@ -5,7 +5,7 @@ import "core:os"
 import "core:thread"
 
 import ml  "../.."
-import cpu "../../backend_cpu"
+import cpu "../../backends/cpu"
 
 WORKLOAD_BATCH :: 64
 WORKLOAD_IN    :: 128
@@ -14,7 +14,7 @@ THREAD_COUNT   :: 4
 
 run_workload :: proc() -> (data_sum, grad_sum: f32) {
 	ctx := cpu.context_create(16 * 1024 * 1024)
-	defer ml.context_destroy(ctx)
+	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
 	weight, _ := ml.make({WORKLOAD_OUT, WORKLOAD_IN})

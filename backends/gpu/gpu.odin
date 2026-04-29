@@ -9,7 +9,7 @@ import "core:sync"
 
 import vk "vendor:vulkan"
 
-import ml ".."
+import ml "../../"
 
 Gpu_Device :: struct {
 	instance:           vk.Instance,
@@ -25,7 +25,9 @@ Gpu_Device :: struct {
 	loader:             dynlib.Library,
 }
 
-Gpu_Context :: struct {
+Context :: struct {
+	using _: ml.Context,
+
 	command_pool:    vk.CommandPool,
 	descriptor_pool: vk.DescriptorPool,
 	batch:           Batch,
@@ -60,8 +62,8 @@ _gpu:       Gpu_Device
 _gpu_mutex: sync.Mutex
 
 @(require_results)
-_gctx :: #force_inline proc(loc := #caller_location) -> ^Gpu_Context {
-	return cast(^Gpu_Context)ml.current_context(loc=loc).backend_data
+_gctx :: #force_inline proc(loc := #caller_location) -> ^Context {
+	return cast(^Context)ml.current_context(loc=loc)
 }
 
 device_init :: proc() {
@@ -233,7 +235,7 @@ _create_device :: proc() {
 DESCRIPTOR_POOL_MAX_SETS    :: 4096
 DESCRIPTOR_POOL_MAX_STORAGE :: 16384
 
-_create_command_pool :: proc(gctx: ^Gpu_Context, loc := #caller_location) {
+_create_command_pool :: proc(gctx: ^Context, loc := #caller_location) {
 	info := vk.CommandPoolCreateInfo{
 		sType            = .COMMAND_POOL_CREATE_INFO,
 		flags            = {.RESET_COMMAND_BUFFER},
@@ -243,7 +245,7 @@ _create_command_pool :: proc(gctx: ^Gpu_Context, loc := #caller_location) {
 	fmt.assertf(res == .SUCCESS, "vkCreateCommandPool failed: %v", res, loc=loc)
 }
 
-_create_descriptor_pool :: proc(gctx: ^Gpu_Context, loc := #caller_location) {
+_create_descriptor_pool :: proc(gctx: ^Context, loc := #caller_location) {
 	pool_size := vk.DescriptorPoolSize{
 		type            = .STORAGE_BUFFER,
 		descriptorCount = DESCRIPTOR_POOL_MAX_STORAGE,

@@ -9,9 +9,9 @@ import "core:strconv"
 import "core:path/filepath"
 
 import ml  "../../.."
-import cpu "../../../backend_cpu"
-import gpu "../../../backend_gpu"
-import mlp "../../../mlp"
+import cpu "../../../backends/cpu"
+import gpu "../../../backends/gpu"
+import mlp "../../../networks/mlp"
 
 MAGIC :: "TNSR"
 
@@ -41,7 +41,12 @@ main :: proc() {
 		fmt.eprintfln("unknown backend: %v (expected cpu or gpu)", backend_name)
 		os.exit(1)
 	}
-	defer ml.context_destroy(ctx)
+	defer {
+		switch backend_name {
+		case "cpu": cpu.context_destroy(ctx)
+		case "gpu": gpu.context_destroy(ctx)
+		}
+	}
 	ml.context_scope(ctx)
 
 	if backend_name == "cpu" {
