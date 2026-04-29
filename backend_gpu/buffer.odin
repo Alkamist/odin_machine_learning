@@ -47,10 +47,10 @@ _create_buffer :: proc(
 }
 
 _pick_memory_type :: proc(type_bits: u32, required: vk.MemoryPropertyFlags, loc := #caller_location) -> u32 {
-	mp := &_gpu.memory_properties
-	for i in 0 ..< mp.memoryTypeCount {
+	memory_properties := &_gpu.memory_properties
+	for i in 0 ..< memory_properties.memoryTypeCount {
 		if (type_bits & (1 << i)) == 0 { continue }
-		if required <= mp.memoryTypes[i].propertyFlags {
+		if required <= memory_properties.memoryTypes[i].propertyFlags {
 			return i
 		}
 	}

@@ -29,8 +29,8 @@ SEQUENCE_LENGTH :: 64
 main :: proc() {
 	defer fmt.println("Finished")
 
-	// ctx := ml.context_create(1024 * 1024 * 16, &cpu.backend)
-	ctx := ml.context_create(1024 * 1024, gpu.backend())
+	// ctx := cpu.context_create(1024 * 1024 * 16)
+	ctx := gpu.context_create()
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 	// cpu.set_thread_count(24)

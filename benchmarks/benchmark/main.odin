@@ -35,7 +35,7 @@ main :: proc() {
 		thread_count = os.get_processor_core_count()
 	}
 
-	ctx := ml.context_create(256 * 1024 * 1024, &cpu.backend)
+	ctx := cpu.context_create(256 * 1024 * 1024)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 

@@ -36,7 +36,7 @@ Buffer_Set :: bit_set[Buffer_Kind; u8]
 Backend_Buffer :: [BACKEND_BUFFER_MAX_SIZE]byte
 
 Tensor :: struct {
-	vtable:  ^Backend_VTable,
+	backend: ^Backend,
 	buffers: [Buffer_Kind]Backend_Buffer,
 	type:    Data_Type,
 	shape:   [MAX_TENSOR_RANK]int,
@@ -44,10 +44,7 @@ Tensor :: struct {
 	count:   int,
 }
 
-Backend_VTable :: struct {
-	init:     proc(ctx: ^Context, size: int, loc: runtime.Source_Code_Location),
-	destroy:  proc(ctx: ^Context, loc: runtime.Source_Code_Location),
-
+Backend :: struct #all_or_none {
 	clear:    proc(loc: runtime.Source_Code_Location),
 	forward:  proc(op: Operation, loc: runtime.Source_Code_Location),
 	backward: proc(op: Operation, loc: runtime.Source_Code_Location),
@@ -61,8 +58,7 @@ Backend_VTable :: struct {
 }
 
 Context :: struct {
-	vtable:       ^Backend_VTable,
-	backend_data: rawptr,
+	backend: Backend,
 
 	op_arena:      mem.Arena,
 	_op_arena_buf: []byte,
@@ -76,36 +72,22 @@ Context :: struct {
 @(thread_local)
 _current_ctx: ^Context
 
-@(require_results)
-context_create :: proc(size: int, vtable: ^Backend_VTable, allocator := context.allocator, loc := #caller_location) -> ^Context {
-	assert(vtable != nil, "Backend vtable must not be nil", loc=loc)
-
-	ctx, ctx_err := builtin.new(Context, allocator=allocator, loc=loc)
-	assert(ctx_err == nil, "Failed to allocate Context", loc=loc)
-
-	ctx.vtable = vtable
+_context_init :: proc(ctx: ^Context, backend: Backend, allocator: mem.Allocator, loc: runtime.Source_Code_Location) {
+	ctx.backend = backend
 
 	op_arena_buf, op_arena_err := builtin.make([]byte, OP_ARENA_DEFAULT_SIZE, allocator=allocator, loc=loc)
 	assert(op_arena_err == nil, "Failed to allocate op-metadata arena", loc=loc)
 	ctx._op_arena_buf = op_arena_buf
 	mem.arena_init(&ctx.op_arena, op_arena_buf)
-
-	vtable.init(ctx, size, loc)
-
-	return ctx
 }
 
-context_destroy :: proc(ctx: ^Context, allocator := context.allocator, loc := #caller_location) {
+_context_destroy :: proc(ctx: ^Context, loc: runtime.Source_Code_Location) {
 	assert(_current_ctx != ctx, "context_destroy called on the active context", loc=loc)
 
-	if ctx.vtable != nil && ctx.vtable.destroy != nil {
-		ctx.vtable.destroy(ctx, loc)
-	}
-
 	if ctx._op_arena_buf != nil {
-		builtin.delete(ctx._op_arena_buf, allocator=allocator, loc=loc)
+		builtin.delete(ctx._op_arena_buf, loc=loc)
 	}
-	builtin.free(ctx, allocator=allocator, loc=loc)
+	builtin.free(ctx, loc=loc)
 }
 
 context_begin :: proc(ctx: ^Context) {
@@ -130,9 +112,10 @@ current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
 }
 
 clear :: proc(loc := #caller_location) {
-	assert(_current_ctx != nil && _current_ctx.vtable != nil, "Did you forget to call context_create or context_scope?", loc=loc)
+	assert(_current_ctx != nil, "Did you forget to call context_create or context_scope?", loc=loc)
 
-	_current_ctx.vtable.clear(loc)
+	_current_ctx.backend.clear(loc)
+
 	mem.arena_free_all(&_current_ctx.op_arena)
 	_current_ctx.operation_count = 0
 }
@@ -160,14 +143,14 @@ DEFAULT_PARAMETER_BUFFERS  :: Buffer_Set{.Data, .Gradient, .Adam_M, .Adam_V}
 
 @(require_results)
 alloc :: proc(shape: []int, persistent: bool, buffers: Buffer_Set, loc := #caller_location) -> (t: Tensor) {
-	assert(_current_ctx != nil && _current_ctx.vtable != nil, "Did you forget to call context_create / context_scope?", loc=loc)
+	assert(_current_ctx != nil, "Did you forget to call context_create / context_scope?", loc=loc)
 	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
 	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
 
 	element_count := shape_element_count(shape)
 	assert(element_count > 0, "Tensor element count must be positive", loc=loc)
 
-	t.vtable = _current_ctx.vtable
+	t.backend = &_current_ctx.backend
 	t.type   = .F32
 	t.count  = element_count
 	t.rank   = builtin.len(shape)
@@ -178,7 +161,7 @@ alloc :: proc(shape: []int, persistent: bool, buffers: Buffer_Set, loc := #calle
 
 	for kind in Buffer_Kind {
 		if kind in buffers {
-			t.buffers[kind] = t.vtable.buffer_alloc(element_count, persistent, loc)
+			t.buffers[kind] = t.backend.buffer_alloc(element_count, persistent, loc)
 		}
 	}
 
@@ -201,7 +184,7 @@ tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
 	shape := [1]int{builtin.len(data)}
 	t = zeros(shape[:], loc=loc)
-	t.vtable.buffer_set(t.buffers[.Data], data, loc)
+	t.backend.buffer_set(t.buffers[.Data], data, loc)
 	return
 }
 
@@ -210,7 +193,7 @@ scalar :: proc(value: f32, loc := #caller_location) -> (t: Tensor) {
 	shape := [1]int{1}
 	t = zeros(shape[:], loc=loc)
 	src := [1]f32{value}
-	t.vtable.buffer_set(t.buffers[.Data], src[:], loc)
+	t.backend.buffer_set(t.buffers[.Data], src[:], loc)
 	return
 }
 
@@ -246,7 +229,7 @@ reshape :: proc(src: Tensor, shape: []int, loc := #caller_location) -> (t: Tenso
 	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
 	assert(shape_element_count(shape) == len(src), "Reshape element count mismatch", loc=loc)
 
-	t.vtable  = src.vtable
+	t.backend  = src.backend
 	t.buffers = src.buffers
 	t.type    = src.type
 	t.count   = src.count
@@ -264,30 +247,30 @@ make :: proc(shape: []int, loc := #caller_location) -> (t: Tensor, err: mem.Allo
 }
 
 destroy :: proc(t: Tensor, loc := #caller_location) {
-	if t.vtable == nil { return }
+	if t.backend == nil { return }
 	for kind in Buffer_Kind {
-		t.vtable.buffer_free(t.buffers[kind], loc)
+		t.backend.buffer_free(t.buffers[kind], loc)
 	}
 }
 
 copy :: proc(dst, src: Tensor, loc := #caller_location) {
 	assert(len(dst) == len(src), "Tensor lengths must be equal", loc=loc)
-	assert(dst.vtable == src.vtable, "Tensor copy across backends not supported", loc=loc)
+	assert(dst.backend == src.backend, "Tensor copy across backends not supported", loc=loc)
 	for kind in Buffer_Kind {
-		dst.vtable.buffer_copy(dst.buffers[kind], src.buffers[kind], loc)
+		dst.backend.buffer_copy(dst.buffers[kind], src.buffers[kind], loc)
 	}
 }
 
 get_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
-	t.vtable.buffer_get(t.buffers[.Data], data, loc)
+	t.backend.buffer_get(t.buffers[.Data], data, loc)
 }
 
 set_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
-	t.vtable.buffer_set(t.buffers[.Data], data, loc)
+	t.backend.buffer_set(t.buffers[.Data], data, loc)
 }
 
 get_gradient :: proc(t: Tensor, data: []f32, loc := #caller_location) {
-	t.vtable.buffer_get(t.buffers[.Gradient], data, loc)
+	t.backend.buffer_get(t.buffers[.Gradient], data, loc)
 }
 
 fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
@@ -296,7 +279,7 @@ fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
 	for i in 0 ..< n {
 		buf[i] = rand.float32_normal(mean, std)
 	}
-	t.vtable.buffer_set(t.buffers[.Data], buf, loc)
+	t.backend.buffer_set(t.buffers[.Data], buf, loc)
 }
 
 fill_value :: proc(t: Tensor, value: f32, loc := #caller_location) {
@@ -305,7 +288,7 @@ fill_value :: proc(t: Tensor, value: f32, loc := #caller_location) {
 	for i in 0 ..< n {
 		buf[i] = value
 	}
-	t.vtable.buffer_set(t.buffers[.Data], buf, loc)
+	t.backend.buffer_set(t.buffers[.Data], buf, loc)
 }
 
 he_initialization :: proc(t: Tensor, input_features: int) {
@@ -362,7 +345,7 @@ optimize :: proc(
 
 update :: proc(opt: Optimizer, t: Tensor, loc := #caller_location) {
 	t := t
-	t.vtable.update(opt, &t, loc)
+	t.backend.update(opt, &t, loc)
 }
 
 Operation_Variant :: union {
@@ -416,7 +399,7 @@ backward :: proc(loc := #caller_location) {
 		return
 	}
 
-	vtable := _current_ctx.vtable
+	backend := _current_ctx.backend
 
 	final_op := &_current_ctx.operations[_current_ctx.operation_count - 1]
 
@@ -424,10 +407,10 @@ backward :: proc(loc := #caller_location) {
 	for &v in ones {
 		v = 1
 	}
-	vtable.buffer_set(final_op.output.buffers[.Gradient], ones, loc)
+	backend.buffer_set(final_op.output.buffers[.Gradient], ones, loc)
 
 	for i := _current_ctx.operation_count - 1; i >= 0; i -= 1 {
-		vtable.backward(_current_ctx.operations[i], loc)
+		backend.backward(_current_ctx.operations[i], loc)
 	}
 }
 
@@ -469,7 +452,7 @@ attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller
 			d_acc           = d_acc,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -490,7 +473,7 @@ add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Add{b = b},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -511,7 +494,7 @@ sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Sub{b = b},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -532,7 +515,7 @@ mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Mul{b = b},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -553,7 +536,7 @@ div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Div{b = b},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -571,7 +554,7 @@ exp :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Exp{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -596,7 +579,7 @@ clamp :: proc(input: Tensor, min_val, max_val: f32, loc := #caller_location) -> 
 			max_val = max_val,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -619,7 +602,7 @@ min :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			b = b,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -642,7 +625,7 @@ max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			b = b,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -659,7 +642,7 @@ mean :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Mean{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -681,7 +664,7 @@ transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Transpose{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -711,7 +694,7 @@ select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (outpu
 			indices = indices_copy,
 		}
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -736,7 +719,7 @@ slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (outpu
 			end   = end,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -763,7 +746,7 @@ slice_trailing :: proc(input: Tensor, start, end: int, loc := #caller_location) 
 			end   = end,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -801,7 +784,7 @@ concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 			inputs = inputs_copy,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -829,7 +812,7 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 			weight = weight,
 		}
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -869,7 +852,7 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_l
 			sin_cache  = sin_cache,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -902,7 +885,7 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 			rstd   = rstd,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -919,7 +902,7 @@ softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Softmax{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -936,7 +919,7 @@ log_softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 		output  = output,
 		variant = Log_Softmax{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -953,7 +936,7 @@ entropy :: proc(probabilities: Tensor, loc := #caller_location) -> (output: Tens
 		output  = output,
 		variant = Entropy{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -976,7 +959,7 @@ mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location
 			targets = targets,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1015,7 +998,7 @@ cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) ->
 			targets       = targets_copy,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1033,7 +1016,7 @@ relu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Relu{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1051,7 +1034,7 @@ sigmoid :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Sigmoid{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1069,7 +1052,7 @@ gelu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Gelu{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1087,7 +1070,7 @@ silu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Silu{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1105,7 +1088,7 @@ tanh :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Tanh{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1134,7 +1117,7 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 			b = b,
 		},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1166,7 +1149,7 @@ permute :: proc(input: Tensor, axes: [3]int, loc := #caller_location) -> (output
 		output  = output,
 		variant = Permute{axes = axes},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1187,7 +1170,7 @@ causal_mask :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 		output  = output,
 		variant = Causal_Mask{},
 	}
-	_current_ctx.vtable.forward(op, loc)
+	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
 
 	return

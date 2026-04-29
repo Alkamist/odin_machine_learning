@@ -4,46 +4,54 @@ import "base:builtin"
 import "base:runtime"
 
 import "core:fmt"
+import "core:sync"
 
 import vk "vendor:vulkan"
 
 import ml ".."
 
-_backend := ml.Backend_VTable{
-	init            = init,
-	destroy         = destroy,
-	clear           = clear,
-	forward         = forward,
-	backward        = backward,
-	update          = update,
-	buffer_alloc    = buffer_alloc,
-	buffer_free     = buffer_free,
-	buffer_get      = buffer_get,
-	buffer_set      = buffer_set,
-	buffer_copy     = buffer_copy,
+_backend := ml.Backend{
+	destroy      = destroy,
+	clear        = clear,
+	forward      = forward,
+	backward     = backward,
+	update       = update,
+	buffer_alloc = buffer_alloc,
+	buffer_free  = buffer_free,
+	buffer_get   = buffer_get,
+	buffer_set   = buffer_set,
+	buffer_copy  = buffer_copy,
 }
 
-// Lazy-init Vulkan and return the vtable. Wire into ml via:
-//   ctx := ml.context_create(N, gpu.backend())
 @(require_results)
-backend :: proc() -> ^ml.Backend_VTable {
+backend :: proc() -> ^ml.Backend {
 	device_init()
 	return &_backend
 }
 
-init :: proc(ctx: ^ml.Context, size: int, loc: runtime.Source_Code_Location) {
-	device_init()
+@(require_results)
+context_create :: proc(allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
 
-	gctx, err := builtin.new(Gpu_Context, allocator=context.allocator, loc=loc)
+	_device_init_locked()
+
+	ctx := ml.context_create(&_backend, allocator=allocator, loc=loc)
+
+	gctx, err := builtin.new(Gpu_Context, allocator=allocator, loc=loc)
 	fmt.assertf(err == nil, "Failed to allocate Gpu_Context: %v", err, loc=loc)
 
 	_create_command_pool(gctx, loc)
 	_create_descriptor_pool(gctx, loc)
 
 	ctx.backend_data = gctx
+	return ctx
 }
 
 destroy :: proc(ctx: ^ml.Context, loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	gctx := cast(^Gpu_Context)ctx.backend_data
 	if gctx == nil { return }
 
@@ -91,6 +99,9 @@ destroy :: proc(ctx: ^ml.Context, loc: runtime.Source_Code_Location) {
 }
 
 clear :: proc(loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	gctx := _gctx(loc)
 	if gctx.batch.active {
 		end_batch(loc)
@@ -109,6 +120,9 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 }
 
 buffer_alloc :: proc(len: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	gctx := _gctx(loc)
 	size := vk.DeviceSize(len * size_of(f32))
 	usage := vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
@@ -134,6 +148,9 @@ buffer_alloc :: proc(len: int, persist: bool, loc: runtime.Source_Code_Location)
 }
 
 buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	gpu_buffer := transmute(Gpu_Buffer)buffer
 	if gpu_buffer.buffer == 0 { return }
 
@@ -143,18 +160,27 @@ buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location
 }
 
 buffer_get :: proc(buffer: ml.Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	gpu_buffer := transmute(Gpu_Buffer)buffer
 	if gpu_buffer.buffer == 0 || builtin.len(data) == 0 { return }
 	_download(gpu_buffer.buffer, data, loc)
 }
 
 buffer_set :: proc(buffer: ml.Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	gpu_buffer := transmute(Gpu_Buffer)buffer
 	if gpu_buffer.buffer == 0 || builtin.len(data) == 0 { return }
 	_upload(gpu_buffer.buffer, data, loc)
 }
 
 buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	dst_buffer := transmute(Gpu_Buffer)dst
 	src_buffer := transmute(Gpu_Buffer)src
 	if dst_buffer.buffer == 0 || src_buffer.buffer == 0 { return }
@@ -192,6 +218,9 @@ adam_v :: #force_inline proc(t: ml.Tensor) -> Gpu_Buffer {
 }
 
 update :: proc(opt: ml.Optimizer, t: ^ml.Tensor, loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	d := data(t^)
 	g := gradient(t^)
 	m := adam_m(t^)
@@ -221,6 +250,9 @@ update :: proc(opt: ml.Optimizer, t: ^ml.Tensor, loc: runtime.Source_Code_Locati
 }
 
 forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	switch _ in op.variant {
 	case ml.Add:                add_forward                (op)
 	case ml.Sub:                sub_forward                (op)
@@ -257,6 +289,9 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 }
 
 backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	switch _ in op.variant {
 	case ml.Add:                add_backward               (op)
 	case ml.Sub:                sub_backward               (op)
@@ -430,196 +465,227 @@ div_backward :: proc(op: ml.Operation) {
 }
 
 exp_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input  := op.input
+	output := op.output
+
 	if _exp_pipeline == nil {
 		_exp_pipeline = _make_pipeline(EXP_SPIRV, 2, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_exp_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_exp_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 exp_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input, output := op.input, op.output
+
 	if _exp_back_pipeline == nil {
 		_exp_back_pipeline = _make_pipeline(EXP_BACK_SPIRV, 3, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [3]vk.Buffer{data(y).buffer, gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_exp_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_exp_back_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 clamp_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Clamp)
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Clamp)
+
 	if _clamp_pipeline == nil {
 		_clamp_pipeline = _make_pipeline(CLAMP_SPIRV, 2, size_of(Clamp_Params))
 	}
-	params := Clamp_Params{n = u32(ml.len(x)), min_val = v.min_val, max_val = v.max_val}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_clamp_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Clamp_Params{n = u32(ml.len(input)), min_val = variant.min_val, max_val = variant.max_val}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_clamp_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 clamp_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Clamp)
+	input, output := op.input, op.output
+
+	variant := op.variant.(ml.Clamp)
+
 	if _clamp_back_pipeline == nil {
 		_clamp_back_pipeline = _make_pipeline(CLAMP_BACK_SPIRV, 3, size_of(Clamp_Params))
 	}
-	params := Clamp_Params{n = u32(ml.len(x)), min_val = v.min_val, max_val = v.max_val}
-	bufs   := [3]vk.Buffer{data(x).buffer, gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_clamp_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Clamp_Params{n = u32(ml.len(input)), min_val = variant.min_val, max_val = variant.max_val}
+	bufs   := [3]vk.Buffer{data(input).buffer, gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_clamp_back_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 min_forward :: proc(op: ml.Operation) {
-	a := op.input; y := op.output; b := op.variant.(ml.Min).b
+	a      := op.input
+	output := op.output
+	b      := op.variant.(ml.Min).b
+
 	if _min_pipeline == nil {
 		_min_pipeline = _make_pipeline(MIN_SPIRV, 3, size_of(MinMax_Params))
 	}
 	params := MinMax_Params{n = u32(ml.len(a))}
-	bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(y).buffer}
+	bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
 	_dispatch(_min_pipeline, bufs[:], &params, _div_up(ml.len(a), 256))
 }
 
 min_backward :: proc(op: ml.Operation) {
-	a := op.input; y := op.output; b := op.variant.(ml.Min).b
+	a, output := op.input, op.output
+	b         := op.variant.(ml.Min).b
+
 	if _min_back_pipeline == nil {
 		_min_back_pipeline = _make_pipeline(MIN_BACK_SPIRV, 5, size_of(MinMax_Params))
 	}
 	params := MinMax_Params{n = u32(ml.len(a))}
-	bufs   := [5]vk.Buffer{data(a).buffer, data(b).buffer, gradient(y).buffer, gradient(a).buffer, gradient(b).buffer}
+	bufs   := [5]vk.Buffer{data(a).buffer, data(b).buffer, gradient(output).buffer, gradient(a).buffer, gradient(b).buffer}
 	_dispatch(_min_back_pipeline, bufs[:], &params, _div_up(ml.len(a), 256))
 }
 
 max_forward :: proc(op: ml.Operation) {
-	a := op.input; y := op.output; b := op.variant.(ml.Max).b
+	a      := op.input
+	output := op.output
+	b      := op.variant.(ml.Max).b
+
 	if _max_pipeline == nil {
 		_max_pipeline = _make_pipeline(MAX_SPIRV, 3, size_of(MinMax_Params))
 	}
 	params := MinMax_Params{n = u32(ml.len(a))}
-	bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(y).buffer}
+	bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
 	_dispatch(_max_pipeline, bufs[:], &params, _div_up(ml.len(a), 256))
 }
 
 max_backward :: proc(op: ml.Operation) {
-	a := op.input; y := op.output; b := op.variant.(ml.Max).b
+	a, output := op.input, op.output
+	b         := op.variant.(ml.Max).b
+
 	if _max_back_pipeline == nil {
 		_max_back_pipeline = _make_pipeline(MAX_BACK_SPIRV, 5, size_of(MinMax_Params))
 	}
 	params := MinMax_Params{n = u32(ml.len(a))}
-	bufs   := [5]vk.Buffer{data(a).buffer, data(b).buffer, gradient(y).buffer, gradient(a).buffer, gradient(b).buffer}
+	bufs   := [5]vk.Buffer{data(a).buffer, data(b).buffer, gradient(output).buffer, gradient(a).buffer, gradient(b).buffer}
 	_dispatch(_max_back_pipeline, bufs[:], &params, _div_up(ml.len(a), 256))
 }
 
 mean_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	count := ml.len(y)
-	size  := ml.len(x) / count
+	input  := op.input
+	output := op.output
+	count  := ml.len(output)
+	size   := ml.len(input) / count
+
 	if _mean_pipeline == nil {
 		_mean_pipeline = _make_pipeline(MEAN_SPIRV, 2, size_of(Mean_Params))
 	}
 	params := Mean_Params{count = u32(count), size = u32(size)}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 	_dispatch(_mean_pipeline, bufs[:], &params, u32(count))
 }
 
 mean_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	count := ml.len(y)
-	size  := ml.len(x) / count
+	input, output := op.input, op.output
+	count := ml.len(output)
+	size  := ml.len(input) / count
+
 	if _mean_back_pipeline == nil {
 		_mean_back_pipeline = _make_pipeline(MEAN_BACK_SPIRV, 2, size_of(Mean_Params))
 	}
 	params := Mean_Params{count = u32(count), size = u32(size)}
-	bufs   := [2]vk.Buffer{gradient(y).buffer, gradient(x).buffer}
+	bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(input).buffer}
 	_dispatch(_mean_back_pipeline, bufs[:], &params, _div_up(count * size, 256))
 }
 
 transpose_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	rows := x.shape[0]
-	cols := x.shape[1]
+	input   := op.input
+	output  := op.output
+	rows    := input.shape[0]
+	columns := input.shape[1]
+
 	if _transpose_pipeline == nil {
 		_transpose_pipeline = _make_pipeline(TRANSPOSE_SPIRV, 2, size_of(Transpose_Params))
 	}
-	params := Transpose_Params{rows = u32(rows), cols = u32(cols)}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_transpose_pipeline, bufs[:], &params, _div_up(cols, 16), _div_up(rows, 16))
+	params := Transpose_Params{rows = u32(rows), cols = u32(columns)}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_transpose_pipeline, bufs[:], &params, _div_up(columns, 16), _div_up(rows, 16))
 }
 
 transpose_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	rows := x.shape[0]
-	cols := x.shape[1]
+	input, output := op.input, op.output
+	rows    := input.shape[0]
+	columns := input.shape[1]
+
 	if _transpose_back_pipeline == nil {
 		_transpose_back_pipeline = _make_pipeline(TRANSPOSE_BACK_SPIRV, 2, size_of(Transpose_Params))
 	}
-	params := Transpose_Params{rows = u32(rows), cols = u32(cols)}
-	bufs   := [2]vk.Buffer{gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_transpose_back_pipeline, bufs[:], &params, _div_up(cols, 16), _div_up(rows, 16))
+	params := Transpose_Params{rows = u32(rows), cols = u32(columns)}
+	bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_transpose_back_pipeline, bufs[:], &params, _div_up(columns, 16), _div_up(rows, 16))
 }
 
 select_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input   := op.input
+	output  := op.output
 	indices := op.variant.(ml.Select).indices
-	size    := ml.len(y) / builtin.len(indices)
+	size    := ml.len(output) / builtin.len(indices)
 
-	idx_buf, idx_mem := _upload_indices(indices)
+	indices_buf, indices_mem := _upload_indices(indices)
 
 	if _select_pipeline == nil {
 		_select_pipeline = _make_pipeline(SELECT_SPIRV, 3, size_of(Select_Params))
 	}
 	params := Select_Params{n_indices = u32(builtin.len(indices)), size = u32(size)}
-	bufs   := [3]vk.Buffer{data(x).buffer, idx_buf, data(y).buffer}
+	bufs   := [3]vk.Buffer{data(input).buffer, indices_buf, data(output).buffer}
 	_dispatch(_select_pipeline, bufs[:], &params, _div_up(size, 256), u32(builtin.len(indices)), 1)
 
-	_queue_destroy_buffer(idx_buf, idx_mem)
+	_queue_destroy_buffer(indices_buf, indices_mem)
 }
 
 select_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input, output := op.input, op.output
 	indices := op.variant.(ml.Select).indices
-	size    := ml.len(y) / builtin.len(indices)
-	vocab   := x.shape[0]
+	size    := ml.len(output) / builtin.len(indices)
+	vocab   := input.shape[0]
 
-	idx_buf, idx_mem := _upload_indices(indices)
+	indices_buf, indices_mem := _upload_indices(indices)
 
 	if _select_back_pipeline == nil {
 		_select_back_pipeline = _make_pipeline(SELECT_BACK_SPIRV, 3, size_of(Select_Back_Params))
 	}
 	params := Select_Back_Params{vocab = u32(vocab), n_indices = u32(builtin.len(indices)), size = u32(size)}
-	bufs   := [3]vk.Buffer{idx_buf, gradient(y).buffer, gradient(x).buffer}
+	bufs   := [3]vk.Buffer{indices_buf, gradient(output).buffer, gradient(input).buffer}
 	_dispatch(_select_back_pipeline, bufs[:], &params, _div_up(vocab, 16), _div_up(size, 16), 1)
 
-	_queue_destroy_buffer(idx_buf, idx_mem)
+	_queue_destroy_buffer(indices_buf, indices_mem)
 }
 
 slice_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output; v := op.variant.(ml.Slice)
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Slice)
+
 	if _slice_pipeline == nil {
 		_slice_pipeline = _make_pipeline(SLICE_SPIRV, 2, size_of(Slice_Params))
 	}
-	params := Slice_Params{n = u32(ml.len(y)), start = u32(v.start)}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_slice_pipeline, bufs[:], &params, _div_up(ml.len(y), 256))
+	params := Slice_Params{n = u32(ml.len(output)), start = u32(variant.start)}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_slice_pipeline, bufs[:], &params, _div_up(ml.len(output), 256))
 }
 
 slice_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output; v := op.variant.(ml.Slice)
+	input, output := op.input, op.output
+	variant := op.variant.(ml.Slice)
+
 	if _slice_back_pipeline == nil {
 		_slice_back_pipeline = _make_pipeline(SLICE_BACK_SPIRV, 2, size_of(Slice_Params))
 	}
-	params := Slice_Params{n = u32(ml.len(y)), start = u32(v.start)}
-	bufs   := [2]vk.Buffer{gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_slice_back_pipeline, bufs[:], &params, _div_up(ml.len(y), 256))
+	params := Slice_Params{n = u32(ml.len(output)), start = u32(variant.start)}
+	bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_slice_back_pipeline, bufs[:], &params, _div_up(ml.len(output), 256))
 }
 
 slice_trailing_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output; v := op.variant.(ml.Slice_Trailing)
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Slice_Trailing)
 
-	trailing     := x.shape[x.rank - 1]
-	new_trailing := y.shape[y.rank - 1]
-	leading      := ml.len(x) / trailing
+	trailing     := input.shape[input.rank - 1]
+	new_trailing := output.shape[output.rank - 1]
+	leading      := ml.len(input) / trailing
 
 	if _slice_trailing_pipeline == nil {
 		_slice_trailing_pipeline = _make_pipeline(SLICE_TRAILING_SPIRV, 2, size_of(Slice_Trailing_Params))
@@ -628,18 +694,19 @@ slice_trailing_forward :: proc(op: ml.Operation) {
 		leading      = u32(leading),
 		trailing     = u32(trailing),
 		new_trailing = u32(new_trailing),
-		start        = u32(v.start),
+		start        = u32(variant.start),
 	}
-	bufs := [2]vk.Buffer{data(x).buffer, data(y).buffer}
+	bufs := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 	_dispatch(_slice_trailing_pipeline, bufs[:], &params, _div_up(leading * new_trailing, 256))
 }
 
 slice_trailing_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output; v := op.variant.(ml.Slice_Trailing)
+	input, output := op.input, op.output
+	variant := op.variant.(ml.Slice_Trailing)
 
-	trailing     := x.shape[x.rank - 1]
-	new_trailing := y.shape[y.rank - 1]
-	leading      := ml.len(x) / trailing
+	trailing     := input.shape[input.rank - 1]
+	new_trailing := output.shape[output.rank - 1]
+	leading      := ml.len(input) / trailing
 
 	if _slice_trailing_back_pipeline == nil {
 		_slice_trailing_back_pipeline = _make_pipeline(SLICE_TRAILING_BACK_SPIRV, 2, size_of(Slice_Trailing_Back_Params))
@@ -648,9 +715,9 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 		leading      = u32(leading),
 		trailing     = u32(trailing),
 		new_trailing = u32(new_trailing),
-		start        = u32(v.start),
+		start        = u32(variant.start),
 	}
-	bufs := [2]vk.Buffer{gradient(x).buffer, gradient(y).buffer}
+	bufs := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
 	_dispatch(_slice_trailing_back_pipeline, bufs[:], &params, _div_up(leading * new_trailing, 256))
 }
 
@@ -761,50 +828,52 @@ linear_backward :: proc(op: ml.Operation) {
 }
 
 rope_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Rope)
-	token_count := x.shape[0]
-	head_size   := x.shape[x.rank - 1] / v.head_count
+	input       := op.input
+	output      := op.output
+	variant     := op.variant.(ml.Rope)
+	token_count := input.shape[0]
+	head_size   := input.shape[input.rank - 1] / variant.head_count
 
 	if _rope_pipeline == nil {
 		_rope_pipeline = _make_pipeline(ROPE_SPIRV, 2, size_of(Rope_Params))
 	}
 	params := Rope_Params{
 		token_count = u32(token_count),
-		head_count  = u32(v.head_count),
+		head_count  = u32(variant.head_count),
 		head_size   = u32(head_size),
-		base        = v.base,
+		base        = variant.base,
 	}
-	bufs        := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	total_pairs := token_count * v.head_count * (head_size / 2)
+	bufs        := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	total_pairs := token_count * variant.head_count * (head_size / 2)
 	_dispatch(_rope_pipeline, bufs[:], &params, _div_up(total_pairs, 256))
 }
 
 rope_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Rope)
-	token_count := x.shape[0]
-	head_size   := x.shape[x.rank - 1] / v.head_count
+	input, output := op.input, op.output
+	variant     := op.variant.(ml.Rope)
+	token_count := input.shape[0]
+	head_size   := input.shape[input.rank - 1] / variant.head_count
 
 	if _rope_back_pipeline == nil {
 		_rope_back_pipeline = _make_pipeline(ROPE_BACK_SPIRV, 2, size_of(Rope_Back_Params))
 	}
 	params := Rope_Back_Params{
 		token_count = u32(token_count),
-		head_count  = u32(v.head_count),
+		head_count  = u32(variant.head_count),
 		head_size   = u32(head_size),
-		base        = v.base,
+		base        = variant.base,
 	}
-	bufs        := [2]vk.Buffer{gradient(x).buffer, gradient(y).buffer}
-	total_pairs := token_count * v.head_count * (head_size / 2)
+	bufs        := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
+	total_pairs := token_count * variant.head_count * (head_size / 2)
 	_dispatch(_rope_back_pipeline, bufs[:], &params, _div_up(total_pairs, 256))
 }
 
 layernorm_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Layernorm)
-	size  := x.shape[x.rank - 1]
-	count := ml.len(x) / size
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Layernorm)
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
 
 	if _layernorm_stats_pipeline == nil {
 		_layernorm_stats_pipeline = _make_pipeline(LAYERNORM_STATS_SPIRV, 3, size_of(Layernorm_Stats_Params))
@@ -814,19 +883,19 @@ layernorm_forward :: proc(op: ml.Operation) {
 	}
 
 	stats_params := Layernorm_Stats_Params{count = u32(count), size = u32(size)}
-	stats_bufs   := [3]vk.Buffer{data(x).buffer, data(v.mean).buffer, data(v.rstd).buffer}
+	stats_bufs   := [3]vk.Buffer{data(input).buffer, data(variant.mean).buffer, data(variant.rstd).buffer}
 	_dispatch(_layernorm_stats_pipeline, stats_bufs[:], &stats_params, u32(count))
 
 	fwd_params := Layernorm_Params{count = u32(count), size = u32(size)}
-	fwd_bufs   := [3]vk.Buffer{data(x).buffer, data(v.weight).buffer, data(y).buffer}
+	fwd_bufs   := [3]vk.Buffer{data(input).buffer, data(variant.weight).buffer, data(output).buffer}
 	_dispatch(_layernorm_pipeline, fwd_bufs[:], &fwd_params, u32(count))
 }
 
 layernorm_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Layernorm)
-	size  := x.shape[x.rank - 1]
-	count := ml.len(x) / size
+	input, output := op.input, op.output
+	variant := op.variant.(ml.Layernorm)
+	size  := input.shape[input.rank - 1]
+	count := ml.len(input) / size
 
 	if _layernorm_back_input_pipeline == nil {
 		_layernorm_back_input_pipeline = _make_pipeline(LAYERNORM_BACK_INPUT_SPIRV, 6, size_of(Layernorm_Back_Params))
@@ -837,259 +906,288 @@ layernorm_backward :: proc(op: ml.Operation) {
 
 	params := Layernorm_Back_Params{count = u32(count), size = u32(size)}
 
-	in_bufs := [6]vk.Buffer{
-		data(x).buffer, data(v.weight).buffer, gradient(y).buffer,
-		data(v.mean).buffer, data(v.rstd).buffer, gradient(x).buffer,
+	input_bufs := [6]vk.Buffer{
+		data(input).buffer, data(variant.weight).buffer, gradient(output).buffer,
+		data(variant.mean).buffer, data(variant.rstd).buffer, gradient(input).buffer,
 	}
-	_dispatch(_layernorm_back_input_pipeline, in_bufs[:], &params, u32(count))
+	_dispatch(_layernorm_back_input_pipeline, input_bufs[:], &params, u32(count))
 
-	w_bufs := [5]vk.Buffer{
-		data(x).buffer, gradient(y).buffer,
-		data(v.mean).buffer, data(v.rstd).buffer, gradient(v.weight).buffer,
+	weight_bufs := [5]vk.Buffer{
+		data(input).buffer, gradient(output).buffer,
+		data(variant.mean).buffer, data(variant.rstd).buffer, gradient(variant.weight).buffer,
 	}
-	_dispatch(_layernorm_back_weight_pipeline, w_bufs[:], &params, _div_up(size, 256))
+	_dispatch(_layernorm_back_weight_pipeline, weight_bufs[:], &params, _div_up(size, 256))
 }
 
 softmax_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	size  := x.shape[x.rank - 1]
-	count := ml.len(x) / size
+	input  := op.input
+	output := op.output
+	size   := input.shape[input.rank - 1]
+	count  := ml.len(input) / size
+
 	if _softmax_pipeline == nil {
 		_softmax_pipeline = _make_pipeline(SOFTMAX_SPIRV, 2, size_of(Softmax_Params))
 	}
 	params := Softmax_Params{count = u32(count), size = u32(size)}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 	_dispatch(_softmax_pipeline, bufs[:], &params, u32(count))
 }
 
 softmax_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	size  := x.shape[x.rank - 1]
-	count := ml.len(x) / size
+	input, output := op.input, op.output
+	size  := input.shape[input.rank - 1]
+	count := ml.len(input) / size
+
 	if _softmax_back_pipeline == nil {
 		_softmax_back_pipeline = _make_pipeline(SOFTMAX_BACK_SPIRV, 3, size_of(Softmax_Back_Params))
 	}
 	params := Softmax_Back_Params{count = u32(count), size = u32(size)}
-	bufs   := [3]vk.Buffer{data(y).buffer, gradient(y).buffer, gradient(x).buffer}
+	bufs   := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, gradient(input).buffer}
 	_dispatch(_softmax_back_pipeline, bufs[:], &params, u32(count))
 }
 
 entropy_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	size  := x.shape[x.rank - 1]
-	count := ml.len(x) / size
+	input  := op.input
+	output := op.output
+	size   := input.shape[input.rank - 1]
+	count  := ml.len(input) / size
+
 	if _entropy_pipeline == nil {
 		_entropy_pipeline = _make_pipeline(ENTROPY_SPIRV, 2, size_of(Entropy_Params))
 	}
 	params := Entropy_Params{count = u32(count), size = u32(size)}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 	_dispatch(_entropy_pipeline, bufs[:], &params, u32(count))
 }
 
 entropy_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	size  := x.shape[x.rank - 1]
-	count := ml.len(x) / size
+	input, output := op.input, op.output
+	size  := input.shape[input.rank - 1]
+	count := ml.len(input) / size
+
 	if _entropy_back_pipeline == nil {
 		_entropy_back_pipeline = _make_pipeline(ENTROPY_BACK_SPIRV, 3, size_of(Entropy_Params))
 	}
 	params := Entropy_Params{count = u32(count), size = u32(size)}
-	bufs   := [3]vk.Buffer{data(x).buffer, gradient(y).buffer, gradient(x).buffer}
+	bufs   := [3]vk.Buffer{data(input).buffer, gradient(output).buffer, gradient(input).buffer}
 	_dispatch(_entropy_back_pipeline, bufs[:], &params, _div_up(count * size, 256))
 }
 
 log_softmax_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	size  := x.shape[x.rank - 1]
-	count := ml.len(x) / size
+	input  := op.input
+	output := op.output
+	size   := input.shape[input.rank - 1]
+	count  := ml.len(input) / size
+
 	if _log_softmax_pipeline == nil {
 		_log_softmax_pipeline = _make_pipeline(LOG_SOFTMAX_SPIRV, 2, size_of(Log_Softmax_Params))
 	}
 	params := Log_Softmax_Params{count = u32(count), size = u32(size)}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 	_dispatch(_log_softmax_pipeline, bufs[:], &params, u32(count))
 }
 
 log_softmax_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	size  := x.shape[x.rank - 1]
-	count := ml.len(x) / size
+	input, output := op.input, op.output
+	size  := input.shape[input.rank - 1]
+	count := ml.len(input) / size
+
 	if _log_softmax_back_pipeline == nil {
 		_log_softmax_back_pipeline = _make_pipeline(LOG_SOFTMAX_BACK_SPIRV, 3, size_of(Log_Softmax_Params))
 	}
 	params := Log_Softmax_Params{count = u32(count), size = u32(size)}
-	bufs   := [3]vk.Buffer{data(y).buffer, gradient(y).buffer, gradient(x).buffer}
+	bufs   := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, gradient(input).buffer}
 	_dispatch(_log_softmax_back_pipeline, bufs[:], &params, u32(count))
 }
 
 mean_squared_error_forward :: proc(op: ml.Operation) {
-	predictions := op.input; y := op.output
-	targets := op.variant.(ml.Mean_Squared_Error).targets
-	count := ml.len(y)
-	size  := ml.len(predictions) / count
+	predictions := op.input
+	output      := op.output
+	targets     := op.variant.(ml.Mean_Squared_Error).targets
+	count       := ml.len(output)
+	sample_size := ml.len(predictions) / count
+
 	if _mean_squared_error_pipeline == nil {
 		_mean_squared_error_pipeline = _make_pipeline(MEAN_SQUARED_ERROR_SPIRV, 3, size_of(Mean_Squared_Error_Params))
 	}
-	params := Mean_Squared_Error_Params{count = u32(count), size = u32(size)}
-	bufs   := [3]vk.Buffer{data(predictions).buffer, data(targets).buffer, data(y).buffer}
+	params := Mean_Squared_Error_Params{count = u32(count), size = u32(sample_size)}
+	bufs   := [3]vk.Buffer{data(predictions).buffer, data(targets).buffer, data(output).buffer}
 	_dispatch(_mean_squared_error_pipeline, bufs[:], &params, u32(count))
 }
 
 mean_squared_error_backward :: proc(op: ml.Operation) {
-	predictions := op.input; y := op.output
-	targets := op.variant.(ml.Mean_Squared_Error).targets
-	count := ml.len(y)
-	size  := ml.len(predictions) / count
+	predictions, output := op.input, op.output
+	targets     := op.variant.(ml.Mean_Squared_Error).targets
+	count       := ml.len(output)
+	sample_size := ml.len(predictions) / count
+
 	if _mean_squared_error_back_pipeline == nil {
 		_mean_squared_error_back_pipeline = _make_pipeline(MEAN_SQUARED_ERROR_BACK_SPIRV, 4, size_of(Mean_Squared_Error_Params))
 	}
-	params := Mean_Squared_Error_Params{count = u32(count), size = u32(size)}
-	bufs   := [4]vk.Buffer{data(predictions).buffer, data(targets).buffer, gradient(y).buffer, gradient(predictions).buffer}
+	params := Mean_Squared_Error_Params{count = u32(count), size = u32(sample_size)}
+	bufs   := [4]vk.Buffer{data(predictions).buffer, data(targets).buffer, gradient(output).buffer, gradient(predictions).buffer}
 	_dispatch(_mean_squared_error_back_pipeline, bufs[:], &params, _div_up(ml.len(predictions), 256))
 }
 
 cross_entropy_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Cross_Entropy)
-	class_size := x.shape[x.rank - 1]
+	input      := op.input
+	output     := op.output
+	variant    := op.variant.(ml.Cross_Entropy)
+	class_size := input.shape[input.rank - 1]
 
-	tgt_buf, tgt_mem := _upload_indices(v.targets)
+	targets_buf, targets_mem := _upload_indices(variant.targets)
 
 	if _cross_entropy_pipeline == nil {
 		_cross_entropy_pipeline = _make_pipeline(CROSS_ENTROPY_SPIRV, 4, size_of(Cross_Entropy_Params))
 	}
-	params := Cross_Entropy_Params{count = u32(builtin.len(v.targets)), class_size = u32(class_size)}
-	bufs   := [4]vk.Buffer{data(x).buffer, tgt_buf, data(v.probabilities).buffer, data(y).buffer}
-	_dispatch(_cross_entropy_pipeline, bufs[:], &params, u32(builtin.len(v.targets)))
+	params := Cross_Entropy_Params{count = u32(builtin.len(variant.targets)), class_size = u32(class_size)}
+	bufs   := [4]vk.Buffer{data(input).buffer, targets_buf, data(variant.probabilities).buffer, data(output).buffer}
+	_dispatch(_cross_entropy_pipeline, bufs[:], &params, u32(builtin.len(variant.targets)))
 
-	_queue_destroy_buffer(tgt_buf, tgt_mem)
+	_queue_destroy_buffer(targets_buf, targets_mem)
 }
 
 cross_entropy_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Cross_Entropy)
-	class_size := x.shape[x.rank - 1]
+	input, output := op.input, op.output
+	variant    := op.variant.(ml.Cross_Entropy)
+	class_size := input.shape[input.rank - 1]
 
-	tgt_buf, tgt_mem := _upload_indices(v.targets)
+	targets_buf, targets_mem := _upload_indices(variant.targets)
 
 	if _cross_entropy_back_pipeline == nil {
 		_cross_entropy_back_pipeline = _make_pipeline(CROSS_ENTROPY_BACK_SPIRV, 4, size_of(Cross_Entropy_Params))
 	}
-	params := Cross_Entropy_Params{count = u32(builtin.len(v.targets)), class_size = u32(class_size)}
-	bufs   := [4]vk.Buffer{data(v.probabilities).buffer, tgt_buf, gradient(y).buffer, gradient(x).buffer}
-	total  := builtin.len(v.targets) * class_size
+	params := Cross_Entropy_Params{count = u32(builtin.len(variant.targets)), class_size = u32(class_size)}
+	bufs   := [4]vk.Buffer{data(variant.probabilities).buffer, targets_buf, gradient(output).buffer, gradient(input).buffer}
+	total  := builtin.len(variant.targets) * class_size
 	_dispatch(_cross_entropy_back_pipeline, bufs[:], &params, _div_up(total, 256))
 
-	_queue_destroy_buffer(tgt_buf, tgt_mem)
+	_queue_destroy_buffer(targets_buf, targets_mem)
 }
 
 relu_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input  := op.input
+	output := op.output
+
 	if _relu_pipeline == nil {
 		_relu_pipeline = _make_pipeline(RELU_SPIRV, 2, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_relu_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_relu_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 relu_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input, output := op.input, op.output
+
 	if _relu_back_pipeline == nil {
 		_relu_back_pipeline = _make_pipeline(RELU_BACK_SPIRV, 3, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [3]vk.Buffer{data(x).buffer, gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_relu_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [3]vk.Buffer{data(input).buffer, gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_relu_back_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 sigmoid_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input  := op.input
+	output := op.output
+
 	if _sigmoid_pipeline == nil {
 		_sigmoid_pipeline = _make_pipeline(SIGMOID_SPIRV, 2, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_sigmoid_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_sigmoid_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 sigmoid_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input, output := op.input, op.output
+
 	if _sigmoid_back_pipeline == nil {
 		_sigmoid_back_pipeline = _make_pipeline(SIGMOID_BACK_SPIRV, 3, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [3]vk.Buffer{data(y).buffer, gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_sigmoid_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_sigmoid_back_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 gelu_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input  := op.input
+	output := op.output
+
 	if _gelu_pipeline == nil {
 		_gelu_pipeline = _make_pipeline(GELU_SPIRV, 2, size_of(Gelu_Params))
 	}
-	params := Gelu_Params{n = u32(ml.len(x))}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_gelu_pipeline, bufs[:], &params, _div_up(ml.len(x), GELU_LOCAL_SIZE))
+	params := Gelu_Params{n = u32(ml.len(input))}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_gelu_pipeline, bufs[:], &params, _div_up(ml.len(input), GELU_LOCAL_SIZE))
 }
 
 gelu_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input, output := op.input, op.output
+
 	if _gelu_back_pipeline == nil {
 		_gelu_back_pipeline = _make_pipeline(GELU_BACK_SPIRV, 3, size_of(Gelu_Back_Params))
 	}
-	params := Gelu_Back_Params{n = u32(ml.len(x))}
-	bufs   := [3]vk.Buffer{data(x).buffer, gradient(x).buffer, gradient(y).buffer}
-	_dispatch(_gelu_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Gelu_Back_Params{n = u32(ml.len(input))}
+	bufs   := [3]vk.Buffer{data(input).buffer, gradient(input).buffer, gradient(output).buffer}
+	_dispatch(_gelu_back_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 silu_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input  := op.input
+	output := op.output
+
 	if _silu_pipeline == nil {
 		_silu_pipeline = _make_pipeline(SILU_SPIRV, 2, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_silu_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_silu_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 silu_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input, output := op.input, op.output
+
 	if _silu_back_pipeline == nil {
 		_silu_back_pipeline = _make_pipeline(SILU_BACK_SPIRV, 3, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [3]vk.Buffer{data(x).buffer, gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_silu_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [3]vk.Buffer{data(input).buffer, gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_silu_back_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 tanh_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input  := op.input
+	output := op.output
+
 	if _tanh_pipeline == nil {
 		_tanh_pipeline = _make_pipeline(TANH_SPIRV, 2, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_tanh_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_tanh_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 tanh_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input, output := op.input, op.output
+
 	if _tanh_back_pipeline == nil {
 		_tanh_back_pipeline = _make_pipeline(TANH_BACK_SPIRV, 3, size_of(Activation_Params))
 	}
-	params := Activation_Params{n = u32(ml.len(x))}
-	bufs   := [3]vk.Buffer{data(y).buffer, gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_tanh_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Activation_Params{n = u32(ml.len(input))}
+	bufs   := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_tanh_back_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 batched_matmul_forward :: proc(op: ml.Operation) {
-	a := op.input; output := op.output
-	b := op.variant.(ml.Batched_Matmul).b
+	a           := op.input
+	output      := op.output
+	b           := op.variant.(ml.Batched_Matmul).b
 	batch_count := a.shape[0]
-	m := a.shape[1]
-	k := a.shape[2]
-	n := b.shape[2]
+	m           := a.shape[1]
+	k           := a.shape[2]
+	n           := b.shape[2]
 
 	if _batched_matmul_pipeline == nil {
 		_batched_matmul_pipeline = _make_pipeline(BATCHED_MATMUL_SPIRV, 3, size_of(Batched_Matmul_Params))
@@ -1110,12 +1208,12 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 }
 
 batched_matmul_backward :: proc(op: ml.Operation) {
-	a := op.input; output := op.output
-	b := op.variant.(ml.Batched_Matmul).b
+	a, output   := op.input, op.output
+	b           := op.variant.(ml.Batched_Matmul).b
 	batch_count := a.shape[0]
-	m := a.shape[1]
-	k := a.shape[2]
-	n := b.shape[2]
+	m           := a.shape[1]
+	k           := a.shape[2]
+	n           := b.shape[2]
 
 	if _batched_matmul_back_input_pipeline == nil {
 		_batched_matmul_back_input_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_INPUT_SPIRV, 3, size_of(Batched_Matmul_Params))
@@ -1148,97 +1246,102 @@ batched_matmul_backward :: proc(op: ml.Operation) {
 }
 
 permute_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	axes := op.variant.(ml.Permute).axes
+	input  := op.input
+	output := op.output
+	axes   := op.variant.(ml.Permute).axes
 
 	if _permute_pipeline == nil {
 		_permute_pipeline = _make_pipeline(PERMUTE_SPIRV, 2, size_of(Permute_Params))
 	}
 	params := Permute_Params{
-		out_d0 = u32(y.shape[0]),
-		out_d1 = u32(y.shape[1]),
-		out_d2 = u32(y.shape[2]),
-		in_d1  = u32(x.shape[1]),
-		in_d2  = u32(x.shape[2]),
+		out_d0 = u32(output.shape[0]),
+		out_d1 = u32(output.shape[1]),
+		out_d2 = u32(output.shape[2]),
+		in_d1  = u32(input.shape[1]),
+		in_d2  = u32(input.shape[2]),
 		axes_0 = u32(axes[0]),
 		axes_1 = u32(axes[1]),
 		axes_2 = u32(axes[2]),
 	}
-	bufs := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_permute_pipeline, bufs[:], &params, _div_up(ml.len(y), 256))
+	bufs := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_permute_pipeline, bufs[:], &params, _div_up(ml.len(output), 256))
 }
 
 permute_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
+	input, output := op.input, op.output
 	axes := op.variant.(ml.Permute).axes
 
 	if _permute_back_pipeline == nil {
 		_permute_back_pipeline = _make_pipeline(PERMUTE_BACK_SPIRV, 2, size_of(Permute_Params))
 	}
 	params := Permute_Params{
-		out_d0 = u32(y.shape[0]),
-		out_d1 = u32(y.shape[1]),
-		out_d2 = u32(y.shape[2]),
-		in_d1  = u32(x.shape[1]),
-		in_d2  = u32(x.shape[2]),
+		out_d0 = u32(output.shape[0]),
+		out_d1 = u32(output.shape[1]),
+		out_d2 = u32(output.shape[2]),
+		in_d1  = u32(input.shape[1]),
+		in_d2  = u32(input.shape[2]),
 		axes_0 = u32(axes[0]),
 		axes_1 = u32(axes[1]),
 		axes_2 = u32(axes[2]),
 	}
-	bufs := [2]vk.Buffer{gradient(y).buffer, gradient(x).buffer}
-	_dispatch(_permute_back_pipeline, bufs[:], &params, _div_up(ml.len(y), 256))
+	bufs := [2]vk.Buffer{gradient(output).buffer, gradient(input).buffer}
+	_dispatch(_permute_back_pipeline, bufs[:], &params, _div_up(ml.len(output), 256))
 }
 
 causal_mask_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	T := x.shape[x.rank - 1]
+	input  := op.input
+	output := op.output
+	T      := input.shape[input.rank - 1]
+
 	if _causal_mask_pipeline == nil {
 		_causal_mask_pipeline = _make_pipeline(CAUSAL_MASK_SPIRV, 2, size_of(Causal_Mask_Params))
 	}
-	params := Causal_Mask_Params{total = u32(ml.len(x)), T = u32(T)}
-	bufs   := [2]vk.Buffer{data(x).buffer, data(y).buffer}
-	_dispatch(_causal_mask_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Causal_Mask_Params{total = u32(ml.len(input)), T = u32(T)}
+	bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+	_dispatch(_causal_mask_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 causal_mask_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	T := x.shape[x.rank - 1]
+	input, output := op.input, op.output
+	T := input.shape[input.rank - 1]
+
 	if _causal_mask_back_pipeline == nil {
 		_causal_mask_back_pipeline = _make_pipeline(CAUSAL_MASK_BACK_SPIRV, 2, size_of(Causal_Mask_Params))
 	}
-	params := Causal_Mask_Params{total = u32(ml.len(x)), T = u32(T)}
-	bufs   := [2]vk.Buffer{gradient(x).buffer, gradient(y).buffer}
-	_dispatch(_causal_mask_back_pipeline, bufs[:], &params, _div_up(ml.len(x), 256))
+	params := Causal_Mask_Params{total = u32(ml.len(input)), T = u32(T)}
+	bufs   := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
+	_dispatch(_causal_mask_back_pipeline, bufs[:], &params, _div_up(ml.len(input), 256))
 }
 
 attention_forward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Attention)
-	token_count := x.shape[0]
-	embed_size  := y.shape[1]
-	head_size   := embed_size / v.head_count
+	input       := op.input
+	output      := op.output
+	variant     := op.variant.(ml.Attention)
+	token_count := input.shape[0]
+	embed_size  := output.shape[1]
+	head_size   := embed_size / variant.head_count
 	fmt.assertf(head_size <= 256, "GPU attention currently caps head_size at 256 (got %v)", head_size)
 
 	if _attention_pipeline == nil {
 		_attention_pipeline = _make_pipeline(ATTENTION_SPIRV, 3, size_of(Attention_Params))
 	}
 	params := Attention_Params{
-		head_count  = u32(v.head_count),
+		head_count  = u32(variant.head_count),
 		head_size   = u32(head_size),
 		token_count = u32(token_count),
 		embed_size  = u32(embed_size),
-		causal      = v.causal ? 1 : 0,
+		causal      = variant.causal ? 1 : 0,
 	}
-	bufs := [3]vk.Buffer{data(x).buffer, data(y).buffer, data(v.lse).buffer}
-	_dispatch(_attention_pipeline, bufs[:], &params, u32(v.head_count), u32(token_count))
+	bufs := [3]vk.Buffer{data(input).buffer, data(output).buffer, data(variant.lse).buffer}
+	_dispatch(_attention_pipeline, bufs[:], &params, u32(variant.head_count), u32(token_count))
 }
 
 attention_backward :: proc(op: ml.Operation) {
-	x := op.input; y := op.output
-	v := op.variant.(ml.Attention)
-	token_count := x.shape[0]
-	embed_size  := y.shape[1]
-	head_size   := embed_size / v.head_count
+	input, output := op.input, op.output
+	variant     := op.variant.(ml.Attention)
+	token_count := input.shape[0]
+	embed_size  := output.shape[1]
+	head_size   := embed_size / variant.head_count
 
 	if _attention_back_d_pipeline == nil {
 		_attention_back_d_pipeline = _make_pipeline(ATTENTION_BACK_D_SPIRV, 3, size_of(Attention_Back_D_Params))
@@ -1251,47 +1354,47 @@ attention_backward :: proc(op: ml.Operation) {
 	}
 
 	d_params := Attention_Back_D_Params{
-		head_count  = u32(v.head_count),
+		head_count  = u32(variant.head_count),
 		head_size   = u32(head_size),
 		token_count = u32(token_count),
 		embed_size  = u32(embed_size),
 	}
-	d_bufs := [3]vk.Buffer{data(y).buffer, gradient(y).buffer, data(v.d_acc).buffer}
-	_dispatch(_attention_back_d_pipeline, d_bufs[:], &d_params, u32(v.head_count), u32(token_count))
+	d_bufs := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, data(variant.d_acc).buffer}
+	_dispatch(_attention_back_d_pipeline, d_bufs[:], &d_params, u32(variant.head_count), u32(token_count))
 
-	bk_params := Attention_Params{
-		head_count  = u32(v.head_count),
+	back_params := Attention_Params{
+		head_count  = u32(variant.head_count),
 		head_size   = u32(head_size),
 		token_count = u32(token_count),
 		embed_size  = u32(embed_size),
-		causal      = v.causal ? 1 : 0,
+		causal      = variant.causal ? 1 : 0,
 	}
 	kv_bufs := [5]vk.Buffer{
-		data(x).buffer, gradient(y).buffer, data(v.lse).buffer,
-		data(v.d_acc).buffer, gradient(x).buffer,
+		data(input).buffer, gradient(output).buffer, data(variant.lse).buffer,
+		data(variant.d_acc).buffer, gradient(input).buffer,
 	}
-	_dispatch(_attention_back_kv_pipeline, kv_bufs[:], &bk_params, u32(v.head_count), u32(token_count))
+	_dispatch(_attention_back_kv_pipeline, kv_bufs[:], &back_params, u32(variant.head_count), u32(token_count))
 
 	q_bufs := [5]vk.Buffer{
-		data(x).buffer, gradient(y).buffer, data(v.lse).buffer,
-		data(v.d_acc).buffer, gradient(x).buffer,
+		data(input).buffer, gradient(output).buffer, data(variant.lse).buffer,
+		data(variant.d_acc).buffer, gradient(input).buffer,
 	}
-	_dispatch(_attention_back_q_pipeline, q_bufs[:], &bk_params, u32(v.head_count), u32(token_count))
+	_dispatch(_attention_back_q_pipeline, q_bufs[:], &back_params, u32(variant.head_count), u32(token_count))
 }
 
-_upload_indices :: proc(indices: []int, loc := #caller_location) -> (buf: vk.Buffer, m: vk.DeviceMemory) {
-	n := builtin.len(indices)
-	idx_size := vk.DeviceSize(n * size_of(u32))
-	buf, m = _create_buffer(idx_size, {.STORAGE_BUFFER}, {.HOST_VISIBLE, .HOST_COHERENT}, loc)
+_upload_indices :: proc(indices: []int, loc := #caller_location) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {
+	count := builtin.len(indices)
+	size  := vk.DeviceSize(count * size_of(u32))
+	buffer, memory = _create_buffer(size, {.STORAGE_BUFFER}, {.HOST_VISIBLE, .HOST_COHERENT}, loc)
 
 	mapped: rawptr
-	res := vk.MapMemory(_gpu.device, m, 0, idx_size, {}, &mapped)
+	res := vk.MapMemory(_gpu.device, memory, 0, size, {}, &mapped)
 	fmt.assertf(res == .SUCCESS, "vkMapMemory(indices) failed: %v", res, loc=loc)
-	arr := ([^]u32)(mapped)
-	for v, i in indices {
-		arr[i] = u32(v)
+	indices_u32 := ([^]u32)(mapped)
+	for index, i in indices {
+		indices_u32[i] = u32(index)
 	}
-	vk.UnmapMemory(_gpu.device, m)
+	vk.UnmapMemory(_gpu.device, memory)
 	return
 }
 

@@ -21,7 +21,7 @@ main :: proc() {
 
 	// --- Phase 1: alloc / clear plumbing ---
 	{
-		ctx := ml.context_create(16 * 1024 * 1024, gpu.backend())
+		ctx := gpu.context_create()
 		defer ml.context_destroy(ctx)
 		ml.context_scope(ctx)
 
@@ -60,7 +60,7 @@ main :: proc() {
 		cpu_grad_a: [N]f32
 		cpu_grad_b: [N]f32
 		{
-			ctx := ml.context_create(1 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(1 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -79,7 +79,7 @@ main :: proc() {
 		gpu_grad_a: [N]f32
 		gpu_grad_b: [N]f32
 		{
-			ctx := ml.context_create(16 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -130,7 +130,7 @@ main :: proc() {
 		cpu_dx: [COUNT * INPUT_SIZE]f32
 		cpu_dw: [OUTPUT_SIZE * INPUT_SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -151,7 +151,7 @@ main :: proc() {
 		gpu_dx: [COUNT * INPUT_SIZE]f32
 		gpu_dw: [OUTPUT_SIZE * INPUT_SIZE]f32
 		{
-			ctx := ml.context_create(16 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -192,7 +192,7 @@ main :: proc() {
 		cpu_y:  [N]f32
 		cpu_dx: [N]f32
 		{
-			ctx := ml.context_create(1 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(1 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -207,7 +207,7 @@ main :: proc() {
 		gpu_y:  [N]f32
 		gpu_dx: [N]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -248,7 +248,7 @@ main :: proc() {
 		cpu_y:  [N * SIZE]f32
 		cpu_dt: [VOCAB * SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -265,7 +265,7 @@ main :: proc() {
 		gpu_y:  [N * SIZE]f32
 		gpu_dt: [VOCAB * SIZE]f32
 		{
-			ctx := ml.context_create(16 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -300,7 +300,7 @@ main :: proc() {
 		cpu_y:  [TOKENS * HEADS * HEAD_SIZE]f32
 		cpu_dx: [TOKENS * HEADS * HEAD_SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -317,7 +317,7 @@ main :: proc() {
 		gpu_y:  [TOKENS * HEADS * HEAD_SIZE]f32
 		gpu_dx: [TOKENS * HEADS * HEAD_SIZE]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -353,7 +353,7 @@ main :: proc() {
 		cpu_y:  [ROWS * (END - START)]f32
 		cpu_dx: [ROWS * TRAILING]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -370,7 +370,7 @@ main :: proc() {
 		gpu_y:  [ROWS * (END - START)]f32
 		gpu_dx: [ROWS * TRAILING]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -413,7 +413,7 @@ main :: proc() {
 		cpu_db: [ROWS * T_B]f32
 		cpu_dc: [ROWS * T_C]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -438,7 +438,7 @@ main :: proc() {
 		gpu_db: [ROWS * T_B]f32
 		gpu_dc: [ROWS * T_C]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -482,7 +482,7 @@ main :: proc() {
 		cpu_y:  [COUNT * SIZE]f32
 		cpu_dx: [COUNT * SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -499,7 +499,7 @@ main :: proc() {
 		gpu_y:  [COUNT * SIZE]f32
 		gpu_dx: [COUNT * SIZE]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -533,7 +533,7 @@ main :: proc() {
 		cpu_y:  [D0 * D1 * D2]f32
 		cpu_dx: [D0 * D1 * D2]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -550,7 +550,7 @@ main :: proc() {
 		gpu_y:  [D0 * D1 * D2]f32
 		gpu_dx: [D0 * D1 * D2]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -583,7 +583,7 @@ main :: proc() {
 		cpu_y:  [H * T * T]f32
 		cpu_dx: [H * T * T]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -600,7 +600,7 @@ main :: proc() {
 		gpu_y:  [H * T * T]f32
 		gpu_dx: [H * T * T]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -637,7 +637,7 @@ main :: proc() {
 	{
 		run_mul :: proc(a_data, b_data: []f32, cpu_out, cpu_da, cpu_db, gpu_out, gpu_da, gpu_db: []f32) {
 			{
-				ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+				ctx := cpu.context_create(2 * 1024 * 1024)
 				defer ml.context_destroy(ctx)
 				ml.context_scope(ctx)
 
@@ -651,7 +651,7 @@ main :: proc() {
 				copy(cpu_db,  cpu.gradient(b))
 			}
 			{
-				ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+				ctx := gpu.context_create()
 				defer ml.context_destroy(ctx)
 				ml.context_scope(ctx)
 
@@ -743,7 +743,7 @@ main :: proc() {
 		cpu_da: [B * M * K]f32
 		cpu_db: [B * K * N]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -764,7 +764,7 @@ main :: proc() {
 		gpu_da: [B * M * K]f32
 		gpu_db: [B * K * N]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -812,7 +812,7 @@ main :: proc() {
 		cpu_y:  [TOKENS * EMBED]f32
 		cpu_dx: [TOKENS * IN_SIZE]f32
 		{
-			ctx := ml.context_create(4 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(4 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -829,7 +829,7 @@ main :: proc() {
 		gpu_y:  [TOKENS * EMBED]f32
 		gpu_dx: [TOKENS * IN_SIZE]f32
 		{
-			ctx := ml.context_create(32 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -869,7 +869,7 @@ main :: proc() {
 		cpu_dx: [COUNT * SIZE]f32
 		cpu_dw: [SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -890,7 +890,7 @@ main :: proc() {
 		gpu_dx: [COUNT * SIZE]f32
 		gpu_dw: [SIZE]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -933,7 +933,7 @@ main :: proc() {
 		cpu_loss: [COUNT]f32
 		cpu_dx:   [COUNT * CLASS_SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -950,7 +950,7 @@ main :: proc() {
 		gpu_loss: [COUNT]f32
 		gpu_dx:   [COUNT * CLASS_SIZE]f32
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -985,7 +985,7 @@ main :: proc() {
 		cpu_dx, gpu_dx: [COUNT * SIZE]f32
 
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -999,7 +999,7 @@ main :: proc() {
 			copy(cpu_dx[:], cpu.gradient(x))
 		}
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -1045,8 +1045,7 @@ main :: proc() {
 		run :: proc(use_gpu: bool, x_data: []f32, w0_init, w1_init: []f32, targets: []int,
 			out_w0, out_w1: []f32) {
 			arena_size := 16 * 1024 * 1024
-			vtable := use_gpu ? gpu.backend() : &cpu.backend
-			ctx := ml.context_create(arena_size, vtable)
+			ctx := use_gpu ? gpu.context_create() : cpu.context_create(arena_size)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 
@@ -1115,7 +1114,7 @@ main :: proc() {
 			gpu_dx := make([]f32, n, context.temp_allocator)
 
 			{
-				ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+				ctx := cpu.context_create(2 * 1024 * 1024)
 				defer ml.context_destroy(ctx)
 				ml.context_scope(ctx)
 				x := ml.tensor(x_data)
@@ -1125,7 +1124,7 @@ main :: proc() {
 				copy(cpu_dx, cpu.gradient(x))
 			}
 			{
-				ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+				ctx := gpu.context_create()
 				defer ml.context_destroy(ctx)
 				ml.context_scope(ctx)
 				x := ml.zeros({n})
@@ -1175,7 +1174,7 @@ main :: proc() {
 			gpu_y, gpu_da, gpu_db := make([]f32, n, context.temp_allocator), make([]f32, n, context.temp_allocator), make([]f32, n, context.temp_allocator)
 
 			{
-				ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+				ctx := cpu.context_create(2 * 1024 * 1024)
 				defer ml.context_destroy(ctx)
 				ml.context_scope(ctx)
 				a := ml.tensor(a_data)
@@ -1187,7 +1186,7 @@ main :: proc() {
 				copy(cpu_db, cpu.gradient(b))
 			}
 			{
-				ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+				ctx := gpu.context_create()
 				defer ml.context_destroy(ctx)
 				ml.context_scope(ctx)
 				a := ml.zeros({n}); b := ml.zeros({n})
@@ -1236,7 +1235,7 @@ main :: proc() {
 			cpu_db, gpu_db := make([]f32, n_b, context.temp_allocator), make([]f32, n_b, context.temp_allocator)
 
 			{
-				ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+				ctx := cpu.context_create(2 * 1024 * 1024)
 				defer ml.context_destroy(ctx)
 				ml.context_scope(ctx)
 				a := ml.tensor(a_data); b := ml.tensor(b_data)
@@ -1247,7 +1246,7 @@ main :: proc() {
 				copy(cpu_db, cpu.gradient(b))
 			}
 			{
-				ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+				ctx := gpu.context_create()
 				defer ml.context_destroy(ctx)
 				ml.context_scope(ctx)
 				a := ml.zeros({n}); b := ml.zeros({n_b})
@@ -1290,7 +1289,7 @@ main :: proc() {
 		cpu_y, gpu_y:   [COLS * ROWS]f32
 		cpu_dx, gpu_dx: [ROWS * COLS]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			x := ml.zeros({ROWS, COLS}); ml.set_data(x, x_data[:])
@@ -1300,7 +1299,7 @@ main :: proc() {
 			copy(cpu_dx[:], cpu.gradient(x))
 		}
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			x := ml.zeros({ROWS, COLS}); gpu.upload_tensor(x, x_data[:])
@@ -1328,7 +1327,7 @@ main :: proc() {
 		cpu_y, gpu_y:   [END - START]f32
 		cpu_dx, gpu_dx: [N]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			x := ml.tensor(x_data[:])
@@ -1338,7 +1337,7 @@ main :: proc() {
 			copy(cpu_dx[:], cpu.gradient(x))
 		}
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			x := ml.zeros({N}); gpu.upload_tensor(x, x_data[:])
@@ -1365,7 +1364,7 @@ main :: proc() {
 		cpu_y, gpu_y:   [COUNT * SIZE]f32
 		cpu_dx, gpu_dx: [COUNT * SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			x := ml.zeros({COUNT, SIZE}); ml.set_data(x, x_data[:])
@@ -1375,7 +1374,7 @@ main :: proc() {
 			copy(cpu_dx[:], cpu.gradient(x))
 		}
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			x := ml.zeros({COUNT, SIZE}); gpu.upload_tensor(x, x_data[:])
@@ -1416,7 +1415,7 @@ main :: proc() {
 		cpu_y, gpu_y:   [COUNT]f32
 		cpu_dx, gpu_dx: [COUNT * SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			p := ml.zeros({COUNT, SIZE}); ml.set_data(p, probs[:])
@@ -1426,7 +1425,7 @@ main :: proc() {
 			copy(cpu_dx[:], cpu.gradient(p))
 		}
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			p := ml.zeros({COUNT, SIZE}); gpu.upload_tensor(p, probs[:])
@@ -1455,7 +1454,7 @@ main :: proc() {
 		cpu_y, gpu_y:     [COUNT]f32
 		cpu_dpred, gpu_dpred: [COUNT * SIZE]f32
 		{
-			ctx := ml.context_create(2 * 1024 * 1024, &cpu.backend)
+			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			pred   := ml.zeros({COUNT, SIZE}); ml.set_data(pred, pred_data[:])
@@ -1466,7 +1465,7 @@ main :: proc() {
 			copy(cpu_dpred[:], cpu.gradient(pred))
 		}
 		{
-			ctx := ml.context_create(8 * 1024 * 1024, gpu.backend())
+			ctx := gpu.context_create()
 			defer ml.context_destroy(ctx)
 			ml.context_scope(ctx)
 			pred   := ml.zeros({COUNT, SIZE}); gpu.upload_tensor(pred,   pred_data[:])

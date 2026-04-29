@@ -5,6 +5,7 @@ import "base:builtin"
 import "core:dynlib"
 import "core:fmt"
 import "core:strings"
+import "core:sync"
 
 import vk "vendor:vulkan"
 
@@ -55,7 +56,8 @@ Pending_Download :: struct {
 	size:   vk.DeviceSize,
 }
 
-_gpu: Gpu_Device
+_gpu:       Gpu_Device
+_gpu_mutex: sync.Mutex
 
 @(require_results)
 _gctx :: #force_inline proc(loc := #caller_location) -> ^Gpu_Context {
@@ -63,6 +65,12 @@ _gctx :: #force_inline proc(loc := #caller_location) -> ^Gpu_Context {
 }
 
 device_init :: proc() {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+	_device_init_locked()
+}
+
+_device_init_locked :: proc() {
 	if _gpu.device != nil { return }
 	_load_loader()
 	_create_instance()
@@ -73,6 +81,9 @@ device_init :: proc() {
 }
 
 device_destroy :: proc() {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+
 	for p in _gpu.pipelines {
 		_destroy_pipeline(p)
 	}

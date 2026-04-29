@@ -37,7 +37,7 @@ bench_arch :: proc(arch: Arch) {
 	{
 		cpu.set_thread_count(24)
 
-		ctx := ml.context_create(2 * 1024 * 1024 * 1024, &cpu.backend)
+		ctx := cpu.context_create(2 * 1024 * 1024 * 1024)
 		defer ml.context_destroy(ctx)
 		ml.context_scope(ctx)
 
@@ -55,7 +55,7 @@ bench_arch :: proc(arch: Arch) {
 	}
 
 	{
-		ctx := ml.context_create(2 * 1024 * 1024 * 1024, gpu.backend())
+		ctx := gpu.context_create()
 		defer ml.context_destroy(ctx)
 		ml.context_scope(ctx)
 

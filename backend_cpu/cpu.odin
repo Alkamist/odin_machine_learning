@@ -105,6 +105,9 @@ when thread.IS_SUPPORTED {
 	set_thread_count :: proc(count: int, loc := #caller_location) {
 		assert(count > 0, "Thread count must be at least 1", loc=loc)
 
+		sync.mutex_lock(&_pool_mutex)
+		defer sync.mutex_unlock(&_pool_mutex)
+
 		if count == _thread_count {
 			return
 		}
@@ -151,6 +154,9 @@ when thread.IS_SUPPORTED {
 			return
 		}
 
+		sync.mutex_lock(&_pool_mutex)
+		defer sync.mutex_unlock(&_pool_mutex)
+
 		n := task_count
 		if n > _thread_count { n = _thread_count }
 		if n > job_count     { n = job_count     }
@@ -163,9 +169,6 @@ when thread.IS_SUPPORTED {
 		}
 
 		td := Thunk_Data{data=data, job=job}
-
-		sync.mutex_lock(&_pool_mutex)
-		defer sync.mutex_unlock(&_pool_mutex)
 
 		_dispatch = Dispatch{
 			chunk_proc = thunk,
@@ -258,47 +261,45 @@ when intrinsics.has_target_feature("avx") {
 	}
 }
 
-backend := ml.Backend_VTable{
-	init         = init,
-	destroy      = destroy,
-	clear        = clear,
-	forward      = forward,
-	backward     = backward,
-	update       = update,
-	buffer_alloc = buffer_alloc,
-	buffer_free  = buffer_free,
-	buffer_get   = buffer_get,
-	buffer_set   = buffer_set,
-	buffer_copy  = buffer_copy,
+Context :: struct {
+	using _: ml.Context,
+	arena:   mem.Arena,
 }
 
-Backend_Data :: struct {
-	arena: mem.Arena,
-}
-
-init :: proc(ctx: ^ml.Context, size: int, loc: runtime.Source_Code_Location) {
-	backend_data, backend_data_err := builtin.new(Backend_Data, allocator=context.allocator, loc=loc)
-	assert(backend_data_err == nil, "Failed to allocate CPU Backend_Data", loc=loc)
+@(require_results)
+context_create :: proc(size: int, allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
+	ctx, ctx_err := builtin.new(Context, allocator=allocator, loc=loc)
+	assert(ctx_err == nil, "Failed to allocate Context", loc=loc)
 
 	arena_buf, arena_buf_err := builtin.make([]byte, size, allocator=context.allocator, loc=loc)
 	assert(arena_buf_err == nil, "Failed to allocate CPU backend arena data", loc=loc)
+	mem.arena_init(&ctx.arena, arena_buf)
 
-	mem.arena_init(&backend_data.arena, arena_buf)
-	ctx.backend_data = backend_data
+	ml._context_init(ctx, {
+		clear        = clear,
+		forward      = forward,
+		backward     = backward,
+		update       = update,
+		buffer_alloc = buffer_alloc,
+		buffer_free  = buffer_free,
+		buffer_get   = buffer_get,
+		buffer_set   = buffer_set,
+		buffer_copy  = buffer_copy,
+	}, allocator, loc)
+
+	return ctx
 }
 
-destroy :: proc(ctx: ^ml.Context, loc: runtime.Source_Code_Location) {
-	backend_data := cast(^Backend_Data)ctx.backend_data
-	if backend_data == nil { return }
-
-	builtin.delete(backend_data.arena.data, allocator=context.allocator, loc=loc)
-	builtin.free(backend_data, allocator=context.allocator, loc=loc)
-	ctx.backend_data = nil
+context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc := #caller_location) {
+	ctx := cast(^Context)ctx
+	ml._context_destroy(ctx, loc)
+	builtin.delete(ctx.arena.data, loc=loc)
+	builtin.free(ctx, loc=loc)
 }
 
 clear :: proc(loc: runtime.Source_Code_Location) {
-	backend_data := cast(^Backend_Data)ml.current_context(loc=loc).backend_data
-	mem.arena_free_all(&backend_data.arena)
+	ctx := cast(^Context)ml.current_context(loc=loc)
+	mem.arena_free_all(&ctx.arena)
 }
 
 _buffer_get :: #force_inline proc(t: ml.Tensor, kind: ml.Buffer_Kind) -> []f32 {
@@ -326,8 +327,8 @@ adam_v :: #force_inline proc(t: ml.Tensor) -> []f32 {
 }
 
 buffer_alloc :: proc(len: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
-	backend_data := cast(^Backend_Data)ml.current_context(loc=loc).backend_data
-	allocator := persist ? context.allocator : mem.arena_allocator(&backend_data.arena)
+	ctx       := cast(^Context)ml.current_context(loc=loc)
+	allocator := persist ? context.allocator : mem.arena_allocator(&ctx.arena)
 
 	data, err := builtin.make([]f32, len, allocator=allocator, loc=loc)
 	fmt.assertf(err == nil, "Failed to allocate CPU buffer: %v", err, loc=loc)

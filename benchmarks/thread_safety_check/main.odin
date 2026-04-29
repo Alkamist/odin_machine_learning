@@ -13,7 +13,7 @@ WORKLOAD_OUT   :: 256
 THREAD_COUNT   :: 4
 
 run_workload :: proc() -> (data_sum, grad_sum: f32) {
-	ctx := ml.context_create(16 * 1024 * 1024, &cpu.backend)
+	ctx := cpu.context_create(16 * 1024 * 1024)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 

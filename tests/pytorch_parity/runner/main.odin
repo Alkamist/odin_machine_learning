@@ -31,18 +31,16 @@ main :: proc() {
 		}
 	}
 
-	vtable: ^ml.Backend_VTable
+	ctx: ^ml.Context
 	switch backend_name {
 	case "cpu":
-		vtable = &cpu.backend
+		ctx = cpu.context_create(64 * 1024 * 1024)
 	case "gpu":
-		vtable = gpu.backend()
+		ctx = gpu.context_create()
 	case:
 		fmt.eprintfln("unknown backend: %v (expected cpu or gpu)", backend_name)
 		os.exit(1)
 	}
-
-	ctx := ml.context_create(64 * 1024 * 1024, vtable)
 	defer ml.context_destroy(ctx)
 	ml.context_scope(ctx)
 
