@@ -1,35 +1,59 @@
 package machine_learning_backend_gpu
 
-ADD_SPIRV        :: #load("shaders/add.spv",        []u8)
-ADD_BACK_A_SPIRV :: #load("shaders/add_back_a.spv", []u8)
-ADD_BACK_B_SPIRV :: #load("shaders/add_back_b.spv", []u8)
+ADD_SPIRV             :: #load("shaders/add.spv",             []u8)
+ADD_BACK_A_SPIRV      :: #load("shaders/add_back_a.spv",      []u8)
+ADD_BACK_B_SPIRV      :: #load("shaders/add_back_b.spv",      []u8)
+ADD_BF16_SPIRV        :: #load("shaders/add_bf16.spv",        []u8)
+ADD_BACK_A_BF16_SPIRV :: #load("shaders/add_back_a_bf16.spv", []u8)
+ADD_BACK_B_BF16_SPIRV :: #load("shaders/add_back_b_bf16.spv", []u8)
 ADD_LOCAL_SIZE :: 256
-Add_Params        :: struct { n,   n_b:    u32 }
-Add_Back_A_Params :: struct { n: u32 }
-Add_Back_B_Params :: struct { n_b, stride: u32 }
-_add_pipeline, _add_back_a_pipeline, _add_back_b_pipeline: ^Pipeline
+Add_Params             :: struct { n,   n_b:    u32 }
+Add_Back_A_Params      :: struct { n: u32 }
+Add_Back_B_Params      :: struct { n_b, stride: u32 }
+Add_Bf16_Params        :: struct { n,   n_b,    pair_count: u32 }
+Add_Back_A_Bf16_Params :: struct { n,   pair_count: u32 }
+Add_Back_B_Bf16_Params :: struct { n_b, stride, pair_count: u32 }
+_add_pipeline, _add_back_a_pipeline, _add_back_b_pipeline:                      ^Pipeline
+_add_bf16_pipeline, _add_back_a_bf16_pipeline, _add_back_b_bf16_pipeline:       ^Pipeline
 
-LINEAR_SPIRV :: #load("shaders/linear.spv", []u8)
-LINEAR_LOCAL_X :: 32   // must match TILE_M in shaders/linear.comp
-LINEAR_LOCAL_Y :: 64   // must match TILE_N in shaders/linear.comp
+LINEAR_SPIRV              :: #load("shaders/linear.spv",              []u8)
+LINEAR_BF16_SPIRV         :: #load("shaders/linear_bf16.spv",         []u8)
+LINEAR_BF16_COOPMAT_SPIRV :: #load("shaders/linear_bf16_coopmat.spv", []u8)
+LINEAR_LOCAL_X      :: 32   // must match TILE_M in shaders/linear.comp
+LINEAR_LOCAL_Y      :: 64   // must match TILE_N in shaders/linear.comp
+LINEAR_BF16_LOCAL_X :: 32   // must match TILE_M in shaders/linear_bf16.comp
+LINEAR_BF16_LOCAL_Y :: 64   // must match TILE_N in shaders/linear_bf16.comp
+LINEAR_BF16_COOPMAT_TILE :: 16   // must match {M,N,K}_TILE in shaders/linear_bf16_coopmat.comp
 Linear_Params :: struct { count, input_size, output_size: u32 }
-_linear_pipeline: ^Pipeline
+_linear_pipeline:              ^Pipeline
+_linear_bf16_pipeline:         ^Pipeline
+_linear_bf16_coopmat_pipeline: ^Pipeline
 
-LINEAR_BACK_INPUT_SPIRV  :: #load("shaders/linear_back_input.spv",  []u8)
-LINEAR_BACK_WEIGHT_SPIRV :: #load("shaders/linear_back_weight.spv", []u8)
+LINEAR_BACK_INPUT_SPIRV       :: #load("shaders/linear_back_input.spv",       []u8)
+LINEAR_BACK_WEIGHT_SPIRV      :: #load("shaders/linear_back_weight.spv",      []u8)
+LINEAR_BACK_INPUT_BF16_SPIRV  :: #load("shaders/linear_back_input_bf16.spv",  []u8)
+LINEAR_BACK_WEIGHT_BF16_SPIRV :: #load("shaders/linear_back_weight_bf16.spv", []u8)
 Linear_Back_Params :: struct { count, input_size, output_size: u32 }
-_linear_back_input_pipeline:  ^Pipeline
-_linear_back_weight_pipeline: ^Pipeline
+_linear_back_input_pipeline:       ^Pipeline
+_linear_back_weight_pipeline:      ^Pipeline
+_linear_back_input_bf16_pipeline:  ^Pipeline
+_linear_back_weight_bf16_pipeline: ^Pipeline
 
-BATCHED_MATMUL_SPIRV             :: #load("shaders/batched_matmul.spv",             []u8)
-BATCHED_MATMUL_BACK_INPUT_SPIRV  :: #load("shaders/batched_matmul_back_input.spv",  []u8)
-BATCHED_MATMUL_BACK_WEIGHT_SPIRV :: #load("shaders/batched_matmul_back_weight.spv", []u8)
+BATCHED_MATMUL_SPIRV                  :: #load("shaders/batched_matmul.spv",                  []u8)
+BATCHED_MATMUL_BACK_INPUT_SPIRV       :: #load("shaders/batched_matmul_back_input.spv",       []u8)
+BATCHED_MATMUL_BACK_WEIGHT_SPIRV      :: #load("shaders/batched_matmul_back_weight.spv",      []u8)
+BATCHED_MATMUL_BF16_SPIRV             :: #load("shaders/batched_matmul_bf16.spv",             []u8)
+BATCHED_MATMUL_BACK_INPUT_BF16_SPIRV  :: #load("shaders/batched_matmul_back_input_bf16.spv",  []u8)
+BATCHED_MATMUL_BACK_WEIGHT_BF16_SPIRV :: #load("shaders/batched_matmul_back_weight_bf16.spv", []u8)
 BATCHED_MATMUL_LOCAL_X :: 16
 BATCHED_MATMUL_LOCAL_Y :: 16
 Batched_Matmul_Params :: struct { batch_count, m, k, n: u32 }
-_batched_matmul_pipeline:             ^Pipeline
-_batched_matmul_back_input_pipeline:  ^Pipeline
-_batched_matmul_back_weight_pipeline: ^Pipeline
+_batched_matmul_pipeline:                  ^Pipeline
+_batched_matmul_back_input_pipeline:       ^Pipeline
+_batched_matmul_back_weight_pipeline:      ^Pipeline
+_batched_matmul_bf16_pipeline:             ^Pipeline
+_batched_matmul_back_input_bf16_pipeline:  ^Pipeline
+_batched_matmul_back_weight_bf16_pipeline: ^Pipeline
 
 MUL_SPIRV        :: #load("shaders/mul.spv",        []u8)
 MUL_BACK_A_SPIRV :: #load("shaders/mul_back_a.spv", []u8)

@@ -1,0 +1,129 @@
+// Bf16 forward GEMM, naive SIMT version. Same tiled structure as linear.comp,
+// but reads x and w as packed bf16 (two halves per uint, low=2i, high=2i+1)
+// and writes y the same way. Accumulators stay f32; bf16 only at the storage
+// boundary. Each thread owns a TM x TN sub-tile and writes whole packed
+// uints, which requires N to be even (asserted at dispatch). K must also be
+// even so each row of x and w starts on a pair boundary.
+#version 450
+
+#define TILE_M 32
+#define TILE_N 64
+#define TILE_K 16
+#define TM     4
+#define TN     4
+#define WG_X   8
+#define WG_Y   16
+#define WG     128
+
+layout(local_size_x = WG_X, local_size_y = WG_Y) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { uint x[]; };
+layout(set = 0, binding = 1) readonly  buffer W { uint w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { uint y[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+} p;
+
+shared float sx[TILE_M][TILE_K + 1];
+shared float sw[TILE_N][TILE_K + 1];
+
+float bf16_expand(uint half_bits) {
+    return uintBitsToFloat(half_bits << 16);
+}
+
+uint bf16_round(float v) {
+    uint bits = floatBitsToUint(v);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
+    uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    return (rounded >> 16) & 0xffffu;
+}
+
+void main() {
+    uint wg_i = gl_WorkGroupID.x;
+    uint wg_o = gl_WorkGroupID.y;
+    uint tx   = gl_LocalInvocationID.x;
+    uint ty   = gl_LocalInvocationID.y;
+    uint tid  = ty * WG_X + tx;
+
+    uint i_base = wg_i * TILE_M + tx * TM;
+    uint o_base = wg_o * TILE_N + ty * TN;
+
+    float acc[TM][TN];
+    for (int a = 0; a < TM; ++a)
+        for (int b = 0; b < TN; ++b)
+            acc[a][b] = 0.0;
+
+    uint k_tiles = (p.K + TILE_K - 1u) / TILE_K;
+
+    for (uint kt = 0u; kt < k_tiles; ++kt) {
+        // Cooperatively load x tile [TILE_M, TILE_K] from packed bf16. Each
+        // thread reads one uint = 2 elements per iter; the 4-iter loop in
+        // the f32 version becomes 2 iters here.
+        for (uint l = 0u; l < (TILE_M * TILE_K) / (2u * WG); ++l) {
+            uint pair_idx = tid + l * WG;
+            uint elem_idx = 2u * pair_idx;
+            uint row = elem_idx / TILE_K;
+            uint col = elem_idx % TILE_K;
+            uint gi  = wg_i * TILE_M + row;
+            uint gk  = kt   * TILE_K + col;
+
+            uint packed = 0u;
+            if (gi < p.M && gk < p.K) {
+                uint elem_global = gi * p.K + gk;
+                packed = x[elem_global >> 1u];
+            }
+            sx[row][col]      = bf16_expand(packed & 0xffffu);
+            sx[row][col + 1u] = bf16_expand((packed >> 16) & 0xffffu);
+        }
+        // Same for w: [TILE_N, TILE_K], 4 iters per thread.
+        for (uint l = 0u; l < (TILE_N * TILE_K) / (2u * WG); ++l) {
+            uint pair_idx = tid + l * WG;
+            uint elem_idx = 2u * pair_idx;
+            uint row = elem_idx / TILE_K;
+            uint col = elem_idx % TILE_K;
+            uint go  = wg_o * TILE_N + row;
+            uint gk  = kt   * TILE_K + col;
+
+            uint packed = 0u;
+            if (go < p.N && gk < p.K) {
+                uint elem_global = go * p.K + gk;
+                packed = w[elem_global >> 1u];
+            }
+            sw[row][col]      = bf16_expand(packed & 0xffffu);
+            sw[row][col + 1u] = bf16_expand((packed >> 16) & 0xffffu);
+        }
+        barrier();
+
+        for (uint kk = 0u; kk < TILE_K; ++kk) {
+            float xreg[TM];
+            float wreg[TN];
+            for (int a = 0; a < TM; ++a) xreg[a] = sx[tx * TM + a][kk];
+            for (int b = 0; b < TN; ++b) wreg[b] = sw[ty * TN + b][kk];
+            for (int a = 0; a < TM; ++a)
+                for (int b = 0; b < TN; ++b)
+                    acc[a][b] += xreg[a] * wreg[b];
+        }
+        barrier();
+    }
+
+    // Store accumulators back as packed bf16. Threads tile o_base in steps
+    // of TN=4 (even), so each thread owns TN/2 whole uints per row and the
+    // write is race-free.
+    for (int a = 0; a < TM; ++a) {
+        uint gi = i_base + uint(a);
+        if (gi >= p.M) continue;
+        for (int b = 0; b < TN; b += 2) {
+            uint go0 = o_base + uint(b);
+            uint go1 = go0 + 1u;
+            uint lo = (go0 < p.N) ? bf16_round(acc[a][b])     : 0u;
+            uint hi = (go1 < p.N) ? bf16_round(acc[a][b + 1]) : 0u;
+            if (go0 < p.N) {
+                uint elem_global = gi * p.N + go0;
+                y[elem_global >> 1u] = (hi << 16) | lo;
+            }
+        }
+    }
+}

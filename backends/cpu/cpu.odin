@@ -522,10 +522,33 @@ add_forward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
-	for i in 0 ..< stride {
-		for j in 0 ..< ml.len(b) {
-			o := i * ml.len(b) + j
-			data(output)[o] = data(a)[o] + data(b)[j]
+	switch a.type {
+	case .F32:
+		for i in 0 ..< stride {
+			for j in 0 ..< ml.len(b) {
+				o := i * ml.len(b) + j
+				data(output)[o] = data(a)[o] + data(b)[j]
+			}
+		}
+	case .Bf16:
+		a_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Data]))
+		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
+		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
+		for i in 0 ..< stride {
+			for j in 0 ..< ml.len(b) {
+				o := i * ml.len(b) + j
+				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) + ml.bf16_to_f32(b_bf[j]))
+			}
+		}
+	case .F16:
+		a_h := ([^]f16)(raw_data(transmute([]byte)a.buffers     [.Data]))
+		b_h := ([^]f16)(raw_data(transmute([]byte)b.buffers     [.Data]))
+		o_h := ([^]f16)(raw_data(transmute([]byte)output.buffers[.Data]))
+		for i in 0 ..< stride {
+			for j in 0 ..< ml.len(b) {
+				o := i * ml.len(b) + j
+				o_h[o] = f16(f32(a_h[o]) + f32(b_h[j]))
+			}
 		}
 	}
 }
@@ -535,11 +558,38 @@ add_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
-	for i in 0 ..< stride {
-		for j in 0 ..< ml.len(b) {
-			o := i * ml.len(b) + j
-			gradient(a)[o] += gradient(output)[o]
-			gradient(b)[j] += gradient(output)[o]
+	switch a.type {
+	case .F32:
+		for i in 0 ..< stride {
+			for j in 0 ..< ml.len(b) {
+				o := i * ml.len(b) + j
+				gradient(a)[o] += gradient(output)[o]
+				gradient(b)[j] += gradient(output)[o]
+			}
+		}
+	case .Bf16:
+		da_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
+		db_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Gradient]))
+		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+		for i in 0 ..< stride {
+			for j in 0 ..< ml.len(b) {
+				o := i * ml.len(b) + j
+				dy := ml.bf16_to_f32(dy_bf[o])
+				da_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(da_bf[o]) + dy)
+				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) + dy)
+			}
+		}
+	case .F16:
+		da_h := ([^]f16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
+		db_h := ([^]f16)(raw_data(transmute([]byte)b.buffers     [.Gradient]))
+		dy_h := ([^]f16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+		for i in 0 ..< stride {
+			for j in 0 ..< ml.len(b) {
+				o := i * ml.len(b) + j
+				dy := f32(dy_h[o])
+				da_h[o] = f16(f32(da_h[o]) + dy)
+				db_h[j] = f16(f32(db_h[j]) + dy)
+			}
 		}
 	}
 }
@@ -909,6 +959,14 @@ concat_backward :: proc(op: ml.Operation) {
 }
 
 linear_forward :: proc(op: ml.Operation) {
+	switch op.input.type {
+	case .F32:  linear_forward_f32 (op)
+	case .Bf16: linear_forward_bf16(op)
+	case .F16:  fmt.panicf("CPU linear_forward: F16 not yet supported")
+	}
+}
+
+linear_forward_f32 :: proc(op: ml.Operation) {
 	weight := op.variant.(ml.Linear).weight
 	count  := ml.len(op.input) / weight.shape[1]
 
@@ -931,7 +989,91 @@ linear_forward :: proc(op: ml.Operation) {
 	})
 }
 
+linear_forward_bf16 :: proc(op: ml.Operation) {
+	weight := op.variant.(ml.Linear).weight
+	count  := ml.len(op.input) / weight.shape[1]
+
+	parallelize(count, count, op, proc(index: int, op: ml.Operation) {
+		input, output := op.input, op.output
+		weight      := op.variant.(ml.Linear).weight
+		output_size := weight.shape[0]
+		input_size  := weight.shape[1]
+
+		x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
+		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
+		w_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
+
+		x_row := x_bf[index * input_size:]
+		y_row := y_bf[index * output_size:]
+
+		for o in 0 ..< output_size {
+			w_row := w_bf[o * input_size:]
+			acc:  f32
+			for k in 0 ..< input_size {
+				acc += ml.bf16_to_f32(w_row[k]) * ml.bf16_to_f32(x_row[k])
+			}
+			y_row[o] = ml.bf16_from_f32(acc)
+		}
+	})
+}
+
 linear_backward :: proc(op: ml.Operation) {
+	switch op.input.type {
+	case .F32:  linear_backward_f32 (op)
+	case .Bf16: linear_backward_bf16(op)
+	case .F16:  fmt.panicf("CPU linear_backward: F16 not yet supported")
+	}
+}
+
+linear_backward_bf16 :: proc(op: ml.Operation) {
+	weight      := op.variant.(ml.Linear).weight
+	output_size := weight.shape[0]
+	count       := ml.len(op.input) / weight.shape[1]
+
+	parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
+		weight      := op.variant.(ml.Linear).weight
+		input_size  := weight.shape[1]
+		output_size := weight.shape[0]
+		count       := ml.len(op.input) / input_size
+
+		x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Data]))
+		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
+		dw_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers   [.Gradient]))
+
+		dw_row := dw_bf[o * input_size:]
+		for k in 0 ..< input_size {
+			acc: f32
+			for c in 0 ..< count {
+				acc += ml.bf16_to_f32(x_bf[c * input_size + k]) *
+				       ml.bf16_to_f32(dy_bf[c * output_size + o])
+			}
+			dw_row[k] = ml.bf16_from_f32(ml.bf16_to_f32(dw_row[k]) + acc)
+		}
+	})
+
+	parallelize(count, count, op, proc(c: int, op: ml.Operation) {
+		weight      := op.variant.(ml.Linear).weight
+		input_size  := weight.shape[1]
+		output_size := weight.shape[0]
+
+		w_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers   [.Data]))
+		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
+		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Gradient]))
+
+		dx_row := dx_bf[c * input_size:]
+		dy_row := dy_bf[c * output_size:]
+		for k in 0 ..< input_size {
+			acc: f32
+			for o in 0 ..< output_size {
+				acc += ml.bf16_to_f32(w_bf[o * input_size + k]) *
+				       ml.bf16_to_f32(dy_row[o])
+			}
+			dx_row[k] = ml.bf16_from_f32(ml.bf16_to_f32(dx_row[k]) + acc)
+		}
+	})
+}
+
+linear_backward_f32 :: proc(op: ml.Operation) {
 	weight      := op.variant.(ml.Linear).weight
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
@@ -1489,6 +1631,48 @@ tanh_backward :: proc(op: ml.Operation) {
 }
 
 batched_matmul_forward :: proc(op: ml.Operation) {
+	switch op.input.type {
+	case .F32:  batched_matmul_forward_f32 (op)
+	case .Bf16: batched_matmul_forward_bf16(op)
+	case .F16:  fmt.panicf("CPU batched_matmul_forward: F16 not yet supported")
+	}
+}
+
+batched_matmul_forward_bf16 :: proc(op: ml.Operation) {
+	a           := op.input
+	batch_count := a.shape[0]
+	m           := a.shape[1]
+
+	parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
+		a       := op.input
+		output  := op.output
+		bt      := op.variant.(ml.Batched_Matmul).b
+		m       := a.shape[1]
+		k_count := a.shape[2]
+		n       := bt.shape[2]
+
+		bi := idx / m
+		i  := idx % m
+
+		a_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Data]))
+		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)bt.buffers    [.Data]))
+		c_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
+
+		a_row := a_bf[bi * m * k_count + i * k_count:]
+		c_row := c_bf[bi * m * n + i * n:]
+
+		for j in 0 ..< n {
+			acc: f32
+			for kk in 0 ..< k_count {
+				acc += ml.bf16_to_f32(a_row[kk]) *
+				       ml.bf16_to_f32(b_bf[bi * k_count * n + kk * n + j])
+			}
+			c_row[j] = ml.bf16_from_f32(acc)
+		}
+	})
+}
+
+batched_matmul_forward_f32 :: proc(op: ml.Operation) {
 	a := op.input
 	batch_count := a.shape[0]
 	m := a.shape[1]
@@ -1520,6 +1704,75 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 }
 
 batched_matmul_backward :: proc(op: ml.Operation) {
+	switch op.input.type {
+	case .F32:  batched_matmul_backward_f32 (op)
+	case .Bf16: batched_matmul_backward_bf16(op)
+	case .F16:  fmt.panicf("CPU batched_matmul_backward: F16 not yet supported")
+	}
+}
+
+batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
+	a           := op.input
+	batch_count := a.shape[0]
+	m           := a.shape[1]
+	k           := a.shape[2]
+
+	parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
+		a       := op.input
+		output  := op.output
+		bt      := op.variant.(ml.Batched_Matmul).b
+		m       := a.shape[1]
+		k_count := a.shape[2]
+		n       := bt.shape[2]
+
+		bi := idx / m
+		i  := idx % m
+
+		b_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)bt.buffers    [.Data]))
+		dc_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+		da_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
+
+		dc_row := dc_bf[bi * m * n + i * n:]
+		da_row := da_bf[bi * m * k_count + i * k_count:]
+
+		for kk in 0 ..< k_count {
+			acc: f32
+			for j in 0 ..< n {
+				acc += ml.bf16_to_f32(dc_row[j]) *
+				       ml.bf16_to_f32(b_bf[bi * k_count * n + kk * n + j])
+			}
+			da_row[kk] = ml.bf16_from_f32(ml.bf16_to_f32(da_row[kk]) + acc)
+		}
+	})
+
+	parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
+		a       := op.input
+		output  := op.output
+		bt      := op.variant.(ml.Batched_Matmul).b
+		m       := a.shape[1]
+		k_count := a.shape[2]
+		n       := bt.shape[2]
+
+		bi := idx / k_count
+		kk := idx % k_count
+
+		a_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Data]))
+		dc_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+		db_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)bt.buffers    [.Gradient]))
+
+		db_row := db_bf[bi * k_count * n + kk * n:]
+		for j in 0 ..< n {
+			acc: f32
+			for ii in 0 ..< m {
+				acc += ml.bf16_to_f32(a_bf[bi * m * k_count + ii * k_count + kk]) *
+				       ml.bf16_to_f32(dc_bf[bi * m * n + ii * n + j])
+			}
+			db_row[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_row[j]) + acc)
+		}
+	})
+}
+
+batched_matmul_backward_f32 :: proc(op: ml.Operation) {
 	a := op.input
 	batch_count := a.shape[0]
 	m := a.shape[1]

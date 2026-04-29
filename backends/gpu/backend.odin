@@ -4,6 +4,7 @@ import "base:builtin"
 import "base:runtime"
 
 import "core:fmt"
+import "core:mem"
 import "core:sync"
 
 import vk "vendor:vulkan"
@@ -389,12 +390,29 @@ add_forward :: proc(op: ml.Operation) {
 	output := op.output
 	b      := op.variant.(ml.Add).b
 
-	if _add_pipeline == nil {
-		_add_pipeline = _make_pipeline(ADD_SPIRV, 3, size_of(Add_Params))
+	switch a.type {
+	case .F32:
+		if _add_pipeline == nil {
+			_add_pipeline = _make_pipeline(ADD_SPIRV, 3, size_of(Add_Params))
+		}
+		params := Add_Params{n = u32(ml.len(a)), n_b = u32(ml.len(b))}
+		bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
+		_dispatch(_add_pipeline, bufs[:], &params, _div_up(ml.len(a), ADD_LOCAL_SIZE))
+	case .Bf16:
+		if _add_bf16_pipeline == nil {
+			_add_bf16_pipeline = _make_pipeline(ADD_BF16_SPIRV, 3, size_of(Add_Bf16_Params))
+		}
+		pair_count := (ml.len(a) + 1) / 2
+		params := Add_Bf16_Params{
+			n          = u32(ml.len(a)),
+			n_b        = u32(ml.len(b)),
+			pair_count = u32(pair_count),
+		}
+		bufs := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
+		_dispatch(_add_bf16_pipeline, bufs[:], &params, _div_up(pair_count, ADD_LOCAL_SIZE))
+	case .F16:
+		fmt.panicf("GPU add: F16 not yet supported")
 	}
-	params := Add_Params{n = u32(ml.len(a)), n_b = u32(ml.len(b))}
-	bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
-	_dispatch(_add_pipeline, bufs[:], &params, _div_up(ml.len(a), ADD_LOCAL_SIZE))
 }
 
 add_backward :: proc(op: ml.Operation) {
@@ -403,19 +421,48 @@ add_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
-	if _add_back_a_pipeline == nil {
-		_add_back_a_pipeline = _make_pipeline(ADD_BACK_A_SPIRV, 2, size_of(Add_Back_A_Params))
-	}
-	a_params := Add_Back_A_Params{n = u32(ml.len(a))}
-	a_bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(a).buffer}
-	_dispatch(_add_back_a_pipeline, a_bufs[:], &a_params, _div_up(ml.len(a), 256))
+	switch a.type {
+	case .F32:
+		if _add_back_a_pipeline == nil {
+			_add_back_a_pipeline = _make_pipeline(ADD_BACK_A_SPIRV, 2, size_of(Add_Back_A_Params))
+		}
+		a_params := Add_Back_A_Params{n = u32(ml.len(a))}
+		a_bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(a).buffer}
+		_dispatch(_add_back_a_pipeline, a_bufs[:], &a_params, _div_up(ml.len(a), 256))
 
-	if _add_back_b_pipeline == nil {
-		_add_back_b_pipeline = _make_pipeline(ADD_BACK_B_SPIRV, 2, size_of(Add_Back_B_Params))
+		if _add_back_b_pipeline == nil {
+			_add_back_b_pipeline = _make_pipeline(ADD_BACK_B_SPIRV, 2, size_of(Add_Back_B_Params))
+		}
+		b_params := Add_Back_B_Params{n_b = u32(ml.len(b)), stride = u32(stride)}
+		b_bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(b).buffer}
+		_dispatch(_add_back_b_pipeline, b_bufs[:], &b_params, _div_up(ml.len(b), 256))
+	case .Bf16:
+		a_pair_count := (ml.len(a) + 1) / 2
+		b_pair_count := (ml.len(b) + 1) / 2
+
+		if _add_back_a_bf16_pipeline == nil {
+			_add_back_a_bf16_pipeline = _make_pipeline(ADD_BACK_A_BF16_SPIRV, 2, size_of(Add_Back_A_Bf16_Params))
+		}
+		a_params := Add_Back_A_Bf16_Params{
+			n          = u32(ml.len(a)),
+			pair_count = u32(a_pair_count),
+		}
+		a_bufs := [2]vk.Buffer{gradient(output).buffer, gradient(a).buffer}
+		_dispatch(_add_back_a_bf16_pipeline, a_bufs[:], &a_params, _div_up(a_pair_count, 256))
+
+		if _add_back_b_bf16_pipeline == nil {
+			_add_back_b_bf16_pipeline = _make_pipeline(ADD_BACK_B_BF16_SPIRV, 2, size_of(Add_Back_B_Bf16_Params))
+		}
+		b_params := Add_Back_B_Bf16_Params{
+			n_b        = u32(ml.len(b)),
+			stride     = u32(stride),
+			pair_count = u32(b_pair_count),
+		}
+		b_bufs := [2]vk.Buffer{gradient(output).buffer, gradient(b).buffer}
+		_dispatch(_add_back_b_bf16_pipeline, b_bufs[:], &b_params, _div_up(b_pair_count, 256))
+	case .F16:
+		fmt.panicf("GPU add_backward: F16 not yet supported")
 	}
-	b_params := Add_Back_B_Params{n_b = u32(ml.len(b)), stride = u32(stride)}
-	b_bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(b).buffer}
-	_dispatch(_add_back_b_pipeline, b_bufs[:], &b_params, _div_up(ml.len(b), 256))
 }
 
 sub_forward :: proc(op: ml.Operation) {
@@ -830,21 +877,57 @@ linear_forward :: proc(op: ml.Operation) {
 	input_size  := weight.shape[1]
 	count       := ml.len(input) / input_size
 
-	if _linear_pipeline == nil {
-		_linear_pipeline = _make_pipeline(LINEAR_SPIRV, 3, size_of(Linear_Params))
-	}
 	params := Linear_Params{
 		count       = u32(count),
 		input_size  = u32(input_size),
 		output_size = u32(output_size),
 	}
 	bufs := [3]vk.Buffer{data(input).buffer, data(weight).buffer, data(output).buffer}
-	_dispatch(
-		_linear_pipeline, bufs[:], &params,
-		_div_up(count,       LINEAR_LOCAL_X),
-		_div_up(output_size, LINEAR_LOCAL_Y),
-		1,
-	)
+
+	switch input.type {
+	case .F32:
+		if _linear_pipeline == nil {
+			_linear_pipeline = _make_pipeline(LINEAR_SPIRV, 3, size_of(Linear_Params))
+		}
+		_dispatch(
+			_linear_pipeline, bufs[:], &params,
+			_div_up(count,       LINEAR_LOCAL_X),
+			_div_up(output_size, LINEAR_LOCAL_Y),
+			1,
+		)
+	case .Bf16:
+		coopmat_eligible := _gpu.coopmat_bf16 &&
+			count       % LINEAR_BF16_COOPMAT_TILE == 0 &&
+			input_size  % LINEAR_BF16_COOPMAT_TILE == 0 &&
+			output_size % LINEAR_BF16_COOPMAT_TILE == 0
+
+		if coopmat_eligible {
+			if _linear_bf16_coopmat_pipeline == nil {
+				_linear_bf16_coopmat_pipeline = _make_pipeline(LINEAR_BF16_COOPMAT_SPIRV, 3, size_of(Linear_Params))
+			}
+			_dispatch(
+				_linear_bf16_coopmat_pipeline, bufs[:], &params,
+				u32(count       / LINEAR_BF16_COOPMAT_TILE),
+				u32(output_size / LINEAR_BF16_COOPMAT_TILE),
+				1,
+			)
+		} else {
+			fmt.assertf(input_size  % 2 == 0, "GPU bf16 linear requires even input_size, got %v",  input_size)
+			fmt.assertf(output_size % 2 == 0, "GPU bf16 linear requires even output_size, got %v", output_size)
+
+			if _linear_bf16_pipeline == nil {
+				_linear_bf16_pipeline = _make_pipeline(LINEAR_BF16_SPIRV, 3, size_of(Linear_Params))
+			}
+			_dispatch(
+				_linear_bf16_pipeline, bufs[:], &params,
+				_div_up(count,       LINEAR_BF16_LOCAL_X),
+				_div_up(output_size, LINEAR_BF16_LOCAL_Y),
+				1,
+			)
+		}
+	case .F16:
+		fmt.panicf("GPU linear: F16 not yet supported")
+	}
 }
 
 linear_backward :: proc(op: ml.Operation) {
@@ -855,33 +938,59 @@ linear_backward :: proc(op: ml.Operation) {
 	input_size  := weight.shape[1]
 	count       := ml.len(input) / input_size
 
-	if _linear_back_input_pipeline == nil {
-		_linear_back_input_pipeline = _make_pipeline(LINEAR_BACK_INPUT_SPIRV, 3, size_of(Linear_Back_Params))
-	}
-	if _linear_back_weight_pipeline == nil {
-		_linear_back_weight_pipeline = _make_pipeline(LINEAR_BACK_WEIGHT_SPIRV, 3, size_of(Linear_Back_Params))
-	}
 	params := Linear_Back_Params{
 		count       = u32(count),
 		input_size  = u32(input_size),
 		output_size = u32(output_size),
 	}
-
 	dx_bufs := [3]vk.Buffer{gradient(output).buffer, data(weight).buffer, gradient(input).buffer}
-	_dispatch(
-		_linear_back_input_pipeline, dx_bufs[:], &params,
-		_div_up(count,      16),
-		_div_up(input_size, 16),
-		1,
-	)
-
 	dw_bufs := [3]vk.Buffer{data(input).buffer, gradient(output).buffer, gradient(weight).buffer}
-	_dispatch(
-		_linear_back_weight_pipeline, dw_bufs[:], &params,
-		_div_up(output_size, 16),
-		_div_up(input_size,  16),
-		1,
-	)
+
+	switch input.type {
+	case .F32:
+		if _linear_back_input_pipeline == nil {
+			_linear_back_input_pipeline = _make_pipeline(LINEAR_BACK_INPUT_SPIRV, 3, size_of(Linear_Back_Params))
+		}
+		if _linear_back_weight_pipeline == nil {
+			_linear_back_weight_pipeline = _make_pipeline(LINEAR_BACK_WEIGHT_SPIRV, 3, size_of(Linear_Back_Params))
+		}
+		_dispatch(
+			_linear_back_input_pipeline, dx_bufs[:], &params,
+			_div_up(count,      16),
+			_div_up(input_size, 16),
+			1,
+		)
+		_dispatch(
+			_linear_back_weight_pipeline, dw_bufs[:], &params,
+			_div_up(output_size, 16),
+			_div_up(input_size,  16),
+			1,
+		)
+	case .Bf16:
+		fmt.assertf(input_size % 2 == 0, "GPU bf16 linear_backward requires even input_size, got %v", input_size)
+
+		if _linear_back_input_bf16_pipeline == nil {
+			_linear_back_input_bf16_pipeline = _make_pipeline(LINEAR_BACK_INPUT_BF16_SPIRV, 3, size_of(Linear_Back_Params))
+		}
+		if _linear_back_weight_bf16_pipeline == nil {
+			_linear_back_weight_bf16_pipeline = _make_pipeline(LINEAR_BACK_WEIGHT_BF16_SPIRV, 3, size_of(Linear_Back_Params))
+		}
+		k_pair_count := input_size / 2
+		_dispatch(
+			_linear_back_input_bf16_pipeline, dx_bufs[:], &params,
+			_div_up(count,        16),
+			_div_up(k_pair_count, 16),
+			1,
+		)
+		_dispatch(
+			_linear_back_weight_bf16_pipeline, dw_bufs[:], &params,
+			_div_up(output_size,  16),
+			_div_up(k_pair_count, 16),
+			1,
+		)
+	case .F16:
+		fmt.panicf("GPU linear_backward: F16 not yet supported")
+	}
 }
 
 rope_forward :: proc(op: ml.Operation) {
@@ -1246,9 +1355,6 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 	k           := a.shape[2]
 	n           := b.shape[2]
 
-	if _batched_matmul_pipeline == nil {
-		_batched_matmul_pipeline = _make_pipeline(BATCHED_MATMUL_SPIRV, 3, size_of(Batched_Matmul_Params))
-	}
 	params := Batched_Matmul_Params{
 		batch_count = u32(batch_count),
 		m           = u32(m),
@@ -1256,12 +1362,33 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 		n           = u32(n),
 	}
 	bufs := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
-	_dispatch(
-		_batched_matmul_pipeline, bufs[:], &params,
-		_div_up(m, BATCHED_MATMUL_LOCAL_X),
-		_div_up(n, BATCHED_MATMUL_LOCAL_Y),
-		u32(batch_count),
-	)
+
+	switch a.type {
+	case .F32:
+		if _batched_matmul_pipeline == nil {
+			_batched_matmul_pipeline = _make_pipeline(BATCHED_MATMUL_SPIRV, 3, size_of(Batched_Matmul_Params))
+		}
+		_dispatch(
+			_batched_matmul_pipeline, bufs[:], &params,
+			_div_up(m, BATCHED_MATMUL_LOCAL_X),
+			_div_up(n, BATCHED_MATMUL_LOCAL_Y),
+			u32(batch_count),
+		)
+	case .Bf16:
+		fmt.assertf(n % 2 == 0, "GPU bf16 batched_matmul requires even n, got %v", n)
+
+		if _batched_matmul_bf16_pipeline == nil {
+			_batched_matmul_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
+		}
+		_dispatch(
+			_batched_matmul_bf16_pipeline, bufs[:], &params,
+			_div_up(m,     BATCHED_MATMUL_LOCAL_X),
+			_div_up(n / 2, BATCHED_MATMUL_LOCAL_Y),
+			u32(batch_count),
+		)
+	case .F16:
+		fmt.panicf("GPU batched_matmul: F16 not yet supported")
+	}
 }
 
 batched_matmul_backward :: proc(op: ml.Operation) {
@@ -1272,34 +1399,60 @@ batched_matmul_backward :: proc(op: ml.Operation) {
 	k           := a.shape[2]
 	n           := b.shape[2]
 
-	if _batched_matmul_back_input_pipeline == nil {
-		_batched_matmul_back_input_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_INPUT_SPIRV, 3, size_of(Batched_Matmul_Params))
-	}
-	if _batched_matmul_back_weight_pipeline == nil {
-		_batched_matmul_back_weight_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_WEIGHT_SPIRV, 3, size_of(Batched_Matmul_Params))
-	}
 	params := Batched_Matmul_Params{
 		batch_count = u32(batch_count),
 		m           = u32(m),
 		k           = u32(k),
 		n           = u32(n),
 	}
-
 	da_bufs := [3]vk.Buffer{gradient(output).buffer, data(b).buffer, gradient(a).buffer}
-	_dispatch(
-		_batched_matmul_back_input_pipeline, da_bufs[:], &params,
-		_div_up(m, BATCHED_MATMUL_LOCAL_X),
-		_div_up(k, BATCHED_MATMUL_LOCAL_Y),
-		u32(batch_count),
-	)
-
 	db_bufs := [3]vk.Buffer{data(a).buffer, gradient(output).buffer, gradient(b).buffer}
-	_dispatch(
-		_batched_matmul_back_weight_pipeline, db_bufs[:], &params,
-		_div_up(k, BATCHED_MATMUL_LOCAL_X),
-		_div_up(n, BATCHED_MATMUL_LOCAL_Y),
-		u32(batch_count),
-	)
+
+	switch a.type {
+	case .F32:
+		if _batched_matmul_back_input_pipeline == nil {
+			_batched_matmul_back_input_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_INPUT_SPIRV, 3, size_of(Batched_Matmul_Params))
+		}
+		if _batched_matmul_back_weight_pipeline == nil {
+			_batched_matmul_back_weight_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_WEIGHT_SPIRV, 3, size_of(Batched_Matmul_Params))
+		}
+		_dispatch(
+			_batched_matmul_back_input_pipeline, da_bufs[:], &params,
+			_div_up(m, BATCHED_MATMUL_LOCAL_X),
+			_div_up(k, BATCHED_MATMUL_LOCAL_Y),
+			u32(batch_count),
+		)
+		_dispatch(
+			_batched_matmul_back_weight_pipeline, db_bufs[:], &params,
+			_div_up(k, BATCHED_MATMUL_LOCAL_X),
+			_div_up(n, BATCHED_MATMUL_LOCAL_Y),
+			u32(batch_count),
+		)
+	case .Bf16:
+		fmt.assertf(k % 2 == 0, "GPU bf16 batched_matmul_backward requires even k, got %v", k)
+		fmt.assertf(n % 2 == 0, "GPU bf16 batched_matmul_backward requires even n, got %v", n)
+
+		if _batched_matmul_back_input_bf16_pipeline == nil {
+			_batched_matmul_back_input_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_INPUT_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
+		}
+		if _batched_matmul_back_weight_bf16_pipeline == nil {
+			_batched_matmul_back_weight_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_WEIGHT_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
+		}
+		_dispatch(
+			_batched_matmul_back_input_bf16_pipeline, da_bufs[:], &params,
+			_div_up(m,     BATCHED_MATMUL_LOCAL_X),
+			_div_up(k / 2, BATCHED_MATMUL_LOCAL_Y),
+			u32(batch_count),
+		)
+		_dispatch(
+			_batched_matmul_back_weight_bf16_pipeline, db_bufs[:], &params,
+			_div_up(k,     BATCHED_MATMUL_LOCAL_X),
+			_div_up(n / 2, BATCHED_MATMUL_LOCAL_Y),
+			u32(batch_count),
+		)
+	case .F16:
+		fmt.panicf("GPU batched_matmul_backward: F16 not yet supported")
+	}
 }
 
 permute_forward :: proc(op: ml.Operation) {
@@ -1457,15 +1610,15 @@ _upload_indices :: proc(indices: []int, loc := #caller_location) -> (buffer: vk.
 
 upload_tensor :: proc(t: ml.Tensor, src: []f32, loc := #caller_location) {
 	assert(t.type == .F32, "upload_tensor with []f32 requires an F32 tensor", loc=loc)
-	t.backend.buffer_set(t.buffers[.Data], ml._slice_to_bytes(src), loc)
+	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src), loc)
 }
 
 download_tensor :: proc(t: ml.Tensor, dst: []f32, loc := #caller_location) {
 	assert(t.type == .F32, "download_tensor with []f32 requires an F32 tensor", loc=loc)
-	t.backend.buffer_get(t.buffers[.Data], ml._slice_to_bytes(dst), loc)
+	t.backend.buffer_get(t.buffers[.Data], mem.slice_to_bytes(dst), loc)
 }
 
 download_tensor_gradient :: proc(t: ml.Tensor, dst: []f32, loc := #caller_location) {
 	assert(t.type == .F32, "download_tensor_gradient with []f32 requires an F32 tensor", loc=loc)
-	t.backend.buffer_get(t.buffers[.Gradient], ml._slice_to_bytes(dst), loc)
+	t.backend.buffer_get(t.buffers[.Gradient], mem.slice_to_bytes(dst), loc)
 }

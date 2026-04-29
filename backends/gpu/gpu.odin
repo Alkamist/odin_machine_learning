@@ -19,10 +19,26 @@ Gpu_Device :: struct {
 	queue_family_index: u32,
 	memory_properties:  vk.PhysicalDeviceMemoryProperties,
 
+	coopmat_bf16:       bool,
+
 	pipelines:          [dynamic]^Pipeline,
 
 	device_name:        string,
 	loader:             dynlib.Library,
+}
+
+// Supplemental constants from VK_KHR_shader_bfloat16, missing from the
+// vendored vulkan binding. Values match the Vulkan 1.4 registry.
+KHR_SHADER_BFLOAT16_EXTENSION_NAME :: "VK_KHR_shader_bfloat16"
+STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR :: vk.StructureType(1000141000)
+COMPONENT_TYPE_BFLOAT16_KHR :: vk.ComponentTypeKHR(1000141000)
+
+Physical_Device_Shader_Bfloat16_Features_KHR :: struct {
+	sType:                            vk.StructureType,
+	pNext:                            rawptr,
+	shaderBFloat16Type:               b32,
+	shaderBFloat16DotProduct:         b32,
+	shaderBFloat16CooperativeMatrix:  b32,
 }
 
 Context :: struct {
@@ -79,7 +95,8 @@ _device_init_locked :: proc() {
 	_pick_physical_device()
 	_create_device()
 
-	fmt.printfln("gpu: %v (queue family %v)", _gpu.device_name, _gpu.queue_family_index)
+	fmt.printfln("gpu: %v (queue family %v, coopmat_bf16=%v)",
+		_gpu.device_name, _gpu.queue_family_index, _gpu.coopmat_bf16)
 }
 
 device_destroy :: proc() {
@@ -219,10 +236,43 @@ _create_device :: proc() {
 		pQueuePriorities = &priority,
 	}
 
+	want_coopmat_bf16 := _query_coopmat_bf16_support()
+
+	extensions := builtin.make([dynamic]cstring, 0, 2, context.temp_allocator)
+	if want_coopmat_bf16 {
+		append(&extensions, cstring(vk.KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))
+		append(&extensions, cstring(KHR_SHADER_BFLOAT16_EXTENSION_NAME))
+	}
+
+	bf16_features := Physical_Device_Shader_Bfloat16_Features_KHR{
+		sType                           = STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR,
+		shaderBFloat16Type              = true,
+		shaderBFloat16CooperativeMatrix = true,
+	}
+	coopmat_features := vk.PhysicalDeviceCooperativeMatrixFeaturesKHR{
+		sType             = .PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+		pNext             = &bf16_features,
+		cooperativeMatrix = true,
+	}
+	v11_features := vk.PhysicalDeviceVulkan11Features{
+		sType                    = .PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		pNext                    = &coopmat_features,
+		storageBuffer16BitAccess = true,
+	}
+	features2 := vk.PhysicalDeviceFeatures2{
+		sType = .PHYSICAL_DEVICE_FEATURES_2,
+		pNext = &v11_features,
+	}
+
 	create_info := vk.DeviceCreateInfo{
 		sType                = .DEVICE_CREATE_INFO,
 		queueCreateInfoCount = 1,
 		pQueueCreateInfos    = &queue_info,
+	}
+	if want_coopmat_bf16 {
+		create_info.pNext                   = &features2
+		create_info.enabledExtensionCount   = u32(builtin.len(extensions))
+		create_info.ppEnabledExtensionNames = raw_data(extensions[:])
 	}
 
 	res := vk.CreateDevice(_gpu.physical_device, &create_info, nil, &_gpu.device)
@@ -230,6 +280,70 @@ _create_device :: proc() {
 
 	vk.load_proc_addresses_device(_gpu.device)
 	vk.GetDeviceQueue(_gpu.device, _gpu.queue_family_index, 0, &_gpu.queue)
+
+	_gpu.coopmat_bf16 = want_coopmat_bf16
+}
+
+_query_coopmat_bf16_support :: proc() -> bool {
+	pd := _gpu.physical_device
+
+	ext_count: u32
+	vk.EnumerateDeviceExtensionProperties(pd, nil, &ext_count, nil)
+	exts := builtin.make([]vk.ExtensionProperties, ext_count, context.temp_allocator)
+	vk.EnumerateDeviceExtensionProperties(pd, nil, &ext_count, raw_data(exts))
+
+	has_coopmat_ext := false
+	has_bf16_ext    := false
+	for &e in exts {
+		name := string(cstring(raw_data(e.extensionName[:])))
+		switch name {
+		case vk.KHR_COOPERATIVE_MATRIX_EXTENSION_NAME: has_coopmat_ext = true
+		case KHR_SHADER_BFLOAT16_EXTENSION_NAME:       has_bf16_ext    = true
+		}
+	}
+	if !has_coopmat_ext || !has_bf16_ext { return false }
+
+	bf16_features := Physical_Device_Shader_Bfloat16_Features_KHR{
+		sType = STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR,
+	}
+	coopmat_features := vk.PhysicalDeviceCooperativeMatrixFeaturesKHR{
+		sType = .PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+		pNext = &bf16_features,
+	}
+	v11_features := vk.PhysicalDeviceVulkan11Features{
+		sType = .PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		pNext = &coopmat_features,
+	}
+	features2 := vk.PhysicalDeviceFeatures2{
+		sType = .PHYSICAL_DEVICE_FEATURES_2,
+		pNext = &v11_features,
+	}
+	vk.GetPhysicalDeviceFeatures2(pd, &features2)
+
+	if !coopmat_features.cooperativeMatrix             { return false }
+	if !bf16_features.shaderBFloat16Type               { return false }
+	if !bf16_features.shaderBFloat16CooperativeMatrix  { return false }
+	if !v11_features.storageBuffer16BitAccess          { return false }
+
+	prop_count: u32
+	vk.GetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &prop_count, nil)
+	props := builtin.make([]vk.CooperativeMatrixPropertiesKHR, prop_count, context.temp_allocator)
+	for &p in props {
+		p.sType = .COOPERATIVE_MATRIX_PROPERTIES_KHR
+	}
+	vk.GetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &prop_count, raw_data(props))
+
+	for p in props {
+		if p.MSize == 16 && p.NSize == 16 && p.KSize == 16 &&
+		   p.AType == COMPONENT_TYPE_BFLOAT16_KHR &&
+		   p.BType == COMPONENT_TYPE_BFLOAT16_KHR &&
+		   p.CType == .FLOAT32 &&
+		   p.ResultType == .FLOAT32 &&
+		   p.scope == .SUBGROUP {
+			return true
+		}
+	}
+	return false
 }
 
 DESCRIPTOR_POOL_MAX_SETS    :: 4096

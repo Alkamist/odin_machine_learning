@@ -553,6 +553,7 @@ Add :: struct {
 @(require_results)
 add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
+	assert(a.type == b.type, "add inputs must have the same dtype", loc=loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -886,6 +887,7 @@ Linear :: struct {
 linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank  >= 1, "Linear input must have rank >= 1",  loc=loc)
 	assert(weight.rank == 2, "Linear weight must be a 2-D tensor [output_size, input_size]", loc=loc)
+	assert(input.type == weight.type, "linear input and weight must have the same dtype", loc=loc)
 
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
@@ -1191,12 +1193,13 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 	assert(a.rank == 3 && b.rank == 3, "batched_matmul requires rank-3 inputs", loc=loc)
 	assert(a.shape[0] == b.shape[0], "batched_matmul batch dims must match", loc=loc)
 	assert(a.shape[2] == b.shape[1], "batched_matmul inner dim must match: a.shape[2] == b.shape[1]", loc=loc)
+	assert(a.type == b.type, "batched_matmul inputs must have the same dtype", loc=loc)
 
 	batch_count := a.shape[0]
 	m           := a.shape[1]
 	n           := b.shape[2]
 
-	output = zeros(.F32, {batch_count, m, n}, loc=loc)
+	output = zeros(a.type, {batch_count, m, n}, loc=loc)
 
 	op := Operation{
 		input   = a,

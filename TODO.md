@@ -101,13 +101,117 @@ proc is `ml.cast_to(input, target_type)`. The op variant is `Cast{}`
   pass. `tests/gpu_unified_check` (the existing F32 op suite) still
   passes — F32 path is untouched.
 
-**Suggested next slice (before jumping straight to coopmat linear):**
-make one element-wise op (e.g. `add` or `gelu`) dtype-generic on Bf16.
-It exercises the typed-dispatch shape inside an op-other-than-cast and
-will surface any plumbing gaps (e.g. shaders reading Bf16 buffers
-without coopmat, dtype assertions in op procs, gradient-dtype
-accumulation rules) in a contained setting. After that, coopmat
-`linear` is the next big jump.
+**Phase 2.5 (`add` dtype-generic on Bf16) — DONE.** `ml.add` now asserts
+`a.type == b.type`. CPU `add_forward`/`add_backward` switch on dtype with
+f32-accumulator paths for Bf16 and F16 (f32 instead of f16 for the bf16
+path because casting bf16 → f16 loses range, and CPUs widen f16 to f32
+for arithmetic anyway). GPU has three new packed-bf16 shaders
+(`add_bf16`, `add_back_a_bf16`, `add_back_b_bf16`) that thread per output
+pair so each thread writes a whole packed uint and avoids partial-uint
+races. Test added in `tests/dtype_roundtrip` (broadcast forward + dx/db
+backward) covering both backends.
+
+**Phase 3a (naive Bf16 `linear` forward) — DONE.** Took the contained
+"BF16 matmul plumbing" half of phase 3 first, before the coopmat work.
+`ml.linear` now asserts `input.type == weight.type`. CPU `linear_forward`
+splits into `_f32` and `_bf16` paths (bf16 dot product accumulates in
+f32, stores result via `bf16_from_f32`); `linear_backward` panics on any
+non-F32 type. GPU has a new `linear_bf16.comp` mirroring `linear.comp`'s
+tile structure but with packed-uint loads and bf16 output writes — each
+thread owns a TM=4 × TN=4 sub-tile, writes 2 whole packed uints per row,
+which requires `input_size` and `output_size` to be even (asserted at
+dispatch). Tests added covering both a small (M=4, K=8, N=6) and a
+multi-tile (M=64, K=64, N=128) shape with values chosen so the bf16
+result is bit-exact against the f32 reference. `linear_backward` panics
+on bf16 in the GPU backend too — that ships with phase 3b.
+
+**Phase 3b (Bf16 `linear` forward via cooperative matrix) — DONE.** RTX
+30+ exposes `VK_KHR_cooperative_matrix` + `VK_KHR_shader_bfloat16` with
+`shaderBFloat16CooperativeMatrix = true` and a 16/16/16 bf16/bf16/fp32
+config; we now query that at device init, set `_gpu.coopmat_bf16`, and
+enable `cooperativeMatrix`, `shaderBFloat16Type`,
+`shaderBFloat16CooperativeMatrix`, and `storageBuffer16BitAccess` in the
+device feature chain.
+
+The vendored `vendor:vulkan` binding doesn't yet expose the bf16
+extension, so `gpu.odin` carries hand-written constants
+(`KHR_SHADER_BFLOAT16_EXTENSION_NAME`, `COMPONENT_TYPE_BFLOAT16_KHR =
+1000141000`, `Physical_Device_Shader_Bfloat16_Features_KHR`) until the
+binding catches up.
+
+`linear_bf16_coopmat.comp` is intentionally minimal: one subgroup per
+workgroup, one 16×16 output tile per subgroup, K loop calls
+`coopMatMulAdd` directly — no shared-memory staging or per-warp tiling
+yet. Buffers are typed `bfloat16_t`; W is loaded ColumnMajor to take its
+[N, K] storage as B's transposed [K, N]. Backend dispatches coopmat when
+`_gpu.coopmat_bf16` is true and all three dims are multiples of 16; else
+falls back to the naive `linear_bf16.comp`. The dtype_roundtrip
+multi-tile test (M=64, K=64, N=128) exercises the coopmat path; the
+small test (M=4, K=8, N=6) exercises the fallback.
+
+**Phase 3c (Bf16 `linear_backward`) — DONE.** CPU `linear_backward`
+splits into f32 and bf16 paths (bf16 dot product accumulates in f32 like
+the forward). GPU has new `linear_back_input_bf16.comp` and
+`linear_back_weight_bf16.comp` — naive thread-per-(c, k_pair) and
+thread-per-(o, k_pair) respectively, each thread writing a whole packed
+uint to dodge partial-uint races. K (input_size) must be even (asserted
+at dispatch). Coopmat backward is deferred — the existing F32 backward
+shaders are also naive, so this matches the project's "tiled GEMM is
+overkill until backward becomes a profile blip" rule.
+
+**Phase 3d (Bf16 `batched_matmul` fwd + bwd) — DONE.** Same shape as
+linear: `ml.batched_matmul` asserts `a.type == b.type`. CPU has bf16
+`*_forward_bf16` and `*_backward_bf16`. GPU has three new bf16 shaders
+(`batched_matmul_bf16`, `batched_matmul_back_input_bf16`,
+`batched_matmul_back_weight_bf16`), all naive thread-per-output-pair
+with N (and K for backward) required even at dispatch. Coopmat for
+batched_matmul is deferred to the perf pass alongside coopmat for
+linear backward and attention.
+
+## Remaining bf16 work for an end-to-end transformer step
+
+Ordered by what unlocks the most when done:
+
+1. **Bf16 `attention` (fused fwd + 3 bwd shaders).** This is the next
+   big chunk — biggest single op, biggest blocker to a bf16 transformer
+   step. The forward shader's `softmax_outputs`, `lse`, `d_p_scratch`,
+   `d_acc` scratch tensors should stay F32 (that's the "internal
+   accumulators are F32" rule). The Q/K/V loads from the packed
+   `[tokens, 3*embedding]` input become shift-extracts on bf16 storage,
+   and the output write packs back to bf16. Backward's three shaders
+   follow the same pattern.
+
+2. **Bf16 element-wise/normalization ops.** Long but mechanical list,
+   all following the `add` pattern (thread-per-output-pair, f32 inner
+   compute, packed bf16 storage):
+   - `mul`, `sub`, `div` — same shape as `add`, can almost copy-paste.
+   - `gelu`, `silu`, `relu`, `sigmoid`, `tanh`, `exp` — pure unary, even
+     simpler.
+   - `layernorm` — needs F32 mean/rstd scratch (already F32 on the GPU
+     forward shader; just preserve that).
+   - `softmax`, `log_softmax`, `entropy` — same pattern, F32 reductions
+     internally.
+   - `rope`, `causal_mask`, `permute`, `concat`, `slice`, `mean` —
+     trivial bf16 loads/stores, no math.
+
+3. **First bf16 transformer parity test.** Mirror the library's
+   transformer block in PyTorch with bf16 weights/activations, sync
+   weights in, compare loss curves the same way `mlp_train` does.
+   That's the forcing function the existing F32 transformer parity
+   test already serves and the cleanest way to surface remaining gaps.
+
+4. **Coopmat perf pass.** The naive bf16 shaders win on storage but
+   the coopmat shader as written is a minimum-viable subgroup-per-tile
+   layout — leaves most tensor-core throughput on the floor. Add BM/BN
+   per workgroup, multiple subgroups, shared-memory K-tile staging,
+   per-subgroup output tiles. Then port the same pattern to backward
+   (linear, batched_matmul) and to attention. This is the move from
+   "correct" to "fast."
+
+5. **Mixed-precision recipe in `examples/`.** End-to-end demo of the
+   standard "FP32 master weights, BF16 forward/backward, FP32 optimizer
+   state" pattern on a small transformer. Deliverable for "this library
+   is a real bf16 stack."
 
 ### Open / next phases
 

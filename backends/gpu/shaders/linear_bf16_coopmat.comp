@@ -1,0 +1,63 @@
+// Bf16 forward GEMM using cooperative matrix (tensor cores). One subgroup
+// per workgroup, each subgroup computes one 16x16 output tile via a single
+// chain of coopMatMulAdd over K. Storage buffers are typed bfloat16_t, so
+// the device needs storageBuffer16BitAccess + shaderBFloat16Type, plus
+// VK_KHR_cooperative_matrix and VK_KHR_shader_bfloat16 (with
+// shaderBFloat16CooperativeMatrix).
+//
+// Constraint: M, N, K must each be multiples of 16.
+#version 460
+
+#extension GL_KHR_cooperative_matrix     : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic  : require
+#extension GL_EXT_shader_16bit_storage   : require
+#extension GL_EXT_bfloat16               : require
+
+#define M_TILE 16
+#define N_TILE 16
+#define K_TILE 16
+
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { bfloat16_t x[]; };
+layout(set = 0, binding = 1) readonly  buffer W { bfloat16_t w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { bfloat16_t y[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+} p;
+
+void main() {
+    uint wg_m = gl_WorkGroupID.x;
+    uint wg_n = gl_WorkGroupID.y;
+
+    coopmat<float, gl_ScopeSubgroup, M_TILE, N_TILE, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, M_TILE, N_TILE, gl_MatrixUseAccumulator>(0.0f);
+
+    uint k_blocks = p.K / K_TILE;
+    for (uint kb = 0u; kb < k_blocks; ++kb) {
+        coopmat<bfloat16_t, gl_ScopeSubgroup, M_TILE, K_TILE, gl_MatrixUseA> mA;
+        coopmat<bfloat16_t, gl_ScopeSubgroup, K_TILE, N_TILE, gl_MatrixUseB> mB;
+
+        // X is [M, K] row-major: load A row-major.
+        uint x_offset = wg_m * M_TILE * p.K + kb * K_TILE;
+        coopMatLoad(mA, x, x_offset, p.K, gl_CooperativeMatrixLayoutRowMajor);
+
+        // W is [N, K] row-major. B is wanted as [K, N] = W transposed; we
+        // achieve that by loading column-major from the same buffer.
+        uint w_offset = wg_n * N_TILE * p.K + kb * K_TILE;
+        coopMatLoad(mB, w, w_offset, p.K, gl_CooperativeMatrixLayoutColumnMajor);
+
+        acc = coopMatMulAdd(mA, mB, acc);
+    }
+
+    // Convert fp32 accumulator down to bf16 and store. Y is [M, N] row-major.
+    coopmat<bfloat16_t, gl_ScopeSubgroup, M_TILE, N_TILE, gl_MatrixUseAccumulator> acc_bf =
+        coopmat<bfloat16_t, gl_ScopeSubgroup, M_TILE, N_TILE, gl_MatrixUseAccumulator>(acc);
+
+    uint y_offset = wg_m * M_TILE * p.N + wg_n * N_TILE;
+    coopMatStore(acc_bf, y, y_offset, p.N, gl_CooperativeMatrixLayoutRowMajor);
+}
