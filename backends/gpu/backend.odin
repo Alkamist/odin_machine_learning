@@ -109,23 +109,23 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 	builtin.clear(&gctx.activations)
 }
 
-buffer_alloc :: proc(len: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 
 	gctx := _gctx(loc)
-	size := vk.DeviceSize(len * size_of(f32))
+	size := vk.DeviceSize(byte_count)
 	usage := vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
 
 	gpu_buffer: Gpu_Buffer
 	if !persist {
-		if list, ok := &gctx.pool[len]; ok && builtin.len(list^) > 0 {
+		if list, ok := &gctx.pool[byte_count]; ok && builtin.len(list^) > 0 {
 			gpu_buffer = pop(list)
 		}
 	}
 	if gpu_buffer.buffer == 0 {
 		gpu_buffer.buffer, gpu_buffer.memory = _create_buffer(size, usage, {.DEVICE_LOCAL}, loc)
-		gctx.sizes[gpu_buffer.buffer] = len
+		gctx.sizes[gpu_buffer.buffer] = byte_count
 	}
 
 	_record_fill_zero(gpu_buffer.buffer, size, loc)
@@ -149,22 +149,22 @@ buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location
 	_destroy_gpu_buffer(gpu_buffer)
 }
 
-buffer_get :: proc(buffer: ml.Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location) {
+buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location) {
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 
 	gpu_buffer := transmute(Gpu_Buffer)buffer
-	if gpu_buffer.buffer == 0 || builtin.len(data) == 0 { return }
-	_download(gpu_buffer.buffer, data, loc)
+	if gpu_buffer.buffer == 0 || builtin.len(dst) == 0 { return }
+	_download(gpu_buffer.buffer, dst, loc)
 }
 
-buffer_set :: proc(buffer: ml.Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location) {
+buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location) {
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 
 	gpu_buffer := transmute(Gpu_Buffer)buffer
-	if gpu_buffer.buffer == 0 || builtin.len(data) == 0 { return }
-	_upload(gpu_buffer.buffer, data, loc)
+	if gpu_buffer.buffer == 0 || builtin.len(src) == 0 { return }
+	_upload(gpu_buffer.buffer, src, loc)
 }
 
 buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
@@ -176,9 +176,9 @@ buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Locati
 	if dst_buffer.buffer == 0 || src_buffer.buffer == 0 { return }
 
 	gctx := _gctx(loc)
-	count, ok := gctx.sizes[src_buffer.buffer]
+	byte_count, ok := gctx.sizes[src_buffer.buffer]
 	fmt.assertf(ok, "buffer_copy: source buffer is not registered with this context", loc=loc)
-	size := vk.DeviceSize(count * size_of(f32))
+	size := vk.DeviceSize(byte_count)
 	_copy(dst_buffer.buffer, src_buffer.buffer, size, loc)
 }
 
@@ -275,6 +275,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Permute:            permute_forward            (op)
 	case ml.Causal_Mask:        causal_mask_forward        (op)
 	case ml.Attention:          attention_forward          (op)
+	case ml.Cast:               cast_forward               (op)
 	}
 }
 
@@ -314,6 +315,72 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Permute:            permute_backward           (op)
 	case ml.Causal_Mask:        causal_mask_backward       (op)
 	case ml.Attention:          attention_backward         (op)
+	case ml.Cast:               cast_backward              (op)
+	}
+}
+
+cast_forward :: proc(op: ml.Operation) {
+	input  := op.input
+	output := op.output
+
+	if input.type == output.type {
+		_copy(data(output).buffer, data(input).buffer, vk.DeviceSize(ml.len(input) * ml.data_type_size(input.type)))
+		return
+	}
+
+	n          := u32(ml.len(input))
+	pair_count := (n + 1) / 2
+	params     := Cast_Params{n = n, pair_count = pair_count}
+	bufs       := [2]vk.Buffer{data(input).buffer, data(output).buffer}
+
+	switch {
+	case input.type == .F32 && output.type == .Bf16:
+		if _cast_f32_to_bf16_pipeline == nil {
+			_cast_f32_to_bf16_pipeline = _make_pipeline(CAST_F32_TO_BF16_SPIRV, 2, size_of(Cast_Params))
+		}
+		_dispatch(_cast_f32_to_bf16_pipeline, bufs[:], &params, _div_up(int(pair_count), 256))
+	case input.type == .Bf16 && output.type == .F32:
+		if _cast_bf16_to_f32_pipeline == nil {
+			_cast_bf16_to_f32_pipeline = _make_pipeline(CAST_BF16_TO_F32_SPIRV, 2, size_of(Cast_Params))
+		}
+		_dispatch(_cast_bf16_to_f32_pipeline, bufs[:], &params, _div_up(int(pair_count), 256))
+	case:
+		fmt.panicf("GPU cast: unsupported pair (%v -> %v)", input.type, output.type)
+	}
+}
+
+cast_backward :: proc(op: ml.Operation) {
+	input  := op.input
+	output := op.output
+
+	if input.type == output.type {
+		// Same-type cast forward is a memcpy; backward accumulates dy into dx.
+		// No element-wise op currently does plain accumulate, but a fused
+		// path is overkill for a degenerate case — fall through to a small
+		// add. For now: assume same-type cast is rare and just panic if it
+		// shows up in a backward pass so we notice.
+		fmt.panicf("GPU cast_backward: same-type cast not implemented")
+	}
+
+	n          := u32(ml.len(input))
+	pair_count := (n + 1) / 2
+	params     := Cast_Params{n = n, pair_count = pair_count}
+
+	switch {
+	case input.type == .F32 && output.type == .Bf16:
+		if _cast_bf16_to_f32_back_pipeline == nil {
+			_cast_bf16_to_f32_back_pipeline = _make_pipeline(CAST_BF16_TO_F32_BACK_SPIRV, 2, size_of(Cast_Params))
+		}
+		bufs := [2]vk.Buffer{gradient(output).buffer, gradient(input).buffer}
+		_dispatch(_cast_bf16_to_f32_back_pipeline, bufs[:], &params, _div_up(int(pair_count), 256))
+	case input.type == .Bf16 && output.type == .F32:
+		if _cast_f32_to_bf16_back_pipeline == nil {
+			_cast_f32_to_bf16_back_pipeline = _make_pipeline(CAST_F32_TO_BF16_BACK_SPIRV, 2, size_of(Cast_Params))
+		}
+		bufs := [2]vk.Buffer{gradient(output).buffer, gradient(input).buffer}
+		_dispatch(_cast_f32_to_bf16_back_pipeline, bufs[:], &params, _div_up(int(pair_count), 256))
+	case:
+		fmt.panicf("GPU cast_backward: unsupported pair (%v -> %v)", input.type, output.type)
 	}
 }
 
@@ -1389,13 +1456,16 @@ _upload_indices :: proc(indices: []int, loc := #caller_location) -> (buffer: vk.
 }
 
 upload_tensor :: proc(t: ml.Tensor, src: []f32, loc := #caller_location) {
-	t.backend.buffer_set(t.buffers[.Data], src, loc)
+	assert(t.type == .F32, "upload_tensor with []f32 requires an F32 tensor", loc=loc)
+	t.backend.buffer_set(t.buffers[.Data], ml._slice_to_bytes(src), loc)
 }
 
 download_tensor :: proc(t: ml.Tensor, dst: []f32, loc := #caller_location) {
-	t.backend.buffer_get(t.buffers[.Data], dst, loc)
+	assert(t.type == .F32, "download_tensor with []f32 requires an F32 tensor", loc=loc)
+	t.backend.buffer_get(t.buffers[.Data], ml._slice_to_bytes(dst), loc)
 }
 
 download_tensor_gradient :: proc(t: ml.Tensor, dst: []f32, loc := #caller_location) {
-	t.backend.buffer_get(t.buffers[.Gradient], dst, loc)
+	assert(t.type == .F32, "download_tensor_gradient with []f32 requires an F32 tensor", loc=loc)
+	t.backend.buffer_get(t.buffers[.Gradient], ml._slice_to_bytes(dst), loc)
 }

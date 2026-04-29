@@ -136,14 +136,14 @@ bench_linear_inference_fwd :: proc() -> Result {
 	OUTPUT :: 2048
 
 	rand.reset(SEED)
-	w := ml.make({OUTPUT, INPUT})
+	w := ml.make(.F32, {OUTPUT, INPUT})
 	defer ml.destroy(w)
 	ml.fill_normal(w, 0, 0.02)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
-		x := ml.zeros({INPUT})
+		x := ml.zeros(.F32, {INPUT})
 		ml.fill_value(x, 0.01)
 		y := ml.linear(x, w_state)
 		return sum(y)
@@ -158,14 +158,14 @@ bench_linear_inference :: proc() -> Result {
 	OUTPUT :: 2048
 
 	rand.reset(SEED)
-	w := ml.make({OUTPUT, INPUT})
+	w := ml.make(.F32, {OUTPUT, INPUT})
 	defer ml.destroy(w)
 	ml.fill_normal(w, 0, 0.02)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
-		x := ml.zeros({INPUT})
+		x := ml.zeros(.F32, {INPUT})
 		ml.fill_value(x, 0.01)
 		y := ml.linear(x, w_state)
 		ml.backward()
@@ -182,14 +182,14 @@ bench_linear_training_fwd :: proc() -> Result {
 	OUTPUT :: 512
 
 	rand.reset(SEED)
-	w := ml.make({OUTPUT, INPUT})
+	w := ml.make(.F32, {OUTPUT, INPUT})
 	defer ml.destroy(w)
 	ml.fill_normal(w, 0, 0.02)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
-		x := ml.zeros({COUNT, INPUT})
+		x := ml.zeros(.F32, {COUNT, INPUT})
 		ml.fill_value(x, 0.01)
 		y := ml.linear(x, w_state)
 		return sum(y)
@@ -205,14 +205,14 @@ bench_linear_training :: proc() -> Result {
 	OUTPUT :: 512
 
 	rand.reset(SEED)
-	w := ml.make({OUTPUT, INPUT})
+	w := ml.make(.F32, {OUTPUT, INPUT})
 	defer ml.destroy(w)
 	ml.fill_normal(w, 0, 0.02)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
-		x := ml.zeros({COUNT, INPUT})
+		x := ml.zeros(.F32, {COUNT, INPUT})
 		ml.fill_value(x, 0.01)
 		y := ml.linear(x, w_state)
 		ml.backward()
@@ -230,7 +230,7 @@ bench_attention :: proc() -> Result {
 
 	run :: proc() -> f32 {
 		ml.clear()
-		qkv := ml.zeros({TOKENS, 3 * EMBED})
+		qkv := ml.zeros(.F32, {TOKENS, 3 * EMBED})
 		ml.fill_value(qkv, 0.01)
 		y := ml.attention(qkv, HEADS)
 		ml.backward()
@@ -244,14 +244,14 @@ bench_layernorm :: proc() -> Result {
 	COUNT :: 64
 	SIZE  :: 128
 
-	w := ml.make({SIZE})
+	w := ml.make(.F32, {SIZE})
 	defer ml.destroy(w)
 	ml.fill_value(w, 1)
 
 	run :: proc() -> f32 {
 		w_state := state_w
 		ml.clear()
-		x := ml.zeros({COUNT, SIZE})
+		x := ml.zeros(.F32, {COUNT, SIZE})
 		ml.fill_value(x, 0.01)
 		y := ml.layernorm(x, w_state)
 		ml.backward()
@@ -268,7 +268,7 @@ bench_softmax :: proc() -> Result {
 
 	run :: proc() -> f32 {
 		ml.clear()
-		x := ml.zeros({COUNT, SIZE})
+		x := ml.zeros(.F32, {COUNT, SIZE})
 		ml.fill_value(x, 0.01)
 		y := ml.softmax(x)
 		ml.backward()
@@ -283,7 +283,7 @@ bench_gelu :: proc() -> Result {
 
 	run :: proc() -> f32 {
 		ml.clear()
-		x := ml.zeros({N})
+		x := ml.zeros(.F32, {N})
 		ml.fill_value(x, 0.01)
 		y := ml.gelu(x)
 		ml.backward()
@@ -297,7 +297,7 @@ bench_adam_update :: proc() -> Result {
 	N :: 128 * 512
 
 	rand.reset(SEED)
-	p := ml.make({N})
+	p := ml.make(.F32, {N})
 	defer ml.destroy(p)
 	ml.fill_normal(p, 0, 0.02)
 	for i in 0 ..< N {

@@ -15,14 +15,35 @@ OP_ARENA_DEFAULT_SIZE   :: 1 * 1024 * 1024
 
 Data_Type :: enum u8 {
 	F32,
+	F16,
+	Bf16,
 }
 
 @(require_results)
 data_type_size :: #force_inline proc(t: Data_Type) -> int {
 	switch t {
-	case .F32: return size_of(f32)
+	case .F32:  return size_of(f32)
+	case .F16:  return size_of(f16)
+	case .Bf16: return size_of(Bf16)
 	}
 	return 0
+}
+
+Bf16 :: distinct u16
+
+@(require_results)
+bf16_from_f32 :: #force_inline proc "contextless" (x: f32) -> Bf16 {
+	bits := transmute(u32)x
+	if bits & 0x7fff_ffff > 0x7f80_0000 {
+		return Bf16(0x7fc0)
+	}
+	rounded := bits + 0x7fff + ((bits >> 16) & 1)
+	return Bf16(rounded >> 16)
+}
+
+@(require_results)
+bf16_to_f32 :: #force_inline proc "contextless" (x: Bf16) -> f32 {
+	return transmute(f32)(u32(x) << 16)
 }
 
 Buffer_Kind :: enum u8 {
@@ -50,10 +71,10 @@ Backend :: struct #all_or_none {
 	backward: proc(op: Operation, loc: runtime.Source_Code_Location),
 	update:   proc(opt: Optimizer, t: ^Tensor, loc: runtime.Source_Code_Location),
 
-	buffer_alloc: proc(len: int, persist: bool, loc: runtime.Source_Code_Location) -> Backend_Buffer,
+	buffer_alloc: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> Backend_Buffer,
 	buffer_free:  proc(buffer: Backend_Buffer, loc: runtime.Source_Code_Location),
-	buffer_get:   proc(buffer: Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location),
-	buffer_set:   proc(buffer: Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location),
+	buffer_get:   proc(buffer: Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location),
+	buffer_set:   proc(buffer: Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location),
 	buffer_copy:  proc(dst, src: Backend_Buffer, loc: runtime.Source_Code_Location),
 }
 
@@ -141,7 +162,7 @@ DEFAULT_ACTIVATION_BUFFERS :: Buffer_Set{.Data, .Gradient}
 DEFAULT_PARAMETER_BUFFERS  :: Buffer_Set{.Data, .Gradient, .Adam_M, .Adam_V}
 
 @(require_results)
-alloc :: proc(shape: []int, persistent: bool, buffers: Buffer_Set, loc := #caller_location) -> (t: Tensor) {
+alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_Set, loc := #caller_location) -> (t: Tensor) {
 	assert(_current_ctx != nil, "Did you forget to call context_create / context_scope?", loc=loc)
 	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
 	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
@@ -149,10 +170,14 @@ alloc :: proc(shape: []int, persistent: bool, buffers: Buffer_Set, loc := #calle
 	element_count := shape_element_count(shape)
 	assert(element_count > 0, "Tensor element count must be positive", loc=loc)
 
+	byte_count := element_count * data_type_size(type)
+	assert(byte_count > 0, "Tensor byte count must be positive", loc=loc)
+	byte_count = (byte_count + 3) & ~int(3)
+
 	t.backend = &_current_ctx.backend
-	t.type   = .F32
-	t.count  = element_count
-	t.rank   = builtin.len(shape)
+	t.type    = type
+	t.count   = element_count
+	t.rank    = builtin.len(shape)
 	for d, i in shape {
 		assert(d > 0, "Tensor dimension must be positive", loc=loc)
 		t.shape[i] = d
@@ -160,7 +185,7 @@ alloc :: proc(shape: []int, persistent: bool, buffers: Buffer_Set, loc := #calle
 
 	for kind in Buffer_Kind {
 		if kind in buffers {
-			t.buffers[kind] = t.backend.buffer_alloc(element_count, persistent, loc)
+			t.buffers[kind] = t.backend.buffer_alloc(byte_count, persistent, loc)
 		}
 	}
 
@@ -168,31 +193,31 @@ alloc :: proc(shape: []int, persistent: bool, buffers: Buffer_Set, loc := #calle
 }
 
 @(require_results)
-zeros :: proc(shape: []int, loc := #caller_location) -> (t: Tensor) {
-	return alloc(shape, persistent=false, buffers=DEFAULT_ACTIVATION_BUFFERS, loc=loc)
+zeros :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> (t: Tensor) {
+	return alloc(type, shape, persistent=false, buffers=DEFAULT_ACTIVATION_BUFFERS, loc=loc)
 }
 
 @(require_results)
 zeros_like :: proc(src: Tensor, loc := #caller_location) -> Tensor {
 	shape := src.shape
-	return zeros(shape[:src.rank], loc=loc)
+	return zeros(src.type, shape[:src.rank], loc=loc)
 }
 
 @(require_results)
 tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
 	shape := [1]int{builtin.len(data)}
-	t = zeros(shape[:], loc=loc)
-	t.backend.buffer_set(t.buffers[.Data], data, loc)
+	t = zeros(.F32, shape[:], loc=loc)
+	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
 	return
 }
 
 @(require_results)
 scalar :: proc(value: f32, loc := #caller_location) -> (t: Tensor) {
 	shape := [1]int{1}
-	t = zeros(shape[:], loc=loc)
+	t = zeros(.F32, shape[:], loc=loc)
 	src := [1]f32{value}
-	t.backend.buffer_set(t.buffers[.Data], src[:], loc)
+	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src[:]), loc)
 	return
 }
 
@@ -200,17 +225,17 @@ scalar :: proc(value: f32, loc := #caller_location) -> (t: Tensor) {
 _zeros_drop_last :: proc(src: Tensor, loc := #caller_location) -> Tensor {
 	if src.rank <= 1 {
 		shape := [1]int{1}
-		return zeros(shape[:], loc=loc)
+		return zeros(src.type, shape[:], loc=loc)
 	}
 	shape := src.shape
-	return zeros(shape[:src.rank - 1], loc=loc)
+	return zeros(src.type, shape[:src.rank - 1], loc=loc)
 }
 
 @(require_results)
 _zeros_replace_trailing :: proc(src: Tensor, new_trailing: int, loc := #caller_location) -> Tensor {
 	new_shape: [MAX_TENSOR_RANK]int = src.shape
 	new_shape[src.rank - 1] = new_trailing
-	return zeros(new_shape[:src.rank], loc=loc)
+	return zeros(src.type, new_shape[:src.rank], loc=loc)
 }
 
 @(require_results)
@@ -228,7 +253,7 @@ reshape :: proc(src: Tensor, shape: []int, loc := #caller_location) -> (t: Tenso
 	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
 	assert(shape_element_count(shape) == len(src), "Reshape element count mismatch", loc=loc)
 
-	t.backend  = src.backend
+	t.backend = src.backend
 	t.buffers = src.buffers
 	t.type    = src.type
 	t.count   = src.count
@@ -240,8 +265,8 @@ reshape :: proc(src: Tensor, shape: []int, loc := #caller_location) -> (t: Tenso
 }
 
 @(require_results)
-make :: proc(shape: []int, loc := #caller_location) -> (t: Tensor, err: mem.Allocator_Error) #optional_allocator_error {
-	t = alloc(shape, persistent=true, buffers=DEFAULT_PARAMETER_BUFFERS, loc=loc)
+make :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> (t: Tensor, err: mem.Allocator_Error) #optional_allocator_error {
+	t = alloc(type, shape, persistent=true, buffers=DEFAULT_PARAMETER_BUFFERS, loc=loc)
 	return t, nil
 }
 
@@ -261,33 +286,76 @@ copy :: proc(dst, src: Tensor, loc := #caller_location) {
 }
 
 get_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
-	t.backend.buffer_get(t.buffers[.Data], data, loc)
+	assert(t.type == .F32, "get_data with []f32 requires an F32 tensor", loc=loc)
+	t.backend.buffer_get(t.buffers[.Data], mem.slice_to_bytes(data), loc)
 }
 
 set_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
-	t.backend.buffer_set(t.buffers[.Data], data, loc)
+	assert(t.type == .F32, "set_data with []f32 requires an F32 tensor", loc=loc)
+	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
 }
 
 get_gradient :: proc(t: Tensor, data: []f32, loc := #caller_location) {
-	t.backend.buffer_get(t.buffers[.Gradient], data, loc)
+	assert(t.type == .F32, "get_gradient with []f32 requires an F32 tensor", loc=loc)
+	t.backend.buffer_get(t.buffers[.Gradient], mem.slice_to_bytes(data), loc)
+}
+
+get_data_bytes :: proc(t: Tensor, dst: []byte, loc := #caller_location) {
+	t.backend.buffer_get(t.buffers[.Data], dst, loc)
+}
+
+set_data_bytes :: proc(t: Tensor, src: []byte, loc := #caller_location) {
+	t.backend.buffer_set(t.buffers[.Data], src, loc)
 }
 
 fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
-	n   := len(t)
-	buf := builtin.make([]f32, n, allocator=context.temp_allocator)
-	for i in 0 ..< n {
-		buf[i] = rand.float32_normal(mean, std)
+	n := len(t)
+	switch t.type {
+	case .F32:
+		buf := builtin.make([]f32, n, allocator=context.temp_allocator)
+		for i in 0 ..< n {
+			buf[i] = rand.float32_normal(mean, std)
+		}
+		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
+	case .Bf16:
+		buf := builtin.make([]Bf16, n, allocator=context.temp_allocator)
+		for i in 0 ..< n {
+			buf[i] = bf16_from_f32(rand.float32_normal(mean, std))
+		}
+		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
+	case .F16:
+		buf := builtin.make([]f16, n, allocator=context.temp_allocator)
+		for i in 0 ..< n {
+			buf[i] = f16(rand.float32_normal(mean, std))
+		}
+		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
 	}
-	t.backend.buffer_set(t.buffers[.Data], buf, loc)
 }
 
 fill_value :: proc(t: Tensor, value: f32, loc := #caller_location) {
-	n   := len(t)
-	buf := builtin.make([]f32, n, allocator=context.temp_allocator)
-	for i in 0 ..< n {
-		buf[i] = value
+	n := len(t)
+	switch t.type {
+	case .F32:
+		buf := builtin.make([]f32, n, allocator=context.temp_allocator)
+		for i in 0 ..< n {
+			buf[i] = value
+		}
+		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
+	case .Bf16:
+		value_bf := bf16_from_f32(value)
+		buf      := builtin.make([]Bf16, n, allocator=context.temp_allocator)
+		for i in 0 ..< n {
+			buf[i] = value_bf
+		}
+		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
+	case .F16:
+		value_f16 := f16(value)
+		buf       := builtin.make([]f16, n, allocator=context.temp_allocator)
+		for i in 0 ..< n {
+			buf[i] = value_f16
+		}
+		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
 	}
-	t.backend.buffer_set(t.buffers[.Data], buf, loc)
 }
 
 he_initialization :: proc(t: Tensor, input_features: int) {
@@ -379,6 +447,7 @@ Operation_Variant :: union {
 	Permute,
 	Causal_Mask,
 	Attention,
+	Cast,
 }
 
 Operation :: struct {
@@ -402,15 +471,35 @@ backward :: proc(loc := #caller_location) {
 
 	final_op := &_current_ctx.operations[_current_ctx.operation_count - 1]
 
+	assert(final_op.output.type == .F32, "backward currently requires an F32 loss tensor", loc=loc)
+
 	ones := builtin.make([]f32, final_op.output.count, allocator=context.temp_allocator)
 	for &v in ones {
 		v = 1
 	}
-	backend.buffer_set(final_op.output.buffers[.Gradient], ones, loc)
+	backend.buffer_set(final_op.output.buffers[.Gradient], mem.slice_to_bytes(ones), loc)
 
 	for i := _current_ctx.operation_count - 1; i >= 0; i -= 1 {
 		backend.backward(_current_ctx.operations[i], loc)
 	}
+}
+
+Cast :: struct {}
+
+@(require_results)
+cast_to :: proc(input: Tensor, target_type: Data_Type, loc := #caller_location) -> (output: Tensor) {
+	shape := input.shape
+	output = zeros(target_type, shape[:input.rank], loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Cast{},
+	}
+	_current_ctx.backend.forward(op, loc)
+	append_operation(op, loc=loc)
+
+	return
 }
 
 Attention :: struct {
@@ -433,11 +522,11 @@ attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller
 	embed_size := input_size / 3
 	assert(embed_size % head_count == 0, "Output size must be divisible by head count", loc=loc)
 
-	output           = zeros({token_count, embed_size}, loc=loc)
-	softmax_outputs := zeros({head_count, token_count, token_count}, loc=loc)
-	d_p_scratch     := zeros({head_count, token_count}, loc=loc)
-	lse             := zeros({head_count, token_count}, loc=loc)
-	d_acc           := zeros({head_count, token_count}, loc=loc)
+	output           = zeros(.F32, {token_count, embed_size}, loc=loc)
+	softmax_outputs := zeros(.F32, {head_count, token_count, token_count}, loc=loc)
+	d_p_scratch     := zeros(.F32, {head_count, token_count}, loc=loc)
+	lse             := zeros(.F32, {head_count, token_count}, loc=loc)
+	d_acc           := zeros(.F32, {head_count, token_count}, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -656,7 +745,7 @@ transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 	rows    := input.shape[0]
 	columns := input.shape[1]
 
-	output = zeros({columns, rows}, loc=loc)
+	output = zeros(.F32, {columns, rows}, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -684,7 +773,7 @@ select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (outpu
 
 	out_shape: [MAX_TENSOR_RANK]int = input.shape
 	out_shape[0] = builtin.len(indices)
-	output = zeros(out_shape[:input.rank], loc=loc)
+	output = zeros(.F32, out_shape[:input.rank], loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -708,7 +797,7 @@ Slice :: struct {
 slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
 	fmt.assertf(start >= 0 && end <= len(input) && start <= end, "Slice indices out of bounds %v:%v", start, end, loc=loc)
 
-	output = zeros({end - start}, loc=loc)
+	output = zeros(.F32, {end - start}, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -838,8 +927,8 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_l
 
 	output = zeros_like(input, loc=loc)
 
-	cos_cache := zeros({token_count * head_size / 2}, loc=loc)
-	sin_cache := zeros({token_count * head_size / 2}, loc=loc)
+	cos_cache := zeros(.F32, {token_count * head_size / 2}, loc=loc)
+	sin_cache := zeros(.F32, {token_count * head_size / 2}, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -870,8 +959,8 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 
 	count := _leading_count(input)
 
-	mean := zeros({count}, loc=loc)
-	rstd := zeros({count}, loc=loc)
+	mean := zeros(.F32, {count}, loc=loc)
+	rstd := zeros(.F32, {count}, loc=loc)
 
 	output = zeros_like(input, loc=loc)
 
@@ -1107,7 +1196,7 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 	m           := a.shape[1]
 	n           := b.shape[2]
 
-	output = zeros({batch_count, m, n}, loc=loc)
+	output = zeros(.F32, {batch_count, m, n}, loc=loc)
 
 	op := Operation{
 		input   = a,
@@ -1141,7 +1230,7 @@ permute :: proc(input: Tensor, axes: [3]int, loc := #caller_location) -> (output
 		input.shape[axes[1]],
 		input.shape[axes[2]],
 	}
-	output = zeros({out_shape[0], out_shape[1], out_shape[2]}, loc=loc)
+	output = zeros(.F32, {out_shape[0], out_shape[1], out_shape[2]}, loc=loc)
 
 	op := Operation{
 		input   = input,

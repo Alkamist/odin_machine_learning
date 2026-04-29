@@ -17,14 +17,14 @@ run_workload :: proc() -> (data_sum, grad_sum: f32) {
 	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	weight, _ := ml.make({WORKLOAD_OUT, WORKLOAD_IN})
+	weight, _ := ml.make(.F32, {WORKLOAD_OUT, WORKLOAD_IN})
 	defer ml.destroy(weight)
 
 	for i in 0 ..< ml.len(weight) {
 		cpu.data(weight)[i] = f32(i % 257) * 1e-3 - 0.05
 	}
 
-	input := ml.zeros({WORKLOAD_BATCH, WORKLOAD_IN})
+	input := ml.zeros(.F32, {WORKLOAD_BATCH, WORKLOAD_IN})
 	for i in 0 ..< ml.len(input) {
 		cpu.data(input)[i] = f32((i * 13 + 7) % 199) * 1e-3
 	}

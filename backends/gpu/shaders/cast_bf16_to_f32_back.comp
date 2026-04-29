@@ -1,0 +1,23 @@
+// Backward of cast(F32 -> Bf16): expand bf16 dst.grad to f32 and accumulate
+// into f32 src.grad. dst.grad is packed two bf16 per uint.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer DY  { uint  dy[]; };
+layout(set = 0, binding = 1)          buffer DX  { float dx[]; };
+layout(push_constant) uniform Params { uint n; uint pair_count; } p;
+
+float bf16_expand(uint half_bits) {
+    return uintBitsToFloat(half_bits << 16);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.pair_count) return;
+
+    uint packed = dy[i];
+    uint i0 = 2u * i;
+    uint i1 = i0 + 1u;
+
+    if (i0 < p.n) dx[i0] += bf16_expand(packed & 0xffffu);
+    if (i1 < p.n) dx[i1] += bf16_expand((packed >> 16) & 0xffffu);
+}

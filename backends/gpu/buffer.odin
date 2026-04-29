@@ -161,7 +161,7 @@ _end_one_shot :: proc(cmd: vk.CommandBuffer, loc := #caller_location) {
 // Copy host data → device buffer via the staging buffer. Synchronous on
 // purpose; uploads are not on the hot path. Flushes any active batch first
 // so prior queued writes to the buffer don't clobber the upload.
-_upload :: proc(dst: vk.Buffer, src: []f32, loc := #caller_location) {
+_upload :: proc(dst: vk.Buffer, src: []byte, loc := #caller_location) {
 	if len(src) == 0 { return }
 
 	gctx := _gctx(loc)
@@ -169,7 +169,7 @@ _upload :: proc(dst: vk.Buffer, src: []f32, loc := #caller_location) {
 		end_batch(loc)
 	}
 
-	size := vk.DeviceSize(len(src) * size_of(f32))
+	size := vk.DeviceSize(len(src))
 	_ensure_staging(size, loc)
 
 	mem.copy(gctx.staging.mapped, raw_data(src), int(size))
@@ -184,11 +184,11 @@ _upload :: proc(dst: vk.Buffer, src: []f32, loc := #caller_location) {
 // holds the GPU's contents. If a batch is active, fold the device →
 // staging copy into it and end the batch so the deferred host memcpy
 // runs (one submit total instead of two).
-_download :: proc(src: vk.Buffer, dst: []f32, loc := #caller_location) {
+_download :: proc(src: vk.Buffer, dst: []byte, loc := #caller_location) {
 	if len(dst) == 0 { return }
 
 	gctx := _gctx(loc)
-	size := vk.DeviceSize(len(dst) * size_of(f32))
+	size := vk.DeviceSize(len(dst))
 
 	if gctx.batch.active {
 		needed := gctx.batch.staging_offset + size

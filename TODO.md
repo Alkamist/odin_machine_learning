@@ -3,6 +3,45 @@
 Notes accumulated during the PyTorch-parity / GPU-optimization session.
 Ordered roughly by leverage, not by difficulty.
 
+## North star: what this library should run
+
+Goals: SOTA transformer LLMs (Gemma 4 class), game-playing agents,
+audio processing (ASR, embeddings), and audio generation. The Gemma 4
+target is the most demanding and is largely a superset of what the
+others need on the architecture side, so the transformer stack is the
+trunk and everything else branches off it.
+
+Cross-cutting capabilities the current library is missing for these
+goals (in addition to the dtype/perf items below):
+
+- **GQA + RoPE as an op + sliding-window attention.** Required by
+  every modern transformer, not just Gemma 4. RoPE must be a real op
+  with config (theta, p-RoPE variant), not baked into `attention`.
+- **KV-cache inference path.** `attention_decode` (single-token Q
+  against cached K/V) plus a way to grow K/V buffers in place. Without
+  this you can train but cannot "run" a model.
+- **Conv1d / Conv2d ops.** Audio frontends, vision encoders, CNN
+  trunks for AlphaZero-style agents. Examples currently sidestep this
+  by flattening MNIST.
+- **FFT / mel-spectrogram preprocessing.** CPU-only, lives outside the
+  autograd graph. Gates all audio work.
+- **Autoregressive generation loop.** Categorical/Gumbel sampling +
+  KV-cache step. Needed for text, audio tokens, Decision Transformer
+  action rollouts.
+- **VQ / residual VQ with straight-through gradient.** Neural audio
+  codecs (EnCodec/SoundStream) and discrete-latent world models.
+
+Suggested phasing:
+1. Dtype foundation (phase 1 below).
+2. Modern attention surface: GQA, RoPE op, sliding window, KV-cache
+   decode. Makes the library "Gemma-shaped."
+3. Conv1d/2d + FFT. Unlocks audio and vision frontends.
+4. End-to-end checkpoint load: pull a small Gemma 4 variant (E4B)
+   from HF, run inference, match logits. This is the forcing function
+   that surfaces every remaining gap.
+5. Branch into one of {audio generation, world-model RL, MoE
+   training} — roughly equal effort off the same trunk.
+
 ## Multi-dtype foundation (precondition for serious LLM work)
 
 The project goal is to infer and train Gemma-class LLMs. That requires BF16
@@ -11,27 +50,66 @@ FP32 master weights for the optimizer, and tensor-core matmul on top.
 Without dtype support the project caps at "small models in FP32," and the
 coopmat shader work below would need to be redone once buffers gain types.
 
-**Existing scaffolding (`ml.odin`):**
+### Status (as of last session)
 
-- `Data_Type :: enum u8 { F32 }` and `data_type_size`. Single-variant
-  today, ready to extend.
-- `Tensor.type: Data_Type` is on every tensor. `alloc` hardcodes `.F32`.
-- `Backend.buffer_alloc(len, ...)` takes element count, not bytes.
-- `Backend.buffer_get/set` take `[]f32` — only FP32 round-trips today.
+**Phase 1 (foundations) — DONE.** Done across `ml.odin`,
+`backends/cpu/cpu.odin`, `backends/gpu/{backend,buffer,gpu,ops}.odin`,
+plus `tests/dtype_roundtrip/`.
 
-**Recommended rollout (do in this order, one phase per session):**
+- `Data_Type` extended to `{F32, F16, Bf16}`. Note: `Bf16` is
+  `distinct u16`, with `bf16_from_f32` (round-to-nearest-even,
+  NaN-preserving) and `bf16_to_f32` helpers in `ml.odin`. Style choice:
+  the type is `Bf16` (not `BF16`); enum cases stay capitalized as
+  `.F32`/`.F16`/`.Bf16`.
+- Backend buffer interface is now byte-oriented:
+  `buffer_alloc(byte_count: int, persist, loc)`,
+  `buffer_get/set(buffer, []byte, loc)`. The CPU helpers
+  (`data`/`gradient`/`adam_m`/`adam_v`) now slice via `[^]f32` cast +
+  `t.count` since the slice header carries byte count.
+- `alloc`/`zeros`/`make` carry `type: Data_Type = .F32`. `zeros_like`
+  and `_zeros_*` helpers preserve source type. `alloc` rounds byte
+  count up to a 4-byte multiple — required because the GPU bf16/f16
+  shaders pack two halves per `uint`, so an odd element count must be
+  writable through the trailing uint.
+- Public typed APIs (`set_data`/`get_data`/`get_gradient`,
+  `upload_tensor`/`download_tensor` in the GPU backend) keep `[]f32`
+  signatures with an `assert(t.type == .F32)`. Raw byte access:
+  `set_data_bytes`/`get_data_bytes`. `fill_normal`/`fill_value` switch
+  on `t.type` and emit F32/F16/Bf16.
+- `backward()` currently asserts the loss tensor is F32.
 
-1. **Foundations.** Extend the enum to `{F32, F16, BF16}`. Switch
-   `buffer_alloc` to bytes (or `(len, type)`), and `buffer_get/set` to
-   `[]byte` with thin `tensor_set_f32`-style helpers on top. Add `type`
-   parameter to `alloc`/`zeros`/`zeros_like`. Verify a BF16 tensor
-   allocates and round-trips on both CPU and GPU backends with no ops
-   defined yet.
+**Phase 2 (`cast_to` op) — DONE.** `cast` is reserved in Odin so the
+proc is `ml.cast_to(input, target_type)`. The op variant is `Cast{}`
+(empty marker — src and dst types are read off `op.input.type` /
+`op.output.type`).
 
-2. **`cast` op.** Forward + backward, both backends. Smallest non-trivial
-   dtype-aware op; proves the dispatch shape. Backward casts the gradient
-   back to the source dtype. Trivial in CPU, one shader on GPU per
-   `(src, dst)` pair (or one shader with a push-constant for type).
+- CPU: full support for all `{F32, F16, Bf16}` pairs, forward and
+  backward. Implementations: `cast_forward` / `cast_backward` in
+  `cpu.odin`, with shared `_cast_bytes` and `_cast_bytes_accumulate`
+  helpers. Backward accumulates (`+=`) into `input.gradient`.
+- GPU: F32 ↔ Bf16 only. Four shaders under
+  `backends/gpu/shaders/cast_*.comp` (with built `.spv`):
+  `cast_f32_to_bf16`, `cast_bf16_to_f32`, plus `_back` variants used
+  by `cast_backward`. Same-type cast forward falls through to `_copy`
+  (a vk buffer copy); same-type backward currently panics (intentional
+  — flag if it ever shows up). The shaders pack two bf16/uint and
+  dispatch one thread per pair; no special Vulkan extensions needed.
+- F16 GPU support was **deliberately deferred** — Gemma 4 is bf16, so
+  this can wait until something asks for it.
+- Tests: `tests/dtype_roundtrip/main.odin` covers F32/Bf16/F16 byte
+  round-trip and `cast_to` forward + backward on both backends. All
+  pass. `tests/gpu_unified_check` (the existing F32 op suite) still
+  passes — F32 path is untouched.
+
+**Suggested next slice (before jumping straight to coopmat linear):**
+make one element-wise op (e.g. `add` or `gelu`) dtype-generic on Bf16.
+It exercises the typed-dispatch shape inside an op-other-than-cast and
+will surface any plumbing gaps (e.g. shaders reading Bf16 buffers
+without coopmat, dtype assertions in op procs, gradient-dtype
+accumulation rules) in a contained setting. After that, coopmat
+`linear` is the next big jump.
+
+### Open / next phases
 
 3. **First coopmat shader: BF16 `linear` forward.** Use
    `GL_KHR_cooperative_matrix` + `GL_EXT_shader_explicit_arithmetic_types_float16`

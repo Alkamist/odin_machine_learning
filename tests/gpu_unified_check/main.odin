@@ -25,8 +25,8 @@ main :: proc() {
 		defer gpu.context_destroy(ctx)
 		ml.context_scope(ctx)
 
-		a := ml.zeros({128, 128})
-		b := ml.zeros({64, 32})
+		a := ml.zeros(.F32, {128, 128})
+		b := ml.zeros(.F32, {64, 32})
 
 		check(a.backend == &ctx.backend,       "phase1: tensor a's backend is GPU",      &any_failed)
 		check(ml.len(a) == 128 * 128,          "phase1: tensor a element count matches", &any_failed)
@@ -83,8 +83,8 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			a := ml.zeros({N})
-			b := ml.zeros({N})
+			a := ml.zeros(.F32, {N})
+			b := ml.zeros(.F32, {N})
 			gpu.upload_tensor(a, a_data[:])
 			gpu.upload_tensor(b, b_data[:])
 
@@ -134,8 +134,8 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, INPUT_SIZE})
-			w := ml.zeros({OUTPUT_SIZE, INPUT_SIZE})
+			x := ml.zeros(.F32, {COUNT, INPUT_SIZE})
+			w := ml.zeros(.F32, {OUTPUT_SIZE, INPUT_SIZE})
 			ml.set_data(x, x_data[:])
 			ml.set_data(w, w_data[:])
 
@@ -155,8 +155,8 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, INPUT_SIZE})
-			w := ml.zeros({OUTPUT_SIZE, INPUT_SIZE})
+			x := ml.zeros(.F32, {COUNT, INPUT_SIZE})
+			w := ml.zeros(.F32, {OUTPUT_SIZE, INPUT_SIZE})
 			gpu.upload_tensor(x, x_data[:])
 			gpu.upload_tensor(w, w_data[:])
 
@@ -211,7 +211,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({N})
+			x := ml.zeros(.F32, {N})
 			gpu.upload_tensor(x, x_data[:])
 
 			y := ml.gelu(x)
@@ -252,7 +252,7 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			table := ml.zeros({VOCAB, SIZE})
+			table := ml.zeros(.F32, {VOCAB, SIZE})
 			ml.set_data(table, table_data[:])
 
 			y := ml.select(table, indices[:])
@@ -269,7 +269,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			table := ml.zeros({VOCAB, SIZE})
+			table := ml.zeros(.F32, {VOCAB, SIZE})
 			gpu.upload_tensor(table, table_data[:])
 
 			y := ml.select(table, indices[:])
@@ -304,7 +304,7 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({TOKENS, HEADS * HEAD_SIZE})
+			x := ml.zeros(.F32, {TOKENS, HEADS * HEAD_SIZE})
 			ml.set_data(x, x_data[:])
 
 			y := ml.rope(x, HEADS)
@@ -321,7 +321,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({TOKENS, HEADS * HEAD_SIZE})
+			x := ml.zeros(.F32, {TOKENS, HEADS * HEAD_SIZE})
 			gpu.upload_tensor(x, x_data[:])
 
 			y := ml.rope(x, HEADS)
@@ -357,7 +357,7 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({ROWS, TRAILING})
+			x := ml.zeros(.F32, {ROWS, TRAILING})
 			ml.set_data(x, x_data[:])
 
 			y := ml.slice_trailing(x, START, END)
@@ -374,7 +374,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({ROWS, TRAILING})
+			x := ml.zeros(.F32, {ROWS, TRAILING})
 			gpu.upload_tensor(x, x_data[:])
 
 			y := ml.slice_trailing(x, START, END)
@@ -417,9 +417,9 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			a := ml.zeros({ROWS, T_A})
-			b := ml.zeros({ROWS, T_B})
-			c := ml.zeros({ROWS, T_C})
+			a := ml.zeros(.F32, {ROWS, T_A})
+			b := ml.zeros(.F32, {ROWS, T_B})
+			c := ml.zeros(.F32, {ROWS, T_C})
 			ml.set_data(a, a_data[:])
 			ml.set_data(b, b_data[:])
 			ml.set_data(c, c_data[:])
@@ -442,9 +442,9 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			a := ml.zeros({ROWS, T_A})
-			b := ml.zeros({ROWS, T_B})
-			c := ml.zeros({ROWS, T_C})
+			a := ml.zeros(.F32, {ROWS, T_A})
+			b := ml.zeros(.F32, {ROWS, T_B})
+			c := ml.zeros(.F32, {ROWS, T_C})
 			gpu.upload_tensor(a, a_data[:])
 			gpu.upload_tensor(b, b_data[:])
 			gpu.upload_tensor(c, c_data[:])
@@ -486,7 +486,7 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, SIZE})
+			x := ml.zeros(.F32, {COUNT, SIZE})
 			ml.set_data(x, x_data[:])
 
 			y := ml.softmax(x)
@@ -503,7 +503,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, SIZE})
+			x := ml.zeros(.F32, {COUNT, SIZE})
 			gpu.upload_tensor(x, x_data[:])
 
 			y := ml.softmax(x)
@@ -537,7 +537,7 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({D0, D1, D2})
+			x := ml.zeros(.F32, {D0, D1, D2})
 			ml.set_data(x, x_data[:])
 
 			y := ml.permute(x, {1, 0, 2})
@@ -554,7 +554,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({D0, D1, D2})
+			x := ml.zeros(.F32, {D0, D1, D2})
 			gpu.upload_tensor(x, x_data[:])
 
 			y := ml.permute(x, {1, 0, 2})
@@ -587,7 +587,7 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({H, T, T})
+			x := ml.zeros(.F32, {H, T, T})
 			ml.set_data(x, x_data[:])
 
 			y := ml.causal_mask(x)
@@ -604,7 +604,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({H, T, T})
+			x := ml.zeros(.F32, {H, T, T})
 			gpu.upload_tensor(x, x_data[:])
 
 			y := ml.causal_mask(x)
@@ -655,8 +655,8 @@ main :: proc() {
 				defer gpu.context_destroy(ctx)
 				ml.context_scope(ctx)
 
-				a := ml.zeros({len(a_data)})
-				b := ml.zeros({len(b_data)})
+				a := ml.zeros(.F32, {len(a_data)})
+				b := ml.zeros(.F32, {len(b_data)})
 				gpu.upload_tensor(a, a_data)
 				gpu.upload_tensor(b, b_data)
 
@@ -747,8 +747,8 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			a := ml.zeros({B, M, K})
-			b := ml.zeros({B, K, N})
+			a := ml.zeros(.F32, {B, M, K})
+			b := ml.zeros(.F32, {B, K, N})
 			ml.set_data(a, a_data[:])
 			ml.set_data(b, b_data[:])
 
@@ -768,8 +768,8 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			a := ml.zeros({B, M, K})
-			b := ml.zeros({B, K, N})
+			a := ml.zeros(.F32, {B, M, K})
+			b := ml.zeros(.F32, {B, K, N})
 			gpu.upload_tensor(a, a_data[:])
 			gpu.upload_tensor(b, b_data[:])
 
@@ -833,7 +833,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({TOKENS, IN_SIZE})
+			x := ml.zeros(.F32, {TOKENS, IN_SIZE})
 			gpu.upload_tensor(x, x_data[:])
 
 			y := ml.attention(x, HEADS)
@@ -873,8 +873,8 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, SIZE})
-			w := ml.zeros({SIZE})
+			x := ml.zeros(.F32, {COUNT, SIZE})
+			w := ml.zeros(.F32, {SIZE})
 			ml.set_data(x, x_data[:])
 			ml.set_data(w, w_data[:])
 
@@ -894,8 +894,8 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, SIZE})
-			w := ml.zeros({SIZE})
+			x := ml.zeros(.F32, {COUNT, SIZE})
+			w := ml.zeros(.F32, {SIZE})
 			gpu.upload_tensor(x, x_data[:])
 			gpu.upload_tensor(w, w_data[:])
 
@@ -937,7 +937,7 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, CLASS_SIZE})
+			x := ml.zeros(.F32, {COUNT, CLASS_SIZE})
 			ml.set_data(x, x_data[:])
 
 			loss := ml.cross_entropy(x, targets[:])
@@ -954,7 +954,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, CLASS_SIZE})
+			x := ml.zeros(.F32, {COUNT, CLASS_SIZE})
 			gpu.upload_tensor(x, x_data[:])
 
 			loss := ml.cross_entropy(x, targets[:])
@@ -989,7 +989,7 @@ main :: proc() {
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, SIZE})
+			x := ml.zeros(.F32, {COUNT, SIZE})
 			ml.set_data(x, x_data[:])
 
 			y := ml.mean(x)
@@ -1003,7 +1003,7 @@ main :: proc() {
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
 
-			x := ml.zeros({COUNT, SIZE})
+			x := ml.zeros(.F32, {COUNT, SIZE})
 			gpu.upload_tensor(x, x_data[:])
 
 			y := ml.mean(x)
@@ -1051,9 +1051,9 @@ main :: proc() {
 
 			// Persistent parameters survive ml.clear; x lives in the per-step
 			// arena and is re-seeded each iteration.
-			w0, _ := ml.make({HIDDEN, IN_DIM})
+			w0, _ := ml.make(.F32, {HIDDEN, IN_DIM})
 			defer ml.destroy(w0)
-			w1, _ := ml.make({OUT_DIM, HIDDEN})
+			w1, _ := ml.make(.F32, {OUT_DIM, HIDDEN})
 			defer ml.destroy(w1)
 
 			ml.set_data(w0, w0_init)
@@ -1063,7 +1063,7 @@ main :: proc() {
 			for step in 0 ..< STEPS {
 				ml.clear()
 
-				x := ml.zeros({BATCH, IN_DIM})
+				x := ml.zeros(.F32, {BATCH, IN_DIM})
 				ml.set_data(x, x_data)
 
 				h := ml.linear(x, w0)
@@ -1127,7 +1127,7 @@ main :: proc() {
 				ctx := gpu.context_create()
 				defer gpu.context_destroy(ctx)
 				ml.context_scope(ctx)
-				x := ml.zeros({n})
+				x := ml.zeros(.F32, {n})
 				gpu.upload_tensor(x, x_data)
 				y := fn(x)
 				ml.backward()
@@ -1189,7 +1189,7 @@ main :: proc() {
 				ctx := gpu.context_create()
 				defer gpu.context_destroy(ctx)
 				ml.context_scope(ctx)
-				a := ml.zeros({n}); b := ml.zeros({n})
+				a := ml.zeros(.F32, {n}); b := ml.zeros(.F32, {n})
 				gpu.upload_tensor(a, a_data)
 				gpu.upload_tensor(b, b_data)
 				y := fn(a, b)
@@ -1249,7 +1249,7 @@ main :: proc() {
 				ctx := gpu.context_create()
 				defer gpu.context_destroy(ctx)
 				ml.context_scope(ctx)
-				a := ml.zeros({n}); b := ml.zeros({n_b})
+				a := ml.zeros(.F32, {n}); b := ml.zeros(.F32, {n_b})
 				gpu.upload_tensor(a, a_data); gpu.upload_tensor(b, b_data)
 				y := fn(a, b)
 				ml.backward()
@@ -1292,7 +1292,7 @@ main :: proc() {
 			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			x := ml.zeros({ROWS, COLS}); ml.set_data(x, x_data[:])
+			x := ml.zeros(.F32, {ROWS, COLS}); ml.set_data(x, x_data[:])
 			y := ml.transpose(x)
 			ml.backward()
 			copy(cpu_y[:],  cpu.data(y))
@@ -1302,7 +1302,7 @@ main :: proc() {
 			ctx := gpu.context_create()
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			x := ml.zeros({ROWS, COLS}); gpu.upload_tensor(x, x_data[:])
+			x := ml.zeros(.F32, {ROWS, COLS}); gpu.upload_tensor(x, x_data[:])
 			y := ml.transpose(x)
 			ml.backward()
 			gpu.download_tensor          (y, gpu_y[:])
@@ -1340,7 +1340,7 @@ main :: proc() {
 			ctx := gpu.context_create()
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			x := ml.zeros({N}); gpu.upload_tensor(x, x_data[:])
+			x := ml.zeros(.F32, {N}); gpu.upload_tensor(x, x_data[:])
 			y := ml.slice(x, START, END)
 			ml.backward()
 			gpu.download_tensor          (y, gpu_y[:])
@@ -1367,7 +1367,7 @@ main :: proc() {
 			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			x := ml.zeros({COUNT, SIZE}); ml.set_data(x, x_data[:])
+			x := ml.zeros(.F32, {COUNT, SIZE}); ml.set_data(x, x_data[:])
 			y := ml.log_softmax(x)
 			ml.backward()
 			copy(cpu_y[:],  cpu.data(y))
@@ -1377,7 +1377,7 @@ main :: proc() {
 			ctx := gpu.context_create()
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			x := ml.zeros({COUNT, SIZE}); gpu.upload_tensor(x, x_data[:])
+			x := ml.zeros(.F32, {COUNT, SIZE}); gpu.upload_tensor(x, x_data[:])
 			y := ml.log_softmax(x)
 			ml.backward()
 			gpu.download_tensor          (y, gpu_y[:])
@@ -1418,7 +1418,7 @@ main :: proc() {
 			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			p := ml.zeros({COUNT, SIZE}); ml.set_data(p, probs[:])
+			p := ml.zeros(.F32, {COUNT, SIZE}); ml.set_data(p, probs[:])
 			y := ml.entropy(p)
 			ml.backward()
 			copy(cpu_y[:],  cpu.data(y))
@@ -1428,7 +1428,7 @@ main :: proc() {
 			ctx := gpu.context_create()
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			p := ml.zeros({COUNT, SIZE}); gpu.upload_tensor(p, probs[:])
+			p := ml.zeros(.F32, {COUNT, SIZE}); gpu.upload_tensor(p, probs[:])
 			y := ml.entropy(p)
 			ml.backward()
 			gpu.download_tensor          (y, gpu_y[:])
@@ -1457,8 +1457,8 @@ main :: proc() {
 			ctx := cpu.context_create(2 * 1024 * 1024)
 			defer cpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			pred   := ml.zeros({COUNT, SIZE}); ml.set_data(pred, pred_data[:])
-			target := ml.zeros({COUNT, SIZE}); ml.set_data(target, target_data[:])
+			pred   := ml.zeros(.F32, {COUNT, SIZE}); ml.set_data(pred, pred_data[:])
+			target := ml.zeros(.F32, {COUNT, SIZE}); ml.set_data(target, target_data[:])
 			y := ml.mean_squared_error(pred, target)
 			ml.backward()
 			copy(cpu_y[:],     cpu.data(y))
@@ -1468,8 +1468,8 @@ main :: proc() {
 			ctx := gpu.context_create()
 			defer gpu.context_destroy(ctx)
 			ml.context_scope(ctx)
-			pred   := ml.zeros({COUNT, SIZE}); gpu.upload_tensor(pred,   pred_data[:])
-			target := ml.zeros({COUNT, SIZE}); gpu.upload_tensor(target, target_data[:])
+			pred   := ml.zeros(.F32, {COUNT, SIZE}); gpu.upload_tensor(pred,   pred_data[:])
+			target := ml.zeros(.F32, {COUNT, SIZE}); gpu.upload_tensor(target, target_data[:])
 			y := ml.mean_squared_error(pred, target)
 			ml.backward()
 			gpu.download_tensor          (y,    gpu_y[:])

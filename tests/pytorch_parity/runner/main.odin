@@ -96,9 +96,9 @@ run_binary_op :: proc(dir: string, op: Binary_Op) {
 	a_shape, a_data := load_tensor(_path(dir, "input_a.bin"))
 	b_shape, b_data := load_tensor(_path(dir, "input_b.bin"))
 
-	a := ml.alloc(a_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	a := ml.alloc(.F32, a_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(a)
-	b := ml.alloc(b_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	b := ml.alloc(.F32, b_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(b)
 
 	ml.set_data(a, a_data)
@@ -130,9 +130,9 @@ run_linear :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	w_shape, w_data := load_tensor(_path(dir, "input_w.bin"))
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
-	w := ml.alloc(w_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	w := ml.alloc(.F32, w_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(w)
 
 	ml.set_data(x, x_data)
@@ -164,7 +164,7 @@ Unary_Op :: enum { Mean, Softmax, Log_Softmax, Gelu, Relu, Silu, Tanh, Sigmoid }
 run_unary :: proc(dir: string, op: Unary_Op) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 
@@ -196,9 +196,9 @@ run_layernorm :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	w_shape, w_data := load_tensor(_path(dir, "input_w.bin"))
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
-	w := ml.alloc(w_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	w := ml.alloc(.F32, w_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(w)
 
 	ml.set_data(x, x_data)
@@ -225,7 +225,7 @@ run_cross_entropy :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	targets         := load_int_array(_path(dir, "targets.bin"))
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 
@@ -247,9 +247,9 @@ run_batched_matmul :: proc(dir: string) {
 	a_shape, a_data := load_tensor(_path(dir, "input_a.bin"))
 	b_shape, b_data := load_tensor(_path(dir, "input_b.bin"))
 
-	a := ml.alloc(a_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	a := ml.alloc(.F32, a_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(a)
-	b := ml.alloc(b_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	b := ml.alloc(.F32, b_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(b)
 
 	ml.set_data(a, a_data)
@@ -276,7 +276,7 @@ run_permute :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	axes_array      := load_int_array(_path(dir, "axes.bin"))
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 
@@ -299,7 +299,7 @@ run_attention :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	config          := load_int_array(_path(dir, "config.bin"))
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 
@@ -345,9 +345,9 @@ run_mlp_train :: proc(dir: string) {
 		ml.set_data(model.layers[layer_index].bias,   b_data)
 	}
 
-	x_target := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x_target := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x_target)
-	y_target := ml.alloc(y_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	y_target := ml.alloc(.F32, y_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(y_target)
 	ml.set_data(x_target, x_data)
 	ml.set_data(y_target, y_data)
@@ -379,7 +379,7 @@ run_select :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	indices         := load_int_array(_path(dir, "indices.bin"))
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 
@@ -403,7 +403,7 @@ run_slice_trailing :: proc(dir: string) {
 	start := config[0]
 	end   := config[1]
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 
@@ -426,11 +426,11 @@ run_concat3 :: proc(dir: string) {
 	b_shape, b_data := load_tensor(_path(dir, "input_b.bin"))
 	c_shape, c_data := load_tensor(_path(dir, "input_c.bin"))
 
-	a := ml.alloc(a_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	a := ml.alloc(.F32, a_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(a)
-	b := ml.alloc(b_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	b := ml.alloc(.F32, b_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(b)
-	c := ml.alloc(c_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	c := ml.alloc(.F32, c_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(c)
 	ml.set_data(a, a_data)
 	ml.set_data(b, b_data)
@@ -460,7 +460,7 @@ run_rope :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	config          := load_int_array(_path(dir, "config.bin"))
 
-	x := ml.alloc(x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 

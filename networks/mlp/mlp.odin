@@ -17,8 +17,8 @@ make :: proc(sizes: ..int, allocator := context.allocator) -> (mlp: Mlp) {
 	mlp.layers = builtin.make([]Layer, len(sizes) - 1)
 
 	for i in 0 ..< len(mlp.layers) {
-		mlp.layers[i].weight = ml.make({sizes[i + 1], sizes[i]})
-		mlp.layers[i].bias   = ml.make({sizes[i + 1]})
+		mlp.layers[i].weight = ml.make(.F32, {sizes[i + 1], sizes[i]})
+		mlp.layers[i].bias   = ml.make(.F32, {sizes[i + 1]})
 	}
 
 	randomize(mlp)

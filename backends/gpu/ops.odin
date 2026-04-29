@@ -156,6 +156,16 @@ Clamp_Params :: struct { n: u32, min_val, max_val: f32 }
 _clamp_pipeline:      ^Pipeline
 _clamp_back_pipeline: ^Pipeline
 
+CAST_F32_TO_BF16_SPIRV      :: #load("shaders/cast_f32_to_bf16.spv",      []u8)
+CAST_BF16_TO_F32_SPIRV      :: #load("shaders/cast_bf16_to_f32.spv",      []u8)
+CAST_F32_TO_BF16_BACK_SPIRV :: #load("shaders/cast_f32_to_bf16_back.spv", []u8)
+CAST_BF16_TO_F32_BACK_SPIRV :: #load("shaders/cast_bf16_to_f32_back.spv", []u8)
+Cast_Params :: struct { n: u32, pair_count: u32 }
+_cast_f32_to_bf16_pipeline:      ^Pipeline
+_cast_bf16_to_f32_pipeline:      ^Pipeline
+_cast_f32_to_bf16_back_pipeline: ^Pipeline
+_cast_bf16_to_f32_back_pipeline: ^Pipeline
+
 MIN_SPIRV      :: #load("shaders/min.spv",      []u8)
 MIN_BACK_SPIRV :: #load("shaders/min_back.spv", []u8)
 MAX_SPIRV      :: #load("shaders/max.spv",      []u8)

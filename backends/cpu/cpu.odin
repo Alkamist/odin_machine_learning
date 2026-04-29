@@ -303,53 +303,58 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 }
 
 _buffer_get :: #force_inline proc(t: ml.Tensor, kind: ml.Buffer_Kind) -> []f32 {
-	return transmute([]f32)t.buffers[kind]
+	bytes := transmute([]byte)t.buffers[kind]
+	return ([^]f32)(raw_data(bytes))[:t.count]
 }
 
 @(require_results)
 data :: #force_inline proc(t: ml.Tensor) -> []f32 {
-	return transmute([]f32)t.buffers[.Data]
+	bytes := transmute([]byte)t.buffers[.Data]
+	return ([^]f32)(raw_data(bytes))[:t.count]
 }
 
 @(require_results)
 gradient :: #force_inline proc(t: ml.Tensor) -> []f32 {
-	return transmute([]f32)t.buffers[.Gradient]
+	bytes := transmute([]byte)t.buffers[.Gradient]
+	return ([^]f32)(raw_data(bytes))[:t.count]
 }
 
 @(require_results)
 adam_m :: #force_inline proc(t: ml.Tensor) -> []f32 {
-	return transmute([]f32)t.buffers[.Adam_M]
+	bytes := transmute([]byte)t.buffers[.Adam_M]
+	return ([^]f32)(raw_data(bytes))[:t.count]
 }
 
 @(require_results)
 adam_v :: #force_inline proc(t: ml.Tensor) -> []f32 {
-	return transmute([]f32)t.buffers[.Adam_V]
+	bytes := transmute([]byte)t.buffers[.Adam_V]
+	return ([^]f32)(raw_data(bytes))[:t.count]
 }
 
-buffer_alloc :: proc(len: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
 	ctx       := cast(^Context)ml.current_context(loc=loc)
 	allocator := persist ? context.allocator : mem.arena_allocator(&ctx.arena)
 
-	data, err := builtin.make([]f32, len, allocator=allocator, loc=loc)
+	bytes, err := builtin.make([]byte, byte_count, allocator=allocator, loc=loc)
 	fmt.assertf(err == nil, "Failed to allocate CPU buffer: %v", err, loc=loc)
 
-	return transmute([ml.BACKEND_BUFFER_MAX_SIZE]byte)data
+	return transmute([ml.BACKEND_BUFFER_MAX_SIZE]byte)bytes
 }
 
 buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
-	builtin.delete(transmute([]f32)buffer, loc=loc)
+	builtin.delete(transmute([]byte)buffer, loc=loc)
 }
 
-buffer_get :: proc(buffer: ml.Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location) {
-	builtin.copy(data, transmute([]f32)buffer)
+buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location) {
+	builtin.copy(dst, transmute([]byte)buffer)
 }
 
-buffer_set :: proc(buffer: ml.Backend_Buffer, data: []f32, loc: runtime.Source_Code_Location) {
-	builtin.copy(transmute([]f32)buffer, data)
+buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location) {
+	builtin.copy(transmute([]byte)buffer, src)
 }
 
 buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
-	builtin.copy(transmute([]f32)dst, transmute([]f32)src)
+	builtin.copy(transmute([]byte)dst, transmute([]byte)src)
 }
 
 update :: proc(opt: ml.Optimizer, t: ^ml.Tensor, loc: runtime.Source_Code_Location) {
@@ -410,6 +415,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Permute:            permute_forward            (op)
 	case ml.Causal_Mask:        causal_mask_forward        (op)
 	case ml.Attention:          attention_forward          (op)
+	case ml.Cast:               cast_forward               (op)
 	}
 }
 
@@ -446,6 +452,67 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Permute:            permute_backward           (op)
 	case ml.Causal_Mask:        causal_mask_backward       (op)
 	case ml.Attention:          attention_backward         (op)
+	case ml.Cast:               cast_backward              (op)
+	}
+}
+
+cast_forward :: proc(op: ml.Operation) {
+	src_bytes := transmute([]byte)op.input.buffers[.Data]
+	dst_bytes := transmute([]byte)op.output.buffers[.Data]
+	_cast_bytes(src_bytes, op.input.type, dst_bytes, op.output.type, op.input.count)
+}
+
+cast_backward :: proc(op: ml.Operation) {
+	dst_grad := transmute([]byte)op.output.buffers[.Gradient]
+	src_grad := transmute([]byte)op.input.buffers[.Gradient]
+	_cast_bytes_accumulate(dst_grad, op.output.type, src_grad, op.input.type, op.input.count)
+}
+
+_cast_bytes :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: ml.Data_Type, count: int) {
+	src_f32  := ([^]f32    )(raw_data(src))[:count] if src_type == .F32  else nil
+	src_bf16 := ([^]ml.Bf16)(raw_data(src))[:count] if src_type == .Bf16 else nil
+	src_f16  := ([^]f16    )(raw_data(src))[:count] if src_type == .F16  else nil
+
+	dst_f32  := ([^]f32    )(raw_data(dst))[:count] if dst_type == .F32  else nil
+	dst_bf16 := ([^]ml.Bf16)(raw_data(dst))[:count] if dst_type == .Bf16 else nil
+	dst_f16  := ([^]f16    )(raw_data(dst))[:count] if dst_type == .F16  else nil
+
+	for i in 0 ..< count {
+		v: f32
+		switch src_type {
+		case .F32:  v = src_f32 [i]
+		case .F16:  v = f32(src_f16[i])
+		case .Bf16: v = ml.bf16_to_f32(src_bf16[i])
+		}
+		switch dst_type {
+		case .F32:  dst_f32 [i] = v
+		case .F16:  dst_f16 [i] = f16(v)
+		case .Bf16: dst_bf16[i] = ml.bf16_from_f32(v)
+		}
+	}
+}
+
+_cast_bytes_accumulate :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: ml.Data_Type, count: int) {
+	src_f32  := ([^]f32    )(raw_data(src))[:count] if src_type == .F32  else nil
+	src_bf16 := ([^]ml.Bf16)(raw_data(src))[:count] if src_type == .Bf16 else nil
+	src_f16  := ([^]f16    )(raw_data(src))[:count] if src_type == .F16  else nil
+
+	dst_f32  := ([^]f32    )(raw_data(dst))[:count] if dst_type == .F32  else nil
+	dst_bf16 := ([^]ml.Bf16)(raw_data(dst))[:count] if dst_type == .Bf16 else nil
+	dst_f16  := ([^]f16    )(raw_data(dst))[:count] if dst_type == .F16  else nil
+
+	for i in 0 ..< count {
+		v: f32
+		switch src_type {
+		case .F32:  v = src_f32 [i]
+		case .F16:  v = f32(src_f16[i])
+		case .Bf16: v = ml.bf16_to_f32(src_bf16[i])
+		}
+		switch dst_type {
+		case .F32:  dst_f32 [i] += v
+		case .F16:  dst_f16 [i] += f16(v)
+		case .Bf16: dst_bf16[i]  = ml.bf16_from_f32(ml.bf16_to_f32(dst_bf16[i]) + v)
+		}
 	}
 }
 

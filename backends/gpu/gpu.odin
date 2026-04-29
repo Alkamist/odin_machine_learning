@@ -53,7 +53,7 @@ Staging :: struct {
 }
 
 Pending_Download :: struct {
-	dst:    []f32,
+	dst:    []byte,
 	offset: vk.DeviceSize,
 	size:   vk.DeviceSize,
 }

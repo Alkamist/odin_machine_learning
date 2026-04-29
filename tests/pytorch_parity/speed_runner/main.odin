@@ -118,8 +118,8 @@ MLP_OUT   :: 64
 
 bench_linear_fwd :: proc() -> f32 {
 	if _linear_w.backend == nil {
-		_linear_w = ml.make({LINEAR_OUTPUT, LINEAR_INPUT})
-		_linear_x = ml.make({LINEAR_BATCH,  LINEAR_INPUT})
+		_linear_w = ml.make(.F32, {LINEAR_OUTPUT, LINEAR_INPUT})
+		_linear_x = ml.make(.F32, {LINEAR_BATCH,  LINEAR_INPUT})
 		ml.fill_normal(_linear_w, 0, 0.02)
 		ml.fill_value (_linear_x, 0.01)
 	}
@@ -130,8 +130,8 @@ bench_linear_fwd :: proc() -> f32 {
 
 bench_linear_fwdbwd :: proc() -> f32 {
 	if _linear_w.backend == nil {
-		_linear_w = ml.make({LINEAR_OUTPUT, LINEAR_INPUT})
-		_linear_x = ml.make({LINEAR_BATCH,  LINEAR_INPUT})
+		_linear_w = ml.make(.F32, {LINEAR_OUTPUT, LINEAR_INPUT})
+		_linear_x = ml.make(.F32, {LINEAR_BATCH,  LINEAR_INPUT})
 		ml.fill_normal(_linear_w, 0, 0.02)
 		ml.fill_value (_linear_x, 0.01)
 	}
@@ -143,8 +143,8 @@ bench_linear_fwdbwd :: proc() -> f32 {
 
 bench_layernorm :: proc() -> f32 {
 	if _layernorm_w.backend == nil {
-		_layernorm_w = ml.make({LAYERNORM_SIZE})
-		_layernorm_x = ml.make({LAYERNORM_BATCH, LAYERNORM_SIZE})
+		_layernorm_w = ml.make(.F32, {LAYERNORM_SIZE})
+		_layernorm_x = ml.make(.F32, {LAYERNORM_BATCH, LAYERNORM_SIZE})
 		ml.fill_value(_layernorm_w, 1)
 		ml.fill_value(_layernorm_x, 0.01)
 	}
@@ -156,7 +156,7 @@ bench_layernorm :: proc() -> f32 {
 
 bench_softmax :: proc() -> f32 {
 	if _softmax_x.backend == nil {
-		_softmax_x = ml.make({SOFTMAX_BATCH, SOFTMAX_SIZE})
+		_softmax_x = ml.make(.F32, {SOFTMAX_BATCH, SOFTMAX_SIZE})
 		ml.fill_value(_softmax_x, 0.01)
 	}
 	ml.clear()
@@ -167,7 +167,7 @@ bench_softmax :: proc() -> f32 {
 
 bench_attention :: proc() -> f32 {
 	if _attention_x.backend == nil {
-		_attention_x = ml.make({ATTN_TOKENS, 3 * ATTN_EMBED})
+		_attention_x = ml.make(.F32, {ATTN_TOKENS, 3 * ATTN_EMBED})
 		ml.fill_value(_attention_x, 0.01)
 	}
 	ml.clear()
@@ -179,8 +179,8 @@ bench_attention :: proc() -> f32 {
 bench_mlp_step :: proc() -> f32 {
 	if _mlp_model.layers == nil {
 		_mlp_model = mlp.make(MLP_IN, MLP_HID, MLP_HID, MLP_OUT)
-		_mlp_x     = ml.make({MLP_BATCH, MLP_IN})
-		_mlp_y     = ml.make({MLP_BATCH, MLP_OUT})
+		_mlp_x     = ml.make(.F32, {MLP_BATCH, MLP_IN})
+		_mlp_y     = ml.make(.F32, {MLP_BATCH, MLP_OUT})
 		ml.fill_value(_mlp_x, 0.01)
 		ml.fill_value(_mlp_y, 0.5)
 	}
