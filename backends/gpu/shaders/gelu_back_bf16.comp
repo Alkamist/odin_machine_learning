@@ -1,0 +1,46 @@
+#version 450
+#define GELU_SCALE 0.7978845608028654
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer X  { uint x[];  };
+layout(set = 0, binding = 1)          buffer DX { uint dx[]; };
+layout(set = 0, binding = 2) readonly buffer DY { uint dy[]; };
+layout(push_constant) uniform Params { uint n; uint pair_count; } p;
+
+float bf16_expand(uint h) { return uintBitsToFloat(h << 16); }
+uint bf16_round(float v) {
+    uint b = floatBitsToUint(v);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
+    uint r = b + 0x7fffu + ((b >> 16) & 1u);
+    return (r >> 16) & 0xffffu;
+}
+
+float gelu_grad(float v) {
+    float cube  = 0.044715 * v * v * v;
+    float t_arg = GELU_SCALE * (v + cube);
+    float t_out = tanh(t_arg);
+    float c_out = cosh(t_arg);
+    float sech2 = 1.0 / (c_out * c_out);
+    return 0.5 * (1.0 + t_out) + v * 0.5 * sech2 * GELU_SCALE * (1.0 + 3.0 * 0.044715 * v * v);
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+    uint xp = x[pair];
+    uint dyp = dy[pair];
+    uint dxp = dx[pair];
+    uint lo = dxp & 0xffffu;
+    uint hi = (dxp >> 16) & 0xffffu;
+    uint i0 = 2u*pair, i1 = i0+1u;
+    if (i0 < p.n) {
+        float xv = bf16_expand(xp & 0xffffu);
+        float dv = bf16_expand(dyp & 0xffffu);
+        lo = bf16_round(bf16_expand(lo) + dv * gelu_grad(xv));
+    }
+    if (i1 < p.n) {
+        float xv = bf16_expand((xp >> 16) & 0xffffu);
+        float dv = bf16_expand((dyp >> 16) & 0xffffu);
+        hi = bf16_round(bf16_expand(hi) + dv * gelu_grad(xv));
+    }
+    dx[pair] = (hi << 16) | lo;
+}

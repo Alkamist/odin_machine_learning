@@ -172,33 +172,64 @@ linear backward and attention.
 
 Ordered by what unlocks the most when done:
 
-1. **Bf16 `attention` (fused fwd + 3 bwd shaders).** This is the next
-   big chunk — biggest single op, biggest blocker to a bf16 transformer
-   step. The forward shader's `softmax_outputs`, `lse`, `d_p_scratch`,
-   `d_acc` scratch tensors should stay F32 (that's the "internal
-   accumulators are F32" rule). The Q/K/V loads from the packed
-   `[tokens, 3*embedding]` input become shift-extracts on bf16 storage,
-   and the output write packs back to bf16. Backward's three shaders
-   follow the same pattern.
+1. **Bf16 `attention` (fused fwd + 3 bwd shaders) — DONE.** `ml.attention`
+   now allows F32 or Bf16 input; output type matches input, scratch
+   (`softmax_outputs`, `lse`, `d_p_scratch`, `d_acc`) stays F32. CPU has
+   `attention_forward_bf16` / `attention_backward_bf16` mirroring the F32
+   path with f32 inner compute and bf16 storage. GPU has four new shaders
+   (`attention_bf16`, `attention_back_d_bf16`, `attention_back_kv_bf16`,
+   `attention_back_q_bf16`) that load bf16 via packed-uint shift-extract,
+   run the same online-softmax FA2 algorithm in f32, and pair-pack writes
+   back to bf16. Backward kernels stage per-thread dQ/dK/dV in shared
+   memory and have the first D/2 threads do the bf16 RMW so adjacent d's
+   share a packed uint without races. Even `head_size` is required and
+   asserted at dispatch. Tests in `tests/dtype_roundtrip` cover bf16
+   attention forward + backward against an F32 reference on both backends
+   (5e-2 tolerance, since softmax/exp prevent bit-exact compare).
 
-2. **Bf16 element-wise/normalization ops.** Long but mechanical list,
-   all following the `add` pattern (thread-per-output-pair, f32 inner
-   compute, packed bf16 storage):
-   - `mul`, `sub`, `div` — same shape as `add`, can almost copy-paste.
-   - `gelu`, `silu`, `relu`, `sigmoid`, `tanh`, `exp` — pure unary, even
-     simpler.
-   - `layernorm` — needs F32 mean/rstd scratch (already F32 on the GPU
-     forward shader; just preserve that).
-   - `softmax`, `log_softmax`, `entropy` — same pattern, F32 reductions
-     internally.
+2. **Bf16 element-wise/normalization ops.** Mechanical rollout following
+   the `add` pattern (thread-per-output-pair, f32 inner compute, packed
+   bf16 storage):
+   - `mul`, `sub`, `div` — DONE (CPU + GPU, parity tests).
+   - `gelu`, `silu`, `relu`, `sigmoid`, `tanh`, `exp` — DONE (CPU + GPU
+     via `_unary_forward_gpu` / `_unary_backward_gpu` helper, parity tests).
+   - `layernorm` — DONE. Stats and forward shaders use packed-bf16 I/O
+     with f32 mean/rstd scratch; backward input/weight use the same
+     pair-aligned RMW pattern. Even `size` required.
+   - `softmax`, `log_softmax`, `entropy` — DONE. F32 reductions
+     internally; even `size` required for pair-aligned writes. `entropy`
+     uses one workgroup per output pair to handle the `output[count]`
+     packed write without races.
    - `rope`, `causal_mask`, `permute`, `concat`, `slice`, `mean` —
-     trivial bf16 loads/stores, no math.
+     DONE (CPU + GPU). Pure-copy ops (`slice`, `concat3`, `permute`,
+     `causal_mask`) use one-thread-per-pair packed-uint reads/writes
+     so the two halves of one packed bf16 slot are owned by exactly
+     one thread (no race on RMW). `rope` rotates whole bf16 pairs:
+     `head_size` is even so `(i_lo, i_hi)` always lands on an aligned
+     packed slot, one thread does both rotations and a single packed
+     write. `mean` forward uses one workgroup per row plus an atomic
+     CompSwap to RMW the half of the output pair belonging to that
+     row; backward is one thread per input pair.
+     `ml.slice` and `ml.permute` now allocate output as `input.type`
+     instead of hardcoded F32.
 
-3. **First bf16 transformer parity test.** Mirror the library's
-   transformer block in PyTorch with bf16 weights/activations, sync
-   weights in, compare loss curves the same way `mlp_train` does.
-   That's the forcing function the existing F32 transformer parity
-   test already serves and the cleanest way to surface remaining gaps.
+3. **First bf16 transformer parity test — DONE.** New
+   `transformer_train_bf16` test in `tests/pytorch_parity` mirrors the
+   library's transformer block in PyTorch with bf16 weights/activations
+   (FP32 master → bf16 cast inside `forward`, FP32 logits at the end
+   so `backward()` gets an F32 loss). Loss curves match within ~3e-4
+   absolute over 10 Adam steps on both CPU and GPU at the
+   `mlp_train`-style tolerance.
+
+   Gap surfaced and fixed: `slice_trailing` had no bf16 path on either
+   backend — CPU `cpu.odin` used the F32-only `data()` / `gradient()`
+   helpers, and the GPU shaders typed the buffer as `float[]`. Both
+   read and wrote 4 bytes per "bf16 element," producing silent memory
+   corruption that the dtype_roundtrip suite missed (it covers `slice`
+   but not `slice_trailing`). Added bf16 paths in `cpu.odin`,
+   `slice_trailing_bf16.comp`, and `slice_trailing_back_bf16.comp`
+   (one-thread-per-pair packed-uint reads with RMW on the backward
+   scatter, same pattern as the existing bf16 pure-copy ops).
 
 4. **Coopmat perf pass.** The naive bf16 shaders win on storage but
    the coopmat shader as written is a minimum-viable subgroup-per-tile

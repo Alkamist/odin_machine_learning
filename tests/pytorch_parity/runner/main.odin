@@ -84,6 +84,7 @@ main :: proc() {
 	case "sigmoid":           run_unary(artifacts_dir, .Sigmoid)
 	case "rope":              run_rope(artifacts_dir)
 	case "rope_xfmr":         run_rope(artifacts_dir)
+	case "transformer_train_bf16": run_transformer_train_bf16(artifacts_dir)
 	case:
 		fmt.eprintfln("unknown test: %v", test_name)
 		os.exit(1)
@@ -477,6 +478,149 @@ run_rope :: proc(dir: string) {
 
 	save_tensor(_path(dir, "odin_out.bin"),    out_shape, out_data)
 	save_tensor(_path(dir, "odin_grad_x.bin"), x_shape,   x_grad)
+}
+
+// Transformer parity test running the "FP32 master, bf16 compute" recipe.
+// Mirrors networks/transformer/transformer.odin's forward but casts every
+// master parameter to bf16 inside the graph each step. Logits are cast back
+// to F32 for cross_entropy so the loss tensor stays F32 (required by
+// ml.backward).
+run_transformer_train_bf16 :: proc(dir: string) {
+	tokens  := load_int_array(_path(dir, "tokens.bin"))
+	targets := load_int_array(_path(dir, "targets.bin"))
+	config  := load_int_array(_path(dir, "config.bin"))
+
+	step_count       := config[0]
+	period           := config[1]
+	layer_count      := config[2]
+	head_count       := config[3]
+	embedding_size   := config[4]
+	vocabulary_size  := config[5]
+	token_count      := config[6]
+	learning_rate    := f32(config[7]) / 1_000_000
+	_ = token_count
+
+	hidden_size := 4 * embedding_size
+
+	Layer :: struct {
+		norm0_weight, qkv_weight, proj_weight, norm1_weight, mlp_up_weight, mlp_down_weight: ml.Tensor,
+	}
+
+	make_param :: proc(shape: []int) -> ml.Tensor {
+		return ml.alloc(.F32, shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	}
+
+	token_embeddings := make_param({vocabulary_size, embedding_size})
+	defer ml.destroy(token_embeddings)
+
+	layers := builtin.make([]Layer, layer_count, context.temp_allocator)
+	for &layer in layers {
+		layer.norm0_weight    = make_param({embedding_size})
+		layer.qkv_weight      = make_param({3 * embedding_size, embedding_size})
+		layer.proj_weight     = make_param({embedding_size,     embedding_size})
+		layer.norm1_weight    = make_param({embedding_size})
+		layer.mlp_up_weight   = make_param({hidden_size,    embedding_size})
+		layer.mlp_down_weight = make_param({embedding_size, hidden_size})
+	}
+	defer for layer in layers {
+		ml.destroy(layer.norm0_weight)
+		ml.destroy(layer.qkv_weight)
+		ml.destroy(layer.proj_weight)
+		ml.destroy(layer.norm1_weight)
+		ml.destroy(layer.mlp_up_weight)
+		ml.destroy(layer.mlp_down_weight)
+	}
+
+	norm_weight   := make_param({embedding_size})
+	output_weight := make_param({vocabulary_size, embedding_size})
+	defer ml.destroy(norm_weight)
+	defer ml.destroy(output_weight)
+
+	load_into :: proc(t: ml.Tensor, path: string) {
+		_, vals := load_tensor(path)
+		ml.set_data(t, vals)
+	}
+
+	load_into(token_embeddings, _path(dir, "init_token_embeddings.bin"))
+	for layer, i in layers {
+		load_into(layer.norm0_weight,    fmt.tprintf("%v/init_layer%v_norm0_weight.bin",    dir, i))
+		load_into(layer.qkv_weight,      fmt.tprintf("%v/init_layer%v_qkv_weight.bin",      dir, i))
+		load_into(layer.proj_weight,     fmt.tprintf("%v/init_layer%v_proj_weight.bin",     dir, i))
+		load_into(layer.norm1_weight,    fmt.tprintf("%v/init_layer%v_norm1_weight.bin",    dir, i))
+		load_into(layer.mlp_up_weight,   fmt.tprintf("%v/init_layer%v_mlp_up_weight.bin",   dir, i))
+		load_into(layer.mlp_down_weight, fmt.tprintf("%v/init_layer%v_mlp_down_weight.bin", dir, i))
+	}
+	load_into(norm_weight,   _path(dir, "init_norm_weight.bin"))
+	load_into(output_weight, _path(dir, "init_output_weight.bin"))
+
+	losses := builtin.make([]f32, step_count, context.temp_allocator)
+	opt: ml.Optimizer
+
+	for step in 0 ..< step_count {
+		ml.clear()
+
+		residual := ml.cast_to(ml.select(token_embeddings, tokens), .Bf16)
+
+		for layer in layers {
+			n0_w  := ml.cast_to(layer.norm0_weight,    .Bf16)
+			qkv_w := ml.cast_to(layer.qkv_weight,      .Bf16)
+			pr_w  := ml.cast_to(layer.proj_weight,     .Bf16)
+			n1_w  := ml.cast_to(layer.norm1_weight,    .Bf16)
+			up_w  := ml.cast_to(layer.mlp_up_weight,   .Bf16)
+			dn_w  := ml.cast_to(layer.mlp_down_weight, .Bf16)
+
+			normed := ml.layernorm(residual, n0_w)
+			qkv    := ml.linear(normed, qkv_w)
+
+			q := ml.slice_trailing(qkv, 0,                  embedding_size)
+			k := ml.slice_trailing(qkv, embedding_size,     2 * embedding_size)
+			v := ml.slice_trailing(qkv, 2 * embedding_size, 3 * embedding_size)
+			q  = ml.rope(q, head_count)
+			k  = ml.rope(k, head_count)
+			qkv_concat := ml.concat(q, k, v)
+
+			attn_out := ml.attention(qkv_concat, head_count)
+			attn_out  = ml.linear(attn_out, pr_w)
+			residual  = ml.add(residual, attn_out)
+
+			normed_mlp := ml.layernorm(residual, n1_w)
+			mlp_out    := ml.linear(normed_mlp, up_w)
+			mlp_out     = ml.gelu(mlp_out)
+			mlp_out     = ml.linear(mlp_out, dn_w)
+			residual    = ml.add(residual, mlp_out)
+		}
+
+		nm_w  := ml.cast_to(norm_weight,   .Bf16)
+		out_w := ml.cast_to(output_weight, .Bf16)
+		out_bf16   := ml.layernorm(residual, nm_w)
+		logits_bf16 := ml.linear(out_bf16, out_w)
+		logits      := ml.cast_to(logits_bf16, .F32)
+
+		per_token := ml.cross_entropy(logits, targets)
+		loss      := ml.mean(per_token)
+		ml.backward()
+
+		if ml.optimize(&opt, period=period, learning_rate=learning_rate) {
+			ml.update(opt, token_embeddings)
+			for layer in layers {
+				ml.update(opt, layer.norm0_weight)
+				ml.update(opt, layer.qkv_weight)
+				ml.update(opt, layer.proj_weight)
+				ml.update(opt, layer.norm1_weight)
+				ml.update(opt, layer.mlp_up_weight)
+				ml.update(opt, layer.mlp_down_weight)
+			}
+			ml.update(opt, norm_weight)
+			ml.update(opt, output_weight)
+		}
+
+		loss_buf: [1]f32
+		ml.get_data(loss, loss_buf[:])
+		losses[step] = loss_buf[0]
+	}
+
+	losses_shape := []int{step_count}
+	save_tensor(_path(dir, "odin_losses.bin"), losses_shape, losses)
 }
 
 _shape_slice :: proc(t: ml.Tensor) -> []int {

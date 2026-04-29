@@ -1,0 +1,67 @@
+// Bf16 forward of `concat3`. One thread per output PAIR.
+// out[r, col] = a / b / c at the appropriate column. The pair's two halves
+// (cols 2*pair, 2*pair+1) may straddle a region boundary, so each is loaded
+// independently and packed.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer A   { uint a[]; };
+layout(set = 0, binding = 1) readonly  buffer B   { uint b[]; };
+layout(set = 0, binding = 2) readonly  buffer C   { uint c[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { uint o[]; };
+
+layout(push_constant) uniform Params {
+    uint leading;
+    uint t_a;
+    uint t_b;
+    uint t_c;
+    uint pair_count;
+} p;
+
+uint load_bf16(uint buf_idx, uint elem_index) {
+    uint pair_index = elem_index >> 1u;
+    uint shift      = (elem_index & 1u) * 16u;
+    uint w;
+    if (buf_idx == 0u) w = a[pair_index];
+    else if (buf_idx == 1u) w = b[pair_index];
+    else w = c[pair_index];
+    return (w >> shift) & 0xffffu;
+}
+
+uint load_for_col(uint r, uint col) {
+    if (col < p.t_a) {
+        return load_bf16(0u, r * p.t_a + col);
+    } else if (col < p.t_a + p.t_b) {
+        return load_bf16(1u, r * p.t_b + (col - p.t_a));
+    } else {
+        return load_bf16(2u, r * p.t_c + (col - p.t_a - p.t_b));
+    }
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+
+    uint out_trailing = p.t_a + p.t_b + p.t_c;
+    uint total        = p.leading * out_trailing;
+
+    uint i0 = 2u * pair;
+    uint i1 = i0 + 1u;
+
+    uint lo = 0u;
+    uint hi = 0u;
+
+    if (i0 < total) {
+        uint r = i0 / out_trailing;
+        uint col = i0 - r * out_trailing;
+        lo = load_for_col(r, col);
+    }
+    if (i1 < total) {
+        uint r = i1 / out_trailing;
+        uint col = i1 - r * out_trailing;
+        hi = load_for_col(r, col);
+    }
+
+    o[pair] = (hi << 16) | lo;
+}

@@ -5,6 +5,7 @@ invokes the Odin runner, then compares the two using np.allclose.
 """
 
 import argparse
+import math
 import os
 import struct
 import subprocess
@@ -498,6 +499,193 @@ def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: b
     return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
 
 
+class TorchTransformerBf16(torch.nn.Module):
+    """FP32 master weights, bf16 compute view.
+
+    Mirrors networks/transformer/transformer.odin's forward exactly: split
+    QKV along the trailing dim, RoPE applied to Q and K, causal attention,
+    pre-norm with layernorm-no-bias, GELU('tanh') in the MLP. Each forward
+    casts the F32 masters to bf16 so the compute graph runs end-to-end in
+    bf16 while gradients still land on the F32 masters.
+    """
+    def __init__(self, layer_count, head_count, embedding_size, vocabulary_size):
+        super().__init__()
+        self.head_count      = head_count
+        self.embedding_size  = embedding_size
+        self.vocabulary_size = vocabulary_size
+
+        self.token_embeddings = torch.nn.Parameter(torch.empty(vocabulary_size, embedding_size))
+
+        layers = []
+        for _ in range(layer_count):
+            block = torch.nn.ParameterDict({
+                "norm0_weight":    torch.nn.Parameter(torch.empty(embedding_size)),
+                "qkv_weight":      torch.nn.Parameter(torch.empty(3 * embedding_size, embedding_size)),
+                "proj_weight":     torch.nn.Parameter(torch.empty(embedding_size,     embedding_size)),
+                "norm1_weight":    torch.nn.Parameter(torch.empty(embedding_size)),
+                "mlp_up_weight":   torch.nn.Parameter(torch.empty(4 * embedding_size, embedding_size)),
+                "mlp_down_weight": torch.nn.Parameter(torch.empty(embedding_size, 4 * embedding_size)),
+            })
+            layers.append(block)
+        self.layers = torch.nn.ModuleList(layers)
+
+        self.norm_weight   = torch.nn.Parameter(torch.empty(embedding_size))
+        self.output_weight = torch.nn.Parameter(torch.empty(vocabulary_size, embedding_size))
+
+    @staticmethod
+    def _rope(x, head_count, base=10000.0):
+        tokens, embed = x.shape
+        head_size = embed // head_count
+        half      = head_size // 2
+
+        pos = torch.arange(tokens, dtype=torch.float32).unsqueeze(1)
+        inv = 1.0 / (base ** (torch.arange(half, dtype=torch.float32) * 2.0 / head_size))
+        cos = torch.cos(pos * inv).to(x.dtype)
+        sin = torch.sin(pos * inv).to(x.dtype)
+
+        x_view = x.reshape(tokens, head_count, half, 2)
+        even   = x_view[..., 0]
+        odd    = x_view[..., 1]
+        cos_b  = cos.unsqueeze(1)
+        sin_b  = sin.unsqueeze(1)
+        out_even = even * cos_b - odd  * sin_b
+        out_odd  = even * sin_b + odd  * cos_b
+        out_view = torch.stack([out_even, out_odd], dim=-1)
+        return out_view.reshape(tokens, embed)
+
+    @staticmethod
+    def _attention(qkv, head_count):
+        tokens, three_embed = qkv.shape
+        embed     = three_embed // 3
+        head_size = embed // head_count
+
+        q_flat = qkv[:, 0:embed]
+        k_flat = qkv[:, embed:2 * embed]
+        v_flat = qkv[:, 2 * embed:3 * embed]
+
+        q = q_flat.reshape(tokens, head_count, head_size).permute(1, 0, 2)
+        k = k_flat.reshape(tokens, head_count, head_size).permute(1, 0, 2)
+        v = v_flat.reshape(tokens, head_count, head_size).permute(1, 0, 2)
+
+        scores = torch.matmul(q, k.transpose(1, 2)) / (head_size ** 0.5)
+        mask   = torch.triu(torch.ones(tokens, tokens, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
+        attn   = torch.nn.functional.softmax(scores, dim=-1)
+        out    = torch.matmul(attn, v)
+        return out.permute(1, 0, 2).reshape(tokens, embed)
+
+    def forward(self, tokens):
+        embed_size = self.embedding_size
+
+        # select() in the library is FP32; cast to bf16 right after.
+        residual = self.token_embeddings[tokens].to(torch.bfloat16)
+
+        for layer in self.layers:
+            n0_w  = layer["norm0_weight"   ].to(torch.bfloat16)
+            qkv_w = layer["qkv_weight"     ].to(torch.bfloat16)
+            pr_w  = layer["proj_weight"    ].to(torch.bfloat16)
+            n1_w  = layer["norm1_weight"   ].to(torch.bfloat16)
+            up_w  = layer["mlp_up_weight"  ].to(torch.bfloat16)
+            dn_w  = layer["mlp_down_weight"].to(torch.bfloat16)
+
+            normed = torch.nn.functional.layer_norm(residual, [embed_size], weight=n0_w, bias=None, eps=1e-5)
+            qkv    = torch.nn.functional.linear(normed, qkv_w)
+
+            q = qkv[:, 0:embed_size]
+            k = qkv[:, embed_size:2 * embed_size]
+            v = qkv[:, 2 * embed_size:3 * embed_size]
+            q = self._rope(q, self.head_count)
+            k = self._rope(k, self.head_count)
+            qkv = torch.cat([q, k, v], dim=-1)
+
+            attn_out = self._attention(qkv, self.head_count)
+            attn_out = torch.nn.functional.linear(attn_out, pr_w)
+            residual = residual + attn_out
+
+            normed   = torch.nn.functional.layer_norm(residual, [embed_size], weight=n1_w, bias=None, eps=1e-5)
+            mlp_out  = torch.nn.functional.linear(normed, up_w)
+            mlp_out  = torch.nn.functional.gelu(mlp_out, approximate="tanh")
+            mlp_out  = torch.nn.functional.linear(mlp_out, dn_w)
+            residual = residual + mlp_out
+
+        norm_w = self.norm_weight  .to(torch.bfloat16)
+        out_w  = self.output_weight.to(torch.bfloat16)
+        out = torch.nn.functional.layer_norm(residual, [embed_size], weight=norm_w, bias=None, eps=1e-5)
+        out = torch.nn.functional.linear(out, out_w)
+        return out.float()
+
+
+def gen_transformer_train_bf16(name, layer_count, head_count, embedding_size, vocabulary_size, token_count, step_count, learning_rate, period=1):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    tokens_np  = rng.integers(0, vocabulary_size, size=token_count).astype(np.int32)
+    targets_np = rng.integers(0, vocabulary_size, size=token_count).astype(np.int32)
+    write_int_array(test_dir / "tokens.bin",  tokens_np)
+    write_int_array(test_dir / "targets.bin", targets_np)
+    write_int_array(test_dir / "config.bin", [
+        step_count, period, layer_count, head_count, embedding_size, vocabulary_size, token_count,
+        int(round(learning_rate * 1_000_000)),
+    ])
+
+    torch.manual_seed(SEED)
+    model = TorchTransformerBf16(layer_count, head_count, embedding_size, vocabulary_size)
+
+    # Initialize masters with the same recipe as networks/transformer/transformer.odin.
+    with torch.no_grad():
+        model.token_embeddings.normal_(0.0, 0.02)
+        for layer in model.layers:
+            layer["norm0_weight"].fill_(1.0)
+            layer["qkv_weight"   ].normal_(0.0, 0.02)
+            layer["proj_weight"  ].normal_(0.0, 0.02 / math.sqrt(2 * layer_count))
+            layer["norm1_weight"].fill_(1.0)
+            # he_initialization(t, fan_in) = N(0, sqrt(2 / fan_in))
+            layer["mlp_up_weight"  ].normal_(0.0, math.sqrt(2.0 / embedding_size))
+            layer["mlp_down_weight"].normal_(0.0, math.sqrt(2.0 / (4 * embedding_size)))
+        model.norm_weight.fill_(1.0)
+        model.output_weight.normal_(0.0, 0.02)
+
+    # Save initial F32 masters; the runner loads these as F32 master tensors.
+    write_tensor(test_dir / "init_token_embeddings.bin", model.token_embeddings.detach().numpy())
+    for i, layer in enumerate(model.layers):
+        for key in ("norm0_weight", "qkv_weight", "proj_weight", "norm1_weight", "mlp_up_weight", "mlp_down_weight"):
+            write_tensor(test_dir / f"init_layer{i}_{key}.bin", layer[key].detach().numpy())
+    write_tensor(test_dir / "init_norm_weight.bin",   model.norm_weight  .detach().numpy())
+    write_tensor(test_dir / "init_output_weight.bin", model.output_weight.detach().numpy())
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+
+    tokens_pt  = torch.tensor(tokens_np .astype(np.int64))
+    targets_pt = torch.tensor(targets_np.astype(np.int64))
+
+    losses = np.zeros(step_count, dtype=np.float32)
+    for step in range(step_count):
+        logits = model(tokens_pt)  # [tokens, vocab], F32
+        loss   = torch.nn.functional.cross_entropy(logits, targets_pt, reduction="mean")
+        losses[step] = loss.item()
+        loss.backward()
+        if (step + 1) % period == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+    return test_dir, {"losses": losses}
+
+
+def verify_transformer_train_bf16(test_dir: Path, refs: dict) -> None:
+    odin_losses  = read_tensor(test_dir / "odin_losses.bin")
+    torch_losses = refs["losses"]
+    if odin_losses.shape != torch_losses.shape:
+        raise AssertionError(f"loss shape mismatch {odin_losses.shape} vs {torch_losses.shape}")
+    diff = np.abs(odin_losses - torch_losses)
+    rel  = diff / np.maximum(np.abs(torch_losses), 1e-8)
+    if diff.max() > 1e-3 and rel.max() > 5e-3:
+        worst = int(np.argmax(diff))
+        raise AssertionError(
+            f"loss curve diverged: max abs {diff.max():.3e} at step {worst} "
+            f"(odin={odin_losses[worst]:.6f}, torch={torch_losses[worst]:.6f})"
+        )
+
+
 TESTS = [
     ("add_equal",     lambda: gen_binary_op("add_equal",     "add", (4, 8), (4, 8)),    verify_binary_op),
     ("add_broadcast", lambda: gen_binary_op("add_broadcast", "add", (4, 8), (8,)),      verify_binary_op),
@@ -529,6 +717,11 @@ TESTS = [
     ("rope_xfmr",          lambda: gen_rope("rope_xfmr", tokens=64, head_count=4, head_size=32), verify_unary),
     ("attention_xfmr",     lambda: gen_attention("attention_xfmr", tokens=64, embed=128, head_count=4, causal=True), verify_unary),
     ("mlp_train_period12", lambda: gen_mlp_train("mlp_train_period12", sizes=[4, 8, 8, 1], sample_count=16, step_count=60, learning_rate=0.01, period=12), verify_mlp_train),
+    ("transformer_train_bf16", lambda: gen_transformer_train_bf16(
+        "transformer_train_bf16",
+        layer_count=1, head_count=2, embedding_size=32, vocabulary_size=64,
+        token_count=16, step_count=10, learning_rate=0.01,
+    ), verify_transformer_train_bf16),
 ]
 
 

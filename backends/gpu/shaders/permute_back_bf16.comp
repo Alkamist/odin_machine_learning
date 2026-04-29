@@ -1,0 +1,75 @@
+// Bf16 backward of `permute`. dx[src] += dy[dst] (forward maps dst → src
+// with src[axes[k]] = dst[k]).
+//
+// One thread per INPUT pair: each thread does a packed RMW of one dx uint.
+// For each of its two halves (input multi-indices j), compute the matching
+// output multi-index via i[k] = j[axes[k]] and read dy.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0)          buffer DX { uint dx[]; };
+layout(set = 0, binding = 1) readonly buffer DY { uint dy[]; };
+layout(push_constant) uniform Params {
+    uint out_d0, out_d1, out_d2;
+    uint in_d1,  in_d2;
+    uint axes_0, axes_1, axes_2;
+    uint in_d0, pair_count;
+} p;
+
+float bf16_expand(uint half_bits) {
+    return uintBitsToFloat(half_bits << 16);
+}
+
+uint bf16_round(float v) {
+    uint bits = floatBitsToUint(v);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
+    uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    return (rounded >> 16) & 0xffffu;
+}
+
+uint load_dy(uint elem_index) {
+    uint pair_index = elem_index >> 1u;
+    uint shift      = (elem_index & 1u) * 16u;
+    return (dy[pair_index] >> shift) & 0xffffu;
+}
+
+uint dst_idx_for(uint j0, uint j1, uint j2) {
+    uint j[3]; j[0] = j0; j[1] = j1; j[2] = j2;
+    uint i0 = j[p.axes_0];
+    uint i1 = j[p.axes_1];
+    uint i2 = j[p.axes_2];
+    return i0 * p.out_d1 * p.out_d2 + i1 * p.out_d2 + i2;
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+
+    uint total = p.in_d0 * p.in_d1 * p.in_d2;
+    uint i0 = 2u * pair;
+    uint i1 = i0 + 1u;
+
+    uint cur = dx[pair];
+    uint cur_lo = cur & 0xffffu;
+    uint cur_hi = (cur >> 16) & 0xffffu;
+    uint lo = cur_lo;
+    uint hi = cur_hi;
+
+    if (i0 < total) {
+        uint q  = i0 / p.in_d2;
+        uint j2 = i0 - q * p.in_d2;
+        uint j0v = q / p.in_d1;
+        uint j1v = q - j0v * p.in_d1;
+        float v = bf16_expand(load_dy(dst_idx_for(j0v, j1v, j2)));
+        lo = bf16_round(bf16_expand(cur_lo) + v);
+    }
+    if (i1 < total) {
+        uint q  = i1 / p.in_d2;
+        uint j2 = i1 - q * p.in_d2;
+        uint j0v = q / p.in_d1;
+        uint j1v = q - j0v * p.in_d1;
+        float v = bf16_expand(load_dy(dst_idx_for(j0v, j1v, j2)));
+        hi = bf16_round(bf16_expand(cur_hi) + v);
+    }
+
+    dx[pair] = (hi << 16) | lo;
+}

@@ -1,0 +1,58 @@
+// Bf16 forward of `permute` (rank-3). One thread per OUTPUT pair (two adjacent
+// trailing-axis output elements). Each half is loaded from the input buffer
+// at its own (possibly non-adjacent) src index via shift-extract; the two
+// halves are packed into one output uint.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly  buffer X { uint x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { uint y[]; };
+layout(push_constant) uniform Params {
+    uint out_d0, out_d1, out_d2;
+    uint in_d1,  in_d2;
+    uint axes_0, axes_1, axes_2;
+    uint pair_count;
+} p;
+
+uint load_bf16(uint elem_index) {
+    uint pair_index = elem_index >> 1u;
+    uint shift      = (elem_index & 1u) * 16u;
+    return (x[pair_index] >> shift) & 0xffffu;
+}
+
+uint src_idx_for(uint i0, uint i1, uint i2) {
+    uint coord[3]; coord[0] = i0; coord[1] = i1; coord[2] = i2;
+    uint src[3];
+    src[p.axes_0] = coord[0];
+    src[p.axes_1] = coord[1];
+    src[p.axes_2] = coord[2];
+    return src[0] * p.in_d1 * p.in_d2 + src[1] * p.in_d2 + src[2];
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+
+    uint total = p.out_d0 * p.out_d1 * p.out_d2;
+    uint i0 = 2u * pair;
+    uint i1 = i0 + 1u;
+
+    uint lo = 0u;
+    uint hi = 0u;
+
+    if (i0 < total) {
+        uint q  = i0 / p.out_d2;
+        uint c2 = i0 - q * p.out_d2;
+        uint c0 = q / p.out_d1;
+        uint c1 = q - c0 * p.out_d1;
+        lo = load_bf16(src_idx_for(c0, c1, c2));
+    }
+    if (i1 < total) {
+        uint q  = i1 / p.out_d2;
+        uint c2 = i1 - q * p.out_d2;
+        uint c0 = q / p.out_d1;
+        uint c1 = q - c0 * p.out_d1;
+        hi = load_bf16(src_idx_for(c0, c1, c2));
+    }
+
+    y[pair] = (hi << 16) | lo;
+}

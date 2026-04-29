@@ -1,0 +1,104 @@
+// Bf16 backward of `concat3`. One thread per dst-input PAIR (across a, b, c).
+// Each pair maps to two adjacent halves of one of {da, db, dc}; the two
+// corresponding output-gradient elements are at the same row of dy at offsets
+// shifted by (start_col_for_buffer + col_in_buffer).
+//
+// Threads are partitioned by gid: gid in [0, leading*t_a/2) covers da pairs,
+// next chunk covers db, etc. Each thread does a packed RMW on its dx buffer.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0)          buffer DA  { uint da[]; };
+layout(set = 0, binding = 1)          buffer DB  { uint db[]; };
+layout(set = 0, binding = 2)          buffer DC  { uint dc[]; };
+layout(set = 0, binding = 3) readonly buffer DY  { uint dy[]; };
+
+layout(push_constant) uniform Params {
+    uint leading;
+    uint t_a;
+    uint t_b;
+    uint t_c;
+    uint pair_a;
+    uint pair_b;
+    uint pair_c;
+} p;
+
+float bf16_expand(uint half_bits) {
+    return uintBitsToFloat(half_bits << 16);
+}
+
+uint bf16_round(float v) {
+    uint bits = floatBitsToUint(v);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
+    uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    return (rounded >> 16) & 0xffffu;
+}
+
+uint load_dy(uint elem_index) {
+    uint pair_index = elem_index >> 1u;
+    uint shift      = (elem_index & 1u) * 16u;
+    return (dy[pair_index] >> shift) & 0xffffu;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total_pairs = p.pair_a + p.pair_b + p.pair_c;
+    if (gid >= total_pairs) return;
+
+    uint out_trailing = p.t_a + p.t_b + p.t_c;
+
+    // Decide which dx buffer this thread serves.
+    uint buf_idx;
+    uint pair_in_buf;
+    uint in_trailing;
+    uint dy_col_offset;
+    if (gid < p.pair_a) {
+        buf_idx = 0u;
+        pair_in_buf = gid;
+        in_trailing = p.t_a;
+        dy_col_offset = 0u;
+    } else if (gid < p.pair_a + p.pair_b) {
+        buf_idx = 1u;
+        pair_in_buf = gid - p.pair_a;
+        in_trailing = p.t_b;
+        dy_col_offset = p.t_a;
+    } else {
+        buf_idx = 2u;
+        pair_in_buf = gid - p.pair_a - p.pair_b;
+        in_trailing = p.t_c;
+        dy_col_offset = p.t_a + p.t_b;
+    }
+
+    uint i0 = 2u * pair_in_buf;
+    uint i1 = i0 + 1u;
+    uint total_in = p.leading * in_trailing;
+
+    uint cur;
+    if (buf_idx == 0u) cur = da[pair_in_buf];
+    else if (buf_idx == 1u) cur = db[pair_in_buf];
+    else cur = dc[pair_in_buf];
+
+    uint cur_lo = cur & 0xffffu;
+    uint cur_hi = (cur >> 16) & 0xffffu;
+    uint lo = cur_lo;
+    uint hi = cur_hi;
+
+    if (i0 < total_in) {
+        uint r = i0 / in_trailing;
+        uint col = i0 - r * in_trailing;
+        uint dy_idx = r * out_trailing + dy_col_offset + col;
+        lo = bf16_round(bf16_expand(cur_lo) + bf16_expand(load_dy(dy_idx)));
+    }
+    if (i1 < total_in) {
+        uint r = i1 / in_trailing;
+        uint col = i1 - r * in_trailing;
+        uint dy_idx = r * out_trailing + dy_col_offset + col;
+        hi = bf16_round(bf16_expand(cur_hi) + bf16_expand(load_dy(dy_idx)));
+    }
+
+    uint packed = (hi << 16) | lo;
+    if (buf_idx == 0u) da[pair_in_buf] = packed;
+    else if (buf_idx == 1u) db[pair_in_buf] = packed;
+    else dc[pair_in_buf] = packed;
+}

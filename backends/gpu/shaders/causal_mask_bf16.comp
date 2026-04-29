@@ -1,0 +1,44 @@
+// Bf16 forward of `causal_mask`. One thread per output PAIR (two adjacent
+// trailing-axis elements). The mask is column-wise so two adjacent elements
+// in the same row may have different mask outcomes — handle each half
+// independently and pack into one output uint. Out-of-range halves write
+// -inf as bf16 (0xff80).
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly  buffer X { uint x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { uint y[]; };
+layout(push_constant) uniform Params { uint total; uint T; uint pair_count; } p;
+
+uint load_bf16(uint elem_index) {
+    uint pair_index = elem_index >> 1u;
+    uint shift      = (elem_index & 1u) * 16u;
+    return (x[pair_index] >> shift) & 0xffffu;
+}
+
+const uint NEG_INF_BF16 = 0xff80u;
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+
+    uint i0 = 2u * pair;
+    uint i1 = i0 + 1u;
+
+    uint lo = NEG_INF_BF16;
+    uint hi = NEG_INF_BF16;
+
+    if (i0 < p.total) {
+        uint within = i0 % (p.T * p.T);
+        uint t1 = within / p.T;
+        uint t2 = within - t1 * p.T;
+        lo = (t2 <= t1) ? load_bf16(i0) : NEG_INF_BF16;
+    }
+    if (i1 < p.total) {
+        uint within = i1 % (p.T * p.T);
+        uint t1 = within / p.T;
+        uint t2 = within - t1 * p.T;
+        hi = (t2 <= t1) ? load_bf16(i1) : NEG_INF_BF16;
+    }
+
+    y[pair] = (hi << 16) | lo;
+}

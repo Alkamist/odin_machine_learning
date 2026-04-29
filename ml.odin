@@ -521,8 +521,9 @@ attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller
 
 	embed_size := input_size / 3
 	assert(embed_size % head_count == 0, "Output size must be divisible by head count", loc=loc)
+	assert(input.type == .F32 || input.type == .Bf16, "attention requires F32 or Bf16 input", loc=loc)
 
-	output           = zeros(.F32, {token_count, embed_size}, loc=loc)
+	output           = zeros(input.type, {token_count, embed_size}, loc=loc)
 	softmax_outputs := zeros(.F32, {head_count, token_count, token_count}, loc=loc)
 	d_p_scratch     := zeros(.F32, {head_count, token_count}, loc=loc)
 	lse             := zeros(.F32, {head_count, token_count}, loc=loc)
@@ -575,6 +576,7 @@ Sub :: struct {
 @(require_results)
 sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
+	assert(a.type == b.type, "sub inputs must have the same dtype", loc=loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -596,6 +598,7 @@ Mul :: struct {
 @(require_results)
 mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
+	assert(a.type == b.type, "mul inputs must have the same dtype", loc=loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -617,6 +620,7 @@ Div :: struct {
 @(require_results)
 div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
+	assert(a.type == b.type, "div inputs must have the same dtype", loc=loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -798,7 +802,7 @@ Slice :: struct {
 slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
 	fmt.assertf(start >= 0 && end <= len(input) && start <= end, "Slice indices out of bounds %v:%v", start, end, loc=loc)
 
-	output = zeros(.F32, {end - start}, loc=loc)
+	output = zeros(input.type, {end - start}, loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -1233,7 +1237,7 @@ permute :: proc(input: Tensor, axes: [3]int, loc := #caller_location) -> (output
 		input.shape[axes[1]],
 		input.shape[axes[2]],
 	}
-	output = zeros(.F32, {out_shape[0], out_shape[1], out_shape[2]}, loc=loc)
+	output = zeros(input.type, {out_shape[0], out_shape[1], out_shape[2]}, loc=loc)
 
 	op := Operation{
 		input   = input,

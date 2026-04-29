@@ -1,0 +1,51 @@
+// Bf16 layernorm stats: read x as packed bf16, write f32 mean/rstd.
+#version 450
+#define BLOCK 256
+#define EPSILON 1e-5
+layout(local_size_x = BLOCK) in;
+layout(set = 0, binding = 0) readonly  buffer X { uint  x[]; };
+layout(set = 0, binding = 1) writeonly buffer M { float mean_out[]; };
+layout(set = 0, binding = 2) writeonly buffer R { float rstd_out[]; };
+layout(push_constant) uniform Params { uint count; uint size; } p;
+
+shared float ssum[BLOCK];
+shared float ssum2[BLOCK];
+
+float bf16_expand(uint h) { return uintBitsToFloat(h << 16); }
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+
+    float s  = 0.0;
+    float s2 = 0.0;
+    uint pair_count = p.size >> 1u;
+    uint pair_base  = (row * p.size) >> 1u;
+    for (uint pi = tid; pi < pair_count; pi += BLOCK) {
+        uint xp = x[pair_base + pi];
+        float v0 = bf16_expand(xp & 0xffffu);
+        float v1 = bf16_expand((xp >> 16) & 0xffffu);
+        s  += v0 + v1;
+        s2 += v0 * v0 + v1 * v1;
+    }
+    ssum[tid]  = s;
+    ssum2[tid] = s2;
+    barrier();
+
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            ssum[tid]  += ssum[tid + stride];
+            ssum2[tid] += ssum2[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        float n = float(p.size);
+        float m = ssum[0]  / n;
+        float v = ssum2[0] / n - m * m;
+        mean_out[row] = m;
+        rstd_out[row] = inversesqrt(v + EPSILON);
+    }
+}

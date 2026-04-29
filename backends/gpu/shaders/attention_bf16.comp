@@ -1,0 +1,152 @@
+// Bf16 variant of attention.comp. Same online-softmax FA2 forward; bf16
+// packed-uint storage for x and o (low=elem 2i, high=elem 2i+1). Internal
+// accumulators (q_shared, o_acc, m_run, l_run) stay f32. head_size and
+// embed_size must be even (asserted at dispatch) so each row of x and o
+// starts on a pair boundary.
+#version 450
+
+#define WG    64
+#define BC    64
+#define MAX_D 256
+#define O_SLOTS ((MAX_D + WG - 1) / WG)
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { uint  x[];   };
+layout(set = 0, binding = 1) writeonly buffer O { uint  o[];   };
+layout(set = 0, binding = 2) writeonly buffer L { float lse[]; };
+
+layout(push_constant) uniform Params {
+    uint head_count;
+    uint head_size;
+    uint token_count;
+    uint embed_size;
+    uint causal;
+} p;
+
+shared float q_shared[MAX_D];
+shared float o_shared[MAX_D];
+shared float score_tile[BC];
+shared float partial[WG];
+
+const float NEG_INF = -3.402823e38;
+
+float bf16_expand(uint half_bits) {
+    return uintBitsToFloat(half_bits << 16);
+}
+
+uint bf16_round(float v) {
+    uint bits = floatBitsToUint(v);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
+    uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    return (rounded >> 16) & 0xffffu;
+}
+
+float load_x(uint elem_idx) {
+    uint pair  = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((x[pair] >> shift) & 0xffffu);
+}
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint t_q  = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+
+    uint D      = p.head_size;
+    uint T      = p.token_count;
+    uint E      = p.embed_size;
+    uint stride = 3u * E;
+    float inv_sqrt_d = inversesqrt(float(D));
+    uint t_k_max = (p.causal != 0u) ? (t_q + 1u) : T;
+
+    uint q_base = t_q * stride + h * D;
+    uint o_base = t_q * E + h * D;
+
+    for (uint d = tid; d < D; d += WG) {
+        q_shared[d] = load_x(q_base + d);
+    }
+    barrier();
+
+    float o_acc[O_SLOTS];
+    for (uint slot = 0u; slot < O_SLOTS; slot += 1u) o_acc[slot] = 0.0;
+
+    float m_run = NEG_INF;
+    float l_run = 0.0;
+
+    for (uint t_k0 = 0u; t_k0 < t_k_max; t_k0 += BC) {
+        uint t_k = t_k0 + tid;
+        float score = NEG_INF;
+        if (tid < BC && t_k < t_k_max) {
+            uint k_base = t_k * stride + E + h * D;
+            float dot = 0.0;
+            for (uint d = 0u; d < D; d += 1u) {
+                dot += q_shared[d] * load_x(k_base + d);
+            }
+            score = dot * inv_sqrt_d;
+        }
+        if (tid < BC) score_tile[tid] = score;
+        partial[tid] = score;
+        barrier();
+
+        for (uint stride2 = WG / 2u; stride2 > 0u; stride2 >>= 1) {
+            if (tid < stride2) partial[tid] = max(partial[tid], partial[tid + stride2]);
+            barrier();
+        }
+        float m_tile = partial[0];
+        float m_new  = max(m_run, m_tile);
+
+        float p_val = (tid < BC) ? exp(score_tile[tid] - m_new) : 0.0;
+        if (tid < BC) score_tile[tid] = p_val;
+        partial[tid] = p_val;
+        barrier();
+        for (uint stride2 = WG / 2u; stride2 > 0u; stride2 >>= 1) {
+            if (tid < stride2) partial[tid] += partial[tid + stride2];
+            barrier();
+        }
+        float l_tile = partial[0];
+
+        float alpha = (m_run == NEG_INF) ? 0.0 : exp(m_run - m_new);
+        l_run = alpha * l_run + l_tile;
+        m_run = m_new;
+
+        for (uint slot = 0u; slot < O_SLOTS; slot += 1u) {
+            uint d = tid + slot * WG;
+            if (d < D) {
+                float contrib = 0.0;
+                uint j_max = min(BC, t_k_max - t_k0);
+                for (uint j = 0u; j < j_max; j += 1u) {
+                    uint v_base = (t_k0 + j) * stride + 2u * E + h * D;
+                    contrib += score_tile[j] * load_x(v_base + d);
+                }
+                o_acc[slot] = alpha * o_acc[slot] + contrib;
+            }
+        }
+        barrier();
+    }
+
+    float inv_l = 1.0 / l_run;
+    for (uint slot = 0u; slot < O_SLOTS; slot += 1u) {
+        uint d = tid + slot * WG;
+        if (d < D) {
+            o_shared[d] = o_acc[slot] * inv_l;
+        }
+    }
+    barrier();
+
+    // Pair-pack and write. o_base is even (head_size even), so pair index
+    // is (o_base + 2*tid) >> 1. Each thread writes one whole packed uint.
+    uint pair_count = D >> 1u;
+    for (uint pi = tid; pi < pair_count; pi += WG) {
+        uint d0 = 2u * pi;
+        uint d1 = d0 + 1u;
+        uint lo = bf16_round(o_shared[d0]);
+        uint hi = bf16_round(o_shared[d1]);
+        uint elem_global = o_base + d0;
+        o[elem_global >> 1u] = (hi << 16) | lo;
+    }
+
+    if (tid == 0u) {
+        lse[h * T + t_q] = m_run + log(l_run);
+    }
+}

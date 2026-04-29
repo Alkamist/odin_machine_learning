@@ -1,0 +1,64 @@
+// Bf16 backward of `mean`: dx[row*size + i] += dy[row] / size.
+// One thread per input PAIR (two adjacent input elements, both belonging to
+// the same row whenever size is even). For odd size the two halves of a pair
+// can land in different rows, so we look up dy per element. Output dx is
+// accumulated as packed-uint RMW per pair (no race because each pair is
+// owned by exactly one thread).
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer DY { uint dy[]; };
+layout(set = 0, binding = 1)          buffer DX { uint dx[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+    uint pair_count; // ceil(count*size / 2)
+} p;
+
+float bf16_expand(uint half_bits) {
+    return uintBitsToFloat(half_bits << 16);
+}
+
+uint bf16_round(float v) {
+    uint bits = floatBitsToUint(v);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
+    uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    return (rounded >> 16) & 0xffffu;
+}
+
+uint load_bf16(uint elem_index) {
+    uint pair_index = elem_index >> 1u;
+    uint shift      = (elem_index & 1u) * 16u;
+    return (dy[pair_index] >> shift) & 0xffffu;
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+
+    uint i0 = 2u * pair;
+    uint i1 = i0 + 1u;
+    uint total = p.count * p.size;
+
+    uint cur = dx[pair];
+    uint cur_lo = cur & 0xffffu;
+    uint cur_hi = (cur >> 16) & 0xffffu;
+
+    uint lo = cur_lo;
+    uint hi = cur_hi;
+
+    if (i0 < total) {
+        uint row = i0 / p.size;
+        float dy_v = bf16_expand(load_bf16(row));
+        lo = bf16_round(bf16_expand(cur_lo) + dy_v / float(p.size));
+    }
+    if (i1 < total) {
+        uint row = i1 / p.size;
+        float dy_v = bf16_expand(load_bf16(row));
+        hi = bf16_round(bf16_expand(cur_hi) + dy_v / float(p.size));
+    }
+
+    dx[pair] = (hi << 16) | lo;
+}

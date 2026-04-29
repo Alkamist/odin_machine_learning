@@ -1,0 +1,53 @@
+// Bf16 log_softmax backward. One workgroup per row, size must be even.
+#version 450
+#define BLOCK 256
+layout(local_size_x = BLOCK) in;
+layout(set = 0, binding = 0) readonly buffer Y  { uint y[];  };
+layout(set = 0, binding = 1) readonly buffer DY { uint dy[]; };
+layout(set = 0, binding = 2)          buffer DX { uint dx[]; };
+layout(push_constant) uniform Params { uint count; uint size; } p;
+
+shared float s_sum[BLOCK];
+
+float bf16_expand(uint h) { return uintBitsToFloat(h << 16); }
+uint bf16_round(float v) {
+    uint b = floatBitsToUint(v);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
+    uint r = b + 0x7fffu + ((b >> 16) & 1u);
+    return (r >> 16) & 0xffffu;
+}
+float load_half(uint p2, uint sh) { return bf16_expand((p2 >> sh) & 0xffffu); }
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+
+    uint pair_count = p.size >> 1u;
+    uint pair_base  = (row * p.size) >> 1u;
+
+    float local = 0.0;
+    for (uint pi = tid; pi < pair_count; pi += BLOCK) {
+        uint dyp = dy[pair_base + pi];
+        local += load_half(dyp, 0u) + load_half(dyp, 16u);
+    }
+    s_sum[tid] = local;
+    barrier();
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        barrier();
+    }
+    float sum_dy = s_sum[0];
+    barrier();
+
+    for (uint pi = tid; pi < pair_count; pi += BLOCK) {
+        uint yp  = y [pair_base + pi];
+        uint dyp = dy[pair_base + pi];
+        uint dxp = dx[pair_base + pi];
+
+        float lo_v = load_half(dxp, 0u)  + load_half(dyp, 0u)  - exp(load_half(yp, 0u))  * sum_dy;
+        float hi_v = load_half(dxp, 16u) + load_half(dyp, 16u) - exp(load_half(yp, 16u)) * sum_dy;
+
+        dx[pair_base + pi] = (bf16_round(hi_v) << 16) | bf16_round(lo_v);
+    }
+}
