@@ -23,37 +23,50 @@ LINEAR_LOCAL_X      :: 32   // must match TILE_M in shaders/linear.comp
 LINEAR_LOCAL_Y      :: 64   // must match TILE_N in shaders/linear.comp
 LINEAR_BF16_LOCAL_X :: 32   // must match TILE_M in shaders/linear_bf16.comp
 LINEAR_BF16_LOCAL_Y :: 64   // must match TILE_N in shaders/linear_bf16.comp
-LINEAR_BF16_COOPMAT_TILE :: 16   // must match {M,N,K}_TILE in shaders/linear_bf16_coopmat.comp
+// must match BM/BN/BK in shaders/linear_bf16_coopmat.comp
+LINEAR_BF16_COOPMAT_BM :: 64
+LINEAR_BF16_COOPMAT_BN :: 64
+LINEAR_BF16_COOPMAT_BK :: 16
 Linear_Params :: struct { count, input_size, output_size: u32 }
 _linear_pipeline:              ^Pipeline
 _linear_bf16_pipeline:         ^Pipeline
 _linear_bf16_coopmat_pipeline: ^Pipeline
 
-LINEAR_BACK_INPUT_SPIRV       :: #load("shaders/linear_back_input.spv",       []u8)
-LINEAR_BACK_WEIGHT_SPIRV      :: #load("shaders/linear_back_weight.spv",      []u8)
-LINEAR_BACK_INPUT_BF16_SPIRV  :: #load("shaders/linear_back_input_bf16.spv",  []u8)
-LINEAR_BACK_WEIGHT_BF16_SPIRV :: #load("shaders/linear_back_weight_bf16.spv", []u8)
+LINEAR_BACK_INPUT_SPIRV               :: #load("shaders/linear_back_input.spv",               []u8)
+LINEAR_BACK_WEIGHT_SPIRV              :: #load("shaders/linear_back_weight.spv",              []u8)
+LINEAR_BACK_INPUT_BF16_SPIRV          :: #load("shaders/linear_back_input_bf16.spv",          []u8)
+LINEAR_BACK_WEIGHT_BF16_SPIRV         :: #load("shaders/linear_back_weight_bf16.spv",         []u8)
+LINEAR_BACK_INPUT_BF16_COOPMAT_SPIRV  :: #load("shaders/linear_back_input_bf16_coopmat.spv",  []u8)
+LINEAR_BACK_WEIGHT_BF16_COOPMAT_SPIRV :: #load("shaders/linear_back_weight_bf16_coopmat.spv", []u8)
 Linear_Back_Params :: struct { count, input_size, output_size: u32 }
-_linear_back_input_pipeline:       ^Pipeline
-_linear_back_weight_pipeline:      ^Pipeline
-_linear_back_input_bf16_pipeline:  ^Pipeline
-_linear_back_weight_bf16_pipeline: ^Pipeline
+_linear_back_input_pipeline:               ^Pipeline
+_linear_back_weight_pipeline:              ^Pipeline
+_linear_back_input_bf16_pipeline:          ^Pipeline
+_linear_back_weight_bf16_pipeline:         ^Pipeline
+_linear_back_input_bf16_coopmat_pipeline:  ^Pipeline
+_linear_back_weight_bf16_coopmat_pipeline: ^Pipeline
 
-BATCHED_MATMUL_SPIRV                  :: #load("shaders/batched_matmul.spv",                  []u8)
-BATCHED_MATMUL_BACK_INPUT_SPIRV       :: #load("shaders/batched_matmul_back_input.spv",       []u8)
-BATCHED_MATMUL_BACK_WEIGHT_SPIRV      :: #load("shaders/batched_matmul_back_weight.spv",      []u8)
-BATCHED_MATMUL_BF16_SPIRV             :: #load("shaders/batched_matmul_bf16.spv",             []u8)
-BATCHED_MATMUL_BACK_INPUT_BF16_SPIRV  :: #load("shaders/batched_matmul_back_input_bf16.spv",  []u8)
-BATCHED_MATMUL_BACK_WEIGHT_BF16_SPIRV :: #load("shaders/batched_matmul_back_weight_bf16.spv", []u8)
+BATCHED_MATMUL_SPIRV                          :: #load("shaders/batched_matmul.spv",                          []u8)
+BATCHED_MATMUL_BACK_INPUT_SPIRV               :: #load("shaders/batched_matmul_back_input.spv",               []u8)
+BATCHED_MATMUL_BACK_WEIGHT_SPIRV              :: #load("shaders/batched_matmul_back_weight.spv",              []u8)
+BATCHED_MATMUL_BF16_SPIRV                     :: #load("shaders/batched_matmul_bf16.spv",                     []u8)
+BATCHED_MATMUL_BACK_INPUT_BF16_SPIRV          :: #load("shaders/batched_matmul_back_input_bf16.spv",          []u8)
+BATCHED_MATMUL_BACK_WEIGHT_BF16_SPIRV         :: #load("shaders/batched_matmul_back_weight_bf16.spv",         []u8)
+BATCHED_MATMUL_BF16_COOPMAT_SPIRV             :: #load("shaders/batched_matmul_bf16_coopmat.spv",             []u8)
+BATCHED_MATMUL_BACK_INPUT_BF16_COOPMAT_SPIRV  :: #load("shaders/batched_matmul_back_input_bf16_coopmat.spv",  []u8)
+BATCHED_MATMUL_BACK_WEIGHT_BF16_COOPMAT_SPIRV :: #load("shaders/batched_matmul_back_weight_bf16_coopmat.spv", []u8)
 BATCHED_MATMUL_LOCAL_X :: 16
 BATCHED_MATMUL_LOCAL_Y :: 16
 Batched_Matmul_Params :: struct { batch_count, m, k, n: u32 }
-_batched_matmul_pipeline:                  ^Pipeline
-_batched_matmul_back_input_pipeline:       ^Pipeline
-_batched_matmul_back_weight_pipeline:      ^Pipeline
-_batched_matmul_bf16_pipeline:             ^Pipeline
-_batched_matmul_back_input_bf16_pipeline:  ^Pipeline
-_batched_matmul_back_weight_bf16_pipeline: ^Pipeline
+_batched_matmul_pipeline:                          ^Pipeline
+_batched_matmul_back_input_pipeline:               ^Pipeline
+_batched_matmul_back_weight_pipeline:              ^Pipeline
+_batched_matmul_bf16_pipeline:                     ^Pipeline
+_batched_matmul_back_input_bf16_pipeline:          ^Pipeline
+_batched_matmul_back_weight_bf16_pipeline:         ^Pipeline
+_batched_matmul_bf16_coopmat_pipeline:             ^Pipeline
+_batched_matmul_back_input_bf16_coopmat_pipeline:  ^Pipeline
+_batched_matmul_back_weight_bf16_coopmat_pipeline: ^Pipeline
 
 MUL_SPIRV             :: #load("shaders/mul.spv",             []u8)
 MUL_BACK_A_SPIRV      :: #load("shaders/mul_back_a.spv",      []u8)
@@ -164,6 +177,8 @@ ATTENTION_BF16_SPIRV         :: #load("shaders/attention_bf16.spv",         []u8
 ATTENTION_BACK_D_BF16_SPIRV  :: #load("shaders/attention_back_d_bf16.spv",  []u8)
 ATTENTION_BACK_KV_BF16_SPIRV :: #load("shaders/attention_back_kv_bf16.spv", []u8)
 ATTENTION_BACK_Q_BF16_SPIRV  :: #load("shaders/attention_back_q_bf16.spv",  []u8)
+ATTENTION_BF16_COOPMAT_SPIRV :: #load("shaders/attention_bf16_coopmat.spv", []u8)
+ATTENTION_BF16_COOPMAT_BR    :: 16   // must match BR in shaders/attention_bf16_coopmat.comp
 Attention_Params :: struct {
 	head_count, head_size, token_count, embed_size, causal: u32,
 }
@@ -178,6 +193,7 @@ _attention_bf16_pipeline:         ^Pipeline
 _attention_back_d_bf16_pipeline:  ^Pipeline
 _attention_back_kv_bf16_pipeline: ^Pipeline
 _attention_back_q_bf16_pipeline:  ^Pipeline
+_attention_bf16_coopmat_pipeline: ^Pipeline
 
 SELECT_SPIRV      :: #load("shaders/select.spv",      []u8)
 SELECT_BACK_SPIRV :: #load("shaders/select_back.spv", []u8)

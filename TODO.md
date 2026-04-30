@@ -231,13 +231,84 @@ Ordered by what unlocks the most when done:
    (one-thread-per-pair packed-uint reads with RMW on the backward
    scatter, same pattern as the existing bf16 pure-copy ops).
 
-4. **Coopmat perf pass.** The naive bf16 shaders win on storage but
-   the coopmat shader as written is a minimum-viable subgroup-per-tile
-   layout — leaves most tensor-core throughput on the floor. Add BM/BN
-   per workgroup, multiple subgroups, shared-memory K-tile staging,
-   per-subgroup output tiles. Then port the same pattern to backward
-   (linear, batched_matmul) and to attention. This is the move from
-   "correct" to "fast."
+4. **Coopmat perf pass.** Shared layout across every shader: BM=64,
+   BN=64, BK=16, 4 subgroups arranged 2×2 per WG, each subgroup owning
+   a 2×2 grid of 16×16 output coopmat tiles, inputs staged through
+   shared memory. Subgroup size = 32 hardcoded. Build script now
+   passes `--target-env=vulkan1.3` (needed for `GroupNonUniform`).
+   - **Linear forward, linear backward (input + weight),
+     batched_matmul forward + backward — DONE.** Eligibility for each
+     shader requires the relevant output dims to be multiples of 64
+     and the contraction dim a multiple of 16; smaller/odd shapes
+     fall back to the existing naive packed-uint shaders. Coopmat
+     backward shaders load the existing output tile as a bf16 acc
+     coopmat, convert to fp32, accumulate via `coopMatMulAdd`, and
+     convert back to bf16 on store, so they preserve the `+=`
+     semantics that the naive backward used.
+
+     RTX 3090 Ti microbench (BF16 peak ~150 TFLOPS):
+     - linear forward:
+       - 512×768×768:    2.34 → 3.58 TFLOPS  (1.5x)
+       - 512×2048×2048:  5.88 → 15.62 TFLOPS (2.7x)
+       - 2048×2048×2048: 7.99 → 27.89 TFLOPS (3.5x)
+     - linear backward (sum of dx + dw GEMMs):
+       - 512×768×768:    1.27 → 4.91 TFLOPS  (3.9x)
+       - 512×2048×2048:  1.53 → 14.67 TFLOPS (9.6x)
+       - 2048×2048×2048: 1.81 → 17.33 TFLOPS (9.6x)
+     The backward win is largest because the old naive bf16 backward
+     was bottlenecked on packed-uint RMW serialization, not compute.
+
+     End-to-end transformer bench (`tests/gpu_transformer_bench`,
+     L=12 H=8 E=512 T=256): F32 full step 76.1 ms → Bf16 full step
+     30.9 ms (**2.46x**). Forward alone: 1.49x. The full-step
+     speedup is dominated by backward.
+
+     Tried-and-rejected variants for linear forward: BM=BN=128
+     (faster on huge but slower on medium/big due to
+     under-occupancy); BK=32 (no measurable win, slightly worse on
+     big shapes).
+
+     Coverage: `dtype_roundtrip` multi-tile linear test (M=64, N=128,
+     K=64) exercises the linear coopmat path; new
+     `batched_matmul (coopmat-tile)` test (BATCH=2 M=K=N=64)
+     exercises both the bmm forward and backward coopmat paths.
+
+   - **Attention forward — implemented but disabled.**
+     `attention_bf16_coopmat.comp` is a full FA2-with-Q-tiling
+     rewrite: BR=16 queries per workgroup, BC=64 keys per K-tile, 1
+     subgroup of 32 threads, MAX_D=64 capping shared-memory at
+     ~32 KB. Q@K^T and P@V both run on tensor cores via
+     `coopMatMulAdd`; the online softmax stages scores through fp32
+     shared memory, runs SIMT per-row max/sum via `subgroupMax`/
+     `subgroupAdd` (32 threads × 2 cols each = BC=64), and writes
+     bf16 P back to shared for the P@V matmul. Output is folded
+     into a fp32 running accumulator with per-row alpha rescaling,
+     then normalized and pair-packed to bf16 at the end. Correctness
+     verified by a new `dtype_roundtrip` case at T=32, H=2, D=16
+     (the smallest shape that hits the coopmat path).
+
+     **Disabled in dispatch.** On the bench shapes (D=64, T=64–256)
+     this runs ~18% *slower* than the existing SIMT bf16 shader.
+     Root causes: the per-row softmax loop is sequential across
+     16 rows (one `subgroupMax` + `subgroupAdd` per row), each K-
+     tile costs 4 barriers (Q/K/V stage + score store + softmax +
+     output fold), and shared-memory budget (~32 KB at MAX_D=64,
+     ~58 KB at MAX_D=128) limits occupancy. The SIMT shader hides
+     the same compute under simpler control flow with much less
+     shared-memory pressure, so the tensor-core throughput
+     advantage doesn't materialize at these sizes. Left as a
+     foundation for the backward pass and for future tuning
+     (multi-subgroup BR=32, fewer barriers via more-aggressive
+     overlap, specialization-constant D, larger seq-len bench
+     shapes where the coopmat advantage will dominate).
+
+   - **Attention backward — not started.** The three backward
+     shaders (`attention_back_d`, `attention_back_kv`,
+     `attention_back_q`) are mostly per-token reductions plus
+     `softmax_outputs[H, T, T]` recompute, not pure GEMMs, so a
+     coopmat port is a bigger restructure than the linear/bmm
+     ports. Best done together with the forward redesign once the
+     forward profile is unblocked.
 
 5. **Mixed-precision recipe in `examples/`.** End-to-end demo of the
    standard "FP32 master weights, BF16 forward/backward, FP32 optimizer
@@ -246,30 +317,22 @@ Ordered by what unlocks the most when done:
 
 ### Open / next phases
 
-3. **First coopmat shader: BF16 `linear` forward.** Use
-   `GL_KHR_cooperative_matrix` + `GL_EXT_shader_explicit_arithmetic_types_float16`
-   compiled with `--target-env=vulkan1.2`. Backend dispatches based on
-   `op.input.type`: F32 → existing FP32 SIMT shader, BF16 → coopmat
-   shader. RTX 30+ exposes `cooperativeMatrix = true` and
-   `shaderBFloat16CooperativeMatrix = true` already; query
-   `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` at init to confirm
-   a usable `(M,N,K,types)` config and fall back gracefully on
-   unsupported devices. Update Vulkan device init to enable
-   `VK_KHR_cooperative_matrix`, `shaderFloat16` / `shaderBFloat16`,
-   `storageBuffer16BitAccess`.
+- **Make attention coopmat profitable.** Forward shader exists
+  (`attention_bf16_coopmat.comp`) but currently slower than SIMT.
+  Most promising next moves: parallelize the per-row softmax across
+  threads (use a (row, col) thread layout instead of sequential
+  rows), reduce barrier count by fusing Q-load with the first K
+  iteration, multi-subgroup BR=32 to amortize K/V staging across
+  more queries, specialization constants for D so shared-memory
+  isn't sized for the worst case. Once the forward wins, port the
+  same Q-tile layout to backward.
 
-4. **Roll out coopmat to the rest.** `linear` backward (input + weight),
-   then `batched_matmul` forward + backward, then attention (which uses
-   `batched_matmul` internally — coopmat there is the real win). Then
-   the simple element-wise ops (`add`, `mul`, `gelu`, `layernorm`,
-   activations) become dtype-generic — these don't need coopmat, they
-   just need to read/write the right number of bytes per element.
-
-5. **Mixed-precision recipe in `examples/`.** Show the standard "FP32
-   master weights, BF16 forward/backward, FP32 optimizer state" pattern
-   end-to-end on a small transformer. This is what every modern LLM
-   training stack does and is the actual deliverable for "serious ML
-   work."
+- **Mixed-precision recipe in `examples/`.** Show the standard "FP32
+  master weights, BF16 forward/backward, FP32 optimizer state"
+  pattern end-to-end on a small transformer. The `transformer_train_bf16`
+  parity test and the bf16 path in `tests/gpu_transformer_bench`
+  already demonstrate the building blocks; promote to a runnable
+  example once attention coopmat lands.
 
 **Design decisions to lock in at phase 1:**
 

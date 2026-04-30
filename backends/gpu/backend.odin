@@ -1106,9 +1106,9 @@ linear_forward :: proc(op: ml.Operation) {
 		)
 	case .Bf16:
 		coopmat_eligible := _gpu.coopmat_bf16 &&
-			count       % LINEAR_BF16_COOPMAT_TILE == 0 &&
-			input_size  % LINEAR_BF16_COOPMAT_TILE == 0 &&
-			output_size % LINEAR_BF16_COOPMAT_TILE == 0
+			count       % LINEAR_BF16_COOPMAT_BM == 0 &&
+			output_size % LINEAR_BF16_COOPMAT_BN == 0 &&
+			input_size  % LINEAR_BF16_COOPMAT_BK == 0
 
 		if coopmat_eligible {
 			if _linear_bf16_coopmat_pipeline == nil {
@@ -1116,8 +1116,8 @@ linear_forward :: proc(op: ml.Operation) {
 			}
 			_dispatch(
 				_linear_bf16_coopmat_pipeline, bufs[:], &params,
-				u32(count       / LINEAR_BF16_COOPMAT_TILE),
-				u32(output_size / LINEAR_BF16_COOPMAT_TILE),
+				u32(count       / LINEAR_BF16_COOPMAT_BM),
+				u32(output_size / LINEAR_BF16_COOPMAT_BN),
 				1,
 			)
 		} else {
@@ -1178,25 +1178,55 @@ linear_backward :: proc(op: ml.Operation) {
 	case .Bf16:
 		fmt.assertf(input_size % 2 == 0, "GPU bf16 linear_backward requires even input_size, got %v", input_size)
 
-		if _linear_back_input_bf16_pipeline == nil {
-			_linear_back_input_bf16_pipeline = _make_pipeline(LINEAR_BACK_INPUT_BF16_SPIRV, 3, size_of(Linear_Back_Params))
+		// Coopmat backward eligibility: dx wants count%BM, input_size%BN, output_size%BK;
+		// dw wants output_size%BM, input_size%BN, count%BK. Since BM == BN we need
+		// count, input_size, output_size all multiples of BM and (count, output_size)
+		// also multiples of BK. With BK <= BM that reduces to multiples of BM.
+		coopmat_eligible := _gpu.coopmat_bf16 &&
+			count       % LINEAR_BF16_COOPMAT_BM == 0 &&
+			output_size % LINEAR_BF16_COOPMAT_BM == 0 &&
+			input_size  % LINEAR_BF16_COOPMAT_BN == 0
+
+		if coopmat_eligible {
+			if _linear_back_input_bf16_coopmat_pipeline == nil {
+				_linear_back_input_bf16_coopmat_pipeline = _make_pipeline(LINEAR_BACK_INPUT_BF16_COOPMAT_SPIRV, 3, size_of(Linear_Back_Params))
+			}
+			if _linear_back_weight_bf16_coopmat_pipeline == nil {
+				_linear_back_weight_bf16_coopmat_pipeline = _make_pipeline(LINEAR_BACK_WEIGHT_BF16_COOPMAT_SPIRV, 3, size_of(Linear_Back_Params))
+			}
+			_dispatch(
+				_linear_back_input_bf16_coopmat_pipeline, dx_bufs[:], &params,
+				u32(count      / LINEAR_BF16_COOPMAT_BM),
+				u32(input_size / LINEAR_BF16_COOPMAT_BN),
+				1,
+			)
+			_dispatch(
+				_linear_back_weight_bf16_coopmat_pipeline, dw_bufs[:], &params,
+				u32(output_size / LINEAR_BF16_COOPMAT_BM),
+				u32(input_size  / LINEAR_BF16_COOPMAT_BN),
+				1,
+			)
+		} else {
+			if _linear_back_input_bf16_pipeline == nil {
+				_linear_back_input_bf16_pipeline = _make_pipeline(LINEAR_BACK_INPUT_BF16_SPIRV, 3, size_of(Linear_Back_Params))
+			}
+			if _linear_back_weight_bf16_pipeline == nil {
+				_linear_back_weight_bf16_pipeline = _make_pipeline(LINEAR_BACK_WEIGHT_BF16_SPIRV, 3, size_of(Linear_Back_Params))
+			}
+			k_pair_count := input_size / 2
+			_dispatch(
+				_linear_back_input_bf16_pipeline, dx_bufs[:], &params,
+				_div_up(count,        16),
+				_div_up(k_pair_count, 16),
+				1,
+			)
+			_dispatch(
+				_linear_back_weight_bf16_pipeline, dw_bufs[:], &params,
+				_div_up(output_size,  16),
+				_div_up(k_pair_count, 16),
+				1,
+			)
 		}
-		if _linear_back_weight_bf16_pipeline == nil {
-			_linear_back_weight_bf16_pipeline = _make_pipeline(LINEAR_BACK_WEIGHT_BF16_SPIRV, 3, size_of(Linear_Back_Params))
-		}
-		k_pair_count := input_size / 2
-		_dispatch(
-			_linear_back_input_bf16_pipeline, dx_bufs[:], &params,
-			_div_up(count,        16),
-			_div_up(k_pair_count, 16),
-			1,
-		)
-		_dispatch(
-			_linear_back_weight_bf16_pipeline, dw_bufs[:], &params,
-			_div_up(output_size,  16),
-			_div_up(k_pair_count, 16),
-			1,
-		)
 	case .F16:
 		fmt.panicf("GPU linear_backward: F16 not yet supported")
 	}
@@ -1727,15 +1757,32 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 	case .Bf16:
 		fmt.assertf(n % 2 == 0, "GPU bf16 batched_matmul requires even n, got %v", n)
 
-		if _batched_matmul_bf16_pipeline == nil {
-			_batched_matmul_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
+		coopmat_eligible := _gpu.coopmat_bf16 &&
+			m % LINEAR_BF16_COOPMAT_BM == 0 &&
+			n % LINEAR_BF16_COOPMAT_BN == 0 &&
+			k % LINEAR_BF16_COOPMAT_BK == 0
+
+		if coopmat_eligible {
+			if _batched_matmul_bf16_coopmat_pipeline == nil {
+				_batched_matmul_bf16_coopmat_pipeline = _make_pipeline(BATCHED_MATMUL_BF16_COOPMAT_SPIRV, 3, size_of(Batched_Matmul_Params))
+			}
+			_dispatch(
+				_batched_matmul_bf16_coopmat_pipeline, bufs[:], &params,
+				u32(m / LINEAR_BF16_COOPMAT_BM),
+				u32(n / LINEAR_BF16_COOPMAT_BN),
+				u32(batch_count),
+			)
+		} else {
+			if _batched_matmul_bf16_pipeline == nil {
+				_batched_matmul_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
+			}
+			_dispatch(
+				_batched_matmul_bf16_pipeline, bufs[:], &params,
+				_div_up(m,     BATCHED_MATMUL_LOCAL_X),
+				_div_up(n / 2, BATCHED_MATMUL_LOCAL_Y),
+				u32(batch_count),
+			)
 		}
-		_dispatch(
-			_batched_matmul_bf16_pipeline, bufs[:], &params,
-			_div_up(m,     BATCHED_MATMUL_LOCAL_X),
-			_div_up(n / 2, BATCHED_MATMUL_LOCAL_Y),
-			u32(batch_count),
-		)
 	case .F16:
 		fmt.panicf("GPU batched_matmul: F16 not yet supported")
 	}
@@ -1782,24 +1829,54 @@ batched_matmul_backward :: proc(op: ml.Operation) {
 		fmt.assertf(k % 2 == 0, "GPU bf16 batched_matmul_backward requires even k, got %v", k)
 		fmt.assertf(n % 2 == 0, "GPU bf16 batched_matmul_backward requires even n, got %v", n)
 
-		if _batched_matmul_back_input_bf16_pipeline == nil {
-			_batched_matmul_back_input_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_INPUT_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
+		// dA: M_out=m, N_out=k, K_inner=n. dB: M_out=k, N_out=n, K_inner=m.
+		// All three (m, k, n) must be multiples of BM (= BN = 64), and the
+		// K_inner dim of each kernel must be a multiple of BK = 16. With BK
+		// dividing BM, the BM checks subsume the BK ones.
+		coopmat_eligible := _gpu.coopmat_bf16 &&
+			m % LINEAR_BF16_COOPMAT_BM == 0 &&
+			k % LINEAR_BF16_COOPMAT_BM == 0 &&
+			n % LINEAR_BF16_COOPMAT_BM == 0
+
+		if coopmat_eligible {
+			if _batched_matmul_back_input_bf16_coopmat_pipeline == nil {
+				_batched_matmul_back_input_bf16_coopmat_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_INPUT_BF16_COOPMAT_SPIRV, 3, size_of(Batched_Matmul_Params))
+			}
+			if _batched_matmul_back_weight_bf16_coopmat_pipeline == nil {
+				_batched_matmul_back_weight_bf16_coopmat_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_WEIGHT_BF16_COOPMAT_SPIRV, 3, size_of(Batched_Matmul_Params))
+			}
+			_dispatch(
+				_batched_matmul_back_input_bf16_coopmat_pipeline, da_bufs[:], &params,
+				u32(m / LINEAR_BF16_COOPMAT_BM),
+				u32(k / LINEAR_BF16_COOPMAT_BN),
+				u32(batch_count),
+			)
+			_dispatch(
+				_batched_matmul_back_weight_bf16_coopmat_pipeline, db_bufs[:], &params,
+				u32(k / LINEAR_BF16_COOPMAT_BM),
+				u32(n / LINEAR_BF16_COOPMAT_BN),
+				u32(batch_count),
+			)
+		} else {
+			if _batched_matmul_back_input_bf16_pipeline == nil {
+				_batched_matmul_back_input_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_INPUT_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
+			}
+			if _batched_matmul_back_weight_bf16_pipeline == nil {
+				_batched_matmul_back_weight_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_WEIGHT_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
+			}
+			_dispatch(
+				_batched_matmul_back_input_bf16_pipeline, da_bufs[:], &params,
+				_div_up(m,     BATCHED_MATMUL_LOCAL_X),
+				_div_up(k / 2, BATCHED_MATMUL_LOCAL_Y),
+				u32(batch_count),
+			)
+			_dispatch(
+				_batched_matmul_back_weight_bf16_pipeline, db_bufs[:], &params,
+				_div_up(k,     BATCHED_MATMUL_LOCAL_X),
+				_div_up(n / 2, BATCHED_MATMUL_LOCAL_Y),
+				u32(batch_count),
+			)
 		}
-		if _batched_matmul_back_weight_bf16_pipeline == nil {
-			_batched_matmul_back_weight_bf16_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_WEIGHT_BF16_SPIRV, 3, size_of(Batched_Matmul_Params))
-		}
-		_dispatch(
-			_batched_matmul_back_input_bf16_pipeline, da_bufs[:], &params,
-			_div_up(m,     BATCHED_MATMUL_LOCAL_X),
-			_div_up(k / 2, BATCHED_MATMUL_LOCAL_Y),
-			u32(batch_count),
-		)
-		_dispatch(
-			_batched_matmul_back_weight_bf16_pipeline, db_bufs[:], &params,
-			_div_up(k,     BATCHED_MATMUL_LOCAL_X),
-			_div_up(n / 2, BATCHED_MATMUL_LOCAL_Y),
-			u32(batch_count),
-		)
 	case .F16:
 		fmt.panicf("GPU batched_matmul_backward: F16 not yet supported")
 	}
@@ -1962,18 +2039,6 @@ attention_forward :: proc(op: ml.Operation) {
 		fmt.assertf(embed_size % 2 == 0, "GPU bf16 attention requires even embed_size (got %v)", embed_size)
 	}
 
-	pipeline: ^Pipeline
-	if is_bf16 {
-		if _attention_bf16_pipeline == nil {
-			_attention_bf16_pipeline = _make_pipeline(ATTENTION_BF16_SPIRV, 3, size_of(Attention_Params))
-		}
-		pipeline = _attention_bf16_pipeline
-	} else {
-		if _attention_pipeline == nil {
-			_attention_pipeline = _make_pipeline(ATTENTION_SPIRV, 3, size_of(Attention_Params))
-		}
-		pipeline = _attention_pipeline
-	}
 	params := Attention_Params{
 		head_count  = u32(variant.head_count),
 		head_size   = u32(head_size),
@@ -1982,7 +2047,35 @@ attention_forward :: proc(op: ml.Operation) {
 		causal      = variant.causal ? 1 : 0,
 	}
 	bufs := [3]vk.Buffer{data(input).buffer, data(output).buffer, data(variant.lse).buffer}
-	_dispatch(pipeline, bufs[:], &params, u32(variant.head_count), u32(token_count))
+
+	// Bf16 coopmat path requires head_size % 16 == 0; the shader exists at
+	// `attention_bf16_coopmat.comp` and is correctness-tested by
+	// `dtype_roundtrip`, but on the current bench shapes (D=64, T<=256) it
+	// runs slower than the SIMT bf16 shader due to shared-mem barriers and
+	// sequential per-row softmax. Left disabled until the FA2 backward
+	// pass forces a better layout (multi-subgroup, fewer barriers).
+	use_coopmat := false && is_bf16 && _gpu.coopmat_bf16 && head_size % 16 == 0 && head_size <= 64
+
+	if use_coopmat {
+		if _attention_bf16_coopmat_pipeline == nil {
+			_attention_bf16_coopmat_pipeline = _make_pipeline(ATTENTION_BF16_COOPMAT_SPIRV, 3, size_of(Attention_Params))
+		}
+		_dispatch(
+			_attention_bf16_coopmat_pipeline, bufs[:], &params,
+			u32(variant.head_count),
+			u32(_div_up(token_count, ATTENTION_BF16_COOPMAT_BR)),
+		)
+	} else if is_bf16 {
+		if _attention_bf16_pipeline == nil {
+			_attention_bf16_pipeline = _make_pipeline(ATTENTION_BF16_SPIRV, 3, size_of(Attention_Params))
+		}
+		_dispatch(_attention_bf16_pipeline, bufs[:], &params, u32(variant.head_count), u32(token_count))
+	} else {
+		if _attention_pipeline == nil {
+			_attention_pipeline = _make_pipeline(ATTENTION_SPIRV, 3, size_of(Attention_Params))
+		}
+		_dispatch(_attention_pipeline, bufs[:], &params, u32(variant.head_count), u32(token_count))
+	}
 }
 
 attention_backward :: proc(op: ml.Operation) {

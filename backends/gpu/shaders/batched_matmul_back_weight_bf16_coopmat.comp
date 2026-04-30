@@ -1,0 +1,123 @@
+// Bf16 coopmat backward of batched_matmul w.r.t. B.
+//   dB[bi, k, j] += sum_i A[bi, i, k] * dC[bi, i, j]
+//
+// Coopmat shape: M_out = k, N_out = n, K_inner = m. A is staged into shared
+// with explicit transpose so the inner A coopmat load stays row-major.
+//
+// Constraints: k % BM == 0, n % BN == 0, m % BK == 0, subgroup size == 32.
+#version 460
+
+#extension GL_KHR_cooperative_matrix     : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic  : require
+#extension GL_EXT_shader_16bit_storage   : require
+#extension GL_EXT_bfloat16               : require
+
+#define BM            64
+#define BN            64
+#define BK            16
+#define M_FRAG        16
+#define N_FRAG        16
+#define K_FRAG        16
+#define SUB_M         2
+#define SUB_N         2
+#define SM_TILES      (BM / (M_FRAG * SUB_M))
+#define SN_TILES      (BN / (N_FRAG * SUB_N))
+#define SUBGROUP_SIZE 32
+#define WG_SIZE       (SUB_M * SUB_N * SUBGROUP_SIZE)
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer A  { bfloat16_t a[];  };
+layout(set = 0, binding = 1) readonly buffer DC { bfloat16_t dc[]; };
+layout(set = 0, binding = 2)          buffer DB { bfloat16_t db[]; };
+
+layout(push_constant) uniform Params {
+    uint batch_count;
+    uint m;
+    uint k;
+    uint n;
+} p;
+
+shared bfloat16_t sa[BM * BK];
+shared bfloat16_t sb[BK * BN];
+
+void main() {
+    uint wg_m = gl_WorkGroupID.x;
+    uint wg_n = gl_WorkGroupID.y;
+    uint bi   = gl_WorkGroupID.z;
+    uint sg   = gl_SubgroupID;
+    uint sg_m = sg / SUB_N;
+    uint sg_n = sg % SUB_N;
+    uint tid  = gl_LocalInvocationID.x;
+
+    uint base_m   = wg_m * BM;
+    uint base_n   = wg_n * BN;
+    uint sg_m_off = sg_m * (SM_TILES * M_FRAG);
+    uint sg_n_off = sg_n * (SN_TILES * N_FRAG);
+
+    uint a_batch  = bi * p.m * p.k;
+    uint dc_batch = bi * p.m * p.n;
+    uint db_batch = bi * p.k * p.n;
+
+    coopmat<float, gl_ScopeSubgroup, M_FRAG, N_FRAG, gl_MatrixUseAccumulator>
+        acc[SM_TILES][SN_TILES];
+    for (uint i = 0u; i < SM_TILES; ++i) {
+        for (uint j = 0u; j < SN_TILES; ++j) {
+            coopmat<bfloat16_t, gl_ScopeSubgroup, M_FRAG, N_FRAG, gl_MatrixUseAccumulator> initial;
+            uint y_row = base_m + sg_m_off + i * M_FRAG;
+            uint y_col = base_n + sg_n_off + j * N_FRAG;
+            coopMatLoad(initial, db, db_batch + y_row * p.n + y_col, p.n,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, M_FRAG, N_FRAG, gl_MatrixUseAccumulator>(initial);
+        }
+    }
+
+    uint k_steps = p.m / BK;
+    for (uint kt = 0u; kt < k_steps; ++kt) {
+        // sa[m_local_kdim, k_inner_idim] = A[bi, kt*BK+k_inner, base_m+m_local]
+        for (uint l = 0u; l < (BM * BK) / WG_SIZE; ++l) {
+            uint idx = tid + l * WG_SIZE;
+            uint row = idx / BK;
+            uint col = idx % BK;
+            sa[idx] = a[a_batch + (kt * BK + col) * p.k + (base_m + row)];
+        }
+        // sb[k_inner_idim, n_local] = dC[bi, kt*BK+k_inner, base_n+n_local]
+        for (uint l = 0u; l < (BK * BN) / WG_SIZE; ++l) {
+            uint idx = tid + l * WG_SIZE;
+            uint row = idx / BN;
+            uint col = idx % BN;
+            sb[idx] = dc[dc_batch + (kt * BK + row) * p.n + (base_n + col)];
+        }
+        barrier();
+
+        coopmat<bfloat16_t, gl_ScopeSubgroup, M_FRAG, K_FRAG, gl_MatrixUseA> mA[SM_TILES];
+        coopmat<bfloat16_t, gl_ScopeSubgroup, K_FRAG, N_FRAG, gl_MatrixUseB> mB[SN_TILES];
+
+        for (uint i = 0u; i < SM_TILES; ++i) {
+            uint a_off = (sg_m_off + i * M_FRAG) * BK;
+            coopMatLoad(mA[i], sa, a_off, BK, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        for (uint j = 0u; j < SN_TILES; ++j) {
+            uint b_off = (sg_n_off + j * N_FRAG);
+            coopMatLoad(mB[j], sb, b_off, BN, gl_CooperativeMatrixLayoutRowMajor);
+        }
+
+        for (uint i = 0u; i < SM_TILES; ++i)
+            for (uint j = 0u; j < SN_TILES; ++j)
+                acc[i][j] = coopMatMulAdd(mA[i], mB[j], acc[i][j]);
+
+        barrier();
+    }
+
+    for (uint i = 0u; i < SM_TILES; ++i) {
+        for (uint j = 0u; j < SN_TILES; ++j) {
+            coopmat<bfloat16_t, gl_ScopeSubgroup, M_FRAG, N_FRAG, gl_MatrixUseAccumulator> result =
+                coopmat<bfloat16_t, gl_ScopeSubgroup, M_FRAG, N_FRAG, gl_MatrixUseAccumulator>(acc[i][j]);
+            uint y_row = base_m + sg_m_off + i * M_FRAG;
+            uint y_col = base_n + sg_n_off + j * N_FRAG;
+            coopMatStore(result, db, db_batch + y_row * p.n + y_col, p.n,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

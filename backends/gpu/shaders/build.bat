@@ -7,7 +7,7 @@ set SCRIPT_DIR=%~dp0
 pushd %SCRIPT_DIR%
 for %%f in (*.comp) do (
     echo glslc %%f
-    glslc -O "%%f" -o "%%~nf.spv" || goto :fail
+    glslc -O --target-env=vulkan1.3 "%%f" -o "%%~nf.spv" || goto :fail
 )
 popd
 exit /b 0

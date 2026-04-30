@@ -403,6 +403,99 @@ main :: proc() {
 			check(db_ok, fmt.tprintf("%v: Bf16 batched_matmul backward db matches f32 reference", label), any_failed)
 		}
 
+		// Bf16 batched_matmul across the coopmat tile boundary. M=K=N=64 is the
+		// smallest shape for which all three workgroup tiles (BM/BN=64, BK=16)
+		// are exercised in both forward and backward. Same {-1, 0, 1} value
+		// trick keeps every partial sum exact in bf16.
+		{
+			BATCH :: 2
+			M     :: 64
+			K     :: 64
+			N     :: 64
+
+			a_src: [BATCH * M * K]f32
+			for i in 0 ..< BATCH * M * K {
+				a_src[i] = f32((i % 3) - 1)
+			}
+			b_src: [BATCH * K * N]f32
+			for i in 0 ..< BATCH * K * N {
+				b_src[i] = f32(((i + 1) % 3) - 1)
+			}
+
+			a_f32 := ml.tensor(a_src[:])
+			b_f32 := ml.tensor(b_src[:])
+			a     := ml.cast_to(ml.reshape(a_f32, {BATCH, M, K}), .Bf16)
+			b     := ml.cast_to(ml.reshape(b_f32, {BATCH, K, N}), .Bf16)
+
+			c_bf := ml.batched_matmul(a, b)
+			c    := ml.cast_to(c_bf, .F32)
+
+			got_c: [BATCH * M * N]f32
+			ml.get_data(c, got_c[:])
+
+			expected_c: [BATCH * M * N]f32
+			for bi in 0 ..< BATCH {
+				for i in 0 ..< M {
+					for j in 0 ..< N {
+						sum: f32
+						for k in 0 ..< K {
+							sum += a_src[bi * M * K + i * K + k] * b_src[bi * K * N + k * N + j]
+						}
+						expected_c[bi * M * N + i * N + j] = sum
+					}
+				}
+			}
+
+			fwd_ok := true
+			for i in 0 ..< BATCH * M * N {
+				if got_c[i] != expected_c[i] { fwd_ok = false }
+			}
+			check(fwd_ok, fmt.tprintf("%v: Bf16 batched_matmul (coopmat-tile) forward matches f32 reference", label), any_failed)
+
+			ml.backward()
+
+			expected_da: [BATCH * M * K]f32
+			for bi in 0 ..< BATCH {
+				for i in 0 ..< M {
+					for kk in 0 ..< K {
+						sum: f32
+						for j in 0 ..< N {
+							sum += b_src[bi * K * N + kk * N + j]
+						}
+						expected_da[bi * M * K + i * K + kk] = sum
+					}
+				}
+			}
+			expected_db: [BATCH * K * N]f32
+			for bi in 0 ..< BATCH {
+				for kk in 0 ..< K {
+					for j in 0 ..< N {
+						sum: f32
+						for i in 0 ..< M {
+							sum += a_src[bi * M * K + i * K + kk]
+						}
+						expected_db[bi * K * N + kk * N + j] = sum
+					}
+				}
+			}
+
+			got_da: [BATCH * M * K]f32
+			got_db: [BATCH * K * N]f32
+			ml.get_gradient(a_f32, got_da[:])
+			ml.get_gradient(b_f32, got_db[:])
+
+			da_ok := true
+			for i in 0 ..< BATCH * M * K {
+				if got_da[i] != expected_da[i] { da_ok = false }
+			}
+			db_ok := true
+			for i in 0 ..< BATCH * K * N {
+				if got_db[i] != expected_db[i] { db_ok = false }
+			}
+			check(da_ok, fmt.tprintf("%v: Bf16 batched_matmul (coopmat-tile) backward da matches f32 reference", label), any_failed)
+			check(db_ok, fmt.tprintf("%v: Bf16 batched_matmul (coopmat-tile) backward db matches f32 reference", label), any_failed)
+		}
+
 		// Bf16 sub forward + backward. Clean integer/half values that round-trip
 		// exactly through bf16 so the result matches the f32 reference bit-for-bit.
 		{
@@ -809,6 +902,46 @@ main :: proc() {
 				if math.abs(got_dx[i] - ref_dx[i]) > tol { bwd_ok = false }
 			}
 			check(bwd_ok, fmt.tprintf("%v: Bf16 attention backward dx matches f32 reference", label), any_failed)
+		}
+
+		// Bf16 attention forward at coopmat shape: head_size=16 (the smallest
+		// shape the coopmat shader accepts), T=32 covers 2 query-blocks at
+		// BR=16, exercising the WG.y > 1 path. Backward still falls back to
+		// the SIMT bf16 shaders (coopmat backward is not yet implemented).
+		{
+			T     :: 32
+			HEADS :: 2
+			D     :: 16
+			E     :: HEADS * D
+
+			input_src: [T * 3 * E]f32
+			for i in 0 ..< T * 3 * E {
+				input_src[i] = f32(((i + 1) % 5) - 2) * 0.25
+			}
+
+			ref_out: [T * E]f32
+			{
+				x := ml.tensor(input_src[:])
+				x  = ml.reshape(x, {T, 3 * E})
+				y := ml.attention(x, HEADS, true)
+				ml.get_data(y, ref_out[:])
+			}
+
+			x_f32 := ml.tensor(input_src[:])
+			x_f32  = ml.reshape(x_f32, {T, 3 * E})
+			x_bf  := ml.cast_to(x_f32, .Bf16)
+			y_bf  := ml.attention(x_bf, HEADS, true)
+			y     := ml.cast_to(y_bf, .F32)
+
+			got_y: [T * E]f32
+			ml.get_data(y, got_y[:])
+
+			tol :: f32(5e-2)
+			fwd_ok := true
+			for i in 0 ..< T * E {
+				if math.abs(got_y[i] - ref_out[i]) > tol { fwd_ok = false }
+			}
+			check(fwd_ok, fmt.tprintf("%v: Bf16 attention (coopmat-shape) forward matches f32 reference", label), any_failed)
 		}
 
 		// Bf16 mean forward + backward.
