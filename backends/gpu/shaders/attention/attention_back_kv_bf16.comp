@@ -1,0 +1,157 @@
+// Bf16 variant of attention_back_kv.comp. Q/K/V/dO/dK/dV are bf16
+// packed-uint; lse and d_acc stay f32. head_size must be even (asserted at
+// dispatch). Each workgroup uniquely owns its (kv_h, t_k) slot in dK/dV.
+#version 450
+#include "bf16.glsl"
+
+#define WG 64
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly buffer Q  { uint  q_buf[]; };
+layout(set = 0, binding = 1) readonly buffer K  { uint  k_buf[]; };
+layout(set = 0, binding = 2) readonly buffer V  { uint  v_buf[]; };
+layout(set = 0, binding = 3) readonly buffer DO { uint  dout[];  };
+layout(set = 0, binding = 4) readonly buffer L  { float lse[];   };
+layout(set = 0, binding = 5) readonly buffer DA { float d_acc[]; };
+layout(set = 0, binding = 6)          buffer DK { uint  dk[];    };
+layout(set = 0, binding = 7)          buffer DV { uint  dv[];    };
+
+layout(push_constant) uniform Params {
+    uint n_q_heads;
+    uint n_kv_heads;
+    uint head_size;
+    uint token_count;
+    uint q_size;
+    uint kv_size;
+    uint causal;
+} p;
+
+shared float k_shared[256];
+shared float v_shared[256];
+shared float dk_shared[256];
+shared float dv_shared[256];
+shared float partial[WG];
+shared float scratch[2];
+
+float load_q(uint elem_idx) {
+    uint pair = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((q_buf[pair] >> shift) & 0xffffu);
+}
+float load_k(uint elem_idx) {
+    uint pair = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((k_buf[pair] >> shift) & 0xffffu);
+}
+float load_v(uint elem_idx) {
+    uint pair = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((v_buf[pair] >> shift) & 0xffffu);
+}
+float load_dout(uint elem_idx) {
+    uint pair = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((dout[pair] >> shift) & 0xffffu);
+}
+
+void main() {
+    uint kv_h = gl_WorkGroupID.x;
+    uint t_k  = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+
+    uint D = p.head_size;
+    uint T = p.token_count;
+    uint group_size = p.n_q_heads / p.n_kv_heads;
+    float inv_sqrt_d = inversesqrt(float(D));
+
+    uint k_base = t_k * p.kv_size + kv_h * D;
+    uint v_base = t_k * p.kv_size + kv_h * D;
+
+    for (uint d = tid; d < D; d += WG) {
+        k_shared[d] = load_k(k_base + d);
+        v_shared[d] = load_v(v_base + d);
+    }
+    if (tid < D) {
+        dk_shared[tid] = 0.0;
+        dv_shared[tid] = 0.0;
+    }
+    barrier();
+
+    float d_k_acc = 0.0;
+    float d_v_acc = 0.0;
+    uint  my_d    = tid;
+
+    for (uint q_h_off = 0u; q_h_off < group_size; q_h_off += 1u) {
+        uint h = kv_h * group_size + q_h_off;
+        uint t_q_min = (p.causal != 0u) ? t_k : 0u;
+
+        for (uint t_q = t_q_min; t_q < T; t_q += 1u) {
+            uint q_base  = t_q * p.q_size + h * D;
+            uint do_base = t_q * p.q_size + h * D;
+
+            float s_part = 0.0;
+            for (uint d = tid; d < D; d += WG) {
+                s_part += load_q(q_base + d) * k_shared[d];
+            }
+            partial[tid] = s_part;
+            barrier();
+            for (uint st = WG / 2u; st > 0u; st >>= 1) {
+                if (tid < st) partial[tid] += partial[tid + st];
+                barrier();
+            }
+            if (tid == 0u) scratch[0] = partial[0];
+            barrier();
+            float raw_score = scratch[0];
+            barrier();
+
+            float dp_part = 0.0;
+            for (uint d = tid; d < D; d += WG) {
+                dp_part += load_dout(do_base + d) * v_shared[d];
+            }
+            partial[tid] = dp_part;
+            barrier();
+            for (uint st = WG / 2u; st > 0u; st >>= 1) {
+                if (tid < st) partial[tid] += partial[tid + st];
+                barrier();
+            }
+            if (tid == 0u) scratch[1] = partial[0];
+            barrier();
+            float d_P = scratch[1];
+
+            float p_val   = exp(raw_score * inv_sqrt_d - lse[h * T + t_q]);
+            float d_S_inv = p_val * (d_P - d_acc[h * T + t_q]) * inv_sqrt_d;
+
+            if (my_d < D) {
+                d_v_acc += p_val   * load_dout(do_base + my_d);
+                d_k_acc += d_S_inv * load_q   (q_base  + my_d);
+            }
+            barrier();
+        }
+    }
+
+    if (my_d < D) {
+        dk_shared[my_d] = d_k_acc;
+        dv_shared[my_d] = d_v_acc;
+    }
+    barrier();
+
+    uint pair_count = D >> 1u;
+    for (uint pi = tid; pi < pair_count; pi += WG) {
+        uint d0 = 2u * pi;
+        uint d1 = d0 + 1u;
+
+        uint k_pair = (k_base + d0) >> 1u;
+        uint v_pair = (v_base + d0) >> 1u;
+
+        uint k_old = dk[k_pair];
+        float k0 = bf16_expand(k_old & 0xffffu)         + dk_shared[d0];
+        float k1 = bf16_expand((k_old >> 16) & 0xffffu) + dk_shared[d1];
+        dk[k_pair] = (bf16_round(k1) << 16) | bf16_round(k0);
+
+        uint v_old = dv[v_pair];
+        float v0 = bf16_expand(v_old & 0xffffu)         + dv_shared[d0];
+        float v1 = bf16_expand((v_old >> 16) & 0xffffu) + dv_shared[d1];
+        dv[v_pair] = (bf16_round(v1) << 16) | bf16_round(v0);
+    }
+}

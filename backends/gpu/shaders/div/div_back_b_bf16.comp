@@ -1,0 +1,56 @@
+// b.grad[j] += sum_i dy[i*n_b + j] * (-a[i*n_b + j] / b[j]^2), packed bf16.
+#version 450
+#include "bf16.glsl"
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer A    { uint a[];    };
+layout(set = 0, binding = 1) readonly buffer B    { uint b[];    };
+layout(set = 0, binding = 2) readonly buffer DY   { uint dy[];   };
+layout(set = 0, binding = 3)          buffer DA_B { uint da_b[]; };
+layout(push_constant) uniform Params { uint n_b; uint stride; uint pair_count; } p;
+
+uint load_half(uint buf_pair, uint shift) { return (buf_pair >> shift) & 0xffffu; }
+float load_b(uint j) {
+    uint pair = j >> 1u;
+    uint shift = (j & 1u) * 16u;
+    return bf16_expand((b[pair] >> shift) & 0xffffu);
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+    uint j0 = 2u * pair;
+    uint j1 = j0 + 1u;
+
+    float bj0    = (j0 < p.n_b) ? load_b(j0) : 1.0;
+    float bj1    = (j1 < p.n_b) ? load_b(j1) : 1.0;
+    float bj0_sq = bj0 * bj0;
+    float bj1_sq = bj1 * bj1;
+
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    for (uint i = 0; i < p.stride; ++i) {
+        uint row = i * p.n_b;
+        if (j0 < p.n_b) {
+            uint idx = row + j0;
+            uint pi = idx >> 1u;
+            uint sh = (idx & 1u) * 16u;
+            float dy_v = bf16_expand(load_half(dy[pi], sh));
+            float a_v  = bf16_expand(load_half(a [pi], sh));
+            acc0 += dy_v * (-a_v / bj0_sq);
+        }
+        if (j1 < p.n_b) {
+            uint idx = row + j1;
+            uint pi = idx >> 1u;
+            uint sh = (idx & 1u) * 16u;
+            float dy_v = bf16_expand(load_half(dy[pi], sh));
+            float a_v  = bf16_expand(load_half(a [pi], sh));
+            acc1 += dy_v * (-a_v / bj1_sq);
+        }
+    }
+    uint da_pair = da_b[pair];
+    uint lo = da_pair & 0xffffu;
+    uint hi = (da_pair >> 16) & 0xffffu;
+    if (j0 < p.n_b) lo = bf16_round(bf16_expand(lo) + acc0);
+    if (j1 < p.n_b) hi = bf16_round(bf16_expand(hi) + acc1);
+    da_b[pair] = (hi << 16) | lo;
+}

@@ -1,0 +1,23 @@
+#version 450
+#include "bf16.glsl"
+#define GELU_SCALE 0.7978845608028654
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly  buffer X { uint x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { uint y[]; };
+layout(push_constant) uniform Params { uint n; uint pair_count; } p;
+
+float gelu(float v) {
+    float cube = 0.044715 * v * v * v;
+    return 0.5 * v * (1.0 + tanh(GELU_SCALE * (v + cube)));
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+    uint xp = x[pair];
+    uint i0 = 2u*pair, i1 = i0+1u;
+    uint lo = 0u, hi = 0u;
+    if (i0 < p.n) lo = bf16_round(gelu(bf16_expand(xp & 0xffffu)));
+    if (i1 < p.n) hi = bf16_round(gelu(bf16_expand((xp >> 16) & 0xffffu)));
+    y[pair] = (hi << 16) | lo;
+}

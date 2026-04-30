@@ -310,7 +310,7 @@ proc is `ml.cast_to(input, target_type)`. The op variant is `Cast{}`
   `cpu.odin`, with shared `_cast_bytes` and `_cast_bytes_accumulate`
   helpers. Backward accumulates (`+=`) into `input.gradient`.
 - GPU: F32 ↔ Bf16 only. Four shaders under
-  `backends/gpu/shaders/cast_*.comp` (with built `.spv`):
+  `backends/gpu/shaders/cast/*.comp` (with built `.spv`):
   `cast_f32_to_bf16`, `cast_bf16_to_f32`, plus `_back` variants used
   by `cast_backward`. Same-type cast forward falls through to `_copy`
   (a vk buffer copy); same-type backward currently panics (intentional

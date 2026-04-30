@@ -1,0 +1,21 @@
+#version 450
+#include "bf16.glsl"
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Y  { uint y[];  };
+layout(set = 0, binding = 1) readonly buffer DY { uint dy[]; };
+layout(set = 0, binding = 2)          buffer DX { uint dx[]; };
+layout(push_constant) uniform Params { uint n; uint pair_count; } p;
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+    uint yp = y[pair];
+    uint dyp = dy[pair];
+    uint dxp = dx[pair];
+    uint lo = dxp & 0xffffu;
+    uint hi = (dxp >> 16) & 0xffffu;
+    uint i0 = 2u*pair, i1 = i0+1u;
+    if (i0 < p.n) lo = bf16_round(bf16_expand(lo) + bf16_expand(yp & 0xffffu)        * bf16_expand(dyp & 0xffffu));
+    if (i1 < p.n) hi = bf16_round(bf16_expand(hi) + bf16_expand((yp >> 16) & 0xffffu) * bf16_expand((dyp >> 16) & 0xffffu));
+    dx[pair] = (hi << 16) | lo;
+}

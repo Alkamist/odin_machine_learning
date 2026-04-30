@@ -1,0 +1,53 @@
+// Bf16 variant of attention_back_d.comp. o and dout are bf16 packed-uint;
+// d_acc stays f32 (internal scratch).
+#version 450
+#include "bf16.glsl"
+
+#define WG 64
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer O  { uint  o[];     };
+layout(set = 0, binding = 1) readonly  buffer DO { uint  dout[];  };
+layout(set = 0, binding = 2) writeonly buffer DA { float d_acc[]; };
+
+layout(push_constant) uniform Params {
+    uint n_q_heads;
+    uint head_size;
+    uint token_count;
+    uint q_size;
+} p;
+
+shared float partial[WG];
+
+float load_o(uint elem_idx) {
+    uint pair  = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((o[pair] >> shift) & 0xffffu);
+}
+float load_dout(uint elem_idx) {
+    uint pair  = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((dout[pair] >> shift) & 0xffffu);
+}
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint t_q  = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+    uint base = t_q * p.q_size + h * p.head_size;
+
+    float s = 0.0;
+    for (uint d = tid; d < p.head_size; d += WG) {
+        s += load_dout(base + d) * load_o(base + d);
+    }
+    partial[tid] = s;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) {
+        d_acc[h * p.token_count + t_q] = partial[0];
+    }
+}

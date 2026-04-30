@@ -1,0 +1,33 @@
+// b.grad[j] -= sum_i dy[i*n_b + j], packed-bf16 RMW per b-pair.
+#version 450
+#include "bf16.glsl"
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer DY   { uint dy[];   };
+layout(set = 0, binding = 1)          buffer DA_B { uint da_b[]; };
+layout(push_constant) uniform Params { uint n_b; uint stride; uint pair_count; } p;
+
+uint load_dy(uint elem_index) {
+    uint pair = elem_index >> 1u;
+    uint shift = (elem_index & 1u) * 16u;
+    return (dy[pair] >> shift) & 0xffffu;
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= p.pair_count) return;
+    uint j0 = 2u * pair;
+    uint j1 = j0 + 1u;
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    for (uint i = 0; i < p.stride; ++i) {
+        uint row = i * p.n_b;
+        if (j0 < p.n_b) acc0 += bf16_expand(load_dy(row + j0));
+        if (j1 < p.n_b) acc1 += bf16_expand(load_dy(row + j1));
+    }
+    uint da_pair = da_b[pair];
+    uint lo = da_pair & 0xffffu;
+    uint hi = (da_pair >> 16) & 0xffffu;
+    if (j0 < p.n_b) lo = bf16_round(bf16_expand(lo) - acc0);
+    if (j1 < p.n_b) hi = bf16_round(bf16_expand(hi) - acc1);
+    da_b[pair] = (hi << 16) | lo;
+}

@@ -1,0 +1,138 @@
+// Bf16 variant of attention_back_q.comp.
+#version 450
+#include "bf16.glsl"
+
+#define WG 64
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly buffer Q  { uint  q_buf[]; };
+layout(set = 0, binding = 1) readonly buffer K  { uint  k_buf[]; };
+layout(set = 0, binding = 2) readonly buffer V  { uint  v_buf[]; };
+layout(set = 0, binding = 3) readonly buffer DO { uint  dout[];  };
+layout(set = 0, binding = 4) readonly buffer L  { float lse[];   };
+layout(set = 0, binding = 5) readonly buffer DA { float d_acc[]; };
+layout(set = 0, binding = 6)          buffer DQ { uint  dq[];    };
+
+layout(push_constant) uniform Params {
+    uint n_q_heads;
+    uint n_kv_heads;
+    uint head_size;
+    uint token_count;
+    uint q_size;
+    uint kv_size;
+    uint causal;
+} p;
+
+shared float q_shared[256];
+shared float do_shared[256];
+shared float dq_shared[256];
+shared float partial[WG];
+shared float scratch[2];
+
+float load_q(uint elem_idx) {
+    uint pair = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((q_buf[pair] >> shift) & 0xffffu);
+}
+float load_k(uint elem_idx) {
+    uint pair = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((k_buf[pair] >> shift) & 0xffffu);
+}
+float load_v(uint elem_idx) {
+    uint pair = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((v_buf[pair] >> shift) & 0xffffu);
+}
+float load_dout(uint elem_idx) {
+    uint pair = elem_idx >> 1u;
+    uint shift = (elem_idx & 1u) * 16u;
+    return bf16_expand((dout[pair] >> shift) & 0xffffu);
+}
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint t_q  = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+
+    uint D    = p.head_size;
+    uint T    = p.token_count;
+    uint kv_h = h * p.n_kv_heads / p.n_q_heads;
+    float inv_sqrt_d = inversesqrt(float(D));
+
+    uint q_base  = t_q * p.q_size + h * D;
+    uint do_base = t_q * p.q_size + h * D;
+
+    for (uint d = tid; d < D; d += WG) {
+        q_shared[d]  = load_q   (q_base  + d);
+        do_shared[d] = load_dout(do_base + d);
+    }
+    barrier();
+
+    float lse_q = lse[h * T + t_q];
+    float dac_q = d_acc[h * T + t_q];
+
+    float d_q_acc = 0.0;
+    uint  my_d    = tid;
+
+    uint t_k_max = (p.causal != 0u) ? (t_q + 1u) : T;
+    for (uint t_k = 0u; t_k < t_k_max; t_k += 1u) {
+        uint k_base = t_k * p.kv_size + kv_h * D;
+        uint v_base = t_k * p.kv_size + kv_h * D;
+
+        float s_part = 0.0;
+        for (uint d = tid; d < D; d += WG) {
+            s_part += q_shared[d] * load_k(k_base + d);
+        }
+        partial[tid] = s_part;
+        barrier();
+        for (uint st = WG / 2u; st > 0u; st >>= 1) {
+            if (tid < st) partial[tid] += partial[tid + st];
+            barrier();
+        }
+        if (tid == 0u) scratch[0] = partial[0];
+        barrier();
+        float raw_score = scratch[0];
+        barrier();
+
+        float dp_part = 0.0;
+        for (uint d = tid; d < D; d += WG) {
+            dp_part += do_shared[d] * load_v(v_base + d);
+        }
+        partial[tid] = dp_part;
+        barrier();
+        for (uint st = WG / 2u; st > 0u; st >>= 1) {
+            if (tid < st) partial[tid] += partial[tid + st];
+            barrier();
+        }
+        if (tid == 0u) scratch[1] = partial[0];
+        barrier();
+        float d_P = scratch[1];
+
+        float p_val   = exp(raw_score * inv_sqrt_d - lse_q);
+        float d_S_inv = p_val * (d_P - dac_q) * inv_sqrt_d;
+
+        if (my_d < D) {
+            d_q_acc += d_S_inv * load_k(k_base + my_d);
+        }
+        barrier();
+    }
+
+    if (my_d < D) {
+        dq_shared[my_d] = d_q_acc;
+    }
+    barrier();
+
+    uint pair_count = D >> 1u;
+    for (uint pi = tid; pi < pair_count; pi += WG) {
+        uint d0 = 2u * pi;
+        uint d1 = d0 + 1u;
+        uint q_pair = (q_base + d0) >> 1u;
+
+        uint q_old = dq[q_pair];
+        float q0 = bf16_expand(q_old & 0xffffu)         + dq_shared[d0];
+        float q1 = bf16_expand((q_old >> 16) & 0xffffu) + dq_shared[d1];
+        dq[q_pair] = (bf16_round(q1) << 16) | bf16_round(q0);
+    }
+}
