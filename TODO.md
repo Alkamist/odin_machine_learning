@@ -32,15 +32,237 @@ goals (in addition to the dtype/perf items below):
   codecs (EnCodec/SoundStream) and discrete-latent world models.
 
 Suggested phasing:
-1. Dtype foundation (phase 1 below).
-2. Modern attention surface: GQA, RoPE op, sliding window, KV-cache
-   decode. Makes the library "Gemma-shaped."
-3. Conv1d/2d + FFT. Unlocks audio and vision frontends.
-4. End-to-end checkpoint load: pull a small Gemma 4 variant (E4B)
-   from HF, run inference, match logits. This is the forcing function
-   that surfaces every remaining gap.
-5. Branch into one of {audio generation, world-model RL, MoE
-   training} — roughly equal effort off the same trunk.
+1. Dtype foundation (phase 1 below). DONE.
+2. Modern attention surface for training: RMSNorm, RoPE-as-an-op, GQA,
+   tied embeddings — all forward + backward. SwiGLU MLP comes free
+   from existing primitives. DONE — `networks/llama/llama.odin` exists
+   and `pytorch_parity llama_train` validates the full stack.
+3. SmolLM2-135M forward-parity inference. DONE — safetensors loader
+   plus `examples/smollm_inference/main.odin` matches HF logits within
+   3e-4 on the 30-layer 135M checkpoint.
+4. **Odin GPT-2 BPE tokenizer + sampling loop.** "Watch it generate"
+   path. See "Next up" under the SmolLM2 section.
+5. Stack-validation pretrain: ~30–50M params, ~1B tokens, overnight
+   run. Sanity check that the training loop, optimizer, and data
+   pipeline are correct end-to-end.
+6. SmolLM2-135M fine-tune on a small corpus. Reuses the training loop
+   from step 5; once forward parity is in (DONE), this is mostly data
+   plumbing.
+7. Sliding-window attention + KV-cache + `attention_decode`. Promotes
+   the library from "can run a small generation demo" to "can run
+   long-context inference at speed."
+8. Gemma 4 E4B end-to-end: pull bf16 safetensors from HF, run
+   inference, match logits. Forcing function for any remaining gaps
+   (multimodal-tower-skipping in loader, SentencePiece tokenizer,
+   etc.).
+9. From-scratch pretrain at 160M+ scale. Match a published recipe
+   (Pythia-160M or SmolLM2-135M). This is the "trainable
+   intelligence" claim landing.
+10. Conv1d/2d + FFT. Unlocks audio and vision frontends.
+11. Branch into one of {audio generation, world-model RL, MoE
+    training} — roughly equal effort off the same trunk.
+
+## Current plan: SmolLM2-135M fine-tune path
+
+Decided this session. The Gemma 4 E4B inference POC was reframed as a
+later milestone after realizing it validates inference-only infra
+(KV-cache, sampling, multimodal loader) without exercising the
+training story, which is the actual project goal.
+
+SmolLM2-135M is architecturally a miniature Gemma (RMSNorm, RoPE, GQA
+9q/3kv, SwiGLU MLP, tied embeddings, GPT-2 BPE tokenizer). Every op
+needed to load and fine-tune it is also needed for Gemma later. Fits
+comfortably on a 3090 Ti (~5–7 GB train memory with FP32 master + bf16
+compute + Adam).
+
+Steps in order, each runnable:
+
+1. **Op surface** (forward + backward, bf16 + f32, CPU + GPU):
+   - RMSNorm — DONE. New `Rmsnorm` variant in `ml.odin` (`weight`,
+     `rstd` scratch — no mean), proc `ml.rmsnorm(input, weight)`.
+     CPU `rmsnorm_forward`/`rmsnorm_backward` split into `_f32` and
+     `_bf16` paths mirroring `layernorm`. GPU has four shaders
+     (`rmsnorm_stats`, `rmsnorm`, `rmsnorm_back_input`,
+     `rmsnorm_back_weight`) plus bf16 variants; bf16 forward/backward
+     require even `size`. Coverage: dtype_roundtrip bf16 case
+     (CPU + GPU), pytorch_parity `rmsnorm` and `rmsnorm_big` (M=64,
+     N=128) on both backends.
+   - RoPE-as-an-op with `theta` config — DONE. Already promoted to
+     `ml.rope(input, head_count, base = 10000) -> output`. Uses
+     `cos_cache` / `sin_cache` scratch tensors. The transformer block
+     calls it directly (no inlined RoPE).
+   - GQA in `attention` — DONE. Reshaped the API: `ml.attention(query,
+     key, value, n_q_heads, n_kv_heads = n_q_heads, causal = true)`.
+     The op variant carries `key`/`value` plus the existing scratch
+     tensors; `Operation.input` holds query (mirrors the `Add{b}` /
+     `Linear{weight}` pattern). Shapes:
+     `query: [T, n_q_heads * D]`, `key/value: [T, n_kv_heads * D]`.
+     Inside kernels, `kv_h = h * n_kv_heads / n_q_heads` — K/V are
+     never expanded into a buffer. CPU forward parallelizes over
+     q-heads; backward parallelizes over kv-heads (with the inner
+     loop covering the q-head group) so dK/dV writes are race-free.
+     GPU back_kv shader is one workgroup per `(kv_head, key)`,
+     iterating the q-head group internally; back_q / back_d /
+     forward stay one workgroup per `(q_head, query)`. Coverage:
+     dtype_roundtrip Bf16 GQA case (4 q-heads × 2 kv-heads),
+     pytorch_parity `attention_gqa` and `attention_gqa_big`
+     (SmolLM2-shaped: 9 q-heads × 3 kv-heads, T=64) on CPU + GPU.
+     The disabled `attention_bf16_coopmat.comp` was minimally
+     updated to take Q/K/V separately and asserts `n_kv == n_q` at
+     dispatch — full GQA support deferred until the coopmat
+     attention path becomes profitable.
+   - Tied embeddings — DONE. No new op was needed: re-using one
+     `Tensor` across `ml.select` (embed lookup) and `ml.linear`
+     (lm_head) just works because both backward paths accumulate
+     into `gradient(weight)` with `+=`. `networks/transformer/`
+     gained a `tied_embeddings` flag (default true): when true,
+     `transformer.output_weight` aliases `transformer.token_embeddings`
+     and is skipped in `make`/`destroy`/`copy`/`randomize`/`update`
+     so the shared tensor isn't double-allocated or double-stepped.
+     Coverage: pytorch_parity `tied_embeddings` test
+     (vocab=32, embed=8, 12 tokens) checks loss + grad_w against a
+     PyTorch reference where one `nn.Parameter` is reused for embed
+     and lm_head.
+   - PyTorch parity tests for each, plus a `_big` variant for
+     attention to exercise the GQA path at realistic shapes — DONE
+     (`rmsnorm` + `rmsnorm_big`, `attention_gqa` + `attention_gqa_big`,
+     `tied_embeddings`, plus the new `llama_train` end-to-end test).
+
+   **Network module — DONE.** `networks/llama/llama.odin` composes the
+   above ops into a Llama/SmolLM2-shaped model: `select` → per-layer
+   (RMSNorm → q/k/v_proj → RoPE on Q/K → GQA attention → o_proj →
+   residual → RMSNorm → SwiGLU MLP → residual) → final RMSNorm → tied
+   lm_head. Weight field names match HuggingFace safetensors so the
+   loader work (step 3) is mechanical. Provides `SMOLLM2_135M_CONFIG`
+   (30L / 576E / 9q×3kv / D=64 / FFN=1536 / vocab=49152 /
+   rope_base=100000). Coverage: `pytorch_parity llama_train` (2 layers,
+   embed=32, 4q×2kv, 20 Adam steps, F32, loss curve matches PyTorch
+   reference within 1e-3 abs / 5e-3 rel) plus a `tests/smollm_smoke/`
+   that allocates the full 30-layer config and runs one forward
+   (71 ms on CPU at 8 tokens) to confirm dimensions check out
+   end-to-end.
+
+2. **Stack-validation pretrain** (overnight, ~30–50M params):
+   - Streaming dataset loader (FineWeb-Edu sample or similar).
+   - GPT-2 BPE tokenizer (matches SmolLM2 — saves work later).
+   - Training loop with gradient accumulation, checkpointing,
+     periodic eval. Live in `examples/pretrain_small/`.
+   - Mixed-precision recipe: FP32 master weights, bf16 compute,
+     FP32 Adam state. Subsumes the deferred mixed-precision
+     example below.
+   - Acceptance: loss drops from ~10 nats to ~4 nats on FineWeb-Edu
+     within a few hours. Curve shape matches published references
+     for similarly-sized models.
+
+3. **Safetensors loader** — DONE.
+   - Generic `loaders/safetensors/safetensors.odin`: read file,
+     parse the v0.3 JSON header, expose `get_info(name)` /
+     `get_bytes(name)` lookups. JSON is parsed with
+     `core:encoding/json` (parse_integers=true).
+   - SmolLM2/Llama mapping in `networks/llama/loader.odin`:
+     `llama.load_safetensors(model, path)` walks the HF tensor
+     names (`model.embed_tokens.weight`, `model.layers.{i}.*`,
+     `model.norm.weight`, optional `lm_head.weight`) and uploads
+     them. Handles both F32 and BF16 storage by converting to F32
+     master weights. **Q/K projection rows are permuted at load
+     time** to convert HF's `rotate_half` RoPE layout
+     (`[first_half, second_half]` per head) into our `ml.rope`
+     layout (interleaved pairs). V/o_proj need no permutation.
+   - Currently reads the whole file into RAM. mmap optimization
+     deferred until 8B-class checkpoints make it matter.
+
+4. **Forward parity check** — DONE.
+   - `examples/smollm_inference/main.odin` allocates
+     `llama.SMOLLM2_135M_CONFIG`, loads HF weights, runs forward
+     on a fixed prompt, compares to logits dumped by
+     `tools/smollm_dump.py` (which downloads the HF checkpoint
+     and runs `transformers` as the reference).
+   - Result on prompt *"The capital of France is"*: max abs logit
+     diff **3e-4**, top-5 predictions match HF identically at
+     every position. " Paris" sits at position 2 in the next-token
+     top-5, same rank as HF.
+   - Forward at 5 tokens runs in ~50 ms on CPU; weight load takes
+     ~200 ms. Single-threaded would be slower; this used 8 CPU
+     threads.
+
+5. **Fine-tune**:
+   - Pick a small instruction or domain corpus.
+   - Reuse the training loop from step 2.
+   - A few thousand steps. Acceptance: loss drops cleanly,
+     greedy-decode samples reflect the fine-tune corpus.
+
+### Next up: Odin tokenizer + sampling loop ("watch it generate")
+
+Forward parity is in place; the missing piece between that and "type a
+prompt and see SmolLM2 talk" is text I/O. User decision: the tokenizer
+will be implemented entirely in Odin (no Python tokenizer wrapper).
+
+Components, in implementation order:
+
+1. **GPT-2 byte-level BPE tokenizer** in `tokenizers/gpt2/` (or
+   similar). The HF `tokenizer.json` for SmolLM2-135M is already saved
+   at `smollm_data/tokenizer.json`. Structure:
+   - `model.type = "BPE"`, vocab size 49152, 48900 merges.
+   - Pre-tokenizer is a `Sequence` of `Digits{individual_digits=true}`
+     then `ByteLevel{add_prefix_space=false, use_regex=true}`.
+   - ByteLevel decoder (inverse byte-to-unicode mapping).
+   - 1 entry in `added_tokens` (the `<|endoftext|>`-equivalent;
+     verify exact name when implementing).
+   Implementation pieces:
+   - Parse `tokenizer.json` with `core:encoding/json`.
+   - Build the standard 256-byte → Unicode-printable map and its
+     inverse.
+   - Implement the GPT-2 pre-tokenizer regex
+     `' ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`. Check
+     `core:text/regex` for Unicode property class support
+     (`\p{L}`, `\p{N}`); if missing, hand-roll a small character-
+     class state machine — that's what gpt2.c, llama.cpp, and
+     tokenizers-rs all do.
+   - BPE merge step: per pre-token word, repeatedly merge the
+     highest-priority adjacent pair (using a `map[Pair]int` rank
+     lookup built from the merges list). Standard algorithm —
+     ~50 lines.
+   - Decoder: ID → BPE-token strings → concatenate → byte-level
+     decode → UTF-8.
+   - Acceptance: encode/decode parity against HF's tokenizer for
+     ~50 fixed prompts (a small parity script + a binary that
+     prints token IDs would do it).
+
+2. **Sampling loop.** Lives in `examples/smollm_chat/main.odin` (or
+   inside the existing `smollm_inference` example). Naive: re-runs
+   the full forward each generated token. KV-cache stays deferred —
+   short generations (< 100 tokens) at the SmolLM2-135M scale should
+   be tolerable on CPU (~50 ms × N²/2 / batch). Modes:
+   - Greedy: argmax of last-row logits.
+   - Top-k with temperature: top-k indices, softmax with `T`,
+     sample via cumulative + `rand_float32`.
+   Optional: top-p (nucleus). Defer if greedy + top-k cover the
+   demo case.
+
+3. **Chat example.** `examples/smollm_chat/main.odin`: CLI takes a
+   prompt, tokenizes, runs N sampling steps, decodes incrementally,
+   prints tokens as they arrive. Matches HF's greedy continuation
+   for the first ~20 tokens of *"The capital of France is"* as the
+   acceptance check.
+
+Once this is in, we also have the BPE tokenizer needed for step 2
+(stack-validation pretrain) and step 4 (SmolLM2 fine-tune corpus
+encoding).
+
+Deferred until after the above lands:
+- Sliding-window attention, KV-cache, `attention_decode`. Needed
+  for fast generation at long context; not needed for short demo
+  generations or for fine-tune validation.
+- SentencePiece tokenizer. Gemma uses it; SmolLM2 uses GPT-2 BPE,
+  which is simpler.
+- 8B-scale checkpoint loading + multimodal-tower-skipping. Gemma
+  4-specific.
+- Attention coopmat performance tuning (currently disabled). Not
+  blocking 135M training; revisit when something benches slow.
+- `select` bf16 path. SmolLM2 fine-tune in mixed precision keeps
+  `token_embeddings` as F32 master and casts the lookup output to
+  Bf16; a bf16 select would shave one cast per step but is not
+  blocking.
 
 ## Multi-dtype foundation (precondition for serious LLM work)
 
@@ -317,6 +539,10 @@ Ordered by what unlocks the most when done:
 
 ### Open / next phases
 
+The bf16 trunk is functionally complete for training. Next work is
+driven by the SmolLM2-135M plan above, not by more bf16 perf. Items
+left from this section that were deferred rather than retired:
+
 - **Make attention coopmat profitable.** Forward shader exists
   (`attention_bf16_coopmat.comp`) but currently slower than SIMT.
   Most promising next moves: parallelize the per-row softmax across
@@ -325,14 +551,13 @@ Ordered by what unlocks the most when done:
   iteration, multi-subgroup BR=32 to amortize K/V staging across
   more queries, specialization constants for D so shared-memory
   isn't sized for the worst case. Once the forward wins, port the
-  same Q-tile layout to backward.
+  same Q-tile layout to backward. Revisit once 135M training
+  benches show attention as a bottleneck — at seq=1024 the coopmat
+  path may already win without further tuning.
 
-- **Mixed-precision recipe in `examples/`.** Show the standard "FP32
-  master weights, BF16 forward/backward, FP32 optimizer state"
-  pattern end-to-end on a small transformer. The `transformer_train_bf16`
-  parity test and the bf16 path in `tests/gpu_transformer_bench`
-  already demonstrate the building blocks; promote to a runnable
-  example once attention coopmat lands.
+- **Mixed-precision recipe in `examples/`.** Subsumed by step 2 of
+  the SmolLM2 plan: the stack-validation pretrain run is the
+  end-to-end mixed-precision recipe.
 
 **Design decisions to lock in at phase 1:**
 
@@ -418,12 +643,12 @@ Ordered by what unlocks the most when done:
 
 ## Test coverage
 
-- **End-to-end transformer parity test.** This session's `linear` bug (M > TILE_M
-  rows uninitialized) wasn't caught by op-level parity tests because every
-  `linear_*` test had M <= 32. A small "transformer training step" parity test
-  (mirror the library's transformer block in PyTorch, sync weights, compare
-  loss curves like `mlp_train` does) would catch op-composition bugs much
-  faster than guessing which individual op might be wrong.
+- **End-to-end transformer parity tests.** DONE — `pytorch_parity` now
+  has `transformer_train_bf16` (GPT-2-style block, FP32-master + bf16
+  compute) and `llama_train` (RMSNorm + RoPE + GQA + SwiGLU + tied
+  lm_head, F32). Both compare loss curves to PyTorch references, and
+  the SmolLM2 forward-parity check at `examples/smollm_inference/`
+  validates the full 30-layer 135M model against HF.
 
 - **Larger-shape variants for every parity test.** Add a `_big` variant for any
   op with internal tile sizes. The new `linear_big` (M=64) is the template;

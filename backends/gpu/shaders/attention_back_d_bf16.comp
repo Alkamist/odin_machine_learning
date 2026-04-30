@@ -11,24 +11,21 @@ layout(set = 0, binding = 1) readonly  buffer DO { uint  dout[];  };
 layout(set = 0, binding = 2) writeonly buffer DA { float d_acc[]; };
 
 layout(push_constant) uniform Params {
-    uint head_count;
+    uint n_q_heads;
     uint head_size;
     uint token_count;
-    uint embed_size;
+    uint q_size;
 } p;
 
 shared float partial[WG];
 
-float bf16_expand(uint half_bits) {
-    return uintBitsToFloat(half_bits << 16);
-}
+float bf16_expand(uint half_bits) { return uintBitsToFloat(half_bits << 16); }
 
 float load_o(uint elem_idx) {
     uint pair  = elem_idx >> 1u;
     uint shift = (elem_idx & 1u) * 16u;
     return bf16_expand((o[pair] >> shift) & 0xffffu);
 }
-
 float load_dout(uint elem_idx) {
     uint pair  = elem_idx >> 1u;
     uint shift = (elem_idx & 1u) * 16u;
@@ -39,7 +36,7 @@ void main() {
     uint h    = gl_WorkGroupID.x;
     uint t_q  = gl_WorkGroupID.y;
     uint tid  = gl_LocalInvocationID.x;
-    uint base = t_q * p.embed_size + h * p.head_size;
+    uint base = t_q * p.q_size + h * p.head_size;
 
     float s = 0.0;
     for (uint d = tid; d < p.head_size; d += WG) {

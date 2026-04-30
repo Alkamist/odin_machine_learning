@@ -846,6 +846,63 @@ main :: proc() {
 				check(dx_ok, fmt.tprintf("%v: Bf16 layernorm backward dx matches f32 reference", label), any_failed)
 				check(dw_ok, fmt.tprintf("%v: Bf16 layernorm backward dw matches f32 reference", label), any_failed)
 			}
+
+			// Rmsnorm: same shape as layernorm, no mean term.
+			{
+				count :: 4
+				size  :: 8
+				x_src: [count * size]f32
+				w_src: [size]f32
+				for i in 0 ..< count * size { x_src[i] = f32(((i + 1) % 7) - 3) * 0.5 }
+				for i in 0 ..< size { w_src[i] = f32((i % 3) - 1) }
+
+				ref_y:  [count * size]f32
+				ref_dx: [count * size]f32
+				ref_dw: [size]f32
+				{
+					x := ml.tensor(x_src[:])
+					x  = ml.reshape(x, {count, size})
+					w := ml.tensor(w_src[:])
+					y := ml.rmsnorm(x, w)
+					ml.get_data(y, ref_y[:])
+					ml.backward()
+					ml.get_gradient(x, ref_dx[:])
+					ml.get_gradient(w, ref_dw[:])
+					ml.clear()
+				}
+
+				x_f32 := ml.tensor(x_src[:])
+				x_f32  = ml.reshape(x_f32, {count, size})
+				w_f32 := ml.tensor(w_src[:])
+				x_bf  := ml.cast_to(x_f32, .Bf16)
+				w_bf  := ml.cast_to(w_f32, .Bf16)
+				y_bf  := ml.rmsnorm(x_bf, w_bf)
+				y     := ml.cast_to(y_bf, .F32)
+
+				got_y: [count * size]f32
+				ml.get_data(y, got_y[:])
+				fwd_ok := true
+				for i in 0 ..< count * size {
+					if math.abs(got_y[i] - ref_y[i]) > 0.05 { fwd_ok = false }
+				}
+				check(fwd_ok, fmt.tprintf("%v: Bf16 rmsnorm forward matches f32 reference", label), any_failed)
+
+				ml.backward()
+				got_dx: [count * size]f32
+				got_dw: [size]f32
+				ml.get_gradient(x_f32, got_dx[:])
+				ml.get_gradient(w_f32, got_dw[:])
+				dx_ok := true
+				for i in 0 ..< count * size {
+					if math.abs(got_dx[i] - ref_dx[i]) > 0.1 { dx_ok = false }
+				}
+				dw_ok := true
+				for i in 0 ..< size {
+					if math.abs(got_dw[i] - ref_dw[i]) > 0.1 { dw_ok = false }
+				}
+				check(dx_ok, fmt.tprintf("%v: Bf16 rmsnorm backward dx matches f32 reference", label), any_failed)
+				check(dw_ok, fmt.tprintf("%v: Bf16 rmsnorm backward dw matches f32 reference", label), any_failed)
+			}
 		}
 
 		// Bf16 attention forward + backward — compared against an F32 attention
@@ -868,7 +925,10 @@ main :: proc() {
 			{
 				x := ml.tensor(input_src[:])
 				x  = ml.reshape(x, {T, 3 * E})
-				y := ml.attention(x, HEADS, true)
+				q := ml.slice_trailing(x, 0,     E)
+				k := ml.slice_trailing(x, E,     2 * E)
+				v := ml.slice_trailing(x, 2 * E, 3 * E)
+				y := ml.attention(q, k, v, HEADS, causal=true)
 				ml.get_data(y, ref_out[:])
 				ml.backward()
 				ml.get_gradient(x, ref_dx[:])
@@ -879,7 +939,10 @@ main :: proc() {
 			x_f32 := ml.tensor(input_src[:])
 			x_f32  = ml.reshape(x_f32, {T, 3 * E})
 			x_bf  := ml.cast_to(x_f32, .Bf16)
-			y_bf  := ml.attention(x_bf, HEADS, true)
+			q_bf  := ml.slice_trailing(x_bf, 0,     E)
+			k_bf  := ml.slice_trailing(x_bf, E,     2 * E)
+			v_bf  := ml.slice_trailing(x_bf, 2 * E, 3 * E)
+			y_bf  := ml.attention(q_bf, k_bf, v_bf, HEADS, causal=true)
 			y     := ml.cast_to(y_bf, .F32)
 
 			got_y: [T * E]f32
@@ -923,14 +986,20 @@ main :: proc() {
 			{
 				x := ml.tensor(input_src[:])
 				x  = ml.reshape(x, {T, 3 * E})
-				y := ml.attention(x, HEADS, true)
+				q := ml.slice_trailing(x, 0,     E)
+				k := ml.slice_trailing(x, E,     2 * E)
+				v := ml.slice_trailing(x, 2 * E, 3 * E)
+				y := ml.attention(q, k, v, HEADS, causal=true)
 				ml.get_data(y, ref_out[:])
 			}
 
 			x_f32 := ml.tensor(input_src[:])
 			x_f32  = ml.reshape(x_f32, {T, 3 * E})
 			x_bf  := ml.cast_to(x_f32, .Bf16)
-			y_bf  := ml.attention(x_bf, HEADS, true)
+			q_bf  := ml.slice_trailing(x_bf, 0,     E)
+			k_bf  := ml.slice_trailing(x_bf, E,     2 * E)
+			v_bf  := ml.slice_trailing(x_bf, 2 * E, 3 * E)
+			y_bf  := ml.attention(q_bf, k_bf, v_bf, HEADS, causal=true)
 			y     := ml.cast_to(y_bf, .F32)
 
 			got_y: [T * E]f32
@@ -942,6 +1011,77 @@ main :: proc() {
 				if math.abs(got_y[i] - ref_out[i]) > tol { fwd_ok = false }
 			}
 			check(fwd_ok, fmt.tprintf("%v: Bf16 attention (coopmat-shape) forward matches f32 reference", label), any_failed)
+		}
+
+		// Bf16 GQA attention: 4 q-heads, 2 kv-heads (group_size=2).
+		{
+			T     :: 8
+			N_Q   :: 4
+			N_KV  :: 2
+			D     :: 4
+			Q_E   :: N_Q  * D
+			KV_E  :: N_KV * D
+
+			q_src: [T * Q_E]f32
+			k_src: [T * KV_E]f32
+			v_src: [T * KV_E]f32
+			for i in 0 ..< T * Q_E  { q_src[i] = f32(((i + 1) % 5) - 2) * 0.5 }
+			for i in 0 ..< T * KV_E { k_src[i] = f32(((i + 3) % 5) - 2) * 0.5 }
+			for i in 0 ..< T * KV_E { v_src[i] = f32(((i + 2) % 5) - 2) * 0.5 }
+
+			ref_out: [T * Q_E]f32
+			ref_dq:  [T * Q_E]f32
+			ref_dk:  [T * KV_E]f32
+			ref_dv:  [T * KV_E]f32
+			{
+				q := ml.reshape(ml.tensor(q_src[:]), {T, Q_E})
+				k := ml.reshape(ml.tensor(k_src[:]), {T, KV_E})
+				v := ml.reshape(ml.tensor(v_src[:]), {T, KV_E})
+				y := ml.attention(q, k, v, N_Q, N_KV, causal=true)
+				ml.get_data(y, ref_out[:])
+				ml.backward()
+				ml.get_gradient(q, ref_dq[:])
+				ml.get_gradient(k, ref_dk[:])
+				ml.get_gradient(v, ref_dv[:])
+				ml.clear()
+			}
+
+			q_f32 := ml.reshape(ml.tensor(q_src[:]), {T, Q_E})
+			k_f32 := ml.reshape(ml.tensor(k_src[:]), {T, KV_E})
+			v_f32 := ml.reshape(ml.tensor(v_src[:]), {T, KV_E})
+			q_bf  := ml.cast_to(q_f32, .Bf16)
+			k_bf  := ml.cast_to(k_f32, .Bf16)
+			v_bf  := ml.cast_to(v_f32, .Bf16)
+			y_bf  := ml.attention(q_bf, k_bf, v_bf, N_Q, N_KV, causal=true)
+			y     := ml.cast_to(y_bf, .F32)
+
+			got_out: [T * Q_E]f32
+			ml.get_data(y, got_out[:])
+
+			tol :: f32(5e-2)
+			fwd_ok := true
+			for i in 0 ..< T * Q_E {
+				if math.abs(got_out[i] - ref_out[i]) > tol { fwd_ok = false }
+			}
+			check(fwd_ok, fmt.tprintf("%v: Bf16 GQA attention forward matches f32 reference", label), any_failed)
+
+			ml.backward()
+			got_dq: [T * Q_E]f32
+			got_dk: [T * KV_E]f32
+			got_dv: [T * KV_E]f32
+			ml.get_gradient(q_f32, got_dq[:])
+			ml.get_gradient(k_f32, got_dk[:])
+			ml.get_gradient(v_f32, got_dv[:])
+
+			dq_ok := true
+			for i in 0 ..< T * Q_E  { if math.abs(got_dq[i] - ref_dq[i]) > tol { dq_ok = false } }
+			dk_ok := true
+			for i in 0 ..< T * KV_E { if math.abs(got_dk[i] - ref_dk[i]) > tol { dk_ok = false } }
+			dv_ok := true
+			for i in 0 ..< T * KV_E { if math.abs(got_dv[i] - ref_dv[i]) > tol { dv_ok = false } }
+			check(dq_ok, fmt.tprintf("%v: Bf16 GQA attention backward dq matches f32 reference", label), any_failed)
+			check(dk_ok, fmt.tprintf("%v: Bf16 GQA attention backward dk matches f32 reference", label), any_failed)
+			check(dv_ok, fmt.tprintf("%v: Bf16 GQA attention backward dv matches f32 reference", label), any_failed)
 		}
 
 		// Bf16 mean forward + backward.

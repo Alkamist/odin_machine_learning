@@ -1,0 +1,210 @@
+package machine_learning_network_llama
+
+import "base:builtin"
+import "core:math"
+
+import ml "../../"
+
+Config :: struct {
+	layer_count:       int,
+	n_q_heads:         int,
+	n_kv_heads:        int,
+	head_size:         int,
+	embedding_size:    int,
+	intermediate_size: int,
+	vocabulary_size:   int,
+	rope_base:         f32,
+	tied_embeddings:   bool,
+}
+
+SMOLLM2_135M_CONFIG :: Config{
+	layer_count       = 30,
+	n_q_heads         = 9,
+	n_kv_heads        = 3,
+	head_size         = 64,
+	embedding_size    = 576,
+	intermediate_size = 1536,
+	vocabulary_size   = 49152,
+	rope_base         = 100000,
+	tied_embeddings   = true,
+}
+
+Layer :: struct {
+	input_norm_weight:     ml.Tensor, // [embedding_size]
+	q_proj_weight:         ml.Tensor, // [n_q_heads  * head_size, embedding_size]
+	k_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, embedding_size]
+	v_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, embedding_size]
+	o_proj_weight:         ml.Tensor, // [embedding_size, n_q_heads * head_size]
+	post_attn_norm_weight: ml.Tensor, // [embedding_size]
+	gate_proj_weight:      ml.Tensor, // [intermediate_size, embedding_size]
+	up_proj_weight:        ml.Tensor, // [intermediate_size, embedding_size]
+	down_proj_weight:      ml.Tensor, // [embedding_size, intermediate_size]
+}
+
+Llama :: struct {
+	config: Config,
+
+	token_embeddings:   ml.Tensor, // [vocabulary_size, embedding_size]
+
+	layers: []Layer,
+
+	output_norm_weight: ml.Tensor, // [embedding_size]
+	lm_head_weight:     ml.Tensor, // [vocabulary_size, embedding_size]; aliases token_embeddings when tied.
+}
+
+make :: proc(config: Config, allocator := context.allocator) -> (model: Llama) {
+	q_size  := config.n_q_heads  * config.head_size
+	kv_size := config.n_kv_heads * config.head_size
+
+	model.config           = config
+	model.layers           = builtin.make([]Layer, config.layer_count)
+	model.token_embeddings = ml.make(.F32, {config.vocabulary_size, config.embedding_size})
+
+	for &layer in model.layers {
+		layer.input_norm_weight     = ml.make(.F32, {config.embedding_size})
+		layer.q_proj_weight         = ml.make(.F32, {q_size,  config.embedding_size})
+		layer.k_proj_weight         = ml.make(.F32, {kv_size, config.embedding_size})
+		layer.v_proj_weight         = ml.make(.F32, {kv_size, config.embedding_size})
+		layer.o_proj_weight         = ml.make(.F32, {config.embedding_size, q_size})
+		layer.post_attn_norm_weight = ml.make(.F32, {config.embedding_size})
+		layer.gate_proj_weight      = ml.make(.F32, {config.intermediate_size, config.embedding_size})
+		layer.up_proj_weight        = ml.make(.F32, {config.intermediate_size, config.embedding_size})
+		layer.down_proj_weight      = ml.make(.F32, {config.embedding_size,    config.intermediate_size})
+	}
+
+	model.output_norm_weight = ml.make(.F32, {config.embedding_size})
+	if config.tied_embeddings {
+		model.lm_head_weight = model.token_embeddings
+	} else {
+		model.lm_head_weight = ml.make(.F32, {config.vocabulary_size, config.embedding_size})
+	}
+
+	randomize(model)
+
+	return
+}
+
+destroy :: proc(model: Llama) {
+	ml.destroy(model.token_embeddings)
+
+	for layer in model.layers {
+		ml.destroy(layer.input_norm_weight)
+		ml.destroy(layer.q_proj_weight)
+		ml.destroy(layer.k_proj_weight)
+		ml.destroy(layer.v_proj_weight)
+		ml.destroy(layer.o_proj_weight)
+		ml.destroy(layer.post_attn_norm_weight)
+		ml.destroy(layer.gate_proj_weight)
+		ml.destroy(layer.up_proj_weight)
+		ml.destroy(layer.down_proj_weight)
+	}
+
+	ml.destroy(model.output_norm_weight)
+	if !model.config.tied_embeddings {
+		ml.destroy(model.lm_head_weight)
+	}
+
+	delete(model.layers)
+}
+
+copy :: proc(dst, src: Llama) {
+	ml.copy(dst.token_embeddings, src.token_embeddings)
+
+	for i in 0 ..< len(dst.layers) {
+		ml.copy(dst.layers[i].input_norm_weight,     src.layers[i].input_norm_weight)
+		ml.copy(dst.layers[i].q_proj_weight,         src.layers[i].q_proj_weight)
+		ml.copy(dst.layers[i].k_proj_weight,         src.layers[i].k_proj_weight)
+		ml.copy(dst.layers[i].v_proj_weight,         src.layers[i].v_proj_weight)
+		ml.copy(dst.layers[i].o_proj_weight,         src.layers[i].o_proj_weight)
+		ml.copy(dst.layers[i].post_attn_norm_weight, src.layers[i].post_attn_norm_weight)
+		ml.copy(dst.layers[i].gate_proj_weight,      src.layers[i].gate_proj_weight)
+		ml.copy(dst.layers[i].up_proj_weight,        src.layers[i].up_proj_weight)
+		ml.copy(dst.layers[i].down_proj_weight,      src.layers[i].down_proj_weight)
+	}
+
+	ml.copy(dst.output_norm_weight, src.output_norm_weight)
+	if !dst.config.tied_embeddings {
+		ml.copy(dst.lm_head_weight, src.lm_head_weight)
+	}
+}
+
+randomize :: proc(model: Llama) {
+	layer_count := len(model.layers)
+	residual_scale := 0.02 / math.sqrt(f32(2 * layer_count))
+
+	ml.fill_normal(model.token_embeddings, 0, 0.02)
+
+	for &layer in model.layers {
+		ml.fill_value(layer.input_norm_weight, 1)
+		ml.fill_normal(layer.q_proj_weight, 0, 0.02)
+		ml.fill_normal(layer.k_proj_weight, 0, 0.02)
+		ml.fill_normal(layer.v_proj_weight, 0, 0.02)
+		ml.fill_normal(layer.o_proj_weight, 0, residual_scale)
+
+		ml.fill_value(layer.post_attn_norm_weight, 1)
+		ml.fill_normal(layer.gate_proj_weight, 0, 0.02)
+		ml.fill_normal(layer.up_proj_weight,   0, 0.02)
+		ml.fill_normal(layer.down_proj_weight, 0, residual_scale)
+	}
+
+	ml.fill_value(model.output_norm_weight, 1)
+	if !model.config.tied_embeddings {
+		ml.fill_normal(model.lm_head_weight, 0, 0.02)
+	}
+}
+
+@(require_results)
+forward :: proc(model: Llama, tokens: []int) -> (output: ml.Tensor) {
+	output = ml.select(model.token_embeddings, tokens)
+
+	residual := output
+
+	for layer in model.layers {
+		normed := ml.rmsnorm(residual, layer.input_norm_weight)
+
+		q := ml.linear(normed, layer.q_proj_weight)
+		k := ml.linear(normed, layer.k_proj_weight)
+		v := ml.linear(normed, layer.v_proj_weight)
+
+		q = ml.rope(q, model.config.n_q_heads,  model.config.rope_base)
+		k = ml.rope(k, model.config.n_kv_heads, model.config.rope_base)
+
+		attn_output := ml.attention(q, k, v, model.config.n_q_heads, model.config.n_kv_heads)
+		attn_output  = ml.linear(attn_output, layer.o_proj_weight)
+
+		residual = ml.add(residual, attn_output)
+
+		normed = ml.rmsnorm(residual, layer.post_attn_norm_weight)
+
+		gate       := ml.linear(normed, layer.gate_proj_weight)
+		up         := ml.linear(normed, layer.up_proj_weight)
+		mlp_output := ml.linear(ml.mul(ml.silu(gate), up), layer.down_proj_weight)
+
+		residual = ml.add(residual, mlp_output)
+	}
+
+	output = ml.rmsnorm(residual, model.output_norm_weight)
+	output = ml.linear(output, model.lm_head_weight)
+	return
+}
+
+update :: proc(opt: ml.Optimizer, model: Llama) {
+	ml.update(opt, model.token_embeddings)
+
+	for layer in model.layers {
+		ml.update(opt, layer.input_norm_weight)
+		ml.update(opt, layer.q_proj_weight)
+		ml.update(opt, layer.k_proj_weight)
+		ml.update(opt, layer.v_proj_weight)
+		ml.update(opt, layer.o_proj_weight)
+		ml.update(opt, layer.post_attn_norm_weight)
+		ml.update(opt, layer.gate_proj_weight)
+		ml.update(opt, layer.up_proj_weight)
+		ml.update(opt, layer.down_proj_weight)
+	}
+
+	ml.update(opt, model.output_norm_weight)
+	if !model.config.tied_embeddings {
+		ml.update(opt, model.lm_head_weight)
+	}
+}

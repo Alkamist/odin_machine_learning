@@ -18,19 +18,25 @@ Transformer :: struct {
 	head_count:      int,
 	embedding_size:  int,
 	vocabulary_size: int,
+	tied_embeddings: bool,
 
 	token_embeddings: ml.Tensor, // [vocabulary_size, embedding_size]
 
 	layers: []Layer,
 
 	norm_weight:   ml.Tensor, // [embedding_size]
-	output_weight: ml.Tensor, // [embedding_size, vocabulary_size]
+	output_weight: ml.Tensor, // [vocabulary_size, embedding_size]; aliases token_embeddings when tied_embeddings.
 }
 
-make :: proc(layer_count, head_count, embedding_size, vocabulary_size: int, allocator := context.allocator) -> (transformer: Transformer) {
+make :: proc(
+	layer_count, head_count, embedding_size, vocabulary_size: int,
+	tied_embeddings := true,
+	allocator := context.allocator,
+) -> (transformer: Transformer) {
 	transformer.head_count      = head_count
 	transformer.embedding_size  = embedding_size
 	transformer.vocabulary_size = vocabulary_size
+	transformer.tied_embeddings = tied_embeddings
 
 	transformer.layers = builtin.make([]Layer, layer_count)
 
@@ -47,8 +53,12 @@ make :: proc(layer_count, head_count, embedding_size, vocabulary_size: int, allo
 		layer.mlp_down_weight = ml.make(.F32, {embedding_size, hidden_size})
 	}
 
-	transformer.norm_weight   = ml.make(.F32, {embedding_size})
-	transformer.output_weight = ml.make(.F32, {vocabulary_size, embedding_size})
+	transformer.norm_weight = ml.make(.F32, {embedding_size})
+	if tied_embeddings {
+		transformer.output_weight = transformer.token_embeddings
+	} else {
+		transformer.output_weight = ml.make(.F32, {vocabulary_size, embedding_size})
+	}
 
 	randomize(transformer)
 
@@ -68,7 +78,9 @@ destroy :: proc(transformer: Transformer) {
 	}
 
 	ml.destroy(transformer.norm_weight)
-	ml.destroy(transformer.output_weight)
+	if !transformer.tied_embeddings {
+		ml.destroy(transformer.output_weight)
+	}
 
 	delete(transformer.layers)
 }
@@ -85,8 +97,10 @@ copy :: proc(dst, src: Transformer) {
 		ml.copy(dst.layers[i].mlp_down_weight, src.layers[i].mlp_down_weight)
 	}
 
-	ml.copy(dst.norm_weight,   src.norm_weight)
-	ml.copy(dst.output_weight, src.output_weight)
+	ml.copy(dst.norm_weight, src.norm_weight)
+	if !dst.tied_embeddings {
+		ml.copy(dst.output_weight, src.output_weight)
+	}
 }
 
 randomize :: proc(transformer: Transformer) {
@@ -107,7 +121,9 @@ randomize :: proc(transformer: Transformer) {
 	}
 
 	ml.fill_value(transformer.norm_weight, 1)
-	ml.fill_normal(transformer.output_weight, 0, 0.02)
+	if !transformer.tied_embeddings {
+		ml.fill_normal(transformer.output_weight, 0, 0.02)
+	}
 }
 
 @(require_results)
@@ -120,21 +136,15 @@ forward :: proc(transformer: Transformer, tokens: []int) -> (output: ml.Tensor) 
 		norm_output := ml.layernorm(residual, layer.norm0_weight)
 		qkv         := ml.linear(norm_output, layer.qkv_weight)
 
-		// QKV is laid out per-row as [Q-block | K-block | V-block]
-		// (concatenated, not striped). slice_trailing pulls each block out
-		// preserving the [tokens, embed] shape; concat reassembles after
-		// RoPE on Q and K.
 		embed := transformer.embedding_size
 		q := ml.slice_trailing(qkv, 0,         embed)
 		k := ml.slice_trailing(qkv, embed,     2 * embed)
 		v := ml.slice_trailing(qkv, 2 * embed, 3 * embed)
 
-		q  = ml.rope(q, transformer.head_count)
-		k  = ml.rope(k, transformer.head_count)
+		q = ml.rope(q, transformer.head_count)
+		k = ml.rope(k, transformer.head_count)
 
-		qkv = ml.concat(q, k, v)
-
-		attn_output := ml.attention(qkv, transformer.head_count)
+		attn_output := ml.attention(q, k, v, transformer.head_count)
 		attn_output  = ml.linear(attn_output, layer.proj_weight)
 
 		residual = ml.add(residual, attn_output)
@@ -165,5 +175,7 @@ update :: proc(opt: ml.Optimizer, transformer: Transformer) {
 	}
 
 	ml.update(opt, transformer.norm_weight)
-	ml.update(opt, transformer.output_weight)
+	if !transformer.tied_embeddings {
+		ml.update(opt, transformer.output_weight)
+	}
 }

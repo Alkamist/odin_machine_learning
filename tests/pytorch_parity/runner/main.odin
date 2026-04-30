@@ -11,7 +11,8 @@ import "core:path/filepath"
 import ml  "../../.."
 import cpu "../../../backends/cpu"
 import gpu "../../../backends/gpu"
-import mlp "../../../networks/mlp"
+import mlp   "../../../networks/mlp"
+import llama "../../../networks/llama"
 
 MAGIC :: "TNSR"
 
@@ -66,12 +67,17 @@ main :: proc() {
 	case "softmax":        run_unary(artifacts_dir, .Softmax)
 	case "log_softmax":    run_unary(artifacts_dir, .Log_Softmax)
 	case "layernorm":      run_layernorm(artifacts_dir)
+	case "rmsnorm":        run_rmsnorm(artifacts_dir)
+	case "rmsnorm_big":    run_rmsnorm(artifacts_dir)
 	case "cross_entropy":  run_cross_entropy(artifacts_dir)
 	case "batched_matmul": run_batched_matmul(artifacts_dir)
 	case "permute":        run_permute(artifacts_dir)
 	case "attention_causal":  run_attention(artifacts_dir)
 	case "attention_acausal": run_attention(artifacts_dir)
 	case "attention_xfmr":    run_attention(artifacts_dir)
+	case "attention_gqa":     run_attention(artifacts_dir)
+	case "attention_gqa_big": run_attention(artifacts_dir)
+	case "tied_embeddings":   run_tied_embeddings(artifacts_dir)
 	case "mlp_train":         run_mlp_train(artifacts_dir)
 	case "mlp_train_period12":run_mlp_train(artifacts_dir)
 	case "select":            run_select(artifacts_dir)
@@ -85,6 +91,7 @@ main :: proc() {
 	case "rope":              run_rope(artifacts_dir)
 	case "rope_xfmr":         run_rope(artifacts_dir)
 	case "transformer_train_bf16": run_transformer_train_bf16(artifacts_dir)
+	case "llama_train":            run_llama_train(artifacts_dir)
 	case:
 		fmt.eprintfln("unknown test: %v", test_name)
 		os.exit(1)
@@ -222,6 +229,35 @@ run_layernorm :: proc(dir: string) {
 	save_tensor(_path(dir, "odin_grad_w.bin"), w_shape,   w_grad)
 }
 
+run_rmsnorm :: proc(dir: string) {
+	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
+	w_shape, w_data := load_tensor(_path(dir, "input_w.bin"))
+
+	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(x)
+	w := ml.alloc(.F32, w_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(w)
+
+	ml.set_data(x, x_data)
+	ml.set_data(w, w_data)
+
+	out := ml.rmsnorm(x, w)
+	ml.backward()
+
+	out_shape := _shape_slice(out)
+	out_data  := builtin.make([]f32, ml.len(out), context.temp_allocator)
+	ml.get_data(out, out_data)
+
+	x_grad := builtin.make([]f32, ml.len(x), context.temp_allocator)
+	w_grad := builtin.make([]f32, ml.len(w), context.temp_allocator)
+	ml.get_gradient(x, x_grad)
+	ml.get_gradient(w, w_grad)
+
+	save_tensor(_path(dir, "odin_out.bin"),    out_shape, out_data)
+	save_tensor(_path(dir, "odin_grad_x.bin"), x_shape,   x_grad)
+	save_tensor(_path(dir, "odin_grad_w.bin"), w_shape,   w_grad)
+}
+
 run_cross_entropy :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	targets         := load_int_array(_path(dir, "targets.bin"))
@@ -304,10 +340,18 @@ run_attention :: proc(dir: string) {
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 
-	head_count := config[0]
+	n_q_heads  := config[0]
 	causal     := config[1] != 0
+	n_kv_heads := n_q_heads
+	if builtin.len(config) >= 3 { n_kv_heads = config[2] }
 
-	out := ml.attention(x, head_count, causal=causal)
+	q_size  := x_shape[1] * n_q_heads  / (n_q_heads + 2 * n_kv_heads)
+	kv_size := x_shape[1] * n_kv_heads / (n_q_heads + 2 * n_kv_heads)
+	q := ml.slice_trailing(x, 0,                q_size)
+	k := ml.slice_trailing(x, q_size,           q_size + kv_size)
+	v := ml.slice_trailing(x, q_size + kv_size, q_size + 2 * kv_size)
+
+	out := ml.attention(q, k, v, n_q_heads, n_kv_heads, causal=causal)
 	ml.backward()
 
 	out_shape := _shape_slice(out)
@@ -396,6 +440,31 @@ run_select :: proc(dir: string) {
 
 	save_tensor(_path(dir, "odin_out.bin"),    out_shape, out_data)
 	save_tensor(_path(dir, "odin_grad_x.bin"), x_shape,   x_grad)
+}
+
+run_tied_embeddings :: proc(dir: string) {
+	w_shape, w_data := load_tensor(_path(dir, "input_w.bin"))
+	indices         := load_int_array(_path(dir, "indices.bin"))
+	targets         := load_int_array(_path(dir, "targets.bin"))
+
+	w := ml.alloc(.F32, w_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	defer ml.destroy(w)
+	ml.set_data(w, w_data)
+
+	embeds    := ml.select(w, indices)
+	logits    := ml.linear(embeds, w)
+	per_token := ml.cross_entropy(logits, targets)
+	loss      := ml.mean(per_token)
+	ml.backward()
+
+	loss_buf: [1]f32
+	ml.get_data(loss, loss_buf[:])
+
+	w_grad := builtin.make([]f32, ml.len(w), context.temp_allocator)
+	ml.get_gradient(w, w_grad)
+
+	save_tensor(_path(dir, "odin_loss.bin"),   {1},     loss_buf[:])
+	save_tensor(_path(dir, "odin_grad_w.bin"), w_shape, w_grad)
 }
 
 run_slice_trailing :: proc(dir: string) {
@@ -577,9 +646,8 @@ run_transformer_train_bf16 :: proc(dir: string) {
 			v := ml.slice_trailing(qkv, 2 * embedding_size, 3 * embedding_size)
 			q  = ml.rope(q, head_count)
 			k  = ml.rope(k, head_count)
-			qkv_concat := ml.concat(q, k, v)
 
-			attn_out := ml.attention(qkv_concat, head_count)
+			attn_out := ml.attention(q, k, v, head_count)
 			attn_out  = ml.linear(attn_out, pr_w)
 			residual  = ml.add(residual, attn_out)
 
@@ -651,6 +719,83 @@ load_int_array :: proc(path: string) -> []int {
 		out[i] = int((^i32)(&bytes[4 + i * 4])^)
 	}
 	return out
+}
+
+// F32 Llama-shape training-step parity test, exercising
+// `networks/llama/llama.odin` end-to-end against a faithful PyTorch reference.
+run_llama_train :: proc(dir: string) {
+	tokens  := load_int_array(_path(dir, "tokens.bin"))
+	targets := load_int_array(_path(dir, "targets.bin"))
+	config_ints := load_int_array(_path(dir, "config.bin"))
+
+	step_count        := config_ints[0]
+	period            := config_ints[1]
+	layer_count       := config_ints[2]
+	n_q_heads         := config_ints[3]
+	n_kv_heads        := config_ints[4]
+	head_size         := config_ints[5]
+	embedding_size    := config_ints[6]
+	intermediate_size := config_ints[7]
+	vocabulary_size   := config_ints[8]
+	token_count       := config_ints[9]
+	learning_rate     := f32(config_ints[10]) / 1_000_000
+	rope_base         := f32(config_ints[11])
+	_ = token_count
+
+	cfg := llama.Config{
+		layer_count       = layer_count,
+		n_q_heads         = n_q_heads,
+		n_kv_heads        = n_kv_heads,
+		head_size         = head_size,
+		embedding_size    = embedding_size,
+		intermediate_size = intermediate_size,
+		vocabulary_size   = vocabulary_size,
+		rope_base         = rope_base,
+		tied_embeddings   = true,
+	}
+	model := llama.make(cfg)
+	defer llama.destroy(model)
+
+	load_into :: proc(t: ml.Tensor, path: string) {
+		_, vals := load_tensor(path)
+		ml.set_data(t, vals)
+	}
+
+	load_into(model.token_embeddings, _path(dir, "init_token_embeddings.bin"))
+	for layer, i in model.layers {
+		load_into(layer.input_norm_weight,     fmt.tprintf("%v/init_layer%v_input_norm_weight.bin",     dir, i))
+		load_into(layer.q_proj_weight,         fmt.tprintf("%v/init_layer%v_q_proj_weight.bin",         dir, i))
+		load_into(layer.k_proj_weight,         fmt.tprintf("%v/init_layer%v_k_proj_weight.bin",         dir, i))
+		load_into(layer.v_proj_weight,         fmt.tprintf("%v/init_layer%v_v_proj_weight.bin",         dir, i))
+		load_into(layer.o_proj_weight,         fmt.tprintf("%v/init_layer%v_o_proj_weight.bin",         dir, i))
+		load_into(layer.post_attn_norm_weight, fmt.tprintf("%v/init_layer%v_post_attn_norm_weight.bin", dir, i))
+		load_into(layer.gate_proj_weight,      fmt.tprintf("%v/init_layer%v_gate_proj_weight.bin",      dir, i))
+		load_into(layer.up_proj_weight,        fmt.tprintf("%v/init_layer%v_up_proj_weight.bin",        dir, i))
+		load_into(layer.down_proj_weight,      fmt.tprintf("%v/init_layer%v_down_proj_weight.bin",      dir, i))
+	}
+	load_into(model.output_norm_weight, _path(dir, "init_output_norm_weight.bin"))
+
+	losses := builtin.make([]f32, step_count, context.temp_allocator)
+	opt: ml.Optimizer
+
+	for step in 0 ..< step_count {
+		ml.clear()
+
+		logits    := llama.forward(model, tokens)
+		per_token := ml.cross_entropy(logits, targets)
+		loss      := ml.mean(per_token)
+		ml.backward()
+
+		if ml.optimize(&opt, period=period, learning_rate=learning_rate) {
+			llama.update(opt, model)
+		}
+
+		loss_buf: [1]f32
+		ml.get_data(loss, loss_buf[:])
+		losses[step] = loss_buf[0]
+	}
+
+	save_tensor(_path(dir, "odin_losses.bin"), {step_count}, losses)
 }
 
 _path :: proc(dir, name: string) -> string {

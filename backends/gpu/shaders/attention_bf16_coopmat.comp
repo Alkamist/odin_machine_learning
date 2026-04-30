@@ -29,15 +29,21 @@
 
 layout(local_size_x = WG_SIZE) in;
 
-layout(set = 0, binding = 0) readonly  buffer X { bfloat16_t x[];   };
-layout(set = 0, binding = 1) writeonly buffer O { bfloat16_t o[];   };
-layout(set = 0, binding = 2) writeonly buffer L { float      lse[]; };
+layout(set = 0, binding = 0) readonly  buffer Q { bfloat16_t q_buf[]; };
+layout(set = 0, binding = 1) readonly  buffer K { bfloat16_t k_buf[]; };
+layout(set = 0, binding = 2) readonly  buffer V { bfloat16_t v_buf[]; };
+layout(set = 0, binding = 3) writeonly buffer O { bfloat16_t o[];   };
+layout(set = 0, binding = 4) writeonly buffer L { float      lse[]; };
 
+// GQA not supported in this shader (assert n_q_heads == n_kv_heads at dispatch).
+// q_size and kv_size are equal here.
 layout(push_constant) uniform Params {
-    uint head_count;
+    uint n_q_heads;
+    uint n_kv_heads;
     uint head_size;
     uint token_count;
-    uint embed_size;
+    uint q_size;
+    uint kv_size;
     uint causal;
 } p;
 
@@ -64,8 +70,7 @@ void main() {
 
     uint D      = p.head_size;
     uint T      = p.token_count;
-    uint E      = p.embed_size;
-    uint stride = 3u * E;
+    uint E      = p.q_size;       // n_q_heads * D == n_kv_heads * D when GQA disabled
     uint q_base = q_block * BR;
 
     float inv_sqrt_d = inversesqrt(float(D));
@@ -75,7 +80,7 @@ void main() {
         uint r = i / D;
         uint d = i % D;
         uint t = q_base + r;
-        sq[i] = (t < T) ? x[t * stride + h * D + d] : bfloat16_t(0.0f);
+        sq[i] = (t < T) ? q_buf[t * E + h * D + d] : bfloat16_t(0.0f);
     }
 
     // Init running state and output accumulator.
@@ -99,8 +104,8 @@ void main() {
             uint d = i % D;
             uint t = t_k0 + c;
             if (t < T) {
-                sk[i] = x[t * stride + E +        h * D + d];
-                sv[i] = x[t * stride + 2u * E +   h * D + d];
+                sk[i] = k_buf[t * E + h * D + d];
+                sv[i] = v_buf[t * E + h * D + d];
             } else {
                 sk[i] = bfloat16_t(0.0f);
                 sv[i] = bfloat16_t(0.0f);
@@ -214,8 +219,8 @@ void main() {
             uint d1 = d0 + 1u;
             float v0 = so[r * D + d0] * inv_l;
             float v1 = so[r * D + d1] * inv_l;
-            o[t_q * E + h * D + d0]                  = bfloat16_t(v0);
-            o[t_q * E + h * D + d1]                  = bfloat16_t(v1);
+            o[t_q * E + h * D + d0] = bfloat16_t(v0);
+            o[t_q * E + h * D + d1] = bfloat16_t(v1);
         }
 
         if (tid == 0u) {

@@ -433,6 +433,7 @@ Operation_Variant :: union {
 	Linear,
 	Rope,
 	Layernorm,
+	Rmsnorm,
 	Softmax,
 	Entropy,
 	Log_Softmax,
@@ -503,8 +504,11 @@ cast_to :: proc(input: Tensor, target_type: Data_Type, loc := #caller_location) 
 }
 
 Attention :: struct {
-	head_count:      int,
+	n_q_heads:       int,
+	n_kv_heads:      int,
 	causal:          bool,
+	key:             Tensor,
+	value:           Tensor,
 	softmax_outputs: Tensor,
 	d_p_scratch:     Tensor,
 	lse:             Tensor,
@@ -512,29 +516,51 @@ Attention :: struct {
 }
 
 @(require_results)
-attention :: proc(input: Tensor, head_count: int, causal := true, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank == 2, "attention requires a 2-D tensor [tokens, 3 * embedding]", loc=loc)
+attention :: proc(
+	query, key, value: Tensor,
+	n_q_heads:  int,
+	n_kv_heads: int = 0,
+	causal     := true,
+	loc        := #caller_location,
+) -> (output: Tensor) {
+	kv_heads := n_kv_heads if n_kv_heads > 0 else n_q_heads
 
-	token_count := input.shape[0]
-	input_size  := input.shape[1]
-	assert(input_size % 3 == 0, "Trailing dim must be divisible by 3 (for Q, K, V)", loc=loc)
+	assert(query.rank == 2, "attention query must be 2-D [tokens, n_q_heads * head_size]",  loc=loc)
+	assert(key.rank   == 2, "attention key must be 2-D [tokens, n_kv_heads * head_size]",   loc=loc)
+	assert(value.rank == 2, "attention value must be 2-D [tokens, n_kv_heads * head_size]", loc=loc)
 
-	embed_size := input_size / 3
-	assert(embed_size % head_count == 0, "Output size must be divisible by head count", loc=loc)
-	assert(input.type == .F32 || input.type == .Bf16, "attention requires F32 or Bf16 input", loc=loc)
+	token_count := query.shape[0]
+	assert(key.shape[0]   == token_count, "attention key token count must match query",   loc=loc)
+	assert(value.shape[0] == token_count, "attention value token count must match query", loc=loc)
 
-	output           = zeros(input.type, {token_count, embed_size}, loc=loc)
-	softmax_outputs := zeros(.F32, {head_count, token_count, token_count}, loc=loc)
-	d_p_scratch     := zeros(.F32, {head_count, token_count}, loc=loc)
-	lse             := zeros(.F32, {head_count, token_count}, loc=loc)
-	d_acc           := zeros(.F32, {head_count, token_count}, loc=loc)
+	q_size  := query.shape[1]
+	kv_size := key.shape[1]
+	assert(value.shape[1] == kv_size, "attention key and value must have same trailing dim", loc=loc)
+	assert(q_size  % n_q_heads == 0, "query trailing dim must be divisible by n_q_heads", loc=loc)
+	assert(kv_size % kv_heads  == 0, "key/value trailing dim must be divisible by n_kv_heads", loc=loc)
+
+	head_size := q_size / n_q_heads
+	assert(kv_size / kv_heads == head_size, "head_size must match between query and key/value", loc=loc)
+	assert(n_q_heads % kv_heads == 0, "n_q_heads must be a multiple of n_kv_heads", loc=loc)
+
+	assert(query.type == key.type && key.type == value.type, "attention Q/K/V must share dtype", loc=loc)
+	assert(query.type == .F32 || query.type == .Bf16, "attention requires F32 or Bf16 input", loc=loc)
+
+	output           = zeros(query.type, {token_count, q_size}, loc=loc)
+	softmax_outputs := zeros(.F32, {n_q_heads, token_count, token_count}, loc=loc)
+	d_p_scratch     := zeros(.F32, {n_q_heads, token_count}, loc=loc)
+	lse             := zeros(.F32, {n_q_heads, token_count}, loc=loc)
+	d_acc           := zeros(.F32, {n_q_heads, token_count}, loc=loc)
 
 	op := Operation{
-		input   = input,
+		input   = query,
 		output  = output,
 		variant = Attention{
-			head_count      = head_count,
+			n_q_heads       = n_q_heads,
+			n_kv_heads      = kv_heads,
 			causal          = causal,
+			key             = key,
+			value           = value,
 			softmax_outputs = softmax_outputs,
 			d_p_scratch     = d_p_scratch,
 			lse             = lse,
@@ -976,6 +1002,36 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 		variant = Layernorm{
 			weight = weight,
 			mean   = mean,
+			rstd   = rstd,
+		},
+	}
+	_current_ctx.backend.forward(op, loc)
+	append_operation(op, loc=loc)
+
+	return
+}
+
+Rmsnorm :: struct {
+	weight: Tensor,
+	rstd:   Tensor,
+}
+
+@(require_results)
+rmsnorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(weight.rank == 1, "rmsnorm weight must be 1-D", loc=loc)
+	assert(weight.shape[0] == input.shape[input.rank - 1], "rmsnorm weight length must equal input's trailing dim", loc=loc)
+
+	count := _leading_count(input)
+
+	rstd := zeros(.F32, {count}, loc=loc)
+
+	output = zeros_like(input, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Rmsnorm{
+			weight = weight,
 			rstd   = rstd,
 		},
 	}

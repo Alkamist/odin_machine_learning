@@ -160,9 +160,8 @@ bf16_forward :: proc(m: Bf16_Model, tokens: []int) -> ml.Tensor {
 		v := ml.slice_trailing(qkv, 2 * embed, 3 * embed)
 		q  = ml.rope(q, m.head_count)
 		k  = ml.rope(k, m.head_count)
-		qkv_concat := ml.concat(q, k, v)
 
-		attn_out := ml.attention(qkv_concat, m.head_count)
+		attn_out := ml.attention(q, k, v, m.head_count)
 		attn_out  = ml.linear(attn_out, pr_w)
 		residual  = ml.add(residual, attn_out)
 

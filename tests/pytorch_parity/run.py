@@ -210,6 +210,35 @@ def verify_layernorm(test_dir: Path, refs: dict) -> None:
     assert_close("grad_w", read_tensor(test_dir / "odin_grad_w.bin"), refs["grad_w"])
 
 
+def gen_rmsnorm(name: str, x_shape):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    feature_size = x_shape[-1]
+    x_np = rng.standard_normal(x_shape).astype(np.float32)
+    w_np = (rng.standard_normal((feature_size,)).astype(np.float32) * 0.1 + 1.0)
+
+    write_tensor(test_dir / "input_x.bin", x_np)
+    write_tensor(test_dir / "input_w.bin", w_np)
+
+    x = torch.tensor(x_np, requires_grad=True)
+    w = torch.tensor(w_np, requires_grad=True)
+    out = torch.nn.functional.rms_norm(x, [feature_size], weight=w, eps=1e-5)
+    out.sum().backward()
+
+    return test_dir, {
+        "out":    out.detach().numpy(),
+        "grad_x": x.grad.numpy(),
+        "grad_w": w.grad.numpy(),
+    }
+
+
+def verify_rmsnorm(test_dir: Path, refs: dict) -> None:
+    assert_close("out",    read_tensor(test_dir / "odin_out.bin"),    refs["out"])
+    assert_close("grad_x", read_tensor(test_dir / "odin_grad_x.bin"), refs["grad_x"])
+    assert_close("grad_w", read_tensor(test_dir / "odin_grad_w.bin"), refs["grad_w"])
+
+
 def gen_cross_entropy(name: str, sample_count: int, class_size: int):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
@@ -365,6 +394,37 @@ def gen_select(name: str, vocab: int, embed: int, n_indices: int):
     return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
 
 
+def gen_tied_embeddings(name: str, vocab: int, embed: int, n_tokens: int):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    w_np       = (rng.standard_normal((vocab, embed)).astype(np.float32) * 0.02)
+    indices_np = rng.integers(0, vocab, size=n_tokens).astype(np.int64)
+    targets_np = rng.integers(0, vocab, size=n_tokens).astype(np.int64)
+
+    write_tensor(test_dir / "input_w.bin", w_np)
+    write_int_array(test_dir / "indices.bin", indices_np)
+    write_int_array(test_dir / "targets.bin", targets_np)
+
+    w = torch.tensor(w_np, requires_grad=True)
+    embeds = w[torch.tensor(indices_np)]
+    logits = embeds @ w.t()
+    loss   = torch.nn.functional.cross_entropy(
+        logits, torch.tensor(targets_np), reduction="mean",
+    )
+    loss.backward()
+
+    return test_dir, {
+        "loss":   loss.detach().numpy().reshape(1),
+        "grad_w": w.grad.numpy(),
+    }
+
+
+def verify_tied_embeddings(test_dir: Path, refs: dict) -> None:
+    assert_close("loss",   read_tensor(test_dir / "odin_loss.bin"),   refs["loss"])
+    assert_close("grad_w", read_tensor(test_dir / "odin_grad_w.bin"), refs["grad_w"])
+
+
 def gen_slice_trailing(name: str, x_shape, start: int, end: int):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
@@ -468,24 +528,38 @@ def gen_rope(name: str, tokens: int, head_count: int, head_size: int, base: floa
     return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
 
 
-def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: bool):
+def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: bool, n_kv_heads: int = 0):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
 
-    x_np = rng.standard_normal((tokens, 3 * embed)).astype(np.float32) * 0.1
+    n_q   = head_count
+    n_kv  = n_kv_heads if n_kv_heads > 0 else head_count
+    head_size = embed // n_q
+    kv_embed  = n_kv * head_size
+
+    # The runner reads a single packed buffer [Q | K | V]; the values are
+    # arbitrary, so concatenate the three slabs in this order.
+    q_np = rng.standard_normal((tokens, embed)).astype(np.float32) * 0.1
+    k_np = rng.standard_normal((tokens, kv_embed)).astype(np.float32) * 0.1
+    v_np = rng.standard_normal((tokens, kv_embed)).astype(np.float32) * 0.1
+    x_np = np.concatenate([q_np, k_np, v_np], axis=1)
     write_tensor(test_dir / "input_x.bin", x_np)
-    write_int_array(test_dir / "config.bin", [head_count, 1 if causal else 0])
+    write_int_array(test_dir / "config.bin", [n_q, 1 if causal else 0, n_kv])
 
-    head_size = embed // head_count
     x = torch.tensor(x_np, requires_grad=True)
-
     q_flat = x[:, 0:embed]
-    k_flat = x[:, embed:2 * embed]
-    v_flat = x[:, 2 * embed:3 * embed]
+    k_flat = x[:, embed:embed + kv_embed]
+    v_flat = x[:, embed + kv_embed:embed + 2 * kv_embed]
 
-    q = q_flat.reshape(tokens, head_count, head_size).permute(1, 0, 2)
-    k = k_flat.reshape(tokens, head_count, head_size).permute(1, 0, 2)
-    v = v_flat.reshape(tokens, head_count, head_size).permute(1, 0, 2)
+    q = q_flat.reshape(tokens, n_q,  head_size).permute(1, 0, 2)
+    k = k_flat.reshape(tokens, n_kv, head_size).permute(1, 0, 2)
+    v = v_flat.reshape(tokens, n_kv, head_size).permute(1, 0, 2)
+
+    # Repeat K/V to match Q's head count for the reference matmul.
+    if n_kv != n_q:
+        repeat = n_q // n_kv
+        k = k.repeat_interleave(repeat, dim=0)
+        v = v.repeat_interleave(repeat, dim=0)
 
     scores = torch.matmul(q, k.transpose(1, 2)) / (head_size ** 0.5)
     if causal:
@@ -615,6 +689,196 @@ class TorchTransformerBf16(torch.nn.Module):
         return out.float()
 
 
+class TorchLlama(torch.nn.Module):
+    """F32 Llama-shaped network: RMSNorm + GQA + RoPE + SwiGLU + tied lm_head.
+
+    Mirrors networks/llama/llama.odin's forward exactly. RoPE is applied to Q
+    (n_q_heads worth) and K (n_kv_heads worth) with the same theta convention
+    used by ml.rope (interleaved pair rotation).
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.cfg = config
+        c = config
+
+        q_size  = c["n_q_heads"]  * c["head_size"]
+        kv_size = c["n_kv_heads"] * c["head_size"]
+
+        self.token_embeddings = torch.nn.Parameter(torch.empty(c["vocabulary_size"], c["embedding_size"]))
+
+        layers = []
+        for _ in range(c["layer_count"]):
+            block = torch.nn.ParameterDict({
+                "input_norm_weight":     torch.nn.Parameter(torch.empty(c["embedding_size"])),
+                "q_proj_weight":         torch.nn.Parameter(torch.empty(q_size,  c["embedding_size"])),
+                "k_proj_weight":         torch.nn.Parameter(torch.empty(kv_size, c["embedding_size"])),
+                "v_proj_weight":         torch.nn.Parameter(torch.empty(kv_size, c["embedding_size"])),
+                "o_proj_weight":         torch.nn.Parameter(torch.empty(c["embedding_size"], q_size)),
+                "post_attn_norm_weight": torch.nn.Parameter(torch.empty(c["embedding_size"])),
+                "gate_proj_weight":      torch.nn.Parameter(torch.empty(c["intermediate_size"], c["embedding_size"])),
+                "up_proj_weight":        torch.nn.Parameter(torch.empty(c["intermediate_size"], c["embedding_size"])),
+                "down_proj_weight":      torch.nn.Parameter(torch.empty(c["embedding_size"],    c["intermediate_size"])),
+            })
+            layers.append(block)
+        self.layers = torch.nn.ModuleList(layers)
+
+        self.output_norm_weight = torch.nn.Parameter(torch.empty(c["embedding_size"]))
+
+    @staticmethod
+    def _rope(x, head_count, head_size, base):
+        tokens, embed = x.shape
+        half = head_size // 2
+
+        pos = torch.arange(tokens, dtype=torch.float32).unsqueeze(1)
+        inv = 1.0 / (base ** (torch.arange(half, dtype=torch.float32) * 2.0 / head_size))
+        cos = torch.cos(pos * inv)
+        sin = torch.sin(pos * inv)
+
+        x_view = x.reshape(tokens, head_count, half, 2)
+        even   = x_view[..., 0]
+        odd    = x_view[..., 1]
+        cos_b  = cos.unsqueeze(1)
+        sin_b  = sin.unsqueeze(1)
+        out_even = even * cos_b - odd  * sin_b
+        out_odd  = even * sin_b + odd  * cos_b
+        out_view = torch.stack([out_even, out_odd], dim=-1)
+        return out_view.reshape(tokens, embed)
+
+    def _attention(self, q, k, v):
+        c = self.cfg
+        tokens = q.shape[0]
+
+        q = q.reshape(tokens, c["n_q_heads"],  c["head_size"]).permute(1, 0, 2)
+        k = k.reshape(tokens, c["n_kv_heads"], c["head_size"]).permute(1, 0, 2)
+        v = v.reshape(tokens, c["n_kv_heads"], c["head_size"]).permute(1, 0, 2)
+
+        if c["n_kv_heads"] != c["n_q_heads"]:
+            repeat = c["n_q_heads"] // c["n_kv_heads"]
+            k = k.repeat_interleave(repeat, dim=0)
+            v = v.repeat_interleave(repeat, dim=0)
+
+        scores = torch.matmul(q, k.transpose(1, 2)) / (c["head_size"] ** 0.5)
+        mask   = torch.triu(torch.ones(tokens, tokens, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
+        attn   = torch.nn.functional.softmax(scores, dim=-1)
+        out    = torch.matmul(attn, v)
+        return out.permute(1, 0, 2).reshape(tokens, c["n_q_heads"] * c["head_size"])
+
+    def forward(self, tokens):
+        c = self.cfg
+        residual = self.token_embeddings[tokens]
+
+        for layer in self.layers:
+            normed = torch.nn.functional.rms_norm(
+                residual, [c["embedding_size"]],
+                weight=layer["input_norm_weight"], eps=1e-5,
+            )
+            q = torch.nn.functional.linear(normed, layer["q_proj_weight"])
+            k = torch.nn.functional.linear(normed, layer["k_proj_weight"])
+            v = torch.nn.functional.linear(normed, layer["v_proj_weight"])
+            q = self._rope(q, c["n_q_heads"],  c["head_size"], c["rope_base"])
+            k = self._rope(k, c["n_kv_heads"], c["head_size"], c["rope_base"])
+
+            attn_out = self._attention(q, k, v)
+            attn_out = torch.nn.functional.linear(attn_out, layer["o_proj_weight"])
+            residual = residual + attn_out
+
+            normed = torch.nn.functional.rms_norm(
+                residual, [c["embedding_size"]],
+                weight=layer["post_attn_norm_weight"], eps=1e-5,
+            )
+            gate = torch.nn.functional.linear(normed, layer["gate_proj_weight"])
+            up   = torch.nn.functional.linear(normed, layer["up_proj_weight"])
+            mlp_out  = torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, layer["down_proj_weight"])
+            residual = residual + mlp_out
+
+        out = torch.nn.functional.rms_norm(
+            residual, [c["embedding_size"]],
+            weight=self.output_norm_weight, eps=1e-5,
+        )
+        # Tied lm_head: reuse token_embeddings as the projection weight.
+        return torch.nn.functional.linear(out, self.token_embeddings)
+
+
+def gen_llama_train(name, config, token_count, step_count, learning_rate, period=1):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    tokens_np  = rng.integers(0, config["vocabulary_size"], size=token_count).astype(np.int32)
+    targets_np = rng.integers(0, config["vocabulary_size"], size=token_count).astype(np.int32)
+    write_int_array(test_dir / "tokens.bin",  tokens_np)
+    write_int_array(test_dir / "targets.bin", targets_np)
+    write_int_array(test_dir / "config.bin", [
+        step_count, period,
+        config["layer_count"], config["n_q_heads"], config["n_kv_heads"], config["head_size"],
+        config["embedding_size"], config["intermediate_size"], config["vocabulary_size"],
+        token_count,
+        int(round(learning_rate * 1_000_000)),
+        int(round(config["rope_base"])),
+    ])
+
+    torch.manual_seed(SEED)
+    model = TorchLlama(config)
+
+    layer_count    = config["layer_count"]
+    embed          = config["embedding_size"]
+    intermediate   = config["intermediate_size"]
+    residual_scale = 0.02 / math.sqrt(2 * layer_count)
+
+    with torch.no_grad():
+        model.token_embeddings.normal_(0.0, 0.02)
+        for layer in model.layers:
+            layer["input_norm_weight"].fill_(1.0)
+            layer["q_proj_weight"].normal_(0.0, 0.02)
+            layer["k_proj_weight"].normal_(0.0, 0.02)
+            layer["v_proj_weight"].normal_(0.0, 0.02)
+            layer["o_proj_weight"].normal_(0.0, residual_scale)
+            layer["post_attn_norm_weight"].fill_(1.0)
+            layer["gate_proj_weight"].normal_(0.0, 0.02)
+            layer["up_proj_weight"  ].normal_(0.0, 0.02)
+            layer["down_proj_weight"].normal_(0.0, residual_scale)
+        model.output_norm_weight.fill_(1.0)
+
+    write_tensor(test_dir / "init_token_embeddings.bin", model.token_embeddings.detach().numpy())
+    for i, layer in enumerate(model.layers):
+        for key in ("input_norm_weight", "q_proj_weight", "k_proj_weight", "v_proj_weight", "o_proj_weight",
+                    "post_attn_norm_weight", "gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            write_tensor(test_dir / f"init_layer{i}_{key}.bin", layer[key].detach().numpy())
+    write_tensor(test_dir / "init_output_norm_weight.bin", model.output_norm_weight.detach().numpy())
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+
+    tokens_pt  = torch.tensor(tokens_np .astype(np.int64))
+    targets_pt = torch.tensor(targets_np.astype(np.int64))
+
+    losses = np.zeros(step_count, dtype=np.float32)
+    for step in range(step_count):
+        logits = model(tokens_pt)
+        loss   = torch.nn.functional.cross_entropy(logits, targets_pt, reduction="mean")
+        losses[step] = loss.item()
+        loss.backward()
+        if (step + 1) % period == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+    return test_dir, {"losses": losses}
+
+
+def verify_llama_train(test_dir: Path, refs: dict) -> None:
+    odin_losses  = read_tensor(test_dir / "odin_losses.bin")
+    torch_losses = refs["losses"]
+    if odin_losses.shape != torch_losses.shape:
+        raise AssertionError(f"loss shape mismatch {odin_losses.shape} vs {torch_losses.shape}")
+    diff = np.abs(odin_losses - torch_losses)
+    rel  = diff / np.maximum(np.abs(torch_losses), 1e-8)
+    if diff.max() > 1e-3 and rel.max() > 5e-3:
+        worst = int(np.argmax(diff))
+        raise AssertionError(
+            f"loss curve diverged: max abs {diff.max():.3e} at step {worst} "
+            f"(odin={odin_losses[worst]:.6f}, torch={torch_losses[worst]:.6f})"
+        )
+
+
 def gen_transformer_train_bf16(name, layer_count, head_count, embedding_size, vocabulary_size, token_count, step_count, learning_rate, period=1):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
@@ -699,6 +963,8 @@ TESTS = [
     ("softmax",       lambda: gen_unary("softmax",     "softmax",     (4, 8)),  verify_unary),
     ("log_softmax",   lambda: gen_unary("log_softmax", "log_softmax", (4, 8)),  verify_unary),
     ("layernorm",     lambda: gen_layernorm("layernorm", (4, 16)), verify_layernorm),
+    ("rmsnorm",       lambda: gen_rmsnorm("rmsnorm",       (4, 16)),  verify_rmsnorm),
+    ("rmsnorm_big",   lambda: gen_rmsnorm("rmsnorm_big",   (64, 128)), verify_rmsnorm),
     ("cross_entropy", lambda: gen_cross_entropy("cross_entropy", sample_count=8, class_size=10), verify_cross_entropy),
     ("batched_matmul", lambda: gen_batched_matmul("batched_matmul", batch=4, m=6, k=5, n=7), verify_binary_op),
     ("permute",       lambda: gen_permute("permute", (3, 4, 5), [1, 0, 2]), verify_unary),
@@ -716,6 +982,17 @@ TESTS = [
     ("rope",    lambda: gen_rope("rope", tokens=8, head_count=2, head_size=8), verify_unary),
     ("rope_xfmr",          lambda: gen_rope("rope_xfmr", tokens=64, head_count=4, head_size=32), verify_unary),
     ("attention_xfmr",     lambda: gen_attention("attention_xfmr", tokens=64, embed=128, head_count=4, causal=True), verify_unary),
+    ("attention_gqa",      lambda: gen_attention("attention_gqa",     tokens=8,  embed=16,  head_count=4, causal=True, n_kv_heads=2), verify_unary),
+    ("attention_gqa_big",  lambda: gen_attention("attention_gqa_big", tokens=64, embed=144, head_count=9, causal=True, n_kv_heads=3), verify_unary),
+    ("tied_embeddings",    lambda: gen_tied_embeddings("tied_embeddings", vocab=32, embed=8, n_tokens=12), verify_tied_embeddings),
+    ("llama_train",        lambda: gen_llama_train("llama_train",
+        config={
+            "layer_count": 2, "n_q_heads": 4, "n_kv_heads": 2, "head_size": 8,
+            "embedding_size": 32, "intermediate_size": 64, "vocabulary_size": 64,
+            "rope_base": 100000.0,
+        },
+        token_count=16, step_count=20, learning_rate=0.01,
+    ), verify_llama_train),
     ("mlp_train_period12", lambda: gen_mlp_train("mlp_train_period12", sizes=[4, 8, 8, 1], sample_count=16, step_count=60, learning_rate=0.01, period=12), verify_mlp_train),
     ("transformer_train_bf16", lambda: gen_transformer_train_bf16(
         "transformer_train_bf16",

@@ -15,3 +15,7 @@ ggml/
 __pycache__
 
 tests/pytorch_parity/artifacts
+
+*.safetensors
+
+smollm_data/

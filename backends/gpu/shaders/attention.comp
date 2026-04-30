@@ -1,13 +1,12 @@
 // Online-softmax (FA2-style) single-head attention forward.
-//   x:   [T, 3*E]  packed [Q | K | V] on trailing dim
-//   o:   [T, E]    output
-//   lse: [H, T]    log-sum-exp per (head, query), saved for backward
+// GQA-capable: K/V share head index `h * n_kv / n_q`.
+//   q:   [T, n_q_heads * D]
+//   k,v: [T, n_kv_heads * D]
+//   o:   [T, n_q_heads * D]
+//   lse: [n_q_heads, T]
 //
-// One workgroup per (head, query). Threads parallelize over the head dim
-// for the per-tile score reduction and for the running output update.
-// Keys are streamed in tiles of BC; we keep only the running max m,
-// running sum l, and partial output o_acc per thread, so there is no
-// MAX_T cap on the sequence length.
+// One workgroup per (q_head, query). Threads parallelize over the head
+// dim for the per-tile score reduction and for the running output update.
 #version 450
 
 #define WG    64
@@ -17,15 +16,19 @@
 
 layout(local_size_x = WG) in;
 
-layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
-layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
-layout(set = 0, binding = 2) writeonly buffer L { float lse[]; };
+layout(set = 0, binding = 0) readonly  buffer Q { float q_buf[]; };
+layout(set = 0, binding = 1) readonly  buffer K { float k_buf[]; };
+layout(set = 0, binding = 2) readonly  buffer V { float v_buf[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+layout(set = 0, binding = 4) writeonly buffer L { float lse[]; };
 
 layout(push_constant) uniform Params {
-    uint head_count;
+    uint n_q_heads;
+    uint n_kv_heads;
     uint head_size;
     uint token_count;
-    uint embed_size;
+    uint q_size;
+    uint kv_size;
     uint causal;
 } p;
 
@@ -40,18 +43,17 @@ void main() {
     uint t_q  = gl_WorkGroupID.y;
     uint tid  = gl_LocalInvocationID.x;
 
-    uint D      = p.head_size;
-    uint T      = p.token_count;
-    uint E      = p.embed_size;
-    uint stride = 3u * E;
+    uint D    = p.head_size;
+    uint T    = p.token_count;
+    uint kv_h = h * p.n_kv_heads / p.n_q_heads;
     float inv_sqrt_d = inversesqrt(float(D));
     uint t_k_max = (p.causal != 0u) ? (t_q + 1u) : T;
 
-    uint q_base = t_q * stride + h * D;
-    uint o_base = t_q * E + h * D;
+    uint q_base = t_q * p.q_size + h    * D;
+    uint o_base = t_q * p.q_size + h    * D;
 
     for (uint d = tid; d < D; d += WG) {
-        q_shared[d] = x[q_base + d];
+        q_shared[d] = q_buf[q_base + d];
     }
     barrier();
 
@@ -62,14 +64,13 @@ void main() {
     float l_run = 0.0;
 
     for (uint t_k0 = 0u; t_k0 < t_k_max; t_k0 += BC) {
-        // Tile score: each thread computes one Q . K[t_k0 + tid].
         uint t_k = t_k0 + tid;
         float score = NEG_INF;
         if (tid < BC && t_k < t_k_max) {
-            uint k_base = t_k * stride + E + h * D;
+            uint k_base = t_k * p.kv_size + kv_h * D;
             float dot = 0.0;
             for (uint d = 0u; d < D; d += 1u) {
-                dot += q_shared[d] * x[k_base + d];
+                dot += q_shared[d] * k_buf[k_base + d];
             }
             score = dot * inv_sqrt_d;
         }
@@ -84,7 +85,6 @@ void main() {
         float m_tile = partial[0];
         float m_new  = max(m_run, m_tile);
 
-        // exp(score - m_new), in-place; sum to l_tile.
         float p_val = (tid < BC) ? exp(score_tile[tid] - m_new) : 0.0;
         if (tid < BC) score_tile[tid] = p_val;
         partial[tid] = p_val;
@@ -99,15 +99,14 @@ void main() {
         l_run = alpha * l_run + l_tile;
         m_run = m_new;
 
-        // o_acc[d] = alpha * o_acc[d] + sum_j score_tile[j] * V[t_k0+j][d]
         for (uint slot = 0u; slot < O_SLOTS; slot += 1u) {
             uint d = tid + slot * WG;
             if (d < D) {
                 float contrib = 0.0;
                 uint j_max = min(BC, t_k_max - t_k0);
                 for (uint j = 0u; j < j_max; j += 1u) {
-                    uint v_base = (t_k0 + j) * stride + 2u * E + h * D;
-                    contrib += score_tile[j] * x[v_base + d];
+                    uint v_base = (t_k0 + j) * p.kv_size + kv_h * D;
+                    contrib += score_tile[j] * v_buf[v_base + d];
                 }
                 o_acc[slot] = alpha * o_acc[slot] + contrib;
             }

@@ -171,7 +171,10 @@ bench_attention :: proc() -> f32 {
 		ml.fill_value(_attention_x, 0.01)
 	}
 	ml.clear()
-	y := ml.attention(_attention_x, ATTN_HEADS, causal=true)
+	q := ml.slice_trailing(_attention_x, 0,             ATTN_EMBED)
+	k := ml.slice_trailing(_attention_x, ATTN_EMBED,    2 * ATTN_EMBED)
+	v := ml.slice_trailing(_attention_x, 2 * ATTN_EMBED, 3 * ATTN_EMBED)
+	y := ml.attention(q, k, v, ATTN_HEADS, causal=true)
 	ml.backward()
 	return _checksum(y)
 }

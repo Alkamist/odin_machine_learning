@@ -1,0 +1,46 @@
+// Per-row RMSNorm: y[c, i] = x[c, i] * rstd[c] * w[i].
+//   x: [count, size]   row-major
+//   w: [size]          per-feature gain
+//   y: [count, size]
+#version 450
+
+#define WG 256
+#define EPSILON 1e-5
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly  buffer W { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+    uint size;
+} p;
+
+shared float partial[WG];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= p.count) return;
+    uint off = row * p.size;
+
+    float s2 = 0.0;
+    for (uint i = tid; i < p.size; i += WG) {
+        float v = x[off + i];
+        s2 += v * v;
+    }
+    partial[tid] = s2;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+    float rstd = inversesqrt(partial[0] / float(p.size) + EPSILON);
+    barrier();
+
+    for (uint i = tid; i < p.size; i += WG) {
+        y[off + i] = x[off + i] * rstd * w[i];
+    }
+}

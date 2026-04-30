@@ -262,6 +262,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Linear:             linear_forward             (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
+	case ml.Rmsnorm:            rmsnorm_forward            (op)
 	case ml.Softmax:            softmax_forward            (op)
 	case ml.Entropy:            entropy_forward            (op)
 	case ml.Log_Softmax:        log_softmax_forward        (op)
@@ -302,6 +303,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Linear:             linear_backward            (op)
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
+	case ml.Rmsnorm:            rmsnorm_backward           (op)
 	case ml.Softmax:            softmax_backward           (op)
 	case ml.Entropy:            entropy_backward           (op)
 	case ml.Log_Softmax:        log_softmax_backward       (op)
@@ -1395,6 +1397,104 @@ layernorm_backward :: proc(op: ml.Operation) {
 	}
 }
 
+rmsnorm_forward :: proc(op: ml.Operation) {
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Rmsnorm)
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
+
+	is_bf16 := input.type == .Bf16
+	if is_bf16 {
+		fmt.assertf(size % 2 == 0, "GPU bf16 rmsnorm requires even size (got %v)", size)
+	}
+
+	stats_pipe: ^Pipeline
+	fwd_pipe:   ^Pipeline
+	if is_bf16 {
+		if _rmsnorm_stats_bf16_pipeline == nil {
+			_rmsnorm_stats_bf16_pipeline = _make_pipeline(RMSNORM_STATS_BF16_SPIRV, 2, size_of(Rmsnorm_Stats_Params))
+		}
+		if _rmsnorm_bf16_pipeline == nil {
+			_rmsnorm_bf16_pipeline = _make_pipeline(RMSNORM_BF16_SPIRV, 3, size_of(Rmsnorm_Params))
+		}
+		stats_pipe = _rmsnorm_stats_bf16_pipeline
+		fwd_pipe   = _rmsnorm_bf16_pipeline
+	} else {
+		if _rmsnorm_stats_pipeline == nil {
+			_rmsnorm_stats_pipeline = _make_pipeline(RMSNORM_STATS_SPIRV, 2, size_of(Rmsnorm_Stats_Params))
+		}
+		if _rmsnorm_pipeline == nil {
+			_rmsnorm_pipeline = _make_pipeline(RMSNORM_SPIRV, 3, size_of(Rmsnorm_Params))
+		}
+		stats_pipe = _rmsnorm_stats_pipeline
+		fwd_pipe   = _rmsnorm_pipeline
+	}
+
+	stats_params := Rmsnorm_Stats_Params{count = u32(count), size = u32(size)}
+	stats_bufs   := [2]vk.Buffer{data(input).buffer, data(variant.rstd).buffer}
+	_dispatch(stats_pipe, stats_bufs[:], &stats_params, u32(count))
+
+	fwd_params := Rmsnorm_Params{count = u32(count), size = u32(size)}
+	fwd_bufs   := [3]vk.Buffer{data(input).buffer, data(variant.weight).buffer, data(output).buffer}
+	_dispatch(fwd_pipe, fwd_bufs[:], &fwd_params, u32(count))
+}
+
+rmsnorm_backward :: proc(op: ml.Operation) {
+	input, output := op.input, op.output
+	variant := op.variant.(ml.Rmsnorm)
+	size  := input.shape[input.rank - 1]
+	count := ml.len(input) / size
+
+	is_bf16 := input.type == .Bf16
+	if is_bf16 {
+		fmt.assertf(size % 2 == 0, "GPU bf16 rmsnorm_backward requires even size (got %v)", size)
+
+		if _rmsnorm_back_input_bf16_pipeline == nil {
+			_rmsnorm_back_input_bf16_pipeline = _make_pipeline(RMSNORM_BACK_INPUT_BF16_SPIRV, 5, size_of(Rmsnorm_Back_Params))
+		}
+		if _rmsnorm_back_weight_bf16_pipeline == nil {
+			_rmsnorm_back_weight_bf16_pipeline = _make_pipeline(RMSNORM_BACK_WEIGHT_BF16_SPIRV, 4, size_of(Rmsnorm_Back_Weight_Bf16_Params))
+		}
+
+		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size)}
+		input_bufs := [5]vk.Buffer{
+			data(input).buffer, data(variant.weight).buffer, gradient(output).buffer,
+			data(variant.rstd).buffer, gradient(input).buffer,
+		}
+		_dispatch(_rmsnorm_back_input_bf16_pipeline, input_bufs[:], &params, u32(count))
+
+		pair_count := size / 2
+		w_params := Rmsnorm_Back_Weight_Bf16_Params{count = u32(count), size = u32(size), pair_count = u32(pair_count)}
+		weight_bufs := [4]vk.Buffer{
+			data(input).buffer, gradient(output).buffer,
+			data(variant.rstd).buffer, gradient(variant.weight).buffer,
+		}
+		_dispatch(_rmsnorm_back_weight_bf16_pipeline, weight_bufs[:], &w_params, _div_up(pair_count, 256))
+	} else {
+		if _rmsnorm_back_input_pipeline == nil {
+			_rmsnorm_back_input_pipeline = _make_pipeline(RMSNORM_BACK_INPUT_SPIRV, 5, size_of(Rmsnorm_Back_Params))
+		}
+		if _rmsnorm_back_weight_pipeline == nil {
+			_rmsnorm_back_weight_pipeline = _make_pipeline(RMSNORM_BACK_WEIGHT_SPIRV, 4, size_of(Rmsnorm_Back_Params))
+		}
+
+		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size)}
+
+		input_bufs := [5]vk.Buffer{
+			data(input).buffer, data(variant.weight).buffer, gradient(output).buffer,
+			data(variant.rstd).buffer, gradient(input).buffer,
+		}
+		_dispatch(_rmsnorm_back_input_pipeline, input_bufs[:], &params, u32(count))
+
+		weight_bufs := [4]vk.Buffer{
+			data(input).buffer, gradient(output).buffer,
+			data(variant.rstd).buffer, gradient(variant.weight).buffer,
+		}
+		_dispatch(_rmsnorm_back_weight_pipeline, weight_bufs[:], &params, _div_up(size, 256))
+	}
+}
+
 softmax_forward :: proc(op: ml.Operation) {
 	input  := op.input
 	output := op.output
@@ -2024,71 +2124,75 @@ causal_mask_backward :: proc(op: ml.Operation) {
 }
 
 attention_forward :: proc(op: ml.Operation) {
-	input       := op.input
-	output      := op.output
-	variant     := op.variant.(ml.Attention)
-	token_count := input.shape[0]
-	embed_size  := output.shape[1]
-	head_size   := embed_size / variant.head_count
+	query   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Attention)
+	key     := variant.key
+	value   := variant.value
+	token_count := query.shape[0]
+	q_size      := query.shape[1]
+	kv_size     := key.shape[1]
+	head_size   := q_size / variant.n_q_heads
 	fmt.assertf(head_size <= 256, "GPU attention currently caps head_size at 256 (got %v)", head_size)
-	fmt.assertf(input.type == .F32 || input.type == .Bf16, "GPU attention only supports F32 or Bf16 (got %v)", input.type)
+	fmt.assertf(query.type == .F32 || query.type == .Bf16, "GPU attention only supports F32 or Bf16 (got %v)", query.type)
 
-	is_bf16 := input.type == .Bf16
+	is_bf16 := query.type == .Bf16
 	if is_bf16 {
-		fmt.assertf(head_size  % 2 == 0, "GPU bf16 attention requires even head_size (got %v)",  head_size)
-		fmt.assertf(embed_size % 2 == 0, "GPU bf16 attention requires even embed_size (got %v)", embed_size)
+		fmt.assertf(head_size % 2 == 0, "GPU bf16 attention requires even head_size (got %v)", head_size)
 	}
 
 	params := Attention_Params{
-		head_count  = u32(variant.head_count),
+		n_q_heads   = u32(variant.n_q_heads),
+		n_kv_heads  = u32(variant.n_kv_heads),
 		head_size   = u32(head_size),
 		token_count = u32(token_count),
-		embed_size  = u32(embed_size),
+		q_size      = u32(q_size),
+		kv_size     = u32(kv_size),
 		causal      = variant.causal ? 1 : 0,
 	}
-	bufs := [3]vk.Buffer{data(input).buffer, data(output).buffer, data(variant.lse).buffer}
+	bufs := [5]vk.Buffer{
+		data(query).buffer, data(key).buffer, data(value).buffer,
+		data(output).buffer, data(variant.lse).buffer,
+	}
 
-	// Bf16 coopmat path requires head_size % 16 == 0; the shader exists at
-	// `attention_bf16_coopmat.comp` and is correctness-tested by
-	// `dtype_roundtrip`, but on the current bench shapes (D=64, T<=256) it
-	// runs slower than the SIMT bf16 shader due to shared-mem barriers and
-	// sequential per-row softmax. Left disabled until the FA2 backward
-	// pass forces a better layout (multi-subgroup, fewer barriers).
-	use_coopmat := false && is_bf16 && _gpu.coopmat_bf16 && head_size % 16 == 0 && head_size <= 64
+	use_coopmat := false && is_bf16 && _gpu.coopmat_bf16 && head_size % 16 == 0 && head_size <= 64 && variant.n_q_heads == variant.n_kv_heads
 
 	if use_coopmat {
 		if _attention_bf16_coopmat_pipeline == nil {
-			_attention_bf16_coopmat_pipeline = _make_pipeline(ATTENTION_BF16_COOPMAT_SPIRV, 3, size_of(Attention_Params))
+			_attention_bf16_coopmat_pipeline = _make_pipeline(ATTENTION_BF16_COOPMAT_SPIRV, 5, size_of(Attention_Params))
 		}
 		_dispatch(
 			_attention_bf16_coopmat_pipeline, bufs[:], &params,
-			u32(variant.head_count),
+			u32(variant.n_q_heads),
 			u32(_div_up(token_count, ATTENTION_BF16_COOPMAT_BR)),
 		)
 	} else if is_bf16 {
 		if _attention_bf16_pipeline == nil {
-			_attention_bf16_pipeline = _make_pipeline(ATTENTION_BF16_SPIRV, 3, size_of(Attention_Params))
+			_attention_bf16_pipeline = _make_pipeline(ATTENTION_BF16_SPIRV, 5, size_of(Attention_Params))
 		}
-		_dispatch(_attention_bf16_pipeline, bufs[:], &params, u32(variant.head_count), u32(token_count))
+		_dispatch(_attention_bf16_pipeline, bufs[:], &params, u32(variant.n_q_heads), u32(token_count))
 	} else {
 		if _attention_pipeline == nil {
-			_attention_pipeline = _make_pipeline(ATTENTION_SPIRV, 3, size_of(Attention_Params))
+			_attention_pipeline = _make_pipeline(ATTENTION_SPIRV, 5, size_of(Attention_Params))
 		}
-		_dispatch(_attention_pipeline, bufs[:], &params, u32(variant.head_count), u32(token_count))
+		_dispatch(_attention_pipeline, bufs[:], &params, u32(variant.n_q_heads), u32(token_count))
 	}
 }
 
 attention_backward :: proc(op: ml.Operation) {
-	input, output := op.input, op.output
-	variant     := op.variant.(ml.Attention)
-	token_count := input.shape[0]
-	embed_size  := output.shape[1]
-	head_size   := embed_size / variant.head_count
+	query   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Attention)
+	key     := variant.key
+	value   := variant.value
+	token_count := query.shape[0]
+	q_size      := query.shape[1]
+	kv_size     := key.shape[1]
+	head_size   := q_size / variant.n_q_heads
 
-	is_bf16 := input.type == .Bf16
+	is_bf16 := query.type == .Bf16
 	if is_bf16 {
-		fmt.assertf(head_size  % 2 == 0, "GPU bf16 attention requires even head_size (got %v)",  head_size)
-		fmt.assertf(embed_size % 2 == 0, "GPU bf16 attention requires even embed_size (got %v)", embed_size)
+		fmt.assertf(head_size % 2 == 0, "GPU bf16 attention requires even head_size (got %v)", head_size)
 	}
 
 	back_d_pipeline:  ^Pipeline
@@ -2099,10 +2203,10 @@ attention_backward :: proc(op: ml.Operation) {
 			_attention_back_d_bf16_pipeline = _make_pipeline(ATTENTION_BACK_D_BF16_SPIRV, 3, size_of(Attention_Back_D_Params))
 		}
 		if _attention_back_kv_bf16_pipeline == nil {
-			_attention_back_kv_bf16_pipeline = _make_pipeline(ATTENTION_BACK_KV_BF16_SPIRV, 5, size_of(Attention_Params))
+			_attention_back_kv_bf16_pipeline = _make_pipeline(ATTENTION_BACK_KV_BF16_SPIRV, 8, size_of(Attention_Params))
 		}
 		if _attention_back_q_bf16_pipeline == nil {
-			_attention_back_q_bf16_pipeline = _make_pipeline(ATTENTION_BACK_Q_BF16_SPIRV, 5, size_of(Attention_Params))
+			_attention_back_q_bf16_pipeline = _make_pipeline(ATTENTION_BACK_Q_BF16_SPIRV, 7, size_of(Attention_Params))
 		}
 		back_d_pipeline  = _attention_back_d_bf16_pipeline
 		back_kv_pipeline = _attention_back_kv_bf16_pipeline
@@ -2112,10 +2216,10 @@ attention_backward :: proc(op: ml.Operation) {
 			_attention_back_d_pipeline = _make_pipeline(ATTENTION_BACK_D_SPIRV, 3, size_of(Attention_Back_D_Params))
 		}
 		if _attention_back_kv_pipeline == nil {
-			_attention_back_kv_pipeline = _make_pipeline(ATTENTION_BACK_KV_SPIRV, 5, size_of(Attention_Params))
+			_attention_back_kv_pipeline = _make_pipeline(ATTENTION_BACK_KV_SPIRV, 8, size_of(Attention_Params))
 		}
 		if _attention_back_q_pipeline == nil {
-			_attention_back_q_pipeline = _make_pipeline(ATTENTION_BACK_Q_SPIRV, 5, size_of(Attention_Params))
+			_attention_back_q_pipeline = _make_pipeline(ATTENTION_BACK_Q_SPIRV, 7, size_of(Attention_Params))
 		}
 		back_d_pipeline  = _attention_back_d_pipeline
 		back_kv_pipeline = _attention_back_kv_pipeline
@@ -2123,32 +2227,36 @@ attention_backward :: proc(op: ml.Operation) {
 	}
 
 	d_params := Attention_Back_D_Params{
-		head_count  = u32(variant.head_count),
+		n_q_heads   = u32(variant.n_q_heads),
 		head_size   = u32(head_size),
 		token_count = u32(token_count),
-		embed_size  = u32(embed_size),
+		q_size      = u32(q_size),
 	}
 	d_bufs := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, data(variant.d_acc).buffer}
-	_dispatch(back_d_pipeline, d_bufs[:], &d_params, u32(variant.head_count), u32(token_count))
+	_dispatch(back_d_pipeline, d_bufs[:], &d_params, u32(variant.n_q_heads), u32(token_count))
 
 	back_params := Attention_Params{
-		head_count  = u32(variant.head_count),
+		n_q_heads   = u32(variant.n_q_heads),
+		n_kv_heads  = u32(variant.n_kv_heads),
 		head_size   = u32(head_size),
 		token_count = u32(token_count),
-		embed_size  = u32(embed_size),
+		q_size      = u32(q_size),
+		kv_size     = u32(kv_size),
 		causal      = variant.causal ? 1 : 0,
 	}
-	kv_bufs := [5]vk.Buffer{
-		data(input).buffer, gradient(output).buffer, data(variant.lse).buffer,
-		data(variant.d_acc).buffer, gradient(input).buffer,
+	kv_bufs := [8]vk.Buffer{
+		data(query).buffer, data(key).buffer, data(value).buffer,
+		gradient(output).buffer, data(variant.lse).buffer, data(variant.d_acc).buffer,
+		gradient(key).buffer, gradient(value).buffer,
 	}
-	_dispatch(back_kv_pipeline, kv_bufs[:], &back_params, u32(variant.head_count), u32(token_count))
+	_dispatch(back_kv_pipeline, kv_bufs[:], &back_params, u32(variant.n_kv_heads), u32(token_count))
 
-	q_bufs := [5]vk.Buffer{
-		data(input).buffer, gradient(output).buffer, data(variant.lse).buffer,
-		data(variant.d_acc).buffer, gradient(input).buffer,
+	q_bufs := [7]vk.Buffer{
+		data(query).buffer, data(key).buffer, data(value).buffer,
+		gradient(output).buffer, data(variant.lse).buffer, data(variant.d_acc).buffer,
+		gradient(query).buffer,
 	}
-	_dispatch(back_q_pipeline, q_bufs[:], &back_params, u32(variant.head_count), u32(token_count))
+	_dispatch(back_q_pipeline, q_bufs[:], &back_params, u32(variant.n_q_heads), u32(token_count))
 }
 
 _upload_indices :: proc(indices: []int, loc := #caller_location) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {

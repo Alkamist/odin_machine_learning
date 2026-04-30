@@ -121,6 +121,27 @@ _layernorm_stats_bf16_pipeline:       ^Pipeline
 _layernorm_back_input_bf16_pipeline:  ^Pipeline
 _layernorm_back_weight_bf16_pipeline: ^Pipeline
 
+RMSNORM_SPIRV                  :: #load("shaders/rmsnorm.spv",                  []u8)
+RMSNORM_STATS_SPIRV            :: #load("shaders/rmsnorm_stats.spv",            []u8)
+RMSNORM_BACK_INPUT_SPIRV       :: #load("shaders/rmsnorm_back_input.spv",       []u8)
+RMSNORM_BACK_WEIGHT_SPIRV      :: #load("shaders/rmsnorm_back_weight.spv",      []u8)
+RMSNORM_BF16_SPIRV             :: #load("shaders/rmsnorm_bf16.spv",             []u8)
+RMSNORM_STATS_BF16_SPIRV       :: #load("shaders/rmsnorm_stats_bf16.spv",       []u8)
+RMSNORM_BACK_INPUT_BF16_SPIRV  :: #load("shaders/rmsnorm_back_input_bf16.spv",  []u8)
+RMSNORM_BACK_WEIGHT_BF16_SPIRV :: #load("shaders/rmsnorm_back_weight_bf16.spv", []u8)
+Rmsnorm_Params                  :: struct { count, size: u32 }
+Rmsnorm_Stats_Params            :: struct { count, size: u32 }
+Rmsnorm_Back_Params             :: struct { count, size: u32 }
+Rmsnorm_Back_Weight_Bf16_Params :: struct { count, size, pair_count: u32 }
+_rmsnorm_pipeline:                  ^Pipeline
+_rmsnorm_stats_pipeline:            ^Pipeline
+_rmsnorm_back_input_pipeline:       ^Pipeline
+_rmsnorm_back_weight_pipeline:      ^Pipeline
+_rmsnorm_bf16_pipeline:             ^Pipeline
+_rmsnorm_stats_bf16_pipeline:       ^Pipeline
+_rmsnorm_back_input_bf16_pipeline:  ^Pipeline
+_rmsnorm_back_weight_bf16_pipeline: ^Pipeline
+
 SOFTMAX_SPIRV           :: #load("shaders/softmax.spv",           []u8)
 SOFTMAX_BACK_SPIRV      :: #load("shaders/softmax_back.spv",      []u8)
 SOFTMAX_BF16_SPIRV      :: #load("shaders/softmax_bf16.spv",      []u8)
@@ -180,10 +201,10 @@ ATTENTION_BACK_Q_BF16_SPIRV  :: #load("shaders/attention_back_q_bf16.spv",  []u8
 ATTENTION_BF16_COOPMAT_SPIRV :: #load("shaders/attention_bf16_coopmat.spv", []u8)
 ATTENTION_BF16_COOPMAT_BR    :: 16   // must match BR in shaders/attention_bf16_coopmat.comp
 Attention_Params :: struct {
-	head_count, head_size, token_count, embed_size, causal: u32,
+	n_q_heads, n_kv_heads, head_size, token_count, q_size, kv_size, causal: u32,
 }
 Attention_Back_D_Params :: struct {
-	head_count, head_size, token_count, embed_size: u32,
+	n_q_heads, head_size, token_count, q_size: u32,
 }
 _attention_pipeline:              ^Pipeline
 _attention_back_d_pipeline:       ^Pipeline

@@ -232,7 +232,10 @@ bench_attention :: proc() -> Result {
 		ml.clear()
 		qkv := ml.zeros(.F32, {TOKENS, 3 * EMBED})
 		ml.fill_value(qkv, 0.01)
-		y := ml.attention(qkv, HEADS)
+		q := ml.slice_trailing(qkv, 0,         EMBED)
+		k := ml.slice_trailing(qkv, EMBED,     2 * EMBED)
+		v := ml.slice_trailing(qkv, 2 * EMBED, 3 * EMBED)
+		y := ml.attention(q, k, v, HEADS)
 		ml.backward()
 		return sum(y) + sum_grad(qkv)
 	}

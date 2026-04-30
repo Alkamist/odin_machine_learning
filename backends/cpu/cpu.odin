@@ -401,6 +401,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Linear:             linear_forward             (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
+	case ml.Rmsnorm:            rmsnorm_forward            (op)
 	case ml.Softmax:            softmax_forward            (op)
 	case ml.Entropy:            entropy_forward            (op)
 	case ml.Log_Softmax:        log_softmax_forward        (op)
@@ -438,6 +439,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Linear:             linear_backward            (op)
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
+	case ml.Rmsnorm:            rmsnorm_backward           (op)
 	case ml.Softmax:            softmax_backward           (op)
 	case ml.Entropy:            entropy_backward           (op)
 	case ml.Log_Softmax:        log_softmax_backward       (op)
@@ -1730,6 +1732,163 @@ layernorm_backward_bf16 :: proc(op: ml.Operation) {
 	}
 }
 
+RMSNORM_EPSILON :: 1e-5
+
+rmsnorm_forward :: proc(op: ml.Operation) {
+	switch op.input.type {
+	case .F32:  rmsnorm_forward_f32 (op)
+	case .Bf16: rmsnorm_forward_bf16(op)
+	case .F16:  fmt.panicf("CPU rmsnorm_forward: F16 not yet supported")
+	}
+}
+
+rmsnorm_forward_f32 :: proc(op: ml.Operation) {
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Rmsnorm)
+	weight  := variant.weight
+	rstd    := variant.rstd
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
+
+	for c in 0 ..< count {
+		offset := c * size
+
+		ms: f32
+		for i in 0 ..< size {
+			v := data(input)[offset + i]
+			ms += v * v
+		}
+		ms /= f32(size)
+
+		s: f32 = 1.0 / math.sqrt(ms + f32(RMSNORM_EPSILON))
+		for i in 0 ..< size {
+			data(output)[offset + i] = s * data(input)[offset + i] * data(weight)[i]
+		}
+
+		data(rstd)[c] = s
+	}
+}
+
+rmsnorm_forward_bf16 :: proc(op: ml.Operation) {
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Rmsnorm)
+	weight  := variant.weight
+	rstd    := variant.rstd
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
+
+	x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
+	y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
+	w_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
+
+	for c in 0 ..< count {
+		offset := c * size
+
+		ms: f32
+		for i in 0 ..< size {
+			v := ml.bf16_to_f32(x_bf[offset + i])
+			ms += v * v
+		}
+		ms /= f32(size)
+
+		s: f32 = 1.0 / math.sqrt(ms + f32(RMSNORM_EPSILON))
+		for i in 0 ..< size {
+			y := s * ml.bf16_to_f32(x_bf[offset + i]) * ml.bf16_to_f32(w_bf[i])
+			y_bf[offset + i] = ml.bf16_from_f32(y)
+		}
+
+		data(rstd)[c] = s
+	}
+}
+
+rmsnorm_backward :: proc(op: ml.Operation) {
+	switch op.input.type {
+	case .F32:  rmsnorm_backward_f32 (op)
+	case .Bf16: rmsnorm_backward_bf16(op)
+	case .F16:  fmt.panicf("CPU rmsnorm_backward: F16 not yet supported")
+	}
+}
+
+rmsnorm_backward_f32 :: proc(op: ml.Operation) {
+	input, output := op.input, op.output
+
+	variant := op.variant.(ml.Rmsnorm)
+	weight  := variant.weight
+	rstd    := variant.rstd
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
+
+	for c in 0 ..< count {
+		offset := c * size
+		rstd_c := data(rstd)[c]
+
+		dnorm_norm_mean: f32
+		for i in 0 ..< size {
+			norm  := data(input)[offset + i] * rstd_c
+			dnorm := data(weight)[i] * gradient(output)[offset + i]
+			dnorm_norm_mean += dnorm * norm
+		}
+		dnorm_norm_mean /= f32(size)
+
+		for i in 0 ..< size {
+			x_v   := data(input)[offset + i]
+			dy_v  := gradient(output)[offset + i]
+			w_v   := data(weight)[i]
+			norm  := x_v * rstd_c
+			dnorm := w_v * dy_v
+
+			gradient(weight)[i] += norm * dy_v
+
+			grad := (dnorm - norm * dnorm_norm_mean) * rstd_c
+			gradient(input)[offset + i] += grad
+		}
+	}
+}
+
+rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
+	input, output := op.input, op.output
+
+	variant := op.variant.(ml.Rmsnorm)
+	weight  := variant.weight
+	rstd    := variant.rstd
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
+
+	x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
+	w_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
+	dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
+	dw_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Gradient]))
+	dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+
+	for c in 0 ..< count {
+		offset := c * size
+		rstd_c := data(rstd)[c]
+
+		dnorm_norm_mean: f32
+		for i in 0 ..< size {
+			norm  := ml.bf16_to_f32(x_bf[offset + i]) * rstd_c
+			dnorm := ml.bf16_to_f32(w_bf[i]) * ml.bf16_to_f32(dy_bf[offset + i])
+			dnorm_norm_mean += dnorm * norm
+		}
+		dnorm_norm_mean /= f32(size)
+
+		for i in 0 ..< size {
+			x_v   := ml.bf16_to_f32(x_bf[offset + i])
+			dy_v  := ml.bf16_to_f32(dy_bf[offset + i])
+			w_v   := ml.bf16_to_f32(w_bf[i])
+			norm  := x_v * rstd_c
+			dnorm := w_v * dy_v
+
+			dw_bf[i] = ml.bf16_from_f32(ml.bf16_to_f32(dw_bf[i]) + norm * dy_v)
+
+			grad := (dnorm - norm * dnorm_norm_mean) * rstd_c
+			dx_bf[offset + i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[offset + i]) + grad)
+		}
+	}
+}
+
 softmax_forward :: proc(op: ml.Operation) {
 	input  := op.input
 	output := op.output
@@ -2569,25 +2728,29 @@ attention_forward :: proc(op: ml.Operation) {
 }
 
 attention_forward_f32 :: proc(op: ml.Operation) {
-	head_count := op.variant.(ml.Attention).head_count
+	v := op.variant.(ml.Attention)
 
-	parallelize(head_count, head_count, op, proc(h: int, op: ml.Operation) {
+	parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
-		token_count  := op.input.shape[0]
-		embed_size   := op.output.shape[1]
-		head_size    := embed_size / v.head_count
-		causal       := v.causal
-		input_stride := 3 * embed_size
-		inv_sqrt_d   := 1.0 / math.sqrt(f32(head_size))
+		token_count := op.input.shape[0]
+		q_size      := op.input.shape[1]
+		kv_size     := v.key.shape[1]
+		head_size   := q_size / v.n_q_heads
+		group_size  := v.n_q_heads / v.n_kv_heads
+		kv_h        := h / group_size
+		causal      := v.causal
+		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		in_ptr  := ([^]f32)(raw_data(data(op.input)))
+		q_ptr   := ([^]f32)(raw_data(data(op.input)))
+		k_ptr   := ([^]f32)(raw_data(data(v.key)))
+		v_ptr   := ([^]f32)(raw_data(data(v.value)))
 		out_ptr := ([^]f32)(raw_data(data(op.output)))
 		sm_ptr  := ([^]f32)(raw_data(data(v.softmax_outputs)))
 
 		for t_q in 0 ..< token_count {
-			q_offset := t_q * input_stride + h * head_size
-			q := in_ptr[q_offset:]
+			q_offset := t_q * q_size + h * head_size
+			q := q_ptr[q_offset:]
 
 			sm_row_offset := h * token_count * token_count + t_q * token_count
 			sm_row := sm_ptr[sm_row_offset:]
@@ -2597,9 +2760,8 @@ attention_forward_f32 :: proc(op: ml.Operation) {
 
 			max_score := math.NEG_INF_F32
 			for t_k in 0 ..< t_k_max {
-				k_offset := t_k * input_stride + embed_size + h * head_size
-				k := in_ptr[k_offset:]
-				score := _simd_dot_f32(q, k, head_size) * inv_sqrt_d
+				k_offset := t_k * kv_size + kv_h * head_size
+				score := _simd_dot_f32(q, k_ptr[k_offset:], head_size) * inv_sqrt_d
 				sm_row[t_k] = score
 				if score > max_score { max_score = score }
 			}
@@ -2618,37 +2780,41 @@ attention_forward_f32 :: proc(op: ml.Operation) {
 				sm_row[t_k] = 0
 			}
 
-			out_offset := t_q * embed_size + h * head_size
+			out_offset := t_q * q_size + h * head_size
 			for d in 0 ..< head_size {
 				out_ptr[out_offset + d] = 0
 			}
 			for t_k in 0 ..< t_k_max {
-				v_offset := t_k * input_stride + 2 * embed_size + h * head_size
-				_simd_axpy_f32(out_ptr[out_offset:], in_ptr[v_offset:], sm_row[t_k], head_size)
+				v_offset := t_k * kv_size + kv_h * head_size
+				_simd_axpy_f32(out_ptr[out_offset:], v_ptr[v_offset:], sm_row[t_k], head_size)
 			}
 		}
 	})
 }
 
 attention_forward_bf16 :: proc(op: ml.Operation) {
-	head_count := op.variant.(ml.Attention).head_count
+	v := op.variant.(ml.Attention)
 
-	parallelize(head_count, head_count, op, proc(h: int, op: ml.Operation) {
+	parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
-		token_count  := op.input.shape[0]
-		embed_size   := op.output.shape[1]
-		head_size    := embed_size / v.head_count
-		causal       := v.causal
-		input_stride := 3 * embed_size
-		inv_sqrt_d   := 1.0 / math.sqrt(f32(head_size))
+		token_count := op.input.shape[0]
+		q_size      := op.input.shape[1]
+		kv_size     := v.key.shape[1]
+		head_size   := q_size / v.n_q_heads
+		group_size  := v.n_q_heads / v.n_kv_heads
+		kv_h        := h / group_size
+		causal      := v.causal
+		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		in_ptr  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers[.Data]))
+		q_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers[.Data]))
+		k_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.key.buffers   [.Data]))
+		v_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.value.buffers [.Data]))
 		out_ptr := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Data]))
 		sm_ptr  := ([^]f32)(raw_data(data(v.softmax_outputs)))
 
 		for t_q in 0 ..< token_count {
-			q_offset := t_q * input_stride + h * head_size
+			q_offset := t_q * q_size + h * head_size
 
 			sm_row_offset := h * token_count * token_count + t_q * token_count
 			sm_row := sm_ptr[sm_row_offset:]
@@ -2658,10 +2824,10 @@ attention_forward_bf16 :: proc(op: ml.Operation) {
 
 			max_score := math.NEG_INF_F32
 			for t_k in 0 ..< t_k_max {
-				k_offset := t_k * input_stride + embed_size + h * head_size
+				k_offset := t_k * kv_size + kv_h * head_size
 				score: f32
 				for d in 0 ..< head_size {
-					score += ml.bf16_to_f32(in_ptr[q_offset + d]) * ml.bf16_to_f32(in_ptr[k_offset + d])
+					score += ml.bf16_to_f32(q_ptr[q_offset + d]) * ml.bf16_to_f32(k_ptr[k_offset + d])
 				}
 				score *= inv_sqrt_d
 				sm_row[t_k] = score
@@ -2682,12 +2848,12 @@ attention_forward_bf16 :: proc(op: ml.Operation) {
 				sm_row[t_k] = 0
 			}
 
-			out_offset := t_q * embed_size + h * head_size
+			out_offset := t_q * q_size + h * head_size
 			for d in 0 ..< head_size {
 				acc: f32
 				for t_k in 0 ..< t_k_max {
-					v_offset := t_k * input_stride + 2 * embed_size + h * head_size
-					acc += sm_row[t_k] * ml.bf16_to_f32(in_ptr[v_offset + d])
+					v_offset := t_k * kv_size + kv_h * head_size
+					acc += sm_row[t_k] * ml.bf16_to_f32(v_ptr[v_offset + d])
 				}
 				out_ptr[out_offset + d] = ml.bf16_from_f32(acc)
 			}
@@ -2704,131 +2870,149 @@ attention_backward :: proc(op: ml.Operation) {
 }
 
 attention_backward_f32 :: proc(op: ml.Operation) {
-	head_count := op.variant.(ml.Attention).head_count
+	v := op.variant.(ml.Attention)
 
-	parallelize(head_count, head_count, op, proc(h: int, op: ml.Operation) {
+	parallelize(v.n_kv_heads, v.n_kv_heads, op, proc(kv_h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
-		token_count  := op.input.shape[0]
-		embed_size   := op.output.shape[1]
-		head_size    := embed_size / v.head_count
-		causal       := v.causal
-		input_stride := 3 * embed_size
-		inv_sqrt_d   := 1.0 / math.sqrt(f32(head_size))
+		token_count := op.input.shape[0]
+		q_size      := op.input.shape[1]
+		kv_size     := v.key.shape[1]
+		head_size   := q_size / v.n_q_heads
+		group_size  := v.n_q_heads / v.n_kv_heads
+		causal      := v.causal
+		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		in_data_ptr  := ([^]f32)(raw_data(data(op.input)))
-		in_grad_ptr  := ([^]f32)(raw_data(gradient(op.input)))
-		out_grad_ptr := ([^]f32)(raw_data(gradient(op.output)))
-		sm_ptr       := ([^]f32)(raw_data(data(v.softmax_outputs)))
-		dp_ptr       := ([^]f32)(raw_data(data(v.d_p_scratch)))
+		q_data    := ([^]f32)(raw_data(data(op.input)))
+		q_grad    := ([^]f32)(raw_data(gradient(op.input)))
+		k_data    := ([^]f32)(raw_data(data(v.key)))
+		k_grad    := ([^]f32)(raw_data(gradient(v.key)))
+		v_data    := ([^]f32)(raw_data(data(v.value)))
+		v_grad    := ([^]f32)(raw_data(gradient(v.value)))
+		out_grad  := ([^]f32)(raw_data(gradient(op.output)))
+		sm_ptr    := ([^]f32)(raw_data(data(v.softmax_outputs)))
+		dp_ptr    := ([^]f32)(raw_data(data(v.d_p_scratch)))
 
-		dp_base := h * token_count
-		d_p     := dp_ptr[dp_base:]
+		for q_h_off in 0 ..< group_size {
+			h := kv_h * group_size + q_h_off
 
-		for t_q in 0 ..< token_count {
-			t_k_max := token_count
-			if causal { t_k_max = t_q + 1 }
+			dp_base := h * token_count
+			d_p     := dp_ptr[dp_base:]
 
-			d_out_offset := t_q * embed_size + h * head_size
-			d_out := out_grad_ptr[d_out_offset:]
+			for t_q in 0 ..< token_count {
+				t_k_max := token_count
+				if causal { t_k_max = t_q + 1 }
 
-			sm_row_offset := h * token_count * token_count + t_q * token_count
-			sm_row := sm_ptr[sm_row_offset:]
+				d_out_offset := t_q * q_size + h * head_size
+				d_out := out_grad[d_out_offset:]
 
-			for t_k in 0 ..< t_k_max {
-				v_offset := t_k * input_stride + 2 * embed_size + h * head_size
-				d_p[t_k] = _simd_dot_f32(d_out, in_data_ptr[v_offset:], head_size)
-				_simd_axpy_f32(in_grad_ptr[v_offset:], d_out, sm_row[t_k], head_size)
-			}
+				sm_row_offset := h * token_count * token_count + t_q * token_count
+				sm_row := sm_ptr[sm_row_offset:]
 
-			dot_dp_p: f32
-			for t_k in 0 ..< t_k_max {
-				dot_dp_p += d_p[t_k] * sm_row[t_k]
-			}
-			for t_k in 0 ..< t_k_max {
-				d_p[t_k] = sm_row[t_k] * (d_p[t_k] - dot_dp_p) * inv_sqrt_d
-			}
+				for t_k in 0 ..< t_k_max {
+					v_offset := t_k * kv_size + kv_h * head_size
+					d_p[t_k] = _simd_dot_f32(d_out, v_data[v_offset:], head_size)
+					_simd_axpy_f32(v_grad[v_offset:], d_out, sm_row[t_k], head_size)
+				}
 
-			q_offset := t_q * input_stride + h * head_size
-			d_q_vec  := in_grad_ptr[q_offset:]
-			q_vec    := in_data_ptr[q_offset:]
+				dot_dp_p: f32
+				for t_k in 0 ..< t_k_max {
+					dot_dp_p += d_p[t_k] * sm_row[t_k]
+				}
+				for t_k in 0 ..< t_k_max {
+					d_p[t_k] = sm_row[t_k] * (d_p[t_k] - dot_dp_p) * inv_sqrt_d
+				}
 
-			for t_k in 0 ..< t_k_max {
-				k_offset := t_k * input_stride + embed_size + h * head_size
-				_simd_axpy_f32(d_q_vec, in_data_ptr[k_offset:], d_p[t_k], head_size)
-				_simd_axpy_f32(in_grad_ptr[k_offset:], q_vec,  d_p[t_k], head_size)
+				q_offset := t_q * q_size + h * head_size
+				d_q_vec  := q_grad[q_offset:]
+				q_vec    := q_data[q_offset:]
+
+				for t_k in 0 ..< t_k_max {
+					k_offset := t_k * kv_size + kv_h * head_size
+					_simd_axpy_f32(d_q_vec, k_data[k_offset:], d_p[t_k], head_size)
+					_simd_axpy_f32(k_grad[k_offset:], q_vec,   d_p[t_k], head_size)
+				}
 			}
 		}
 	})
 }
 
 attention_backward_bf16 :: proc(op: ml.Operation) {
-	head_count := op.variant.(ml.Attention).head_count
+	v := op.variant.(ml.Attention)
 
-	parallelize(head_count, head_count, op, proc(h: int, op: ml.Operation) {
+	parallelize(v.n_kv_heads, v.n_kv_heads, op, proc(kv_h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
-		token_count  := op.input.shape[0]
-		embed_size   := op.output.shape[1]
-		head_size    := embed_size / v.head_count
-		causal       := v.causal
-		input_stride := 3 * embed_size
-		inv_sqrt_d   := 1.0 / math.sqrt(f32(head_size))
+		token_count := op.input.shape[0]
+		q_size      := op.input.shape[1]
+		kv_size     := v.key.shape[1]
+		head_size   := q_size / v.n_q_heads
+		group_size  := v.n_q_heads / v.n_kv_heads
+		causal      := v.causal
+		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		in_data_ptr  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Data]))
-		in_grad_ptr  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Gradient]))
-		out_grad_ptr := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
-		sm_ptr       := ([^]f32)(raw_data(data(v.softmax_outputs)))
-		dp_ptr       := ([^]f32)(raw_data(data(v.d_p_scratch)))
+		q_data   := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Data]))
+		q_grad   := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Gradient]))
+		k_data   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.key.buffers    [.Data]))
+		k_grad   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.key.buffers    [.Gradient]))
+		v_data   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.value.buffers  [.Data]))
+		v_grad   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.value.buffers  [.Gradient]))
+		out_grad := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
+		sm_ptr   := ([^]f32)(raw_data(data(v.softmax_outputs)))
+		dp_ptr   := ([^]f32)(raw_data(data(v.d_p_scratch)))
 
-		dp_base := h * token_count
-		d_p     := dp_ptr[dp_base:]
+		for q_h_off in 0 ..< group_size {
+			h := kv_h * group_size + q_h_off
 
-		for t_q in 0 ..< token_count {
-			t_k_max := token_count
-			if causal { t_k_max = t_q + 1 }
+			dp_base := h * token_count
+			d_p     := dp_ptr[dp_base:]
 
-			d_out_offset := t_q * embed_size + h * head_size
-			sm_row_offset := h * token_count * token_count + t_q * token_count
-			sm_row := sm_ptr[sm_row_offset:]
+			for t_q in 0 ..< token_count {
+				t_k_max := token_count
+				if causal { t_k_max = t_q + 1 }
 
-			for t_k in 0 ..< t_k_max {
-				v_offset := t_k * input_stride + 2 * embed_size + h * head_size
-				dot:   f32
-				for d in 0 ..< head_size {
-					d_out_d := ml.bf16_to_f32(out_grad_ptr[d_out_offset + d])
-					dot += d_out_d * ml.bf16_to_f32(in_data_ptr[v_offset + d])
+				d_out_offset := t_q * q_size + h * head_size
+				sm_row_offset := h * token_count * token_count + t_q * token_count
+				sm_row := sm_ptr[sm_row_offset:]
+
+				for t_k in 0 ..< t_k_max {
+					v_offset := t_k * kv_size + kv_h * head_size
+					dot: f32
+					for d in 0 ..< head_size {
+						d_out_d := ml.bf16_to_f32(out_grad[d_out_offset + d])
+						dot += d_out_d * ml.bf16_to_f32(v_data[v_offset + d])
+					}
+					d_p[t_k] = dot
+
+					p_val := sm_row[t_k]
+					for d in 0 ..< head_size {
+						existing := ml.bf16_to_f32(v_grad[v_offset + d])
+						contrib  := ml.bf16_to_f32(out_grad[d_out_offset + d]) * p_val
+						v_grad[v_offset + d] = ml.bf16_from_f32(existing + contrib)
+					}
 				}
-				d_p[t_k] = dot
 
-				p_val := sm_row[t_k]
-				for d in 0 ..< head_size {
-					existing := ml.bf16_to_f32(in_grad_ptr[v_offset + d])
-					contrib  := ml.bf16_to_f32(out_grad_ptr[d_out_offset + d]) * p_val
-					in_grad_ptr[v_offset + d] = ml.bf16_from_f32(existing + contrib)
+				dot_dp_p: f32
+				for t_k in 0 ..< t_k_max {
+					dot_dp_p += d_p[t_k] * sm_row[t_k]
 				}
-			}
+				for t_k in 0 ..< t_k_max {
+					d_p[t_k] = sm_row[t_k] * (d_p[t_k] - dot_dp_p) * inv_sqrt_d
+				}
 
-			dot_dp_p: f32
-			for t_k in 0 ..< t_k_max {
-				dot_dp_p += d_p[t_k] * sm_row[t_k]
-			}
-			for t_k in 0 ..< t_k_max {
-				d_p[t_k] = sm_row[t_k] * (d_p[t_k] - dot_dp_p) * inv_sqrt_d
-			}
+				q_offset := t_q * q_size + h * head_size
 
-			q_offset := t_q * input_stride + h * head_size
-
-			for t_k in 0 ..< t_k_max {
-				k_offset := t_k * input_stride + embed_size + h * head_size
-				scale    := d_p[t_k]
-				for d in 0 ..< head_size {
-					q_d  := ml.bf16_to_f32(in_data_ptr[q_offset + d])
-					k_d  := ml.bf16_to_f32(in_data_ptr[k_offset + d])
-					dq_d := ml.bf16_to_f32(in_grad_ptr[q_offset + d])
-					dk_d := ml.bf16_to_f32(in_grad_ptr[k_offset + d])
-					in_grad_ptr[q_offset + d] = ml.bf16_from_f32(dq_d + scale * k_d)
-					in_grad_ptr[k_offset + d] = ml.bf16_from_f32(dk_d + scale * q_d)
+				for t_k in 0 ..< t_k_max {
+					k_offset := t_k * kv_size + kv_h * head_size
+					scale    := d_p[t_k]
+					for d in 0 ..< head_size {
+						q_d  := ml.bf16_to_f32(q_data[q_offset + d])
+						k_d  := ml.bf16_to_f32(k_data[k_offset + d])
+						dq_d := ml.bf16_to_f32(q_grad[q_offset + d])
+						dk_d := ml.bf16_to_f32(k_grad[k_offset + d])
+						q_grad[q_offset + d] = ml.bf16_from_f32(dq_d + scale * k_d)
+						k_grad[k_offset + d] = ml.bf16_from_f32(dk_d + scale * q_d)
+					}
 				}
 			}
 		}

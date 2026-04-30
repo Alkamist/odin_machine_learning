@@ -29,11 +29,15 @@ SEQUENCE_LENGTH :: 64
 main :: proc() {
 	defer fmt.println("Finished")
 
-	// ctx := cpu.context_create(1024 * 1024 * 16)
-	ctx := gpu.context_create()
-	defer gpu.context_destroy(ctx)
+	cpu.set_thread_count(24)
+
+	ctx := cpu.context_create(1024 * 1024 * 16)
+	defer cpu.context_destroy(ctx)
+
+	// ctx := gpu.context_create()
+	// defer gpu.context_destroy(ctx)
+
 	ml.context_scope(ctx)
-	// cpu.set_thread_count(24)
 
 	model := model_make()
 	defer model_destroy(model)
