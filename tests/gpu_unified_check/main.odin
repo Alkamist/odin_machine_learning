@@ -819,7 +819,10 @@ main :: proc() {
 			x := ml.tensor(x_data[:])
 			x = ml.reshape(x, {TOKENS, IN_SIZE})
 
-			y := ml.attention(x, HEADS)
+			q := ml.slice_trailing(x, 0,         EMBED)
+			k := ml.slice_trailing(x, EMBED,     2 * EMBED)
+			v := ml.slice_trailing(x, 2 * EMBED, 3 * EMBED)
+			y := ml.attention(q, k, v, HEADS)
 			ml.backward()
 
 			copy(cpu_y[:],  cpu.data(y))
@@ -836,7 +839,10 @@ main :: proc() {
 			x := ml.zeros(.F32, {TOKENS, IN_SIZE})
 			gpu.upload_tensor(x, x_data[:])
 
-			y := ml.attention(x, HEADS)
+			q := ml.slice_trailing(x, 0,         EMBED)
+			k := ml.slice_trailing(x, EMBED,     2 * EMBED)
+			v := ml.slice_trailing(x, 2 * EMBED, 3 * EMBED)
+			y := ml.attention(q, k, v, HEADS)
 			ml.backward()
 
 			gpu.download_tensor          (y, gpu_y[:])
