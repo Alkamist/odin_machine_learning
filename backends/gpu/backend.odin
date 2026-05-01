@@ -2280,7 +2280,64 @@ _upload_indices :: proc(indices: []int, loc := #caller_location) -> (buffer: vk.
 }
 
 attention_cache_forward :: proc(op: ml.Operation) {
-	fmt.panicf("GPU attention_with_cache not yet implemented")
+	query   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Attention_Cache)
+	key     := variant.key
+	value   := variant.value
+	k_cache := variant.k_cache
+	v_cache := variant.v_cache
+
+	token_count := query.shape[0]
+	q_size      := query.shape[1]
+	kv_size     := key.shape[1]
+	head_size   := q_size / variant.n_q_heads
+	fmt.assertf(head_size <= 256, "GPU attention_with_cache caps head_size at 256 (got %v)", head_size)
+	fmt.assertf(query.type == .F32 || query.type == .Bf16, "GPU attention_with_cache only supports F32 or Bf16 (got %v)", query.type)
+
+	is_bf16 := query.type == .Bf16
+	if is_bf16 {
+		fmt.assertf(head_size % 2 == 0, "GPU bf16 attention_with_cache requires even head_size (got %v)", head_size)
+	}
+
+	gctx := _gctx()
+	if !gctx.batch.active {
+		begin_batch()
+	}
+
+	row_bytes  := vk.DeviceSize(kv_size * ml.data_type_size(key.type))
+	dst_offset := vk.DeviceSize(variant.cache_position) * row_bytes
+	copy_size  := vk.DeviceSize(token_count) * row_bytes
+
+	k_region := vk.BufferCopy{srcOffset = 0, dstOffset = dst_offset, size = copy_size}
+	v_region := vk.BufferCopy{srcOffset = 0, dstOffset = dst_offset, size = copy_size}
+	vk.CmdCopyBuffer(gctx.batch.cmd, data(key).buffer,   data(k_cache).buffer, 1, &k_region)
+	vk.CmdCopyBuffer(gctx.batch.cmd, data(value).buffer, data(v_cache).buffer, 1, &v_region)
+
+	params := Attention_Cache_Params{
+		n_q_heads      = u32(variant.n_q_heads),
+		n_kv_heads     = u32(variant.n_kv_heads),
+		head_size      = u32(head_size),
+		q_token_count  = u32(token_count),
+		cache_position = u32(variant.cache_position),
+		q_size         = u32(q_size),
+		kv_size        = u32(kv_size),
+	}
+	bufs := [4]vk.Buffer{
+		data(query).buffer, data(k_cache).buffer, data(v_cache).buffer, data(output).buffer,
+	}
+
+	if is_bf16 {
+		if _attention_cache_bf16_pipeline == nil {
+			_attention_cache_bf16_pipeline = _make_pipeline(ATTENTION_CACHE_BF16_SPIRV, 4, size_of(Attention_Cache_Params))
+		}
+		_dispatch(_attention_cache_bf16_pipeline, bufs[:], &params, u32(variant.n_q_heads), u32(token_count))
+	} else {
+		if _attention_cache_pipeline == nil {
+			_attention_cache_pipeline = _make_pipeline(ATTENTION_CACHE_SPIRV, 4, size_of(Attention_Cache_Params))
+		}
+		_dispatch(_attention_cache_pipeline, bufs[:], &params, u32(variant.n_q_heads), u32(token_count))
+	}
 }
 
 attention_cache_backward :: proc(op: ml.Operation) {

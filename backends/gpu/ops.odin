@@ -200,11 +200,16 @@ ATTENTION_BACK_KV_BF16_SPIRV :: #load("shaders/attention/attention_back_kv_bf16.
 ATTENTION_BACK_Q_BF16_SPIRV  :: #load("shaders/attention/attention_back_q_bf16.spv",  []u8)
 ATTENTION_BF16_COOPMAT_SPIRV :: #load("shaders/attention/attention_bf16_coopmat.spv", []u8)
 ATTENTION_BF16_COOPMAT_BR    :: 16   // must match BR in shaders/attention_bf16_coopmat.comp
+ATTENTION_CACHE_SPIRV        :: #load("shaders/attention/attention_cache.spv",        []u8)
+ATTENTION_CACHE_BF16_SPIRV   :: #load("shaders/attention/attention_cache_bf16.spv",   []u8)
 Attention_Params :: struct {
 	n_q_heads, n_kv_heads, head_size, token_count, q_size, kv_size, causal: u32,
 }
 Attention_Back_D_Params :: struct {
 	n_q_heads, head_size, token_count, q_size: u32,
+}
+Attention_Cache_Params :: struct {
+	n_q_heads, n_kv_heads, head_size, q_token_count, cache_position, q_size, kv_size: u32,
 }
 _attention_pipeline:              ^Pipeline
 _attention_back_d_pipeline:       ^Pipeline
@@ -215,6 +220,8 @@ _attention_back_d_bf16_pipeline:  ^Pipeline
 _attention_back_kv_bf16_pipeline: ^Pipeline
 _attention_back_q_bf16_pipeline:  ^Pipeline
 _attention_bf16_coopmat_pipeline: ^Pipeline
+_attention_cache_pipeline:        ^Pipeline
+_attention_cache_bf16_pipeline:   ^Pipeline
 
 SELECT_SPIRV      :: #load("shaders/select/select.spv",      []u8)
 SELECT_BACK_SPIRV :: #load("shaders/select/select_back.spv", []u8)

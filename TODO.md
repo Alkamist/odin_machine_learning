@@ -191,7 +191,7 @@ Steps in order, each runnable:
    - A few thousand steps. Acceptance: loss drops cleanly,
      greedy-decode samples reflect the fine-tune corpus.
 
-### KV-cache + `attention_with_cache` (realistic chat) — CPU DONE, GPU pending
+### KV-cache + `attention_with_cache` (realistic chat) — DONE
 
 CPU path landed end-to-end. SmolLM2-135M chat went from 4.4 tok/s
 (re-run-full-forward) to 25.8 tok/s with prefill + per-token decode at
@@ -225,16 +225,15 @@ What landed:
   prompt=5, decode=4) compares prefill+decode logits against a single
   full-forward reference. Passes at 1e-3 abs.
 
-Pieces remaining:
-- **GPU `attention_with_cache` shader.** CPU + GPU dispatch register the
-  op; GPU forward currently `panic`s. Needs a bf16 + f32 shader that
-  appends K/V into the cache buffers and runs causal attention against
-  the prefix. Shape and algorithm are the same as the existing
-  `attention_bf16.comp`, with the per-row K loop bounded by
-  `cache_position + local_q + 1` and an extra setup step that copies
-  K_new/V_new into the cache.
-- **Run `backends/gpu/shaders/build.bat`** so the rope shaders pick up
-  the new `position_offset` push-constant field.
+GPU path landed. New shaders `attention_cache.comp` and
+`attention_cache_bf16.comp` mirror the existing FA2-style attention
+kernels with `t_k_max = cache_position + t_q + 1` and no LSE write
+(forward-only). The K/V cache append is done via two `vkCmdCopyBuffer`
+calls recorded into the active batch before dispatch — the dispatch's
+existing TRANSFER → SHADER memory barrier covers the read-after-write.
+Coverage: new `attention_with_cache prefill+decode` cases (F32 + Bf16)
+in `tests/dtype_roundtrip` plus the existing `kv_cache_decode`
+pytorch_parity test now pass on both backends.
 
 Deferred behind this:
 - Sliding-window attention. Needed for context > what fits in the

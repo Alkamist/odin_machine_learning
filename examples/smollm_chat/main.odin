@@ -31,13 +31,8 @@ main :: proc() {
 
 	parse_args(&prompt, &max_new_tokens, &temperature, &top_k)
 
-	cpu.set_thread_count(8)
-
-	ctx := cpu.context_create(1024 * 1024 * 64)
-	defer cpu.context_destroy(ctx)
-
-	// ctx := gpu.context_create()
-	// defer gpu.context_destroy(ctx)
+	ctx := gpu.context_create()
+	defer gpu.context_destroy(ctx)
 
 	ml.context_scope(ctx)
 

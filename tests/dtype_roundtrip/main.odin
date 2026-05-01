@@ -1083,6 +1083,102 @@ main :: proc() {
 			check(dk_ok, fmt.tprintf("%v: Bf16 GQA attention backward dk matches f32 reference", label), any_failed)
 			check(dv_ok, fmt.tprintf("%v: Bf16 GQA attention backward dv matches f32 reference", label), any_failed)
 		}
+		ml.clear()
+
+		// attention_with_cache: prefill then per-token decode through the
+		// cache should match a full forward pass. Covers both F32 and Bf16
+		// on whichever backend is being exercised.
+		for cache_type in ([?]ml.Data_Type{.F32, .Bf16}) {
+			T_TOTAL  :: 6
+			T_PREFIX :: 3
+			N_Q      :: 4
+			N_KV     :: 2
+			D        :: 4
+			Q_E      :: N_Q  * D
+			KV_E     :: N_KV * D
+
+			q_src: [T_TOTAL * Q_E]f32
+			k_src: [T_TOTAL * KV_E]f32
+			v_src: [T_TOTAL * KV_E]f32
+			for i in 0 ..< T_TOTAL * Q_E  { q_src[i] = f32(((i + 1) % 5) - 2) * 0.5 }
+			for i in 0 ..< T_TOTAL * KV_E { k_src[i] = f32(((i + 3) % 5) - 2) * 0.5 }
+			for i in 0 ..< T_TOTAL * KV_E { v_src[i] = f32(((i + 2) % 5) - 2) * 0.5 }
+
+			ref_out: [T_TOTAL * Q_E]f32
+			{
+				q := ml.reshape(ml.tensor(q_src[:]), {T_TOTAL, Q_E})
+				k := ml.reshape(ml.tensor(k_src[:]), {T_TOTAL, KV_E})
+				v := ml.reshape(ml.tensor(v_src[:]), {T_TOTAL, KV_E})
+				if cache_type == .Bf16 {
+					q = ml.cast_to(q, .Bf16)
+					k = ml.cast_to(k, .Bf16)
+					v = ml.cast_to(v, .Bf16)
+				}
+				y := ml.attention(q, k, v, N_Q, N_KV, causal=true)
+				if cache_type == .Bf16 {
+					y = ml.cast_to(y, .F32)
+				}
+				ml.get_data(y, ref_out[:])
+				ml.clear()
+			}
+
+			k_cache := ml.alloc(cache_type, {T_TOTAL, KV_E}, persistent=true, buffers={.Data})
+			v_cache := ml.alloc(cache_type, {T_TOTAL, KV_E}, persistent=true, buffers={.Data})
+
+			got_out: [T_TOTAL * Q_E]f32
+
+			{
+				q := ml.reshape(ml.tensor(q_src[: T_PREFIX * Q_E]),  {T_PREFIX, Q_E})
+				k := ml.reshape(ml.tensor(k_src[: T_PREFIX * KV_E]), {T_PREFIX, KV_E})
+				v := ml.reshape(ml.tensor(v_src[: T_PREFIX * KV_E]), {T_PREFIX, KV_E})
+				if cache_type == .Bf16 {
+					q = ml.cast_to(q, .Bf16)
+					k = ml.cast_to(k, .Bf16)
+					v = ml.cast_to(v, .Bf16)
+				}
+				y := ml.attention_with_cache(q, k, v, k_cache, v_cache, 0, N_Q, N_KV)
+				if cache_type == .Bf16 {
+					y = ml.cast_to(y, .F32)
+				}
+				ml.get_data(y, got_out[: T_PREFIX * Q_E])
+				ml.clear()
+			}
+
+			for step in 0 ..< (T_TOTAL - T_PREFIX) {
+				pos    := T_PREFIX + step
+				q_step: [Q_E]f32
+				k_step: [KV_E]f32
+				v_step: [KV_E]f32
+				copy(q_step[:], q_src[pos * Q_E  : (pos + 1) * Q_E ])
+				copy(k_step[:], k_src[pos * KV_E : (pos + 1) * KV_E])
+				copy(v_step[:], v_src[pos * KV_E : (pos + 1) * KV_E])
+
+				q := ml.reshape(ml.tensor(q_step[:]), {1, Q_E})
+				k := ml.reshape(ml.tensor(k_step[:]), {1, KV_E})
+				v := ml.reshape(ml.tensor(v_step[:]), {1, KV_E})
+				if cache_type == .Bf16 {
+					q = ml.cast_to(q, .Bf16)
+					k = ml.cast_to(k, .Bf16)
+					v = ml.cast_to(v, .Bf16)
+				}
+				y := ml.attention_with_cache(q, k, v, k_cache, v_cache, pos, N_Q, N_KV)
+				if cache_type == .Bf16 {
+					y = ml.cast_to(y, .F32)
+				}
+				ml.get_data(y, got_out[pos * Q_E : (pos + 1) * Q_E])
+				ml.clear()
+			}
+
+			tol := cache_type == .Bf16 ? f32(5e-2) : f32(1e-4)
+			ok := true
+			for i in 0 ..< T_TOTAL * Q_E {
+				if math.abs(got_out[i] - ref_out[i]) > tol { ok = false }
+			}
+			check(ok, fmt.tprintf("%v: %v attention_with_cache prefill+decode matches full attention", label, cache_type), any_failed)
+
+			ml.destroy(k_cache)
+			ml.destroy(v_cache)
+		}
 
 		// Bf16 mean forward + backward.
 		{
