@@ -92,6 +92,7 @@ main :: proc() {
 	case "rope_xfmr":         run_rope(artifacts_dir)
 	case "transformer_train_bf16": run_transformer_train_bf16(artifacts_dir)
 	case "llama_train":            run_llama_train(artifacts_dir)
+	case "kv_cache_decode":        run_kv_cache_decode(artifacts_dir)
 	case:
 		fmt.eprintfln("unknown test: %v", test_name)
 		os.exit(1)
@@ -796,6 +797,81 @@ run_llama_train :: proc(dir: string) {
 	}
 
 	save_tensor(_path(dir, "odin_losses.bin"), {step_count}, losses)
+}
+
+run_kv_cache_decode :: proc(dir: string) {
+	tokens      := load_int_array(_path(dir, "tokens.bin"))
+	config_ints := load_int_array(_path(dir, "config.bin"))
+
+	layer_count       := config_ints[0]
+	n_q_heads         := config_ints[1]
+	n_kv_heads        := config_ints[2]
+	head_size         := config_ints[3]
+	embedding_size    := config_ints[4]
+	intermediate_size := config_ints[5]
+	vocabulary_size   := config_ints[6]
+	prompt_count      := config_ints[7]
+	decode_count      := config_ints[8]
+	rope_base         := f32(config_ints[9])
+
+	total := prompt_count + decode_count
+
+	cfg := llama.Config{
+		layer_count       = layer_count,
+		n_q_heads         = n_q_heads,
+		n_kv_heads        = n_kv_heads,
+		head_size         = head_size,
+		embedding_size    = embedding_size,
+		intermediate_size = intermediate_size,
+		vocabulary_size   = vocabulary_size,
+		rope_base         = rope_base,
+		tied_embeddings   = true,
+	}
+	model := llama.make(cfg)
+	defer llama.destroy(model)
+
+	load_into :: proc(t: ml.Tensor, path: string) {
+		_, vals := load_tensor(path)
+		ml.set_data(t, vals)
+	}
+
+	load_into(model.token_embeddings, _path(dir, "init_token_embeddings.bin"))
+	for layer, i in model.layers {
+		load_into(layer.input_norm_weight,     fmt.tprintf("%v/init_layer%v_input_norm_weight.bin",     dir, i))
+		load_into(layer.q_proj_weight,         fmt.tprintf("%v/init_layer%v_q_proj_weight.bin",         dir, i))
+		load_into(layer.k_proj_weight,         fmt.tprintf("%v/init_layer%v_k_proj_weight.bin",         dir, i))
+		load_into(layer.v_proj_weight,         fmt.tprintf("%v/init_layer%v_v_proj_weight.bin",         dir, i))
+		load_into(layer.o_proj_weight,         fmt.tprintf("%v/init_layer%v_o_proj_weight.bin",         dir, i))
+		load_into(layer.post_attn_norm_weight, fmt.tprintf("%v/init_layer%v_post_attn_norm_weight.bin", dir, i))
+		load_into(layer.gate_proj_weight,      fmt.tprintf("%v/init_layer%v_gate_proj_weight.bin",      dir, i))
+		load_into(layer.up_proj_weight,        fmt.tprintf("%v/init_layer%v_up_proj_weight.bin",        dir, i))
+		load_into(layer.down_proj_weight,      fmt.tprintf("%v/init_layer%v_down_proj_weight.bin",      dir, i))
+	}
+	load_into(model.output_norm_weight, _path(dir, "init_output_norm_weight.bin"))
+
+	cache := llama.cache_make(model, total)
+	defer llama.cache_destroy(cache)
+
+	all_logits := builtin.make([]f32, total * vocabulary_size, context.temp_allocator)
+
+	{
+		ml.clear()
+		logits := llama.forward_cached(model, &cache, tokens[:prompt_count])
+		row    := builtin.make([]f32, prompt_count * vocabulary_size, context.temp_allocator)
+		ml.get_data(logits, row)
+		copy(all_logits[:prompt_count * vocabulary_size], row)
+	}
+
+	step_buf := builtin.make([]f32, vocabulary_size, context.temp_allocator)
+	for i in 0 ..< decode_count {
+		ml.clear()
+		logits := llama.forward_cached(model, &cache, tokens[prompt_count + i : prompt_count + i + 1])
+		ml.get_data(logits, step_buf)
+		dst := all_logits[(prompt_count + i) * vocabulary_size : (prompt_count + i + 1) * vocabulary_size]
+		copy(dst, step_buf)
+	}
+
+	save_tensor(_path(dir, "odin_logits.bin"), {total, vocabulary_size}, all_logits)
 }
 
 _path :: proc(dir, name: string) -> string {

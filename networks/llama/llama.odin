@@ -153,6 +153,94 @@ randomize :: proc(model: Llama) {
 	}
 }
 
+Layer_Cache :: struct {
+	k: ml.Tensor, // [t_max, n_kv_heads * head_size]
+	v: ml.Tensor,
+}
+
+Cache :: struct {
+	t_max:  int,
+	length: int,
+	layers: []Layer_Cache,
+}
+
+cache_make :: proc(model: Llama, t_max: int, type: ml.Data_Type = .F32, allocator := context.allocator) -> (cache: Cache) {
+	kv_size := model.config.n_kv_heads * model.config.head_size
+
+	cache.t_max  = t_max
+	cache.length = 0
+	cache.layers = builtin.make([]Layer_Cache, len(model.layers), allocator)
+
+	for &layer_cache in cache.layers {
+		layer_cache.k = ml.alloc(type, {t_max, kv_size}, persistent=true, buffers={.Data})
+		layer_cache.v = ml.alloc(type, {t_max, kv_size}, persistent=true, buffers={.Data})
+	}
+
+	return
+}
+
+cache_destroy :: proc(cache: Cache) {
+	for layer_cache in cache.layers {
+		ml.destroy(layer_cache.k)
+		ml.destroy(layer_cache.v)
+	}
+	delete(cache.layers)
+}
+
+cache_reset :: proc(cache: ^Cache) {
+	cache.length = 0
+}
+
+@(require_results)
+forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int) -> (output: ml.Tensor) {
+	token_count := builtin.len(new_tokens)
+	assert(token_count > 0,                          "forward_cached requires at least one new token")
+	assert(cache.length + token_count <= cache.t_max, "forward_cached would overflow KV cache")
+	assert(len(cache.layers) == len(model.layers),    "cache layer count must match model")
+
+	cache_position := cache.length
+
+	output = ml.select(model.token_embeddings, new_tokens)
+
+	residual := output
+
+	for layer, i in model.layers {
+		normed := ml.rmsnorm(residual, layer.input_norm_weight)
+
+		q := ml.linear(normed, layer.q_proj_weight)
+		k := ml.linear(normed, layer.k_proj_weight)
+		v := ml.linear(normed, layer.v_proj_weight)
+
+		q = ml.rope(q, model.config.n_q_heads,  model.config.rope_base, cache_position)
+		k = ml.rope(k, model.config.n_kv_heads, model.config.rope_base, cache_position)
+
+		attn_output := ml.attention_with_cache(
+			q, k, v,
+			cache.layers[i].k, cache.layers[i].v,
+			cache_position,
+			model.config.n_q_heads,
+			model.config.n_kv_heads,
+		)
+		attn_output = ml.linear(attn_output, layer.o_proj_weight)
+
+		residual = ml.add(residual, attn_output)
+
+		normed = ml.rmsnorm(residual, layer.post_attn_norm_weight)
+
+		gate       := ml.linear(normed, layer.gate_proj_weight)
+		up         := ml.linear(normed, layer.up_proj_weight)
+		mlp_output := ml.linear(ml.mul(ml.silu(gate), up), layer.down_proj_weight)
+
+		residual = ml.add(residual, mlp_output)
+	}
+
+	output = ml.rmsnorm(residual, model.output_norm_weight)
+	output = ml.linear(output, model.lm_head_weight)
+
+	cache.length += token_count
+	return
+}
+
 @(require_results)
 forward :: proc(model: Llama, tokens: []int) -> (output: ml.Tensor) {
 	output = ml.select(model.token_embeddings, tokens)

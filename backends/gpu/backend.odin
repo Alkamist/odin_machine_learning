@@ -277,6 +277,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Permute:            permute_forward            (op)
 	case ml.Causal_Mask:        causal_mask_forward        (op)
 	case ml.Attention:          attention_forward          (op)
+	case ml.Attention_Cache:    attention_cache_forward    (op)
 	case ml.Cast:               cast_forward               (op)
 	}
 }
@@ -318,6 +319,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Permute:            permute_backward           (op)
 	case ml.Causal_Mask:        causal_mask_backward       (op)
 	case ml.Attention:          attention_backward         (op)
+	case ml.Attention_Cache:    attention_cache_backward   (op)
 	case ml.Cast:               cast_backward              (op)
 	}
 }
@@ -1242,10 +1244,11 @@ rope_forward :: proc(op: ml.Operation) {
 	head_size   := input.shape[input.rank - 1] / variant.head_count
 
 	params := Rope_Params{
-		token_count = u32(token_count),
-		head_count  = u32(variant.head_count),
-		head_size   = u32(head_size),
-		base        = variant.base,
+		token_count     = u32(token_count),
+		head_count      = u32(variant.head_count),
+		head_size       = u32(head_size),
+		base            = variant.base,
+		position_offset = u32(variant.position_offset),
 	}
 	bufs        := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 	total_pairs := token_count * variant.head_count * (head_size / 2)
@@ -1274,10 +1277,11 @@ rope_backward :: proc(op: ml.Operation) {
 	head_size   := input.shape[input.rank - 1] / variant.head_count
 
 	params := Rope_Back_Params{
-		token_count = u32(token_count),
-		head_count  = u32(variant.head_count),
-		head_size   = u32(head_size),
-		base        = variant.base,
+		token_count     = u32(token_count),
+		head_count      = u32(variant.head_count),
+		head_size       = u32(head_size),
+		base            = variant.base,
+		position_offset = u32(variant.position_offset),
 	}
 	bufs        := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
 	total_pairs := token_count * variant.head_count * (head_size / 2)
@@ -2273,6 +2277,14 @@ _upload_indices :: proc(indices: []int, loc := #caller_location) -> (buffer: vk.
 	}
 	vk.UnmapMemory(_gpu.device, memory)
 	return
+}
+
+attention_cache_forward :: proc(op: ml.Operation) {
+	fmt.panicf("GPU attention_with_cache not yet implemented")
+}
+
+attention_cache_backward :: proc(op: ml.Operation) {
+	fmt.panicf("attention_with_cache is forward-only (inference path); backward is not implemented")
 }
 
 upload_tensor :: proc(t: ml.Tensor, src: []f32, loc := #caller_location) {

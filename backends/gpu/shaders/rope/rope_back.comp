@@ -17,6 +17,7 @@ layout(push_constant) uniform Params {
     uint  head_count;
     uint  head_size;
     float base;
+    uint  position_offset;
 } p;
 
 void main() {
@@ -31,7 +32,7 @@ void main() {
     uint pos      = hg / p.head_count;
 
     float exponent = float(pair_idx * 2u) / float(p.head_size);
-    float theta    = float(pos) / pow(p.base, exponent);
+    float theta    = float(pos + p.position_offset) / pow(p.base, exponent);
     float c_v      = cos(theta);
     float s_v      = sin(theta);
 

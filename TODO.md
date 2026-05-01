@@ -191,11 +191,78 @@ Steps in order, each runnable:
    - A few thousand steps. Acceptance: loss drops cleanly,
      greedy-decode samples reflect the fine-tune corpus.
 
-### Next up: Odin tokenizer + sampling loop ("watch it generate")
+### KV-cache + `attention_with_cache` (realistic chat) — CPU DONE, GPU pending
 
-Forward parity is in place; the missing piece between that and "type a
-prompt and see SmolLM2 talk" is text I/O. User decision: the tokenizer
-will be implemented entirely in Odin (no Python tokenizer wrapper).
+CPU path landed end-to-end. SmolLM2-135M chat went from 4.4 tok/s
+(re-run-full-forward) to 25.8 tok/s with prefill + per-token decode at
+prompt=5, max_tokens=16 on 8 CPU threads — ~5.9x speedup at this size,
+ratio grows with context length.
+
+Design choice: a single fused `ml.attention_with_cache(query, key, value,
+k_cache, v_cache, cache_position, n_q_heads, n_kv_heads)` op handles both
+prefill (`token_count > 1`) and decode (`token_count == 1`). It writes
+the new K/V rows into `k_cache[cache_position : cache_position + token_count]`
+as a side effect, then runs causal attention with each Q row attending to
+`K_cache[0 .. cache_position + local_q + 1]`. Forward-only; backward
+panics. Cache buffers are persistent tensors (`persist=true,
+buffers={.Data}`) — they survive `ml.clear()`.
+
+What landed:
+- `ml.Attention_Cache` op variant + `ml.attention_with_cache` proc in
+  `ml.odin`.
+- CPU forward (`attention_cache_forward_f32` / `_bf16`) in
+  `backends/cpu/cpu.odin`. Parallelized across q-heads, per-thread scratch
+  via `temp_allocator`.
+- `ml.rope` gained a `position_offset: int = 0` parameter (so RoPE in
+  decode-step calls picks up at the cache length). CPU forward + both GPU
+  rope shaders updated; **GPU `.spv` files need regeneration via
+  `backends/gpu/shaders/build.bat`** (push-constant layout grew by a u32).
+- `networks/llama` got `Cache`, `cache_make`, `cache_destroy`,
+  `cache_reset`, and `forward_cached(model, cache, new_tokens)`.
+- `examples/smollm_chat` rewritten to prefill once, then per-token decode
+  through the cache.
+- New `tests/pytorch_parity/kv_cache_decode` test (2-layer Llama,
+  prompt=5, decode=4) compares prefill+decode logits against a single
+  full-forward reference. Passes at 1e-3 abs.
+
+Pieces remaining:
+- **GPU `attention_with_cache` shader.** CPU + GPU dispatch register the
+  op; GPU forward currently `panic`s. Needs a bf16 + f32 shader that
+  appends K/V into the cache buffers and runs causal attention against
+  the prefix. Shape and algorithm are the same as the existing
+  `attention_bf16.comp`, with the per-row K loop bounded by
+  `cache_position + local_q + 1` and an extra setup step that copies
+  K_new/V_new into the cache.
+- **Run `backends/gpu/shaders/build.bat`** so the rope shaders pick up
+  the new `position_offset` push-constant field.
+
+Deferred behind this:
+- Sliding-window attention. Needed for context > what fits in the
+  cache buffers; not blocking realistic chat at SmolLM2's 8k window
+  on a 24 GB card.
+- Stack-validation pretrain (was step 2 of the SmolLM2 plan).
+- SmolLM2 fine-tune (was step 5).
+
+### Earlier "watch it generate" milestone — DONE
+
+The Odin GPT-2 BPE tokenizer (`tokenizers/gpt2/`) and naive sampling
+loop (`examples/smollm_chat/`) shipped this session.
+
+- `tokenizers/gpt2/gpt2.odin`: parses HF `tokenizer.json`, builds the
+  256-byte ↔ Unicode map, hand-rolled GPT-2 alternation regex
+  (contractions / `\p{L}+` / `\p{N}+` / `[^\s\p{L}\p{N}]+` /
+  `\s+(?!\S)` / `\s+`) wrapped in a `Digits{individual_digits=true}`
+  outer split, standard min-rank BPE merge loop, encode + decode.
+- `tests/gpt2_tokenizer/main.odin`: matches HF token IDs on the
+  SmolLM2 prompt (`[504, 3575, 282, 4649, 314]` for "The capital of
+  France is"); decode round-trips on whitespace runs, numbers,
+  contractions, em-dash, tabs/newlines.
+- `examples/smollm_chat/main.odin`: greedy + top-k/temperature
+  sampling, ~4.4 tok/s greedy on CPU at the SmolLM2-135M scale.
+  Activation arena bumped to 256 MB; this is the cap that KV-cache
+  removes.
+
+Original tokenizer plan kept here for reference until KV-cache lands:
 
 Components, in implementation order:
 

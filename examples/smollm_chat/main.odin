@@ -33,7 +33,7 @@ main :: proc() {
 
 	cpu.set_thread_count(8)
 
-	ctx := cpu.context_create(1024 * 1024 * 256)
+	ctx := cpu.context_create(1024 * 1024 * 64)
 	defer cpu.context_destroy(ctx)
 
 	// ctx := gpu.context_create()
@@ -79,24 +79,28 @@ main :: proc() {
 	defer delete(prompt_text)
 	fmt.print(prompt_text)
 
-	logits_buffer: [dynamic]f32
-	defer delete(logits_buffer)
+	t_max := builtin.len(tokens) + max_new_tokens
+	cache := llama.cache_make(model, t_max)
+	defer llama.cache_destroy(cache)
+
+	vocab_size := llama.SMOLLM2_135M_CONFIG.vocabulary_size
+	last_row    := builtin.make([]f32, vocab_size)
+	defer delete(last_row)
+	prefill_buf := builtin.make([]f32, builtin.len(tokens) * vocab_size)
+	defer delete(prefill_buf)
 
 	previous_decoded_length := builtin.len(prompt_text)
 	t_generate := time.tick_now()
-	for step in 0 ..< max_new_tokens {
+
+	{
 		ml.clear()
+		logits := llama.forward_cached(model, &cache, tokens)
+		ml.get_data(logits, prefill_buf)
+		copy(last_row, prefill_buf[(builtin.len(tokens) - 1) * vocab_size :])
+	}
 
-		logits     := llama.forward(model, all_tokens[:])
-		token_count := logits.shape[0]
-		vocab_size  := logits.shape[1]
-		total_floats := token_count * vocab_size
-
-		resize(&logits_buffer, total_floats)
-		ml.get_data(logits, logits_buffer[:])
-
-		last_row := logits_buffer[(token_count - 1) * vocab_size : token_count * vocab_size]
-		next_id  := sample_next(last_row, temperature, top_k)
+	for step in 0 ..< max_new_tokens {
+		next_id := sample_next(last_row, temperature, top_k)
 		append(&all_tokens, next_id)
 
 		current_decoded := gpt2.decode(&tok, all_tokens[:])
@@ -106,7 +110,13 @@ main :: proc() {
 			os.flush(os.stdout)
 		}
 		previous_decoded_length = builtin.len(current_decoded)
-		_ = step
+
+		if step == max_new_tokens - 1 do break
+
+		ml.clear()
+		single := [1]int{next_id}
+		logits := llama.forward_cached(model, &cache, single[:])
+		ml.get_data(logits, last_row)
 	}
 	fmt.println()
 	fmt.println("---")

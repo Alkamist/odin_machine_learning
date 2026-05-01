@@ -227,8 +227,8 @@ ROPE_SPIRV           :: #load("shaders/rope/rope.spv",           []u8)
 ROPE_BACK_SPIRV      :: #load("shaders/rope/rope_back.spv",      []u8)
 ROPE_BF16_SPIRV      :: #load("shaders/rope/rope_bf16.spv",      []u8)
 ROPE_BACK_BF16_SPIRV :: #load("shaders/rope/rope_back_bf16.spv", []u8)
-Rope_Params      :: struct { token_count, head_count, head_size: u32, base: f32 }
-Rope_Back_Params :: struct { token_count, head_count, head_size: u32, base: f32 }
+Rope_Params      :: struct { token_count, head_count, head_size: u32, base: f32, position_offset: u32 }
+Rope_Back_Params :: struct { token_count, head_count, head_size: u32, base: f32, position_offset: u32 }
 _rope_pipeline:           ^Pipeline
 _rope_back_pipeline:      ^Pipeline
 _rope_bf16_pipeline:      ^Pipeline

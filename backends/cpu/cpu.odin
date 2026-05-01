@@ -416,6 +416,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Permute:            permute_forward            (op)
 	case ml.Causal_Mask:        causal_mask_forward        (op)
 	case ml.Attention:          attention_forward          (op)
+	case ml.Attention_Cache:    attention_cache_forward    (op)
 	case ml.Cast:               cast_forward               (op)
 	}
 }
@@ -454,6 +455,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Permute:            permute_backward           (op)
 	case ml.Causal_Mask:        causal_mask_backward       (op)
 	case ml.Attention:          attention_backward         (op)
+	case ml.Attention_Cache:    attention_cache_backward   (op)
 	case ml.Cast:               cast_backward              (op)
 	}
 }
@@ -1399,6 +1401,7 @@ rope_forward_f32 :: proc(op: ml.Operation) {
 	variant     := op.variant.(ml.Rope)
 	head_count  := variant.head_count
 	base        := variant.base
+	pos_offset  := variant.position_offset
 	cos_cache   := variant.cos_cache
 	sin_cache   := variant.sin_cache
 	token_count := input.shape[0]
@@ -1406,7 +1409,7 @@ rope_forward_f32 :: proc(op: ml.Operation) {
 
 	for pos in 0 ..< token_count {
 		for i in 0 ..< head_size / 2 {
-			theta := f32(pos) / math.pow(base, f32(i * 2) / f32(head_size))
+			theta := f32(pos + pos_offset) / math.pow(base, f32(i * 2) / f32(head_size))
 			cache_idx := pos * (head_size / 2) + i
 			data(cos_cache)[cache_idx] = math.cos(theta)
 			data(sin_cache)[cache_idx] = math.sin(theta)
@@ -1438,6 +1441,7 @@ rope_forward_bf16 :: proc(op: ml.Operation) {
 	variant     := op.variant.(ml.Rope)
 	head_count  := variant.head_count
 	base        := variant.base
+	pos_offset  := variant.position_offset
 	cos_cache   := variant.cos_cache
 	sin_cache   := variant.sin_cache
 	token_count := input.shape[0]
@@ -1445,7 +1449,7 @@ rope_forward_bf16 :: proc(op: ml.Operation) {
 
 	for pos in 0 ..< token_count {
 		for i in 0 ..< head_size / 2 {
-			theta := f32(pos) / math.pow(base, f32(i * 2) / f32(head_size))
+			theta := f32(pos + pos_offset) / math.pow(base, f32(i * 2) / f32(head_size))
 			cache_idx := pos * (head_size / 2) + i
 			data(cos_cache)[cache_idx] = math.cos(theta)
 			data(sin_cache)[cache_idx] = math.sin(theta)
@@ -3017,4 +3021,153 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 			}
 		}
 	})
+}
+
+attention_cache_forward :: proc(op: ml.Operation) {
+	v := op.variant.(ml.Attention_Cache)
+
+	token_count := op.input.shape[0]
+	kv_size     := v.key.shape[1]
+	row_bytes   := kv_size * ml.data_type_size(v.key.type)
+	cache_pos   := v.cache_position
+
+	k_new_bytes := transmute([]byte)v.key.buffers     [.Data]
+	v_new_bytes := transmute([]byte)v.value.buffers   [.Data]
+	k_cache_bytes := transmute([]byte)v.k_cache.buffers[.Data]
+	v_cache_bytes := transmute([]byte)v.v_cache.buffers[.Data]
+
+	dst_offset := cache_pos * row_bytes
+	copy_bytes := token_count * row_bytes
+	builtin.copy(k_cache_bytes[dst_offset:dst_offset + copy_bytes], k_new_bytes[:copy_bytes])
+	builtin.copy(v_cache_bytes[dst_offset:dst_offset + copy_bytes], v_new_bytes[:copy_bytes])
+
+	switch op.input.type {
+	case .F32:  attention_cache_forward_f32 (op)
+	case .Bf16: attention_cache_forward_bf16(op)
+	case .F16:  fmt.panicf("CPU attention_cache_forward: F16 not yet supported")
+	}
+}
+
+attention_cache_forward_f32 :: proc(op: ml.Operation) {
+	v := op.variant.(ml.Attention_Cache)
+
+	parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
+		v := op.variant.(ml.Attention_Cache)
+
+		token_count := op.input.shape[0]
+		q_size      := op.input.shape[1]
+		kv_size     := v.key.shape[1]
+		head_size   := q_size / v.n_q_heads
+		group_size  := v.n_q_heads / v.n_kv_heads
+		kv_h        := h / group_size
+		cache_pos   := v.cache_position
+		k_total     := cache_pos + token_count
+		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
+
+		q_ptr   := ([^]f32)(raw_data(data(op.input)))
+		k_ptr   := ([^]f32)(raw_data(data(v.k_cache)))
+		v_ptr   := ([^]f32)(raw_data(data(v.v_cache)))
+		out_ptr := ([^]f32)(raw_data(data(op.output)))
+
+		scores := make([]f32, k_total, context.temp_allocator)
+
+		for t_q in 0 ..< token_count {
+			q_offset := t_q * q_size + h * head_size
+			q := q_ptr[q_offset:]
+
+			t_k_max := cache_pos + t_q + 1
+
+			max_score := math.NEG_INF_F32
+			for t_k in 0 ..< t_k_max {
+				k_offset := t_k * kv_size + kv_h * head_size
+				score := _simd_dot_f32(q, k_ptr[k_offset:], head_size) * inv_sqrt_d
+				scores[t_k] = score
+				if score > max_score { max_score = score }
+			}
+
+			sum_exp: f32
+			for t_k in 0 ..< t_k_max {
+				e := math.exp(scores[t_k] - max_score)
+				scores[t_k] = e
+				sum_exp += e
+			}
+			inv_sum := 1.0 / sum_exp
+
+			out_offset := t_q * q_size + h * head_size
+			for d in 0 ..< head_size {
+				out_ptr[out_offset + d] = 0
+			}
+			for t_k in 0 ..< t_k_max {
+				v_offset := t_k * kv_size + kv_h * head_size
+				_simd_axpy_f32(out_ptr[out_offset:], v_ptr[v_offset:], scores[t_k] * inv_sum, head_size)
+			}
+		}
+	})
+}
+
+attention_cache_forward_bf16 :: proc(op: ml.Operation) {
+	v := op.variant.(ml.Attention_Cache)
+
+	parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
+		v := op.variant.(ml.Attention_Cache)
+
+		token_count := op.input.shape[0]
+		q_size      := op.input.shape[1]
+		kv_size     := v.key.shape[1]
+		head_size   := q_size / v.n_q_heads
+		group_size  := v.n_q_heads / v.n_kv_heads
+		kv_h        := h / group_size
+		cache_pos   := v.cache_position
+		k_total     := cache_pos + token_count
+		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
+
+		q_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers  [.Data]))
+		k_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.k_cache.buffers [.Data]))
+		v_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.v_cache.buffers [.Data]))
+		out_ptr := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers [.Data]))
+
+		scores := make([]f32, k_total, context.temp_allocator)
+
+		for t_q in 0 ..< token_count {
+			q_offset := t_q * q_size + h * head_size
+
+			t_k_max := cache_pos + t_q + 1
+
+			max_score := math.NEG_INF_F32
+			for t_k in 0 ..< t_k_max {
+				k_offset := t_k * kv_size + kv_h * head_size
+				score: f32
+				for d in 0 ..< head_size {
+					score += ml.bf16_to_f32(q_ptr[q_offset + d]) * ml.bf16_to_f32(k_ptr[k_offset + d])
+				}
+				score *= inv_sqrt_d
+				scores[t_k] = score
+				if score > max_score { max_score = score }
+			}
+
+			sum_exp: f32
+			for t_k in 0 ..< t_k_max {
+				e := math.exp(scores[t_k] - max_score)
+				scores[t_k] = e
+				sum_exp += e
+			}
+			inv_sum := 1.0 / sum_exp
+
+			out_offset := t_q * q_size + h * head_size
+			for d in 0 ..< head_size {
+				acc: f32
+				for t_k in 0 ..< t_k_max {
+					v_offset := t_k * kv_size + kv_h * head_size
+					acc += scores[t_k] * inv_sum * ml.bf16_to_f32(v_ptr[v_offset + d])
+				}
+				out_ptr[out_offset + d] = ml.bf16_from_f32(acc)
+			}
+		}
+
+		free_all(context.temp_allocator)
+	})
+}
+
+attention_cache_backward :: proc(op: ml.Operation) {
+	fmt.panicf("attention_with_cache is forward-only (inference path); backward is not implemented")
 }

@@ -879,6 +879,68 @@ def verify_llama_train(test_dir: Path, refs: dict) -> None:
         )
 
 
+def gen_kv_cache_decode(name, config, prompt_count, decode_count):
+    rng = np.random.default_rng(SEED)
+    test_dir = setup_test(name)
+
+    total_tokens = prompt_count + decode_count
+    tokens_np    = rng.integers(0, config["vocabulary_size"], size=total_tokens).astype(np.int32)
+    write_int_array(test_dir / "tokens.bin", tokens_np)
+    write_int_array(test_dir / "config.bin", [
+        config["layer_count"], config["n_q_heads"], config["n_kv_heads"], config["head_size"],
+        config["embedding_size"], config["intermediate_size"], config["vocabulary_size"],
+        prompt_count, decode_count,
+        int(round(config["rope_base"])),
+    ])
+
+    torch.manual_seed(SEED)
+    model = TorchLlama(config)
+
+    layer_count    = config["layer_count"]
+    residual_scale = 0.02 / math.sqrt(2 * layer_count)
+
+    with torch.no_grad():
+        model.token_embeddings.normal_(0.0, 0.02)
+        for layer in model.layers:
+            layer["input_norm_weight"].fill_(1.0)
+            layer["q_proj_weight"].normal_(0.0, 0.02)
+            layer["k_proj_weight"].normal_(0.0, 0.02)
+            layer["v_proj_weight"].normal_(0.0, 0.02)
+            layer["o_proj_weight"].normal_(0.0, residual_scale)
+            layer["post_attn_norm_weight"].fill_(1.0)
+            layer["gate_proj_weight"].normal_(0.0, 0.02)
+            layer["up_proj_weight"  ].normal_(0.0, 0.02)
+            layer["down_proj_weight"].normal_(0.0, residual_scale)
+        model.output_norm_weight.fill_(1.0)
+
+    write_tensor(test_dir / "init_token_embeddings.bin", model.token_embeddings.detach().numpy())
+    for i, layer in enumerate(model.layers):
+        for key in ("input_norm_weight", "q_proj_weight", "k_proj_weight", "v_proj_weight", "o_proj_weight",
+                    "post_attn_norm_weight", "gate_proj_weight", "up_proj_weight", "down_proj_weight"):
+            write_tensor(test_dir / f"init_layer{i}_{key}.bin", layer[key].detach().numpy())
+    write_tensor(test_dir / "init_output_norm_weight.bin", model.output_norm_weight.detach().numpy())
+
+    tokens_pt = torch.tensor(tokens_np.astype(np.int64))
+    with torch.no_grad():
+        ref_logits = model(tokens_pt).detach().numpy()
+
+    return test_dir, {"logits": ref_logits}
+
+
+def verify_kv_cache_decode(test_dir: Path, refs: dict) -> None:
+    odin_logits = read_tensor(test_dir / "odin_logits.bin")
+    ref_logits  = refs["logits"]
+    if odin_logits.shape != ref_logits.shape:
+        raise AssertionError(f"logits shape mismatch {odin_logits.shape} vs {ref_logits.shape}")
+    diff = np.abs(odin_logits - ref_logits)
+    if diff.max() > 1e-3:
+        worst = np.unravel_index(int(np.argmax(diff)), diff.shape)
+        raise AssertionError(
+            f"logits diverged: max abs {diff.max():.3e} at {worst} "
+            f"(odin={odin_logits[worst]:.6f}, torch={ref_logits[worst]:.6f})"
+        )
+
+
 def gen_transformer_train_bf16(name, layer_count, head_count, embedding_size, vocabulary_size, token_count, step_count, learning_rate, period=1):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
@@ -993,6 +1055,14 @@ TESTS = [
         },
         token_count=16, step_count=20, learning_rate=0.01,
     ), verify_llama_train),
+    ("kv_cache_decode",    lambda: gen_kv_cache_decode("kv_cache_decode",
+        config={
+            "layer_count": 2, "n_q_heads": 4, "n_kv_heads": 2, "head_size": 8,
+            "embedding_size": 32, "intermediate_size": 64, "vocabulary_size": 64,
+            "rope_base": 100000.0,
+        },
+        prompt_count=5, decode_count=4,
+    ), verify_kv_cache_decode),
     ("mlp_train_period12", lambda: gen_mlp_train("mlp_train_period12", sizes=[4, 8, 8, 1], sample_count=16, step_count=60, learning_rate=0.01, period=12), verify_mlp_train),
     ("transformer_train_bf16", lambda: gen_transformer_train_bf16(
         "transformer_train_bf16",

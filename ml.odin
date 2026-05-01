@@ -448,6 +448,7 @@ Operation_Variant :: union {
 	Permute,
 	Causal_Mask,
 	Attention,
+	Attention_Cache,
 	Cast,
 }
 
@@ -517,9 +518,11 @@ Attention :: struct {
 
 @(require_results)
 attention :: proc(
-	query, key, value: Tensor,
-	n_q_heads:  int,
-	n_kv_heads: int = 0,
+	query:     Tensor,
+	key:       Tensor,
+	value:     Tensor,
+	n_q_heads: int,
+	n_kv_heads := 0,
 	causal     := true,
 	loc        := #caller_location,
 ) -> (output: Tensor) {
@@ -565,6 +568,82 @@ attention :: proc(
 			d_p_scratch     = d_p_scratch,
 			lse             = lse,
 			d_acc           = d_acc,
+		},
+	}
+	_current_ctx.backend.forward(op, loc)
+	append_operation(op, loc=loc)
+
+	return
+}
+
+Attention_Cache :: struct {
+	n_q_heads:      int,
+	n_kv_heads:     int,
+	cache_position: int,
+
+	key:     Tensor,
+	value:   Tensor,
+	k_cache: Tensor,
+	v_cache: Tensor,
+}
+
+@(require_results)
+attention_with_cache :: proc(
+	query:          Tensor,
+	key:            Tensor,
+	value:          Tensor,
+	k_cache:        Tensor,
+	v_cache:        Tensor,
+	cache_position: int,
+	n_q_heads:      int,
+	n_kv_heads      := 0,
+	loc             := #caller_location,
+) -> (output: Tensor) {
+	kv_heads := n_kv_heads if n_kv_heads > 0 else n_q_heads
+
+	assert(query.rank   == 2, "attention_with_cache query must be 2-D [tokens, n_q_heads * head_size]",  loc=loc)
+	assert(key.rank     == 2, "attention_with_cache key must be 2-D [tokens, n_kv_heads * head_size]",   loc=loc)
+	assert(value.rank   == 2, "attention_with_cache value must be 2-D [tokens, n_kv_heads * head_size]", loc=loc)
+	assert(k_cache.rank == 2, "attention_with_cache k_cache must be 2-D [t_max, n_kv_heads * head_size]", loc=loc)
+	assert(v_cache.rank == 2, "attention_with_cache v_cache must be 2-D [t_max, n_kv_heads * head_size]", loc=loc)
+
+	token_count := query.shape[0]
+	assert(key.shape[0]   == token_count, "attention_with_cache key token count must match query",   loc=loc)
+	assert(value.shape[0] == token_count, "attention_with_cache value token count must match query", loc=loc)
+
+	q_size  := query.shape[1]
+	kv_size := key.shape[1]
+	assert(value.shape[1]   == kv_size, "attention_with_cache key/value trailing dim mismatch", loc=loc)
+	assert(k_cache.shape[1] == kv_size, "attention_with_cache k_cache trailing dim must match key", loc=loc)
+	assert(v_cache.shape[1] == kv_size, "attention_with_cache v_cache trailing dim must match value", loc=loc)
+	assert(q_size  % n_q_heads == 0, "query trailing dim must be divisible by n_q_heads", loc=loc)
+	assert(kv_size % kv_heads  == 0, "key/value trailing dim must be divisible by n_kv_heads", loc=loc)
+
+	head_size := q_size / n_q_heads
+	assert(kv_size / kv_heads == head_size, "head_size must match between query and key/value", loc=loc)
+	assert(n_q_heads % kv_heads == 0, "n_q_heads must be a multiple of n_kv_heads", loc=loc)
+
+	assert(query.type == key.type     && key.type == value.type,    "attention_with_cache Q/K/V must share dtype", loc=loc)
+	assert(query.type == k_cache.type && query.type == v_cache.type, "attention_with_cache cache dtype must match Q", loc=loc)
+	assert(query.type == .F32 || query.type == .Bf16, "attention_with_cache requires F32 or Bf16", loc=loc)
+
+	t_max := k_cache.shape[0]
+	assert(cache_position >= 0,                          "cache_position must be non-negative", loc=loc)
+	assert(cache_position + token_count <= t_max,        "cache overflow: cache_position + token_count > t_max", loc=loc)
+
+	output = zeros(query.type, {token_count, q_size}, loc=loc)
+
+	op := Operation{
+		input   = query,
+		output  = output,
+		variant = Attention_Cache{
+			n_q_heads      = n_q_heads,
+			n_kv_heads     = kv_heads,
+			cache_position = cache_position,
+			key            = key,
+			value          = value,
+			k_cache        = k_cache,
+			v_cache        = v_cache,
 		},
 	}
 	_current_ctx.backend.forward(op, loc)
@@ -939,15 +1018,16 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 }
 
 Rope :: struct {
-	head_count: int,
-	base:       f32,
+	head_count:      int,
+	base:            f32,
+	position_offset: int,
 
 	cos_cache: Tensor,
 	sin_cache: Tensor,
 }
 
 @(require_results)
-rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_location) -> (output: Tensor) {
+rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset: int = 0, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 2, "rope requires rank >= 2", loc=loc)
 
 	token_count := input.shape[0]
@@ -966,10 +1046,11 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, loc := #caller_l
 		input   = input,
 		output  = output,
 		variant = Rope{
-			head_count = head_count,
-			base       = base,
-			cos_cache  = cos_cache,
-			sin_cache  = sin_cache,
+			head_count      = head_count,
+			base            = base,
+			position_offset = position_offset,
+			cos_cache       = cos_cache,
+			sin_cache       = sin_cache,
 		},
 	}
 	_current_ctx.backend.forward(op, loc)
