@@ -67,6 +67,8 @@ run_all :: proc(thread_count: int) {
 	fmt.printfln("%-44s %10s %10s %16s", "benchmark", "min ms", "mean ms", "checksum")
 
 	report(bench_linear_inference_fwd())
+	report(bench_linear_inference_fwd_bf16())
+	report(bench_linear_inference_fwd_bf16_big())
 	report(bench_linear_inference())
 	report(bench_linear_training_fwd())
 	report(bench_linear_training())
@@ -151,6 +153,50 @@ bench_linear_inference_fwd :: proc() -> Result {
 
 	state_w = w
 	return time_iters("linear forward only        (count=1, 512x2048)", run)
+}
+
+bench_linear_inference_fwd_bf16 :: proc() -> Result {
+	INPUT  :: 512
+	OUTPUT :: 2048
+
+	rand.reset(SEED)
+	w := ml.make(.Bf16, {OUTPUT, INPUT})
+	defer ml.destroy(w)
+	ml.fill_normal(w, 0, 0.02)
+
+	run :: proc() -> f32 {
+		w_state := state_w
+		ml.clear()
+		x := ml.zeros(.Bf16, {INPUT})
+		ml.fill_value(x, 0.01)
+		y := ml.linear(x, w_state)
+		return sum(ml.cast_to(y, .F32))
+	}
+
+	state_w = w
+	return time_iters("linear forward only bf16   (count=1, 512x2048)", run)
+}
+
+bench_linear_inference_fwd_bf16_big :: proc() -> Result {
+	INPUT  :: 2304
+	OUTPUT :: 2304
+
+	rand.reset(SEED)
+	w := ml.make(.Bf16, {OUTPUT, INPUT})
+	defer ml.destroy(w)
+	ml.fill_normal(w, 0, 0.02)
+
+	run :: proc() -> f32 {
+		w_state := state_w
+		ml.clear()
+		x := ml.zeros(.Bf16, {INPUT})
+		ml.fill_value(x, 0.01)
+		y := ml.linear(x, w_state)
+		return sum(ml.cast_to(y, .F32))
+	}
+
+	state_w = w
+	return time_iters("linear forward only bf16   (count=1, 2304x2304)", run)
 }
 
 bench_linear_inference :: proc() -> Result {

@@ -237,6 +237,32 @@ when intrinsics.has_target_feature("avx") {
 			y[i] += a * x[i]
 		}
 	}
+
+	// Widen 8 bf16 lanes to 8 f32 lanes by interleaving with zero u16s into the
+	// low half of each u32 (LE), so each bf16's bits land in bits 16..31 — which
+	// is exactly bf16 -> f32 reinterpretation.
+	_bf16x8_to_f32x8 :: #force_inline proc "contextless" (b: #simd[8]u16) -> F32x8 {
+		zeros: #simd[8]u16
+		wide := intrinsics.simd_shuffle(zeros, b,
+			0, 8, 1, 9, 2, 10, 3, 11,
+			4, 12, 5, 13, 6, 14, 7, 15)
+		return transmute(F32x8)wide
+	}
+
+	_simd_dot_bf16_f32 :: #force_inline proc "contextless" (a, b: [^]ml.Bf16, n: int) -> f32 {
+		acc: F32x8
+		i := 0
+		for ; i + SIMD_LANES <= n; i += SIMD_LANES {
+			au := intrinsics.unaligned_load((^#simd[8]u16)(&a[i]))
+			bu := intrinsics.unaligned_load((^#simd[8]u16)(&b[i]))
+			acc = simd.fma(_bf16x8_to_f32x8(au), _bf16x8_to_f32x8(bu), acc)
+		}
+		sum := simd.reduce_add_bisect(acc)
+		for ; i < n; i += 1 {
+			sum += ml.bf16_to_f32(a[i]) * ml.bf16_to_f32(b[i])
+		}
+		return sum
+	}
 } else {
 	_simd_dot_f32 :: #force_inline proc "contextless" (a, b: [^]f32, n: int) -> f32 {
 		s0, s1, s2, s3: f32
@@ -258,6 +284,22 @@ when intrinsics.has_target_feature("avx") {
 		for i in 0 ..< n {
 			y[i] += a * x[i]
 		}
+	}
+
+	_simd_dot_bf16_f32 :: #force_inline proc "contextless" (a, b: [^]ml.Bf16, n: int) -> f32 {
+		s0, s1, s2, s3: f32
+		i := 0
+		for ; i + 4 <= n; i += 4 {
+			s0 += ml.bf16_to_f32(a[i + 0]) * ml.bf16_to_f32(b[i + 0])
+			s1 += ml.bf16_to_f32(a[i + 1]) * ml.bf16_to_f32(b[i + 1])
+			s2 += ml.bf16_to_f32(a[i + 2]) * ml.bf16_to_f32(b[i + 2])
+			s3 += ml.bf16_to_f32(a[i + 3]) * ml.bf16_to_f32(b[i + 3])
+		}
+		sum := (s0 + s1) + (s2 + s3)
+		for ; i < n; i += 1 {
+			sum += ml.bf16_to_f32(a[i]) * ml.bf16_to_f32(b[i])
+		}
+		return sum
 	}
 }
 
@@ -1252,10 +1294,18 @@ linear_forward :: proc(op: ml.Operation) {
 }
 
 linear_forward_f32 :: proc(op: ml.Operation) {
-	weight := op.variant.(ml.Linear).weight
-	count  := ml.len(op.input) / weight.shape[1]
+	weight      := op.variant.(ml.Linear).weight
+	output_size := weight.shape[0]
+	count       := ml.len(op.input) / weight.shape[1]
 
-	parallelize(count, count, op, proc(index: int, op: ml.Operation) {
+	Job_Data :: struct {
+		op:    ml.Operation,
+		count: int,
+	}
+	jd := Job_Data{op = op, count = count}
+
+	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+		op := jd.op
 		input, output := op.input, op.output
 		weight      := op.variant.(ml.Linear).weight
 		output_size := weight.shape[0]
@@ -1265,20 +1315,27 @@ linear_forward_f32 :: proc(op: ml.Operation) {
 		output_ptr := ([^]f32)(raw_data(data(output)))
 		weight_ptr := ([^]f32)(raw_data(data(weight)))
 
-		x := input_ptr [index * input_size:]
-		y := output_ptr[index * output_size:]
-
-		for o in 0 ..< output_size {
-			y[o] = _simd_dot_f32(weight_ptr[o * input_size:], x, input_size)
+		w_row := weight_ptr[o * input_size:]
+		for c in 0 ..< jd.count {
+			x := input_ptr[c * input_size:]
+			output_ptr[c * output_size + o] = _simd_dot_f32(w_row, x, input_size)
 		}
 	})
 }
 
 linear_forward_bf16 :: proc(op: ml.Operation) {
-	weight := op.variant.(ml.Linear).weight
-	count  := ml.len(op.input) / weight.shape[1]
+	weight      := op.variant.(ml.Linear).weight
+	output_size := weight.shape[0]
+	count       := ml.len(op.input) / weight.shape[1]
 
-	parallelize(count, count, op, proc(index: int, op: ml.Operation) {
+	Job_Data :: struct {
+		op:    ml.Operation,
+		count: int,
+	}
+	jd := Job_Data{op = op, count = count}
+
+	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+		op := jd.op
 		input, output := op.input, op.output
 		weight      := op.variant.(ml.Linear).weight
 		output_size := weight.shape[0]
@@ -1288,16 +1345,10 @@ linear_forward_bf16 :: proc(op: ml.Operation) {
 		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		w_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
 
-		x_row := x_bf[index * input_size:]
-		y_row := y_bf[index * output_size:]
-
-		for o in 0 ..< output_size {
-			w_row := w_bf[o * input_size:]
-			acc:  f32
-			for k in 0 ..< input_size {
-				acc += ml.bf16_to_f32(w_row[k]) * ml.bf16_to_f32(x_row[k])
-			}
-			y_row[o] = ml.bf16_from_f32(acc)
+		w_row := w_bf[o * input_size:]
+		for c in 0 ..< jd.count {
+			x_row := x_bf[c * input_size:]
+			y_bf[c * output_size + o] = ml.bf16_from_f32(_simd_dot_bf16_f32(w_row, x_row, input_size))
 		}
 	})
 }
@@ -3252,11 +3303,7 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 			max_score := math.NEG_INF_F32
 			for t_k in t_k_min ..< t_k_max {
 				k_offset := (t_k % t_capacity) * kv_size + kv_h * head_size
-				score: f32
-				for d in 0 ..< head_size {
-					score += ml.bf16_to_f32(q_ptr[q_offset + d]) * ml.bf16_to_f32(k_ptr[k_offset + d])
-				}
-				score *= inv_sqrt_d
+				score := _simd_dot_bf16_f32(q_ptr[q_offset:], k_ptr[k_offset:], head_size) * inv_sqrt_d
 				scores[t_k] = score
 				if score > max_score { max_score = score }
 			}
