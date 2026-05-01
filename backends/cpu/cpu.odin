@@ -3129,7 +3129,22 @@ attention_cache_forward :: proc(op: ml.Operation) {
 attention_cache_forward_f32 :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Attention_Cache)
 
-	parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
+	token_count := op.input.shape[0]
+	k_total     := v.cache_position + token_count
+
+	Job_Data :: struct {
+		op:      ml.Operation,
+		scratch: []f32,
+		k_total: int,
+	}
+	jd := Job_Data{
+		op      = op,
+		scratch = make([]f32, v.n_q_heads * k_total, context.temp_allocator),
+		k_total = k_total,
+	}
+
+	parallelize(v.n_q_heads, v.n_q_heads, jd, proc(h: int, jd: Job_Data) {
+		op := jd.op
 		v := op.variant.(ml.Attention_Cache)
 
 		token_count := op.input.shape[0]
@@ -3141,7 +3156,7 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 		cache_pos   := v.cache_position
 		window      := v.window
 		t_capacity  := v.k_cache.shape[0]
-		k_total     := cache_pos + token_count
+		k_total     := jd.k_total
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
 		q_ptr   := ([^]f32)(raw_data(data(op.input)))
@@ -3149,7 +3164,7 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 		v_ptr   := ([^]f32)(raw_data(data(v.v_cache)))
 		out_ptr := ([^]f32)(raw_data(data(op.output)))
 
-		scores := make([]f32, k_total, context.temp_allocator)
+		scores := jd.scratch[h * k_total : (h + 1) * k_total]
 
 		for t_q in 0 ..< token_count {
 			q_offset := t_q * q_size + h * head_size
@@ -3190,7 +3205,22 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Attention_Cache)
 
-	parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
+	token_count := op.input.shape[0]
+	k_total     := v.cache_position + token_count
+
+	Job_Data :: struct {
+		op:      ml.Operation,
+		scratch: []f32,
+		k_total: int,
+	}
+	jd := Job_Data{
+		op      = op,
+		scratch = make([]f32, v.n_q_heads * k_total, context.temp_allocator),
+		k_total = k_total,
+	}
+
+	parallelize(v.n_q_heads, v.n_q_heads, jd, proc(h: int, jd: Job_Data) {
+		op := jd.op
 		v := op.variant.(ml.Attention_Cache)
 
 		token_count := op.input.shape[0]
@@ -3202,7 +3232,7 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 		cache_pos   := v.cache_position
 		window      := v.window
 		t_capacity  := v.k_cache.shape[0]
-		k_total     := cache_pos + token_count
+		k_total     := jd.k_total
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
 		q_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers  [.Data]))
@@ -3210,7 +3240,7 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 		v_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.v_cache.buffers [.Data]))
 		out_ptr := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers [.Data]))
 
-		scores := make([]f32, k_total, context.temp_allocator)
+		scores := jd.scratch[h * k_total : (h + 1) * k_total]
 
 		for t_q in 0 ..< token_count {
 			q_offset := t_q * q_size + h * head_size
@@ -3249,8 +3279,6 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 				out_ptr[out_offset + d] = ml.bf16_from_f32(acc)
 			}
 		}
-
-		free_all(context.temp_allocator)
 	})
 }
 

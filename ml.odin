@@ -538,19 +538,19 @@ attention :: proc(
 ) -> (output: Tensor) {
 	kv_heads := n_kv_heads if n_kv_heads > 0 else n_q_heads
 
-	assert(query.rank == 2, "attention query must be 2-D [tokens, n_q_heads * head_size]",  loc=loc)
-	assert(key.rank   == 2, "attention key must be 2-D [tokens, n_kv_heads * head_size]",   loc=loc)
+	assert(query.rank == 2, "attention query must be 2-D [tokens, n_q_heads * head_size]", loc=loc)
+	assert(key.rank == 2, "attention key must be 2-D [tokens, n_kv_heads * head_size]", loc=loc)
 	assert(value.rank == 2, "attention value must be 2-D [tokens, n_kv_heads * head_size]", loc=loc)
 
 	token_count := query.shape[0]
-	assert(key.shape[0]   == token_count, "attention key token count must match query",   loc=loc)
+	assert(key.shape[0] == token_count, "attention key token count must match query", loc=loc)
 	assert(value.shape[0] == token_count, "attention value token count must match query", loc=loc)
 
 	q_size  := query.shape[1]
 	kv_size := key.shape[1]
 	assert(value.shape[1] == kv_size, "attention key and value must have same trailing dim", loc=loc)
 	assert(q_size  % n_q_heads == 0, "query trailing dim must be divisible by n_q_heads", loc=loc)
-	assert(kv_size % kv_heads  == 0, "key/value trailing dim must be divisible by n_kv_heads", loc=loc)
+	assert(kv_size % kv_heads == 0, "key/value trailing dim must be divisible by n_kv_heads", loc=loc)
 
 	head_size := q_size / n_q_heads
 	assert(kv_size / kv_heads == head_size, "head_size must match between query and key/value", loc=loc)
@@ -616,19 +616,19 @@ attention_with_cache :: proc(
 ) -> (output: Tensor) {
 	kv_heads := n_kv_heads if n_kv_heads > 0 else n_q_heads
 
-	assert(query.rank   == 2, "attention_with_cache query must be 2-D [tokens, n_q_heads * head_size]",  loc=loc)
-	assert(key.rank     == 2, "attention_with_cache key must be 2-D [tokens, n_kv_heads * head_size]",   loc=loc)
-	assert(value.rank   == 2, "attention_with_cache value must be 2-D [tokens, n_kv_heads * head_size]", loc=loc)
+	assert(query.rank == 2, "attention_with_cache query must be 2-D [tokens, n_q_heads * head_size]", loc=loc)
+	assert(key.rank == 2, "attention_with_cache key must be 2-D [tokens, n_kv_heads * head_size]", loc=loc)
+	assert(value.rank == 2, "attention_with_cache value must be 2-D [tokens, n_kv_heads * head_size]", loc=loc)
 	assert(k_cache.rank == 2, "attention_with_cache k_cache must be 2-D [t_max, n_kv_heads * head_size]", loc=loc)
 	assert(v_cache.rank == 2, "attention_with_cache v_cache must be 2-D [t_max, n_kv_heads * head_size]", loc=loc)
 
 	token_count := query.shape[0]
-	assert(key.shape[0]   == token_count, "attention_with_cache key token count must match query",   loc=loc)
+	assert(key.shape[0] == token_count, "attention_with_cache key token count must match query", loc=loc)
 	assert(value.shape[0] == token_count, "attention_with_cache value token count must match query", loc=loc)
 
 	q_size  := query.shape[1]
 	kv_size := key.shape[1]
-	assert(value.shape[1]   == kv_size, "attention_with_cache key/value trailing dim mismatch", loc=loc)
+	assert(value.shape[1] == kv_size, "attention_with_cache key/value trailing dim mismatch", loc=loc)
 	assert(k_cache.shape[1] == kv_size, "attention_with_cache k_cache trailing dim must match key", loc=loc)
 	assert(v_cache.shape[1] == kv_size, "attention_with_cache v_cache trailing dim must match value", loc=loc)
 	assert(q_size  % n_q_heads == 0, "query trailing dim must be divisible by n_q_heads", loc=loc)
@@ -638,13 +638,13 @@ attention_with_cache :: proc(
 	assert(kv_size / kv_heads == head_size, "head_size must match between query and key/value", loc=loc)
 	assert(n_q_heads % kv_heads == 0, "n_q_heads must be a multiple of n_kv_heads", loc=loc)
 
-	assert(query.type == key.type     && key.type == value.type,    "attention_with_cache Q/K/V must share dtype", loc=loc)
+	assert(query.type == key.type && key.type == value.type, "attention_with_cache Q/K/V must share dtype", loc=loc)
 	assert(query.type == k_cache.type && query.type == v_cache.type, "attention_with_cache cache dtype must match Q", loc=loc)
 	assert(query.type == .F32 || query.type == .Bf16, "attention_with_cache requires F32 or Bf16", loc=loc)
 
 	t_capacity := k_cache.shape[0]
 	assert(cache_position >= 0, "cache_position must be non-negative", loc=loc)
-	assert(window >= 0,         "attention_with_cache window must be non-negative (0 means full attention)", loc=loc)
+	assert(window >= 0, "attention_with_cache window must be non-negative (0 means full attention)", loc=loc)
 	if window == 0 {
 		// Full attention: cache must hold every absolute position.
 		assert(cache_position + token_count <= t_capacity, "cache overflow: cache_position + token_count > t_max", loc=loc)
@@ -653,8 +653,8 @@ attention_with_cache :: proc(
 		// sliding mask only needs the last `window` entries, so storage as
 		// small as `window` is sufficient. Each forward must still fit in
 		// the ring without overwriting itself.
-		assert(t_capacity   >= window, "attention_with_cache: sliding cache capacity must be >= window", loc=loc)
-		assert(token_count  <= t_capacity, "attention_with_cache: token_count exceeds ring capacity", loc=loc)
+		assert(t_capacity >= window, "attention_with_cache: sliding cache capacity must be >= window", loc=loc)
+		assert(token_count <= t_capacity, "attention_with_cache: token_count exceeds ring capacity", loc=loc)
 	}
 
 	output = zeros(query.type, {token_count, q_size}, loc=loc)
