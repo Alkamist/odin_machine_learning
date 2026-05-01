@@ -34,7 +34,7 @@ Two patterns dominate.
 ```odin
 // From core:io
 Error :: enum i32 {
-    None = 0,
+    None,
     EOF,
     Unexpected_EOF,
     Short_Write,
@@ -46,7 +46,7 @@ Error :: enum i32 {
 }
 ```
 
-`None = 0` is essential — it makes the zero value mean "no error" so a fresh-zeroed return slot is already correct. **Always** put `None = 0` (explicit `= 0`) at the top of an error enum.
+`None` is essential — it makes the zero value mean "no error" so a fresh-zeroed return slot is already correct. **Always** put `None` at the top of an error enum.
 
 **(2) A union of enums** for procs that can fail in multiple categories.
 

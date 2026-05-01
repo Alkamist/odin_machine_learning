@@ -5,7 +5,6 @@
 #version 450
 
 #define WG 256
-#define EPSILON 1e-5
 
 layout(local_size_x = WG) in;
 
@@ -14,8 +13,10 @@ layout(set = 0, binding = 1) readonly  buffer W { float w[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform Params {
-    uint count;
-    uint size;
+    uint  count;
+    uint  size;
+    float weight_bias; // 0.0 by default; 1.0 enables Gemma's `(w + 1)` idiom
+    float eps;
 } p;
 
 shared float partial[WG];
@@ -37,10 +38,10 @@ void main() {
         if (tid < stride) partial[tid] += partial[tid + stride];
         barrier();
     }
-    float rstd = inversesqrt(partial[0] / float(p.size) + EPSILON);
+    float rstd = inversesqrt(partial[0] / float(p.size) + p.eps);
     barrier();
 
     for (uint i = tid; i < p.size; i += WG) {
-        y[off + i] = x[off + i] * rstd * w[i];
+        y[off + i] = x[off + i] * rstd * (w[i] + p.weight_bias);
     }
 }

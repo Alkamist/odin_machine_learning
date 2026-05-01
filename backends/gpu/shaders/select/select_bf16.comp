@@ -1,0 +1,28 @@
+// Bf16 embedding lookup. Pure byte-copy of `size`-element rows; the kernel
+// reads/writes packed bf16 pairs as `uint`, so `size` must be even.
+//   table:   [vocab, size]      (bf16, packed)
+//   indices: [n_indices]        (uint32)
+//   out:     [n_indices, size]  (bf16, packed)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer T   { uint t[];  };
+layout(set = 0, binding = 1) readonly  buffer Idx { uint ix[]; };
+layout(set = 0, binding = 2) writeonly buffer O   { uint o[];  };
+
+layout(push_constant) uniform Params {
+    uint n_indices;
+    uint size; // element count per row (must be even)
+} p;
+
+void main() {
+    uint i = gl_WorkGroupID.y;
+    uint pair_idx = gl_GlobalInvocationID.x;
+    uint pair_count = p.size >> 1u;
+    if (i >= p.n_indices || pair_idx >= pair_count) return;
+
+    uint row = ix[i] * pair_count;
+    uint dst = i      * pair_count;
+    o[dst + pair_idx] = t[row + pair_idx];
+}

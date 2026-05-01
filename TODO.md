@@ -35,15 +35,126 @@ Current status of the trunk:
 - KV-cache + `attention_with_cache` (CPU + GPU) — done.
 - Sliding-window attention (forward + backward + cache, CPU + GPU)
   — done.
+- Gemma 4 tokenizer (`tokenizer.json` byte-fallback BPE, 52-prompt HF
+  parity in `tests/gemma_tokenizer/`) — done.
+- `ml.rope` `rope_fraction` parameter (CPU + GPU forward + backward)
+  — done.
+- `ml.rmsnorm` `unit_offset` flag and per-op `eps` parameter — done.
+- Gemma 4 E4B forward parity inference (max abs logit diff 2.99e-4
+  vs HF, mean 3.78e-5) — done.
+  - `networks/gemma/{gemma.odin,loader.odin}` ship the full text
+    stack: scaled embeddings, PLE pathway, KV sharing on layers
+    24..41, alternating sliding/full attention with per-type
+    `head_dim` (256 / 512), `partial_rotary_factor=0.25` on full
+    layers, per-layer `layer_scalar`, `final_logit_softcapping=30`.
+  - `examples/gemma_inference/` runs forward and verifies against
+    `gemma_data/expected_logits.bin`.
+- Gemma 4 E4B chat / decode at GPU bf16 (~6 tok/s on a 3090 Ti, 16 GB
+  VRAM resident) — done. `examples/gemma_chat/` does prefill +
+  per-token decode through KV cache, greedy + top-k/temperature
+  sampling, EOS stop. Several pieces of supporting infrastructure
+  landed in this milestone:
+  - **GPU persistent-buffer sub-allocator** (`backends/gpu/buffer.odin`,
+    `Pool_Block` in `gpu.odin`). NVIDIA's Windows Vulkan driver
+    reserves a multi-MB minimum page per `vkAllocateMemory`, so the
+    naive one-allocation-per-tensor path OOM'd at ~6 GB used despite
+    20 GB free. Sub-allocating from 256 MB pool blocks (or larger
+    when a single buffer exceeds that) drops the alloc count from
+    ~500 to ~40 and unblocked bf16 inference.
+  - **`gemma.make` `for_training` flag**. `ml.make` defaults to
+    allocating `{Data, Gradient, Adam_M, Adam_V}` — 4× memory.
+    `gemma.make` now defaults to `{Data}` only and only allocates the
+    full 4-buffer set when `for_training=true`. This was the actual
+    cause of the bf16 OOM (36 GB targeted instead of 9 GB).
+  - **`embed_tokens_per_layer` host-side**. The per-layer-input
+    embedding table is `[vocab × num_layers × ple_dim]` = 5.6 GB at
+    bf16, exceeding Vulkan's typical `maxStorageBufferRange` (2 GiB
+    on most drivers). Stored as raw bytes on the host; per-forward
+    we look up the `[T, num_layers * ple_dim]` slice and upload it.
+  - **Bf16 GPU `select` shader** (`backends/gpu/shaders/select/select_bf16.comp`)
+    — embedding lookup at bf16 by treating the table as packed
+    `uint`s and copying row pairs.
+  - **`ml.scalar` accepts a `dtype` parameter**, defaulting to F32.
+    Required because `ml.mul` requires matching dtypes and Gemma
+    multiplies bf16 tensors by scalar scales (`sqrt(hidden_size)`,
+    `1/sqrt(2)`, the softcap divisor, etc.).
+  - **`ml.select` now preserves input dtype** instead of always
+    returning F32 (was hard-coded).
+  - **`MAX_D` raised to 512** in `attention_cache{,_bf16}.comp` and
+    the runtime cap in `backend.odin` — Gemma 4 full-attention layers
+    use `head_dim=512`.
+  - **`ml.rmsnorm` `eps` parameter** flowed through the GPU shaders
+    (`rmsnorm`, `rmsnorm_bf16`, `rmsnorm_stats`, `rmsnorm_stats_bf16`)
+    so Gemma's `eps=1e-6` doesn't fall back to a hard-coded `1e-5`.
+- Gemma 4 E4B-IT (instruction-tuned) chat working end-to-end at
+  GPU bf16. Greedy decode on `"What is the capital of France?"`
+  returns `"The capital of France is Paris.<turn|>"` (8 tokens,
+  matches HF F32 byte-for-byte). bf16 GPU forward parity vs HF F32
+  reference: max abs logit diff **1.49**, mean **0.18** — pure
+  numerical drift over 42 layers, no correctness gap. Supporting
+  pieces:
+  - **Tokenizer special-token preprocessing** (`tokenizers/gemma/`).
+    Encoder now scans `added_tokens` for the longest match at each
+    cursor position and emits the special ID directly; gaps go
+    through normal byte-fallback BPE. Required for chat templates
+    where `<bos>`, `<|turn>`, `<turn|>` need to be single token IDs.
+  - **`examples/gemma_chat` chat template wrapping** behind `--chat`.
+    Wraps the user message as `<bos><|turn>user\n…<turn|>\n<|turn>model\n`
+    (Gemma 4's actual format, *not* the older `<start_of_turn>` /
+    `<end_of_turn>` from Gemma 2/3). Stops on `<eos>` or `<turn|>`.
+  - **Sampling extensions** in `examples/gemma_chat`: `--top-p`
+    (nucleus, applied after `--top-k`), `--ignore-eos`, and
+    `--no-cache` for diagnostic comparison vs `forward_cached`.
+  - **`tools/gemma_dump.py` always overwrites** `model.safetensors`.
+    Previously a size-only check left the prior variant's weights
+    in place after switching `MODEL_ID` (base and IT have identical
+    safetensors sizes), which was the actual cause of a multi-hour
+    chase of phantom "bf16 forward bug" symptoms.
+- Bug-fix sweep that came out of the chat work — done.
+  - **GPU activation sub-allocator** (`backends/gpu/buffer.odin`,
+    `_create_pooled_activation_buffer`). Replaced the exact-size
+    `pool` with a bump-arena that resets on `clear()`. Activations
+    no longer require one `vkAllocateMemory` per buffer, so
+    `forward(prompt+N)` for varying N (which `--no-cache` chat or
+    batch-shape-changing training does) stays bounded in VRAM.
+    Fixes the `gemma_chat --no-cache` OOM.
+  - **CPU bf16 `select`** (`backends/cpu/cpu.odin`). Forward is now
+    a dtype-agnostic byte-row copy; backward has a Bf16 branch with
+    f32 accumulation. CPU bf16 chat would now work end-to-end (GPU
+    is still preferred for speed).
 
 Remaining phases, in order:
 
-1. **Gemma 4 E4B text-only inference** — see plan below. Promoted ahead
-   of the pretrain milestones because Gemma 4 is now the explicit
-   target.
+1. **Sliding-window-aware KV-cache eviction** (high priority before
+   long-context use). The current `Cache` lays out K/V as a flat
+   `[t_max, kv_size]` per layer. For sliding layers (`window=512`)
+   we only need the last 512 entries, but right now the cache grows
+   linearly with `cache_position` up to `t_max` and any rows past
+   `cache_position - window` are dead weight. The math stays
+   correct because `attention_with_cache` applies the sliding mask
+   even when stale entries are present, but at E4B's 128k context
+   the sliding layers' cache is ~256× larger than it needs to be.
+   Two implementation paths:
+   - **Ring buffer per sliding layer.** Cache size = `min(t_max, W)`,
+     with a circular-write strategy and an offset push-constant for
+     attention. Smallest memory footprint; requires
+     `attention_with_cache` to know about the ring base.
+   - **Compact-on-overflow.** Keep the flat layout; once
+     `cache_position > t_max`, shift the last `W` rows down to
+     positions `[0, W)` and resume from there. Simpler op
+     interface, occasional copy cost.
+   Plumb a `window` field through `Cache`/`Layer_Cache` so each
+   layer can choose its strategy (full-attention layers stay flat
+   with `window=0`; sliding layers use one of the above).
+
 2. **Gemma 4 E4B fine-tune** on a small corpus. Reuses the training
-   loop from the stack-validation pretrain (run it second, point it at
-   E4B weights).
+   loop from the stack-validation pretrain (run it second, point it
+   at E4B weights). Note: `gemma.make` already supports
+   `for_training=true` to allocate the full
+   `{Data, Gradient, Adam_M, Adam_V}` buffer set; with FP32 master
+   weights at 8B params the optimizer state alone is ~96 GB and
+   will need partial CPU/disk offload.
+
 3. **Stack-validation pretrain** at ~30–50M params. The mixed-precision
    training recipe; useful before fine-tuning E4B for real.
 4. **From-scratch pretrain at 160M+ scale** matching a published
@@ -71,19 +182,66 @@ card and HF blog):
 a 262K SentencePiece vocab. **AltUp and MatFormer are gone** in Gemma
 4 (they were in Gemma 3n) — this is what makes E4B tractable.
 
+E4B specifics confirmed from `gemma_data/config.json` (HF
+`google/gemma-4-e4b`):
+
+- 42 layers, hidden 2560, intermediate 10240.
+- 8 query heads, 2 KV heads (4:1 GQA). `head_dim = 256` on sliding
+  layers but **`global_head_dim = 512`** on full-attention layers — the
+  q/k/v_proj output widths differ by layer type. Confirm by inspecting
+  the safetensors weight shapes for one full vs one sliding layer's
+  `q_proj.weight`.
+- Layer pattern is exactly 5 sliding : 1 full, repeating 7×; full
+  layers at indices 5, 11, 17, 23, 29, 35, 41.
+- Sliding RoPE: `rope_theta = 10_000`, full rotation.
+  Full RoPE: `rope_theta = 1_000_000`, `partial_rotary_factor = 0.25`,
+  `rope_type = "proportional"` (this is the p-RoPE the model card
+  alludes to — only the first quarter of head dims rotate).
+- `num_kv_shared_layers = 18`.
+- PLE: `vocab_size_per_layer_input = 262_144`,
+  `hidden_size_per_layer_input = 256`.
+- `final_logit_softcapping = 30.0` IS applied by
+  `Gemma4ForCausalLM.forward`: `logits = cap * tanh(logits / cap)`
+  after `lm_head`. Composed from existing primitives in our forward
+  (`mul`, `tanh`, `mul`); no new op needed.
+- `hidden_activation = "gelu_pytorch_tanh"` — the tanh-approximation
+  GeLU, which is what our `ml.gelu` already implements
+  (`backends/gpu/shaders/gelu/gelu.comp` confirms). No change needed.
+- Tokenizer ships only as `tokenizer.json` (HF tokenizers fast
+  format) — no `tokenizer.model` SentencePiece protobuf is published.
+  Step 2 below needs revising accordingly.
+
 Architectural deltas vs our existing Llama/SmolLM2 stack:
 
-- **RMSNorm with `+1` weight offset.** Output is `x * (weight + 1) /
-  rstd`. Gemma idiom; needs a flag on `ml.rmsnorm` or a new variant.
+- **RMSNorm.** Plain `x * weight / rstd` — Gemma 4's `Gemma4RMSNorm`
+  does *not* apply the `+1` weight offset that earlier Gemma
+  generations did (verified by reading
+  `transformers/models/gemma4/modeling_gemma4.py`). The
+  `unit_offset` flag on `ml.rmsnorm` is therefore unused for E4B,
+  but stays in as a harmless opt-in for hypothetical future ports
+  of Gemma 2 / 3 weights. Eps is `1e-6` (vs our `1e-5` default) —
+  small enough that bf16 numerics likely hide the difference, but
+  add an `eps` parameter to `ml.rmsnorm` to be safe.
 - **Pre + post norms around attention and MLP** (four norms per block,
   not two). Each block is `x + post_attn_norm(attn(pre_attn_norm(x)))`
   then `x + post_mlp_norm(mlp(pre_mlp_norm(x)))`.
 - **GeGLU MLP**, not SwiGLU. `gate ⊙ gelu(up)` vs SmolLM2's
   `gate ⊙ silu(up)`. We have `gelu` already; this is just a wiring
   change in `networks/gemma`.
-- **QK-norm.** RMSNorm applied to Q and K **after** the q/k projections
-  but **before** RoPE. Two extra (small) norm weights per attention
-  block.
+- **QK-norm + V-norm.** RMSNorm applied to Q and K (each `[head_dim]`,
+  with learned scale) **after** the q/k projections but **before** RoPE.
+  V also goes through an RMSNorm but with `with_scale=False` — i.e. just
+  `x / rstd`, no learned weight. Easiest path on our side: pass an
+  all-ones constant tensor as the v_norm weight. Q-norm is broadcast
+  across heads — view Q as `[T*n_q_heads, head_dim]` (via `ml.reshape`)
+  before the rmsnorm call, then reshape back.
+- **Attention `scaling = 1.0`.** Because q_norm/k_norm pre-normalise
+  Q and K, Gemma drops the usual `1/sqrt(head_dim)` factor on the
+  attention scores. Our `ml.attention` hardcodes `1/sqrt(head_size)`.
+  Cleanest workaround with no API change: at load time, multiply the
+  `q_norm.weight` row by `sqrt(head_dim)`. RoPE preserves magnitude, so
+  the pre-baked scale flows through and exactly cancels our attention's
+  built-in divisor. Zero runtime cost.
 - **Alternating local / global attention layers.** We already have
   sliding-window attention; this needs a per-layer
   `attention_type ∈ {local, global}` flag and a layer-pattern config
@@ -120,23 +278,41 @@ Implementation order, each step runnable:
    PLE config to JSON. This pins the exact numbers (hidden_size,
    head_dim, q/kv head counts, intermediate_size, RoPE bases, etc.)
    the model card omits.
-2. **SentencePiece tokenizer** in `tokenizers/sentencepiece/`. Parse
-   the HF `tokenizer.model` (protobuf). Implementation: byte-fallback
-   BPE with the score-based merge order SentencePiece uses; reuse the
-   regex-free pre-tokenization (SentencePiece is whitespace-prefix
-   based, no regex). Acceptance: encode/decode parity against HF on
-   ~50 fixed prompts including multilingual + code.
+2. **Gemma tokenizer** in `tokenizers/gemma/`. Gemma 4 ships only
+   `tokenizer.json` (HF tokenizers fast format), not the SentencePiece
+   `.model` protobuf. Two viable paths: parse `tokenizer.json`
+   directly (it embeds the byte-fallback BPE vocab + merges in a
+   well-documented JSON schema), or extend `gemma_dump.py` to extract
+   vocab/merges from the live tokenizer into a compact binary that the
+   Odin side reads. The latter is faster to land; the former keeps the
+   loader symmetric with `tokenizers/gpt2/`. Implementation is still
+   byte-fallback BPE with whitespace-prefix pre-tokenization (no
+   regex). Acceptance: encode/decode parity against HF on ~50 fixed
+   prompts including multilingual + code.
 3. **`ml.rope` `rope_fraction` parameter** (CPU + GPU forward, plus
    backward for the eventual fine-tune). Backward parity test added
    to `pytorch_parity` at `rope_fraction = 0.5`.
 4. **`ml.rmsnorm` `+1` weight offset flag.** One more bool on the op
    variant; both backends; parity test.
 5. **`networks/gemma` module.** Composes the above into a Gemma block
-   (pre-attn-norm → q/k/v_proj → QK-norm → RoPE (per-layer config) →
-   attention (local or global, with sliding window) → o_proj →
-   post-attn-norm → residual → pre-mlp-norm → GeGLU MLP →
-   post-mlp-norm → residual → PLE residual). Field names match HF
-   safetensors. Provides `GEMMA4_E4B_CONFIG`.
+   (pre-attn-norm → q/k/v_proj → QK-norm + V-norm-no-scale → RoPE
+   (per-layer config: `head_dim=512, base=1e6, fraction=0.25` on full
+   layers; `head_dim=256, base=10000, fraction=1.0` on sliding) →
+   attention (local on sliding layers, with `sliding_window=512`) →
+   o_proj → post-attn-norm → residual → pre-feedforward-norm → GeGLU
+   MLP (tanh-approx GeLU, already in `ml.gelu`) → post-feedforward-norm
+   → residual → PLE block). The q/k/v_proj output widths differ by
+   layer type (`global_head_dim=512` on full vs 256 on sliding) — store
+   per-layer in the config. Attention `scaling=1.0` is achieved by
+   pre-baking `sqrt(head_dim)` into `q_norm.weight` at load time, so
+   our existing `ml.attention` (which divides by `sqrt(head_size)`)
+   produces the unscaled scores Gemma wants. Apply
+   `final_logit_softcapping = 30.0` (`logits = cap * tanh(logits / cap)`)
+   after `lm_head`. Each layer also has a per-layer trained `layer_scalar`
+   buffer (`[1]`, values ~0.05–0.78 in the released checkpoint, NOT a
+   no-op) that multiplies the post-PLE residual at the end of the
+   block. Field names match HF safetensors. Provides
+   `GEMMA4_E4B_CONFIG`.
 6. **Gemma loader** in `networks/gemma/loader.odin`. Walks HF tensor
    names, skips vision-tower (`vision_tower.*`) and audio-tower
    (`audio_tower.*`) prefixes for text-only inference, loads the rest.
@@ -165,16 +341,29 @@ Once steps 1–10 land, fine-tune is the next phase below — most of the
 remaining work there is data plumbing and the mixed-precision training
 loop, not new ops.
 
-Open questions to resolve at step 1:
-- Does HF's Gemma 4 impl use `rotate_half` or interleaved RoPE? Decides
-  whether the Q/K row permute from `networks/llama/loader.odin`
+Open questions, mostly resolved by the config dump:
+
+- `rope_fraction`: 0.25 on full-attention layers, 1.0 on sliding.
+  ✔ resolved.
+- Layer pattern: 5 sliding : 1 full, repeating 7×. ✔ resolved.
+- `num_kv_shared_layers`: 18. ✔ resolved.
+- PLE dimension: 256 (`hidden_size_per_layer_input`); per-layer-input
+  vocab is 262144 (same as token vocab). ✔ resolved.
+
+Still open after step 1, to nail down by reading HF's Gemma 4 source:
+
+- `rotate_half` vs interleaved RoPE — the dump script's
+  `sniff_rope_convention` will report this; if it returns
+  `"rotate_half"`, the Q/K row permute from `networks/llama/loader.odin`
   applies as-is.
-- Exact `rope_fraction` for global layers (the spec says "p-RoPE" but
-  not the fraction).
-- Layer pattern for local/global (5:1 is common but verify).
-- `num_kv_shared_layers` value for E4B.
-- PLE dimension and where exactly the residual injection happens
-  (post-MLP vs end-of-block).
+- Exact PLE residual injection point (post-MLP residual vs
+  end-of-block addition vs gated mix). Read
+  `transformers/models/gemma4/modeling_gemma4.py`.
+- Whether QK-norm in Gemma 4 uses the same `+1` offset RMSNorm as the
+  block norms or a plain RMSNorm.
+- Whether the `proportional` `rope_type` on full layers does anything
+  beyond `partial_rotary_factor` (e.g. base-frequency scaling for long
+  context). Check `rope_utils.py` in transformers.
 
 ## Gemma 4 E4B fine-tune
 

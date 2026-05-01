@@ -20,6 +20,7 @@ layout(push_constant) uniform Params {
     uint  head_size;   // per-head dim, must be even
     float base;
     uint  position_offset;
+    uint  rotate_pair_count; // pairs in [0, rotate_pair_count) rotate; rest pass through
 } p;
 
 void main() {
@@ -33,14 +34,20 @@ void main() {
     uint head     = hg % p.head_count;
     uint pos      = hg / p.head_count;
 
+    uint head_offset = pos * p.head_count * p.head_size + head * p.head_size;
+    uint i_lo = head_offset + pair_idx * 2u;
+    uint i_hi = i_lo + 1u;
+
+    if (pair_idx >= p.rotate_pair_count) {
+        y[i_lo] = x[i_lo];
+        y[i_hi] = x[i_hi];
+        return;
+    }
+
     float exponent = float(pair_idx * 2u) / float(p.head_size);
     float theta    = float(pos + p.position_offset) / pow(p.base, exponent);
     float c_v      = cos(theta);
     float s_v      = sin(theta);
-
-    uint head_offset = pos * p.head_count * p.head_size + head * p.head_size;
-    uint i_lo = head_offset + pair_idx * 2u;
-    uint i_hi = i_lo + 1u;
 
     float xv = x[i_lo];
     float yv = x[i_hi];

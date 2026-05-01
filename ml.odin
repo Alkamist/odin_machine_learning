@@ -213,11 +213,19 @@ tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 }
 
 @(require_results)
-scalar :: proc(value: f32, loc := #caller_location) -> (t: Tensor) {
+scalar :: proc(value: f32, type: Data_Type = .F32, loc := #caller_location) -> (t: Tensor) {
 	shape := [1]int{1}
-	t = zeros(.F32, shape[:], loc=loc)
-	src := [1]f32{value}
-	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src[:]), loc)
+	t = zeros(type, shape[:], loc=loc)
+	switch type {
+	case .F32:
+		src := [1]f32{value}
+		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src[:]), loc)
+	case .Bf16:
+		src := [1]Bf16{bf16_from_f32(value)}
+		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src[:]), loc)
+	case .F16:
+		fmt.panicf("ml.scalar: F16 not supported")
+	}
 	return
 }
 
@@ -892,7 +900,7 @@ select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (outpu
 
 	out_shape: [MAX_TENSOR_RANK]int = input.shape
 	out_shape[0] = builtin.len(indices)
-	output = zeros(.F32, out_shape[:input.rank], loc=loc)
+	output = zeros(input.type, out_shape[:input.rank], loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -1027,17 +1035,19 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 }
 
 Rope :: struct {
-	head_count:      int,
-	base:            f32,
-	position_offset: int,
+	head_count:         int,
+	base:               f32,
+	position_offset:    int,
+	rotate_pair_count:  int, // pairs in [0, rotate_pair_count) are rotated; the rest pass through
 
 	cos_cache: Tensor,
 	sin_cache: Tensor,
 }
 
 @(require_results)
-rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset: int = 0, loc := #caller_location) -> (output: Tensor) {
+rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset: int = 0, rope_fraction: f32 = 1.0, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 2, "rope requires rank >= 2", loc=loc)
+	assert(rope_fraction > 0 && rope_fraction <= 1, "rope_fraction must be in (0, 1]", loc=loc)
 
 	token_count := input.shape[0]
 	input_size  := input.shape[input.rank - 1]
@@ -1046,20 +1056,25 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset:
 	head_size := input_size / head_count
 	assert(head_size % 2 == 0, "Head size must be even", loc=loc)
 
+	half_head         := head_size / 2
+	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
+	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
+
 	output = zeros_like(input, loc=loc)
 
-	cos_cache := zeros(.F32, {token_count * head_size / 2}, loc=loc)
-	sin_cache := zeros(.F32, {token_count * head_size / 2}, loc=loc)
+	cos_cache := zeros(.F32, {token_count * half_head}, loc=loc)
+	sin_cache := zeros(.F32, {token_count * half_head}, loc=loc)
 
 	op := Operation{
 		input   = input,
 		output  = output,
 		variant = Rope{
-			head_count      = head_count,
-			base            = base,
-			position_offset = position_offset,
-			cos_cache       = cos_cache,
-			sin_cache       = sin_cache,
+			head_count        = head_count,
+			base              = base,
+			position_offset   = position_offset,
+			rotate_pair_count = rotate_pair_count,
+			cos_cache         = cos_cache,
+			sin_cache         = sin_cache,
 		},
 	}
 	_current_ctx.backend.forward(op, loc)
@@ -1102,14 +1117,19 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 }
 
 Rmsnorm :: struct {
-	weight: Tensor,
-	rstd:   Tensor,
+	weight:      Tensor,
+	rstd:        Tensor,
+	eps:         f32,
+	unit_offset: bool, // Gemma idiom: y = x * rstd * (weight + 1)
 }
 
+RMSNORM_DEFAULT_EPS :: f32(1e-5)
+
 @(require_results)
-rmsnorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
+rmsnorm :: proc(input, weight: Tensor, unit_offset: bool = false, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #caller_location) -> (output: Tensor) {
 	assert(weight.rank == 1, "rmsnorm weight must be 1-D", loc=loc)
 	assert(weight.shape[0] == input.shape[input.rank - 1], "rmsnorm weight length must equal input's trailing dim", loc=loc)
+	assert(eps > 0, "rmsnorm eps must be positive", loc=loc)
 
 	count := _leading_count(input)
 
@@ -1121,8 +1141,10 @@ rmsnorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tens
 		input   = input,
 		output  = output,
 		variant = Rmsnorm{
-			weight = weight,
-			rstd   = rstd,
+			weight      = weight,
+			rstd        = rstd,
+			eps         = eps,
+			unit_offset = unit_offset,
 		},
 	}
 	_current_ctx.backend.forward(op, loc)

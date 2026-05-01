@@ -18,8 +18,9 @@ layout(set = 0, binding = 3) readonly buffer R  { float rstd[]; };
 layout(set = 0, binding = 4)          buffer DX { float dx[];   };
 
 layout(push_constant) uniform Params {
-    uint count;
-    uint size;
+    uint  count;
+    uint  size;
+    float weight_bias;
 } p;
 
 shared float s_dn_norm[BLOCK];
@@ -35,7 +36,7 @@ void main() {
     float pb = 0.0;
     for (uint i = tid; i < p.size; i += BLOCK) {
         float norm  = x[base + i] * r;
-        float dnorm = w[i] * dy[base + i];
+        float dnorm = (w[i] + p.weight_bias) * dy[base + i];
         pb += dnorm * norm;
     }
     s_dn_norm[tid] = pb;
@@ -50,7 +51,7 @@ void main() {
 
     for (uint i = tid; i < p.size; i += BLOCK) {
         float norm  = x[base + i] * r;
-        float dnorm = w[i] * dy[base + i];
+        float dnorm = (w[i] + p.weight_bias) * dy[base + i];
         float g     = (dnorm - norm * dnorm_norm_mean) * r;
         dx[base + i] += g;
     }

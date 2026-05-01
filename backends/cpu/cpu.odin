@@ -1011,10 +1011,15 @@ select_forward :: proc(op: ml.Operation) {
 	indices := op.variant.(ml.Select).indices
 	size    := ml.len(output) / builtin.len(indices)
 
-	for i in 0 ..< builtin.len(indices) {
-		for j in 0 ..< size {
-			data(output)[i * size + j] = data(input)[indices[i] * size + j]
-		}
+	// Pure byte-copy of `size`-element rows; works at any dtype.
+	elem_size  := ml.data_type_size(input.type)
+	row_bytes  := size * elem_size
+	src_bytes  := transmute([]byte)input.buffers [.Data]
+	dst_bytes  := transmute([]byte)output.buffers[.Data]
+	for index, i in indices {
+		src_off := index * row_bytes
+		dst_off := i     * row_bytes
+		builtin.copy(dst_bytes[dst_off:dst_off + row_bytes], src_bytes[src_off:src_off + row_bytes])
 	}
 }
 
@@ -1023,10 +1028,25 @@ select_backward :: proc(op: ml.Operation) {
 	indices := op.variant.(ml.Select).indices
 	size    := ml.len(output) / builtin.len(indices)
 
-	for i in 0 ..< builtin.len(indices) {
-		for j in 0 ..< size {
-			gradient(weight)[indices[i] * size + j] += gradient(output)[i * size + j]
+	switch weight.type {
+	case .F32:
+		for i in 0 ..< builtin.len(indices) {
+			for j in 0 ..< size {
+				gradient(weight)[indices[i] * size + j] += gradient(output)[i * size + j]
+			}
 		}
+	case .Bf16:
+		dw := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Gradient]))
+		dy := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+		for i in 0 ..< builtin.len(indices) {
+			for j in 0 ..< size {
+				dst_idx := indices[i] * size + j
+				src_idx := i * size + j
+				dw[dst_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dw[dst_idx]) + ml.bf16_to_f32(dy[src_idx]))
+			}
+		}
+	case .F16:
+		fmt.panicf("CPU select_backward: F16 not yet supported")
 	}
 }
 
@@ -1396,21 +1416,23 @@ rope_forward :: proc(op: ml.Operation) {
 }
 
 rope_forward_f32 :: proc(op: ml.Operation) {
-	input       := op.input
-	output      := op.output
-	variant     := op.variant.(ml.Rope)
-	head_count  := variant.head_count
-	base        := variant.base
-	pos_offset  := variant.position_offset
-	cos_cache   := variant.cos_cache
-	sin_cache   := variant.sin_cache
-	token_count := input.shape[0]
-	head_size   := input.shape[input.rank - 1] / head_count
+	input             := op.input
+	output            := op.output
+	variant           := op.variant.(ml.Rope)
+	head_count        := variant.head_count
+	base              := variant.base
+	pos_offset        := variant.position_offset
+	rotate_pair_count := variant.rotate_pair_count
+	cos_cache         := variant.cos_cache
+	sin_cache         := variant.sin_cache
+	token_count       := input.shape[0]
+	head_size         := input.shape[input.rank - 1] / head_count
+	half_head         := head_size / 2
 
 	for pos in 0 ..< token_count {
-		for i in 0 ..< head_size / 2 {
+		for i in 0 ..< rotate_pair_count {
 			theta := f32(pos + pos_offset) / math.pow(base, f32(i * 2) / f32(head_size))
-			cache_idx := pos * (head_size / 2) + i
+			cache_idx := pos * half_head + i
 			data(cos_cache)[cache_idx] = math.cos(theta)
 			data(sin_cache)[cache_idx] = math.sin(theta)
 		}
@@ -1420,8 +1442,8 @@ rope_forward_f32 :: proc(op: ml.Operation) {
 		for h in 0 ..< head_count {
 			head_offset := t * head_count * head_size + h * head_size
 
-			for i in 0 ..< head_size / 2 {
-				cache_idx := t * (head_size / 2) + i
+			for i in 0 ..< rotate_pair_count {
+				cache_idx := t * half_head + i
 				cos_val := data(cos_cache)[cache_idx]
 				sin_val := data(sin_cache)[cache_idx]
 
@@ -1431,26 +1453,32 @@ rope_forward_f32 :: proc(op: ml.Operation) {
 				data(output)[head_offset + i * 2]     = x * cos_val - y * sin_val
 				data(output)[head_offset + i * 2 + 1] = x * sin_val + y * cos_val
 			}
+			for i in rotate_pair_count ..< half_head {
+				data(output)[head_offset + i * 2]     = data(input)[head_offset + i * 2]
+				data(output)[head_offset + i * 2 + 1] = data(input)[head_offset + i * 2 + 1]
+			}
 		}
 	}
 }
 
 rope_forward_bf16 :: proc(op: ml.Operation) {
-	input       := op.input
-	output      := op.output
-	variant     := op.variant.(ml.Rope)
-	head_count  := variant.head_count
-	base        := variant.base
-	pos_offset  := variant.position_offset
-	cos_cache   := variant.cos_cache
-	sin_cache   := variant.sin_cache
-	token_count := input.shape[0]
-	head_size   := input.shape[input.rank - 1] / head_count
+	input             := op.input
+	output            := op.output
+	variant           := op.variant.(ml.Rope)
+	head_count        := variant.head_count
+	base              := variant.base
+	pos_offset        := variant.position_offset
+	rotate_pair_count := variant.rotate_pair_count
+	cos_cache         := variant.cos_cache
+	sin_cache         := variant.sin_cache
+	token_count       := input.shape[0]
+	head_size         := input.shape[input.rank - 1] / head_count
+	half_head         := head_size / 2
 
 	for pos in 0 ..< token_count {
-		for i in 0 ..< head_size / 2 {
+		for i in 0 ..< rotate_pair_count {
 			theta := f32(pos + pos_offset) / math.pow(base, f32(i * 2) / f32(head_size))
-			cache_idx := pos * (head_size / 2) + i
+			cache_idx := pos * half_head + i
 			data(cos_cache)[cache_idx] = math.cos(theta)
 			data(sin_cache)[cache_idx] = math.sin(theta)
 		}
@@ -1463,8 +1491,8 @@ rope_forward_bf16 :: proc(op: ml.Operation) {
 		for h in 0 ..< head_count {
 			head_offset := t * head_count * head_size + h * head_size
 
-			for i in 0 ..< head_size / 2 {
-				cache_idx := t * (head_size / 2) + i
+			for i in 0 ..< rotate_pair_count {
+				cache_idx := t * half_head + i
 				cos_val := data(cos_cache)[cache_idx]
 				sin_val := data(sin_cache)[cache_idx]
 
@@ -1473,6 +1501,10 @@ rope_forward_bf16 :: proc(op: ml.Operation) {
 
 				out_bf[head_offset + i * 2]     = ml.bf16_from_f32(x * cos_val - y * sin_val)
 				out_bf[head_offset + i * 2 + 1] = ml.bf16_from_f32(x * sin_val + y * cos_val)
+			}
+			for i in rotate_pair_count ..< half_head {
+				out_bf[head_offset + i * 2]     = in_bf[head_offset + i * 2]
+				out_bf[head_offset + i * 2 + 1] = in_bf[head_offset + i * 2 + 1]
 			}
 		}
 	}
@@ -1489,19 +1521,21 @@ rope_backward :: proc(op: ml.Operation) {
 rope_backward_f32 :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
-	variant     := op.variant.(ml.Rope)
-	head_count  := variant.head_count
-	cos_cache   := variant.cos_cache
-	sin_cache   := variant.sin_cache
-	token_count := input.shape[0]
-	head_size   := input.shape[input.rank - 1] / head_count
+	variant           := op.variant.(ml.Rope)
+	head_count        := variant.head_count
+	rotate_pair_count := variant.rotate_pair_count
+	cos_cache         := variant.cos_cache
+	sin_cache         := variant.sin_cache
+	token_count       := input.shape[0]
+	head_size         := input.shape[input.rank - 1] / head_count
+	half_head         := head_size / 2
 
 	for t in 0 ..< token_count {
 		for h in 0 ..< head_count {
 			head_offset := t * head_count * head_size + h * head_size
 
-			for i in 0 ..< head_size / 2 {
-				cache_idx := t * (head_size / 2) + i
+			for i in 0 ..< rotate_pair_count {
+				cache_idx := t * half_head + i
 				cos_val := data(cos_cache)[cache_idx]
 				sin_val := data(sin_cache)[cache_idx]
 
@@ -1511,6 +1545,10 @@ rope_backward_f32 :: proc(op: ml.Operation) {
 				gradient(input)[head_offset + i * 2]     +=  grad_x * cos_val + grad_y * sin_val
 				gradient(input)[head_offset + i * 2 + 1] += -grad_x * sin_val + grad_y * cos_val
 			}
+			for i in rotate_pair_count ..< half_head {
+				gradient(input)[head_offset + i * 2]     += gradient(output)[head_offset + i * 2]
+				gradient(input)[head_offset + i * 2 + 1] += gradient(output)[head_offset + i * 2 + 1]
+			}
 		}
 	}
 }
@@ -1518,12 +1556,14 @@ rope_backward_f32 :: proc(op: ml.Operation) {
 rope_backward_bf16 :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
-	variant     := op.variant.(ml.Rope)
-	head_count  := variant.head_count
-	cos_cache   := variant.cos_cache
-	sin_cache   := variant.sin_cache
-	token_count := input.shape[0]
-	head_size   := input.shape[input.rank - 1] / head_count
+	variant           := op.variant.(ml.Rope)
+	head_count        := variant.head_count
+	rotate_pair_count := variant.rotate_pair_count
+	cos_cache         := variant.cos_cache
+	sin_cache         := variant.sin_cache
+	token_count       := input.shape[0]
+	head_size         := input.shape[input.rank - 1] / head_count
+	half_head         := head_size / 2
 
 	dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
 	dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
@@ -1532,8 +1572,8 @@ rope_backward_bf16 :: proc(op: ml.Operation) {
 		for h in 0 ..< head_count {
 			head_offset := t * head_count * head_size + h * head_size
 
-			for i in 0 ..< head_size / 2 {
-				cache_idx := t * (head_size / 2) + i
+			for i in 0 ..< rotate_pair_count {
+				cache_idx := t * half_head + i
 				cos_val := data(cos_cache)[cache_idx]
 				sin_val := data(sin_cache)[cache_idx]
 
@@ -1544,6 +1584,12 @@ rope_backward_bf16 :: proc(op: ml.Operation) {
 				hi_idx := lo_idx + 1
 				dx_bf[lo_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[lo_idx]) +  grad_x * cos_val + grad_y * sin_val)
 				dx_bf[hi_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[hi_idx]) + -grad_x * sin_val + grad_y * cos_val)
+			}
+			for i in rotate_pair_count ..< half_head {
+				lo_idx := head_offset + i * 2
+				hi_idx := lo_idx + 1
+				dx_bf[lo_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[lo_idx]) + ml.bf16_to_f32(dy_bf[lo_idx]))
+				dx_bf[hi_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[hi_idx]) + ml.bf16_to_f32(dy_bf[hi_idx]))
 			}
 		}
 	}
@@ -1736,8 +1782,6 @@ layernorm_backward_bf16 :: proc(op: ml.Operation) {
 	}
 }
 
-RMSNORM_EPSILON :: 1e-5
-
 rmsnorm_forward :: proc(op: ml.Operation) {
 	switch op.input.type {
 	case .F32:  rmsnorm_forward_f32 (op)
@@ -1747,13 +1791,15 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 }
 
 rmsnorm_forward_f32 :: proc(op: ml.Operation) {
-	input   := op.input
-	output  := op.output
-	variant := op.variant.(ml.Rmsnorm)
-	weight  := variant.weight
-	rstd    := variant.rstd
-	size    := input.shape[input.rank - 1]
-	count   := ml.len(input) / size
+	input        := op.input
+	output       := op.output
+	variant      := op.variant.(ml.Rmsnorm)
+	weight       := variant.weight
+	rstd         := variant.rstd
+	eps          := variant.eps
+	weight_bias  := f32(1.0) if variant.unit_offset else f32(0.0)
+	size         := input.shape[input.rank - 1]
+	count        := ml.len(input) / size
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1765,9 +1811,9 @@ rmsnorm_forward_f32 :: proc(op: ml.Operation) {
 		}
 		ms /= f32(size)
 
-		s: f32 = 1.0 / math.sqrt(ms + f32(RMSNORM_EPSILON))
+		s: f32 = 1.0 / math.sqrt(ms + eps)
 		for i in 0 ..< size {
-			data(output)[offset + i] = s * data(input)[offset + i] * data(weight)[i]
+			data(output)[offset + i] = s * data(input)[offset + i] * (data(weight)[i] + weight_bias)
 		}
 
 		data(rstd)[c] = s
@@ -1775,13 +1821,15 @@ rmsnorm_forward_f32 :: proc(op: ml.Operation) {
 }
 
 rmsnorm_forward_bf16 :: proc(op: ml.Operation) {
-	input   := op.input
-	output  := op.output
-	variant := op.variant.(ml.Rmsnorm)
-	weight  := variant.weight
-	rstd    := variant.rstd
-	size    := input.shape[input.rank - 1]
-	count   := ml.len(input) / size
+	input       := op.input
+	output      := op.output
+	variant     := op.variant.(ml.Rmsnorm)
+	weight      := variant.weight
+	rstd        := variant.rstd
+	eps         := variant.eps
+	weight_bias := f32(1.0) if variant.unit_offset else f32(0.0)
+	size        := input.shape[input.rank - 1]
+	count       := ml.len(input) / size
 
 	x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
 	y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
@@ -1797,9 +1845,9 @@ rmsnorm_forward_bf16 :: proc(op: ml.Operation) {
 		}
 		ms /= f32(size)
 
-		s: f32 = 1.0 / math.sqrt(ms + f32(RMSNORM_EPSILON))
+		s: f32 = 1.0 / math.sqrt(ms + eps)
 		for i in 0 ..< size {
-			y := s * ml.bf16_to_f32(x_bf[offset + i]) * ml.bf16_to_f32(w_bf[i])
+			y := s * ml.bf16_to_f32(x_bf[offset + i]) * (ml.bf16_to_f32(w_bf[i]) + weight_bias)
 			y_bf[offset + i] = ml.bf16_from_f32(y)
 		}
 
@@ -1818,11 +1866,12 @@ rmsnorm_backward :: proc(op: ml.Operation) {
 rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
-	variant := op.variant.(ml.Rmsnorm)
-	weight  := variant.weight
-	rstd    := variant.rstd
-	size    := input.shape[input.rank - 1]
-	count   := ml.len(input) / size
+	variant     := op.variant.(ml.Rmsnorm)
+	weight      := variant.weight
+	rstd        := variant.rstd
+	weight_bias := f32(1.0) if variant.unit_offset else f32(0.0)
+	size        := input.shape[input.rank - 1]
+	count       := ml.len(input) / size
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1831,7 +1880,7 @@ rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 		dnorm_norm_mean: f32
 		for i in 0 ..< size {
 			norm  := data(input)[offset + i] * rstd_c
-			dnorm := data(weight)[i] * gradient(output)[offset + i]
+			dnorm := (data(weight)[i] + weight_bias) * gradient(output)[offset + i]
 			dnorm_norm_mean += dnorm * norm
 		}
 		dnorm_norm_mean /= f32(size)
@@ -1839,7 +1888,7 @@ rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 		for i in 0 ..< size {
 			x_v   := data(input)[offset + i]
 			dy_v  := gradient(output)[offset + i]
-			w_v   := data(weight)[i]
+			w_v   := data(weight)[i] + weight_bias
 			norm  := x_v * rstd_c
 			dnorm := w_v * dy_v
 
@@ -1854,11 +1903,12 @@ rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
-	variant := op.variant.(ml.Rmsnorm)
-	weight  := variant.weight
-	rstd    := variant.rstd
-	size    := input.shape[input.rank - 1]
-	count   := ml.len(input) / size
+	variant     := op.variant.(ml.Rmsnorm)
+	weight      := variant.weight
+	rstd        := variant.rstd
+	weight_bias := f32(1.0) if variant.unit_offset else f32(0.0)
+	size        := input.shape[input.rank - 1]
+	count       := ml.len(input) / size
 
 	x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
 	w_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
@@ -1873,7 +1923,7 @@ rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 		dnorm_norm_mean: f32
 		for i in 0 ..< size {
 			norm  := ml.bf16_to_f32(x_bf[offset + i]) * rstd_c
-			dnorm := ml.bf16_to_f32(w_bf[i]) * ml.bf16_to_f32(dy_bf[offset + i])
+			dnorm := (ml.bf16_to_f32(w_bf[i]) + weight_bias) * ml.bf16_to_f32(dy_bf[offset + i])
 			dnorm_norm_mean += dnorm * norm
 		}
 		dnorm_norm_mean /= f32(size)
@@ -1881,7 +1931,7 @@ rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 		for i in 0 ..< size {
 			x_v   := ml.bf16_to_f32(x_bf[offset + i])
 			dy_v  := ml.bf16_to_f32(dy_bf[offset + i])
-			w_v   := ml.bf16_to_f32(w_bf[i])
+			w_v   := ml.bf16_to_f32(w_bf[i]) + weight_bias
 			norm  := x_v * rstd_c
 			dnorm := w_v * dy_v
 

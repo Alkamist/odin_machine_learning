@@ -210,15 +210,15 @@ When a struct holds heap-owned fields, mirror the lifecycle:
 
 ```odin
 World :: struct {
-    entities: [dynamic]Entity,
-    name:     string,                // owned (cloned)
+    entities:  [dynamic]Entity,
+    name:      string,          // owned (cloned)
     allocator: mem.Allocator,
 }
 
 world_init :: proc(w: ^World, name: string, allocator := context.allocator) {
     w.allocator = allocator
-    w.entities  = make([dynamic]Entity, 0, 64, allocator)
-    w.name      = strings.clone(name, allocator)
+    w.entities  = make([dynamic]Entity, 0, 64, allocator=allocator)
+    w.name      = strings.clone(name, allocator=allocator)
 }
 
 world_destroy :: proc(w: ^World) {

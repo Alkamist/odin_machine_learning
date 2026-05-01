@@ -11,7 +11,7 @@
 
 #define WG    64
 #define BC    64
-#define MAX_D 256
+#define MAX_D 512
 #define O_SLOTS ((MAX_D + WG - 1) / WG)
 
 layout(local_size_x = WG) in;

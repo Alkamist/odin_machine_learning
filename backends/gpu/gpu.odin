@@ -48,8 +48,23 @@ Context :: struct {
 	descriptor_pool: vk.DescriptorPool,
 	batch:           Batch,
 
-	activations: [dynamic]Gpu_Buffer,
-	pool:        map[int][dynamic]Gpu_Buffer,
+	// Activation buffers live for one forward pass (reset on `clear()`).
+	// `activation_arenas` are big VkDeviceMemory blocks; each activation
+	// VkBuffer is bump-allocated at an offset within an arena, then destroyed
+	// on `clear()` while the arena memory is retained for the next forward.
+	// This avoids one `vkAllocateMemory` per activation (NVIDIA's Windows
+	// driver reserves multi-MB minimum per allocation, and per-step prompt
+	// growth in `forward()` makes activation sizes vary, defeating any
+	// exact-size pool).
+	activations:       [dynamic]Gpu_Buffer,
+	activation_arenas: [dynamic]Pool_Block,
+
+	// Sub-allocator for persistent buffers (model weights). Each block is one
+	// VkDeviceMemory allocation backing many VkBuffers via offset binding.
+	// Drastically reduces per-allocation overhead the NVIDIA Windows driver
+	// reserves on each `vkAllocateMemory` call (tens of MB minimum), which
+	// otherwise OOMs at a few GB of weights despite plenty of free VRAM.
+	persistent_pool: [dynamic]Pool_Block,
 
 	// Bytes-per-buffer side table. Backend_Buffer is exactly 16 bytes
 	// (vk.Buffer + vk.DeviceMemory) with no room for the size, but
@@ -73,6 +88,15 @@ Pending_Download :: struct {
 	offset: vk.DeviceSize,
 	size:   vk.DeviceSize,
 }
+
+Pool_Block :: struct {
+	memory:       vk.DeviceMemory,
+	size:         vk.DeviceSize,
+	used:         vk.DeviceSize,
+	mem_type_idx: u32,
+}
+
+POOL_BLOCK_SIZE :: vk.DeviceSize(256 * 1024 * 1024)
 
 _gpu:       Gpu_Device
 _gpu_mutex: sync.Mutex

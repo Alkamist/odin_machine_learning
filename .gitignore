@@ -19,3 +19,4 @@ tests/pytorch_parity/artifacts
 *.safetensors
 
 smollm_data/
+gemma_data/

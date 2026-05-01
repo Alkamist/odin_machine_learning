@@ -67,8 +67,10 @@ main :: proc() {
 	case "softmax":        run_unary(artifacts_dir, .Softmax)
 	case "log_softmax":    run_unary(artifacts_dir, .Log_Softmax)
 	case "layernorm":      run_layernorm(artifacts_dir)
-	case "rmsnorm":        run_rmsnorm(artifacts_dir)
-	case "rmsnorm_big":    run_rmsnorm(artifacts_dir)
+	case "rmsnorm":                  run_rmsnorm(artifacts_dir)
+	case "rmsnorm_big":              run_rmsnorm(artifacts_dir)
+	case "rmsnorm_unit_offset":      run_rmsnorm(artifacts_dir)
+	case "rmsnorm_unit_offset_big":  run_rmsnorm(artifacts_dir)
 	case "cross_entropy":  run_cross_entropy(artifacts_dir)
 	case "batched_matmul": run_batched_matmul(artifacts_dir)
 	case "permute":        run_permute(artifacts_dir)
@@ -91,6 +93,8 @@ main :: proc() {
 	case "tanh":              run_unary(artifacts_dir, .Tanh)
 	case "sigmoid":           run_unary(artifacts_dir, .Sigmoid)
 	case "rope":              run_rope(artifacts_dir)
+	case "rope_partial":         run_rope(artifacts_dir)
+	case "rope_partial_quarter": run_rope(artifacts_dir)
 	case "rope_xfmr":         run_rope(artifacts_dir)
 	case "transformer_train_bf16": run_transformer_train_bf16(artifacts_dir)
 	case "llama_train":            run_llama_train(artifacts_dir)
@@ -235,6 +239,7 @@ run_layernorm :: proc(dir: string) {
 run_rmsnorm :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	w_shape, w_data := load_tensor(_path(dir, "input_w.bin"))
+	config          := load_int_array(_path(dir, "config.bin"))
 
 	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
@@ -244,7 +249,8 @@ run_rmsnorm :: proc(dir: string) {
 	ml.set_data(x, x_data)
 	ml.set_data(w, w_data)
 
-	out := ml.rmsnorm(x, w)
+	unit_offset := len(config) >= 1 && config[0] == 1
+	out := ml.rmsnorm(x, w, unit_offset)
 	ml.backward()
 
 	out_shape := _shape_slice(out)
@@ -539,8 +545,9 @@ run_rope :: proc(dir: string) {
 	defer ml.destroy(x)
 	ml.set_data(x, x_data)
 
-	head_count := config[0]
-	out := ml.rope(x, head_count)
+	head_count    := config[0]
+	rope_fraction := f32(config[1]) / 1000 if len(config) >= 2 else f32(1.0)
+	out := ml.rope(x, head_count, 10000, 0, rope_fraction)
 	ml.backward()
 
 	out_shape := _shape_slice(out)

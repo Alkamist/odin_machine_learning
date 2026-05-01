@@ -16,6 +16,7 @@ layout(push_constant) uniform Params {
     uint  head_size;
     float base;
     uint  position_offset;
+    uint  rotate_pair_count;
 } p;
 
 void main() {
@@ -29,14 +30,19 @@ void main() {
     uint head     = hg % p.head_count;
     uint pos      = hg / p.head_count;
 
+    uint head_offset = pos * p.head_count * p.head_size + head * p.head_size;
+    uint i_lo        = head_offset + pair_idx * 2u;
+    uint pair_index  = i_lo >> 1u; // even, exact
+
+    if (pair_idx >= p.rotate_pair_count) {
+        y[pair_index] = x[pair_index];
+        return;
+    }
+
     float exponent = float(pair_idx * 2u) / float(p.head_size);
     float theta    = float(pos + p.position_offset) / pow(p.base, exponent);
     float c_v      = cos(theta);
     float s_v      = sin(theta);
-
-    uint head_offset = pos * p.head_count * p.head_size + head * p.head_size;
-    uint i_lo        = head_offset + pair_idx * 2u;
-    uint pair_index  = i_lo >> 1u; // even, exact
 
     uint packed = x[pair_index];
     float xv = bf16_expand(packed & 0xffffu);

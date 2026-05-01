@@ -55,13 +55,15 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	}
 	builtin.delete(gctx.activations)
 
-	for _, list in gctx.pool {
-		for buffer in list {
-			_destroy_gpu_buffer(buffer)
-		}
-		builtin.delete(list)
+	for arena in gctx.activation_arenas {
+		vk.FreeMemory(_gpu.device, arena.memory, nil)
 	}
-	builtin.delete(gctx.pool)
+	builtin.delete(gctx.activation_arenas)
+
+	for block in gctx.persistent_pool {
+		vk.FreeMemory(_gpu.device, block.memory, nil)
+	}
+	builtin.delete(gctx.persistent_pool)
 
 	builtin.delete(gctx.sizes)
 
@@ -99,15 +101,13 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 	}
 
 	for buffer in gctx.activations {
-		count := gctx.sizes[buffer.buffer]
-		list, ok := &gctx.pool[count]
-		if !ok {
-			gctx.pool[count] = builtin.make([dynamic]Gpu_Buffer)
-			list = &gctx.pool[count]
-		}
-		append(list, buffer)
+		delete_key(&gctx.sizes, buffer.buffer)
+		_destroy_gpu_buffer(buffer)
 	}
 	builtin.clear(&gctx.activations)
+	for &arena in gctx.activation_arenas {
+		arena.used = 0
+	}
 }
 
 buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
@@ -119,15 +119,12 @@ buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Lo
 	usage := vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
 
 	gpu_buffer: Gpu_Buffer
-	if !persist {
-		if list, ok := &gctx.pool[byte_count]; ok && builtin.len(list^) > 0 {
-			gpu_buffer = pop(list)
-		}
+	if persist {
+		gpu_buffer.buffer, gpu_buffer.memory = _create_pooled_persistent_buffer(size, usage, {.DEVICE_LOCAL}, loc)
+	} else {
+		gpu_buffer.buffer, gpu_buffer.memory = _create_pooled_activation_buffer(size, usage, {.DEVICE_LOCAL}, loc)
 	}
-	if gpu_buffer.buffer == 0 {
-		gpu_buffer.buffer, gpu_buffer.memory = _create_buffer(size, usage, {.DEVICE_LOCAL}, loc)
-		gctx.sizes[gpu_buffer.buffer] = byte_count
-	}
+	gctx.sizes[gpu_buffer.buffer] = byte_count
 
 	_record_fill_zero(gpu_buffer.buffer, size, loc)
 
@@ -843,12 +840,26 @@ select_forward :: proc(op: ml.Operation) {
 
 	indices_buf, indices_mem := _upload_indices(indices)
 
-	if _select_pipeline == nil {
-		_select_pipeline = _make_pipeline(SELECT_SPIRV, 3, size_of(Select_Params))
+	switch input.type {
+	case .F32:
+		if _select_pipeline == nil {
+			_select_pipeline = _make_pipeline(SELECT_SPIRV, 3, size_of(Select_Params))
+		}
+		params := Select_Params{n_indices = u32(builtin.len(indices)), size = u32(size)}
+		bufs   := [3]vk.Buffer{data(input).buffer, indices_buf, data(output).buffer}
+		_dispatch(_select_pipeline, bufs[:], &params, _div_up(size, 256), u32(builtin.len(indices)), 1)
+	case .Bf16:
+		fmt.assertf(size % 2 == 0, "GPU bf16 select requires even row size (got %v)", size)
+		if _select_bf16_pipeline == nil {
+			_select_bf16_pipeline = _make_pipeline(SELECT_BF16_SPIRV, 3, size_of(Select_Params))
+		}
+		pair_count := size / 2
+		params := Select_Params{n_indices = u32(builtin.len(indices)), size = u32(size)}
+		bufs   := [3]vk.Buffer{data(input).buffer, indices_buf, data(output).buffer}
+		_dispatch(_select_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256), u32(builtin.len(indices)), 1)
+	case .F16:
+		fmt.panicf("GPU select_forward: F16 not yet supported")
 	}
-	params := Select_Params{n_indices = u32(builtin.len(indices)), size = u32(size)}
-	bufs   := [3]vk.Buffer{data(input).buffer, indices_buf, data(output).buffer}
-	_dispatch(_select_pipeline, bufs[:], &params, _div_up(size, 256), u32(builtin.len(indices)), 1)
 
 	_queue_destroy_buffer(indices_buf, indices_mem)
 }
@@ -1244,11 +1255,12 @@ rope_forward :: proc(op: ml.Operation) {
 	head_size   := input.shape[input.rank - 1] / variant.head_count
 
 	params := Rope_Params{
-		token_count     = u32(token_count),
-		head_count      = u32(variant.head_count),
-		head_size       = u32(head_size),
-		base            = variant.base,
-		position_offset = u32(variant.position_offset),
+		token_count       = u32(token_count),
+		head_count        = u32(variant.head_count),
+		head_size         = u32(head_size),
+		base              = variant.base,
+		position_offset   = u32(variant.position_offset),
+		rotate_pair_count = u32(variant.rotate_pair_count),
 	}
 	bufs        := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 	total_pairs := token_count * variant.head_count * (head_size / 2)
@@ -1277,11 +1289,12 @@ rope_backward :: proc(op: ml.Operation) {
 	head_size   := input.shape[input.rank - 1] / variant.head_count
 
 	params := Rope_Back_Params{
-		token_count     = u32(token_count),
-		head_count      = u32(variant.head_count),
-		head_size       = u32(head_size),
-		base            = variant.base,
-		position_offset = u32(variant.position_offset),
+		token_count       = u32(token_count),
+		head_count        = u32(variant.head_count),
+		head_size         = u32(head_size),
+		base              = variant.base,
+		position_offset   = u32(variant.position_offset),
+		rotate_pair_count = u32(variant.rotate_pair_count),
 	}
 	bufs        := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
 	total_pairs := token_count * variant.head_count * (head_size / 2)
@@ -1435,11 +1448,13 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 		fwd_pipe   = _rmsnorm_pipeline
 	}
 
-	stats_params := Rmsnorm_Stats_Params{count = u32(count), size = u32(size)}
+	weight_bias := f32(1.0) if variant.unit_offset else f32(0.0)
+
+	stats_params := Rmsnorm_Stats_Params{count = u32(count), size = u32(size), eps = variant.eps}
 	stats_bufs   := [2]vk.Buffer{data(input).buffer, data(variant.rstd).buffer}
 	_dispatch(stats_pipe, stats_bufs[:], &stats_params, u32(count))
 
-	fwd_params := Rmsnorm_Params{count = u32(count), size = u32(size)}
+	fwd_params := Rmsnorm_Params{count = u32(count), size = u32(size), weight_bias = weight_bias, eps = variant.eps}
 	fwd_bufs   := [3]vk.Buffer{data(input).buffer, data(variant.weight).buffer, data(output).buffer}
 	_dispatch(fwd_pipe, fwd_bufs[:], &fwd_params, u32(count))
 }
@@ -1461,7 +1476,7 @@ rmsnorm_backward :: proc(op: ml.Operation) {
 			_rmsnorm_back_weight_bf16_pipeline = _make_pipeline(RMSNORM_BACK_WEIGHT_BF16_SPIRV, 4, size_of(Rmsnorm_Back_Weight_Bf16_Params))
 		}
 
-		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size)}
+		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size), weight_bias = f32(1.0) if variant.unit_offset else f32(0.0)}
 		input_bufs := [5]vk.Buffer{
 			data(input).buffer, data(variant.weight).buffer, gradient(output).buffer,
 			data(variant.rstd).buffer, gradient(input).buffer,
@@ -1483,7 +1498,7 @@ rmsnorm_backward :: proc(op: ml.Operation) {
 			_rmsnorm_back_weight_pipeline = _make_pipeline(RMSNORM_BACK_WEIGHT_SPIRV, 4, size_of(Rmsnorm_Back_Params))
 		}
 
-		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size)}
+		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size), weight_bias = f32(1.0) if variant.unit_offset else f32(0.0)}
 
 		input_bufs := [5]vk.Buffer{
 			data(input).buffer, data(variant.weight).buffer, gradient(output).buffer,
@@ -2137,7 +2152,7 @@ attention_forward :: proc(op: ml.Operation) {
 	q_size      := query.shape[1]
 	kv_size     := key.shape[1]
 	head_size   := q_size / variant.n_q_heads
-	fmt.assertf(head_size <= 256, "GPU attention currently caps head_size at 256 (got %v)", head_size)
+	fmt.assertf(head_size <= 512, "GPU attention currently caps head_size at 512 (got %v)", head_size)
 	fmt.assertf(query.type == .F32 || query.type == .Bf16, "GPU attention only supports F32 or Bf16 (got %v)", query.type)
 
 	is_bf16 := query.type == .Bf16
@@ -2296,7 +2311,7 @@ attention_cache_forward :: proc(op: ml.Operation) {
 	q_size      := query.shape[1]
 	kv_size     := key.shape[1]
 	head_size   := q_size / variant.n_q_heads
-	fmt.assertf(head_size <= 256, "GPU attention_with_cache caps head_size at 256 (got %v)", head_size)
+	fmt.assertf(head_size <= 512, "GPU attention_with_cache caps head_size at 512 (got %v)", head_size)
 	fmt.assertf(query.type == .F32 || query.type == .Bf16, "GPU attention_with_cache only supports F32 or Bf16 (got %v)", query.type)
 
 	is_bf16 := query.type == .Bf16

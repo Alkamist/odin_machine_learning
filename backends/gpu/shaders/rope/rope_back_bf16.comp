@@ -15,6 +15,7 @@ layout(push_constant) uniform Params {
     uint  head_size;
     float base;
     uint  position_offset;
+    uint  rotate_pair_count;
 } p;
 
 void main() {
@@ -28,11 +29,6 @@ void main() {
     uint head     = hg % p.head_count;
     uint pos      = hg / p.head_count;
 
-    float exponent = float(pair_idx * 2u) / float(p.head_size);
-    float theta    = float(pos + p.position_offset) / pow(p.base, exponent);
-    float c_v      = cos(theta);
-    float s_v      = sin(theta);
-
     uint head_offset = pos * p.head_count * p.head_size + head * p.head_size;
     uint i_lo        = head_offset + pair_idx * 2u;
     uint pair_index  = i_lo >> 1u;
@@ -45,8 +41,21 @@ void main() {
     float dx_lo_cur = bf16_expand(dx_packed & 0xffffu);
     float dx_hi_cur = bf16_expand((dx_packed >> 16) & 0xffffu);
 
-    uint out_lo = bf16_round(dx_lo_cur +  gx * c_v + gy * s_v);
-    uint out_hi = bf16_round(dx_hi_cur + -gx * s_v + gy * c_v);
+    float new_lo, new_hi;
+    if (pair_idx >= p.rotate_pair_count) {
+        new_lo = dx_lo_cur + gx;
+        new_hi = dx_hi_cur + gy;
+    } else {
+        float exponent = float(pair_idx * 2u) / float(p.head_size);
+        float theta    = float(pos + p.position_offset) / pow(p.base, exponent);
+        float c_v      = cos(theta);
+        float s_v      = sin(theta);
+        new_lo = dx_lo_cur +  gx * c_v + gy * s_v;
+        new_hi = dx_hi_cur + -gx * s_v + gy * c_v;
+    }
+
+    uint out_lo = bf16_round(new_lo);
+    uint out_hi = bf16_round(new_hi);
 
     dx[pair_index] = (out_hi << 16) | out_lo;
 }

@@ -57,6 +57,127 @@ _pick_memory_type :: proc(type_bits: u32, required: vk.MemoryPropertyFlags, loc 
 	fmt.panicf("no memory type matches type_bits=0x%x required=%v", type_bits, required, loc=loc)
 }
 
+// Sub-allocate an activation (non-persistent) buffer from the context's
+// activation arenas. The VkBuffer is destroyed on `clear()` and the arena
+// space is reset to 0 — no exact-size cache, no per-buffer `vkAllocateMemory`.
+_create_pooled_activation_buffer :: proc(
+	size: vk.DeviceSize,
+	usage: vk.BufferUsageFlags,
+	mem_flags: vk.MemoryPropertyFlags,
+	loc := #caller_location,
+) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {
+	gctx := _gctx(loc)
+
+	info := vk.BufferCreateInfo{
+		sType       = .BUFFER_CREATE_INFO,
+		size        = size,
+		usage       = usage,
+		sharingMode = .EXCLUSIVE,
+	}
+	res := vk.CreateBuffer(_gpu.device, &info, nil, &buffer)
+	fmt.assertf(res == .SUCCESS, "vkCreateBuffer (activation) failed: %v", res, loc=loc)
+
+	reqs: vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(_gpu.device, buffer, &reqs)
+	mem_type_idx := _pick_memory_type(reqs.memoryTypeBits, mem_flags, loc)
+
+	for &arena in gctx.activation_arenas {
+		if arena.mem_type_idx != mem_type_idx do continue
+		aligned := (arena.used + reqs.alignment - 1) & ~(reqs.alignment - 1)
+		if aligned + reqs.size <= arena.size {
+			res = vk.BindBufferMemory(_gpu.device, buffer, arena.memory, aligned)
+			fmt.assertf(res == .SUCCESS, "vkBindBufferMemory (activation reuse) failed: %v", res, loc=loc)
+			arena.used = aligned + reqs.size
+			return buffer, 0
+		}
+	}
+
+	block_size := POOL_BLOCK_SIZE
+	if reqs.size > block_size do block_size = reqs.size
+	alloc_info := vk.MemoryAllocateInfo{
+		sType           = .MEMORY_ALLOCATE_INFO,
+		allocationSize  = block_size,
+		memoryTypeIndex = mem_type_idx,
+	}
+	new_block_memory: vk.DeviceMemory
+	res = vk.AllocateMemory(_gpu.device, &alloc_info, nil, &new_block_memory)
+	fmt.assertf(res == .SUCCESS, "vkAllocateMemory (activation arena, %v MB) failed: %v",
+		f64(block_size) / (1024 * 1024), res, loc=loc)
+
+	append(&gctx.activation_arenas, Pool_Block{
+		memory       = new_block_memory,
+		size         = block_size,
+		used         = reqs.size,
+		mem_type_idx = mem_type_idx,
+	})
+
+	res = vk.BindBufferMemory(_gpu.device, buffer, new_block_memory, 0)
+	fmt.assertf(res == .SUCCESS, "vkBindBufferMemory (activation arena first) failed: %v", res, loc=loc)
+	return buffer, 0
+}
+
+// Sub-allocate a persistent buffer from the context's pool. Each pool block
+// is one VkDeviceMemory backing many VkBuffers via offset binding, which
+// avoids the per-`vkAllocateMemory` overhead NVIDIA's Windows driver reserves
+// (~tens of MB minimum). The returned `Gpu_Buffer.memory == 0` to signal that
+// the memory is owned by the pool, not the buffer; `_destroy_gpu_buffer`
+// skips `vkFreeMemory` in that case.
+_create_pooled_persistent_buffer :: proc(
+	size: vk.DeviceSize,
+	usage: vk.BufferUsageFlags,
+	mem_flags: vk.MemoryPropertyFlags,
+	loc := #caller_location,
+) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {
+	gctx := _gctx(loc)
+
+	info := vk.BufferCreateInfo{
+		sType       = .BUFFER_CREATE_INFO,
+		size        = size,
+		usage       = usage,
+		sharingMode = .EXCLUSIVE,
+	}
+	res := vk.CreateBuffer(_gpu.device, &info, nil, &buffer)
+	fmt.assertf(res == .SUCCESS, "vkCreateBuffer (pooled) failed: %v", res, loc=loc)
+
+	reqs: vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(_gpu.device, buffer, &reqs)
+	mem_type_idx := _pick_memory_type(reqs.memoryTypeBits, mem_flags, loc)
+
+	for &block in gctx.persistent_pool {
+		if block.mem_type_idx != mem_type_idx do continue
+		aligned := (block.used + reqs.alignment - 1) & ~(reqs.alignment - 1)
+		if aligned + reqs.size <= block.size {
+			res = vk.BindBufferMemory(_gpu.device, buffer, block.memory, aligned)
+			fmt.assertf(res == .SUCCESS, "vkBindBufferMemory (pooled reuse) failed: %v", res, loc=loc)
+			block.used = aligned + reqs.size
+			return buffer, 0
+		}
+	}
+
+	block_size := POOL_BLOCK_SIZE
+	if reqs.size > block_size do block_size = reqs.size
+	alloc_info := vk.MemoryAllocateInfo{
+		sType           = .MEMORY_ALLOCATE_INFO,
+		allocationSize  = block_size,
+		memoryTypeIndex = mem_type_idx,
+	}
+	new_block_memory: vk.DeviceMemory
+	res = vk.AllocateMemory(_gpu.device, &alloc_info, nil, &new_block_memory)
+	fmt.assertf(res == .SUCCESS, "vkAllocateMemory (pool block, %v MB) failed: %v",
+		f64(block_size) / (1024 * 1024), res, loc=loc)
+
+	append(&gctx.persistent_pool, Pool_Block{
+		memory       = new_block_memory,
+		size         = block_size,
+		used         = reqs.size,
+		mem_type_idx = mem_type_idx,
+	})
+
+	res = vk.BindBufferMemory(_gpu.device, buffer, new_block_memory, 0)
+	fmt.assertf(res == .SUCCESS, "vkBindBufferMemory (pool block first) failed: %v", res, loc=loc)
+	return buffer, 0
+}
+
 // Lazily grow the active gctx's persistently-mapped staging buffer to hold
 // at least min_size bytes. Existing contents are NOT preserved across regrow,
 // so callers must finish any pending use before triggering one.

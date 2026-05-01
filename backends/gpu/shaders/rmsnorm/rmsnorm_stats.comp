@@ -3,7 +3,6 @@
 #version 450
 
 #define BLOCK 256
-#define EPSILON 1e-5
 
 layout(local_size_x = BLOCK) in;
 
@@ -11,8 +10,9 @@ layout(set = 0, binding = 0) readonly  buffer X { float x[]; };
 layout(set = 0, binding = 1) writeonly buffer R { float rstd_out[]; };
 
 layout(push_constant) uniform Params {
-    uint count;
-    uint size;
+    uint  count;
+    uint  size;
+    float eps;
 } p;
 
 shared float ssum2[BLOCK];
@@ -37,6 +37,6 @@ void main() {
     }
 
     if (tid == 0u) {
-        rstd_out[row] = inversesqrt(ssum2[0] / float(p.size) + EPSILON);
+        rstd_out[row] = inversesqrt(ssum2[0] / float(p.size) + p.eps);
     }
 }

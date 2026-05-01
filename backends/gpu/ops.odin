@@ -129,9 +129,9 @@ RMSNORM_BF16_SPIRV             :: #load("shaders/rmsnorm/rmsnorm_bf16.spv",     
 RMSNORM_STATS_BF16_SPIRV       :: #load("shaders/rmsnorm/rmsnorm_stats_bf16.spv",       []u8)
 RMSNORM_BACK_INPUT_BF16_SPIRV  :: #load("shaders/rmsnorm/rmsnorm_back_input_bf16.spv",  []u8)
 RMSNORM_BACK_WEIGHT_BF16_SPIRV :: #load("shaders/rmsnorm/rmsnorm_back_weight_bf16.spv", []u8)
-Rmsnorm_Params                  :: struct { count, size: u32 }
-Rmsnorm_Stats_Params            :: struct { count, size: u32 }
-Rmsnorm_Back_Params             :: struct { count, size: u32 }
+Rmsnorm_Params                  :: struct { count, size: u32, weight_bias, eps: f32 }
+Rmsnorm_Stats_Params            :: struct { count, size: u32, eps: f32 }
+Rmsnorm_Back_Params             :: struct { count, size: u32, weight_bias: f32 }
 Rmsnorm_Back_Weight_Bf16_Params :: struct { count, size, pair_count: u32 }
 _rmsnorm_pipeline:                  ^Pipeline
 _rmsnorm_stats_pipeline:            ^Pipeline
@@ -224,18 +224,20 @@ _attention_cache_pipeline:        ^Pipeline
 _attention_cache_bf16_pipeline:   ^Pipeline
 
 SELECT_SPIRV      :: #load("shaders/select/select.spv",      []u8)
+SELECT_BF16_SPIRV :: #load("shaders/select/select_bf16.spv", []u8)
 SELECT_BACK_SPIRV :: #load("shaders/select/select_back.spv", []u8)
 Select_Params      :: struct { n_indices, size: u32 }
 Select_Back_Params :: struct { vocab, n_indices, size: u32 }
 _select_pipeline:      ^Pipeline
+_select_bf16_pipeline: ^Pipeline
 _select_back_pipeline: ^Pipeline
 
 ROPE_SPIRV           :: #load("shaders/rope/rope.spv",           []u8)
 ROPE_BACK_SPIRV      :: #load("shaders/rope/rope_back.spv",      []u8)
 ROPE_BF16_SPIRV      :: #load("shaders/rope/rope_bf16.spv",      []u8)
 ROPE_BACK_BF16_SPIRV :: #load("shaders/rope/rope_back_bf16.spv", []u8)
-Rope_Params      :: struct { token_count, head_count, head_size: u32, base: f32, position_offset: u32 }
-Rope_Back_Params :: struct { token_count, head_count, head_size: u32, base: f32, position_offset: u32 }
+Rope_Params      :: struct { token_count, head_count, head_size: u32, base: f32, position_offset, rotate_pair_count: u32 }
+Rope_Back_Params :: struct { token_count, head_count, head_size: u32, base: f32, position_offset, rotate_pair_count: u32 }
 _rope_pipeline:           ^Pipeline
 _rope_back_pipeline:      ^Pipeline
 _rope_bf16_pipeline:      ^Pipeline

@@ -210,20 +210,25 @@ def verify_layernorm(test_dir: Path, refs: dict) -> None:
     assert_close("grad_w", read_tensor(test_dir / "odin_grad_w.bin"), refs["grad_w"])
 
 
-def gen_rmsnorm(name: str, x_shape):
+def gen_rmsnorm(name: str, x_shape, unit_offset: bool = False):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
 
     feature_size = x_shape[-1]
     x_np = rng.standard_normal(x_shape).astype(np.float32)
-    w_np = (rng.standard_normal((feature_size,)).astype(np.float32) * 0.1 + 1.0)
+    # When unit_offset is on, the weight is centred near 0 (output = x*rstd*(w+1));
+    # otherwise centre near 1 to match torch's default RMSNorm convention.
+    w_centre = 0.0 if unit_offset else 1.0
+    w_np = (rng.standard_normal((feature_size,)).astype(np.float32) * 0.1 + w_centre)
 
     write_tensor(test_dir / "input_x.bin", x_np)
     write_tensor(test_dir / "input_w.bin", w_np)
+    write_int_array(test_dir / "config.bin", [1 if unit_offset else 0])
 
     x = torch.tensor(x_np, requires_grad=True)
     w = torch.tensor(w_np, requires_grad=True)
-    out = torch.nn.functional.rms_norm(x, [feature_size], weight=w, eps=1e-5)
+    effective_w = (w + 1.0) if unit_offset else w
+    out = torch.nn.functional.rms_norm(x, [feature_size], weight=effective_w, eps=1e-5)
     out.sum().backward()
 
     return test_dir, {
@@ -495,29 +500,36 @@ def gen_activation(name: str, op_name: str, x_shape):
     return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
 
 
-def gen_rope(name: str, tokens: int, head_count: int, head_size: int, base: float = 10000.0):
+def gen_rope(name: str, tokens: int, head_count: int, head_size: int, base: float = 10000.0, rope_fraction: float = 1.0):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
 
     embed = head_count * head_size
     x_np = rng.standard_normal((tokens, embed)).astype(np.float32)
     write_tensor(test_dir / "input_x.bin", x_np)
-    write_int_array(test_dir / "config.bin", [head_count])
+    # Encode rope_fraction in 1/1000 units so the runner can read it back as
+    # an integer alongside head_count.
+    write_int_array(test_dir / "config.bin", [head_count, int(round(rope_fraction * 1000))])
 
     x = torch.tensor(x_np, requires_grad=True)
     # Match the library's RoPE: pair (x_{2i}, x_{2i+1}), theta = pos / base^(2i/D),
     # rotation (x, y) -> (x*cos - y*sin, x*sin + y*cos). Same theta across heads.
+    # With rope_fraction < 1 the first `rotate_pair_count` pairs rotate and the
+    # remaining pairs pass through unchanged.
     half = head_size // 2
-    pos = torch.arange(tokens, dtype=torch.float32).unsqueeze(1)              # (T, 1)
-    inv = 1.0 / (base ** (torch.arange(half, dtype=torch.float32) * 2.0 / head_size))  # (half,)
-    theta = pos * inv                                                          # (T, half)
-    cos = torch.cos(theta)                                                     # (T, half)
-    sin = torch.sin(theta)                                                     # (T, half)
+    rotate_pair_count = int(rope_fraction * head_size) // 2
+    pos = torch.arange(tokens, dtype=torch.float32).unsqueeze(1)
+    inv = 1.0 / (base ** (torch.arange(half, dtype=torch.float32) * 2.0 / head_size))
+    theta = pos * inv
+    cos = torch.cos(theta)
+    sin = torch.sin(theta)
+    cos[:, rotate_pair_count:] = 1.0
+    sin[:, rotate_pair_count:] = 0.0
 
     x_view = x.reshape(tokens, head_count, half, 2)
     even = x_view[..., 0]
     odd  = x_view[..., 1]
-    cos_b = cos.unsqueeze(1)  # (T, 1, half)
+    cos_b = cos.unsqueeze(1)
     sin_b = sin.unsqueeze(1)
     out_even = even * cos_b - odd  * sin_b
     out_odd  = even * sin_b + odd  * cos_b
@@ -1028,6 +1040,8 @@ TESTS = [
     ("layernorm",     lambda: gen_layernorm("layernorm", (4, 16)), verify_layernorm),
     ("rmsnorm",       lambda: gen_rmsnorm("rmsnorm",       (4, 16)),  verify_rmsnorm),
     ("rmsnorm_big",   lambda: gen_rmsnorm("rmsnorm_big",   (64, 128)), verify_rmsnorm),
+    ("rmsnorm_unit_offset",     lambda: gen_rmsnorm("rmsnorm_unit_offset",     (4, 16),   unit_offset=True), verify_rmsnorm),
+    ("rmsnorm_unit_offset_big", lambda: gen_rmsnorm("rmsnorm_unit_offset_big", (64, 128), unit_offset=True), verify_rmsnorm),
     ("cross_entropy", lambda: gen_cross_entropy("cross_entropy", sample_count=8, class_size=10), verify_cross_entropy),
     ("batched_matmul", lambda: gen_batched_matmul("batched_matmul", batch=4, m=6, k=5, n=7), verify_binary_op),
     ("permute",       lambda: gen_permute("permute", (3, 4, 5), [1, 0, 2]), verify_unary),
@@ -1043,6 +1057,8 @@ TESTS = [
     ("tanh",    lambda: gen_activation("tanh",    "tanh",    (4, 8)), verify_unary),
     ("sigmoid", lambda: gen_activation("sigmoid", "sigmoid", (4, 8)), verify_unary),
     ("rope",    lambda: gen_rope("rope", tokens=8, head_count=2, head_size=8), verify_unary),
+    ("rope_partial",       lambda: gen_rope("rope_partial", tokens=8, head_count=2, head_size=8, rope_fraction=0.5), verify_unary),
+    ("rope_partial_quarter", lambda: gen_rope("rope_partial_quarter", tokens=16, head_count=4, head_size=32, rope_fraction=0.25), verify_unary),
     ("rope_xfmr",          lambda: gen_rope("rope_xfmr", tokens=64, head_count=4, head_size=32), verify_unary),
     ("attention_xfmr",     lambda: gen_attention("attention_xfmr", tokens=64, embed=128, head_count=4, causal=True), verify_unary),
     ("attention_gqa",      lambda: gen_attention("attention_gqa",     tokens=8,  embed=16,  head_count=4, causal=True, n_kv_heads=2), verify_unary),

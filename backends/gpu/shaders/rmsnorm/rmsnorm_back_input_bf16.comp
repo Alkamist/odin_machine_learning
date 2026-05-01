@@ -9,7 +9,7 @@ layout(set = 0, binding = 1) readonly buffer W  { uint  w[];    };
 layout(set = 0, binding = 2) readonly buffer DY { uint  dy[];   };
 layout(set = 0, binding = 3) readonly buffer R  { float rstd[]; };
 layout(set = 0, binding = 4)          buffer DX { uint  dx[];   };
-layout(push_constant) uniform Params { uint count; uint size; } p;
+layout(push_constant) uniform Params { uint count; uint size; float weight_bias; } p;
 
 shared float s_dn_norm[BLOCK];
 
@@ -29,8 +29,8 @@ void main() {
         uint dyp = dy[pair_base + pi];
         float n0 = bf16_expand(xp & 0xffffu)         * rv;
         float n1 = bf16_expand((xp >> 16) & 0xffffu) * rv;
-        float d0 = bf16_expand(wp & 0xffffu)         * bf16_expand(dyp & 0xffffu);
-        float d1 = bf16_expand((wp >> 16) & 0xffffu) * bf16_expand((dyp >> 16) & 0xffffu);
+        float d0 = (bf16_expand(wp & 0xffffu)         + p.weight_bias) * bf16_expand(dyp & 0xffffu);
+        float d1 = (bf16_expand((wp >> 16) & 0xffffu) + p.weight_bias) * bf16_expand((dyp >> 16) & 0xffffu);
         pb += d0 * n0 + d1 * n1;
     }
     s_dn_norm[tid] = pb;
@@ -49,8 +49,8 @@ void main() {
 
         float n0 = bf16_expand(xp & 0xffffu)         * rv;
         float n1 = bf16_expand((xp >> 16) & 0xffffu) * rv;
-        float d0 = bf16_expand(wp & 0xffffu)         * bf16_expand(dyp & 0xffffu);
-        float d1 = bf16_expand((wp >> 16) & 0xffffu) * bf16_expand((dyp >> 16) & 0xffffu);
+        float d0 = (bf16_expand(wp & 0xffffu)         + p.weight_bias) * bf16_expand(dyp & 0xffffu);
+        float d1 = (bf16_expand((wp >> 16) & 0xffffu) + p.weight_bias) * bf16_expand((dyp >> 16) & 0xffffu);
         float g0 = (d0 - n0 * dnorm_norm_mean) * rv;
         float g1 = (d1 - n1 * dnorm_norm_mean) * rv;
 
