@@ -1253,6 +1253,82 @@ main :: proc() {
 			ml.destroy(v_cache)
 		}
 
+		// attention_with_cache ring-buffer: same sliding-window scenario but
+		// the cache is allocated at exactly `WINDOW` rows so writes wrap
+		// repeatedly. Exercises the t_capacity modulo path on both backends.
+		for ring_type in ([?]ml.Data_Type{.F32, .Bf16}) {
+			T      :: 8
+			N_Q    :: 4
+			N_KV   :: 2
+			D      :: 4
+			Q_E    :: N_Q  * D
+			KV_E   :: N_KV * D
+			WINDOW :: 3
+
+			q_src: [T * Q_E]f32
+			k_src: [T * KV_E]f32
+			v_src: [T * KV_E]f32
+			for i in 0 ..< T * Q_E  { q_src[i] = f32(((i + 1) % 7) - 3) * 0.3 }
+			for i in 0 ..< T * KV_E { k_src[i] = f32(((i + 4) % 7) - 3) * 0.3 }
+			for i in 0 ..< T * KV_E { v_src[i] = f32(((i + 2) % 7) - 3) * 0.3 }
+
+			ref_out: [T * Q_E]f32
+			{
+				q := ml.reshape(ml.tensor(q_src[:]), {T, Q_E})
+				k := ml.reshape(ml.tensor(k_src[:]), {T, KV_E})
+				v := ml.reshape(ml.tensor(v_src[:]), {T, KV_E})
+				if ring_type == .Bf16 {
+					q = ml.cast_to(q, .Bf16)
+					k = ml.cast_to(k, .Bf16)
+					v = ml.cast_to(v, .Bf16)
+				}
+				y := ml.attention(q, k, v, N_Q, N_KV, causal=true, window=WINDOW)
+				if ring_type == .Bf16 {
+					y = ml.cast_to(y, .F32)
+				}
+				ml.get_data(y, ref_out[:])
+				ml.clear()
+			}
+
+			k_cache := ml.alloc(ring_type, {WINDOW, KV_E}, persistent=true, buffers={.Data})
+			v_cache := ml.alloc(ring_type, {WINDOW, KV_E}, persistent=true, buffers={.Data})
+
+			got_out: [T * Q_E]f32
+			for pos in 0 ..< T {
+				q_step: [Q_E]f32
+				k_step: [KV_E]f32
+				v_step: [KV_E]f32
+				copy(q_step[:], q_src[pos * Q_E  : (pos + 1) * Q_E ])
+				copy(k_step[:], k_src[pos * KV_E : (pos + 1) * KV_E])
+				copy(v_step[:], v_src[pos * KV_E : (pos + 1) * KV_E])
+
+				q := ml.reshape(ml.tensor(q_step[:]), {1, Q_E})
+				k := ml.reshape(ml.tensor(k_step[:]), {1, KV_E})
+				v := ml.reshape(ml.tensor(v_step[:]), {1, KV_E})
+				if ring_type == .Bf16 {
+					q = ml.cast_to(q, .Bf16)
+					k = ml.cast_to(k, .Bf16)
+					v = ml.cast_to(v, .Bf16)
+				}
+				y := ml.attention_with_cache(q, k, v, k_cache, v_cache, pos, N_Q, N_KV, window=WINDOW)
+				if ring_type == .Bf16 {
+					y = ml.cast_to(y, .F32)
+				}
+				ml.get_data(y, got_out[pos * Q_E : (pos + 1) * Q_E])
+				ml.clear()
+			}
+
+			tol := ring_type == .Bf16 ? f32(5e-2) : f32(1e-4)
+			ok := true
+			for i in 0 ..< T * Q_E {
+				if math.abs(got_out[i] - ref_out[i]) > tol { ok = false }
+			}
+			check(ok, fmt.tprintf("%v: %v attention sliding-window ring cache (capacity=window) matches reference", label, ring_type), any_failed)
+
+			ml.destroy(k_cache)
+			ml.destroy(v_cache)
+		}
+
 		// Bf16 mean forward + backward.
 		{
 			N    :: 12

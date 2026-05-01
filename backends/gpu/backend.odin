@@ -2325,13 +2325,26 @@ attention_cache_forward :: proc(op: ml.Operation) {
 	}
 
 	row_bytes  := vk.DeviceSize(kv_size * ml.data_type_size(key.type))
-	dst_offset := vk.DeviceSize(variant.cache_position) * row_bytes
-	copy_size  := vk.DeviceSize(token_count) * row_bytes
+	t_capacity := k_cache.shape[0]
+	first_phys := variant.cache_position % t_capacity
+	first_count := token_count
+	if first_phys + first_count > t_capacity { first_count = t_capacity - first_phys }
+	first_size := vk.DeviceSize(first_count) * row_bytes
+	first_dst  := vk.DeviceSize(first_phys) * row_bytes
 
-	k_region := vk.BufferCopy{srcOffset = 0, dstOffset = dst_offset, size = copy_size}
-	v_region := vk.BufferCopy{srcOffset = 0, dstOffset = dst_offset, size = copy_size}
-	vk.CmdCopyBuffer(gctx.batch.cmd, data(key).buffer,   data(k_cache).buffer, 1, &k_region)
-	vk.CmdCopyBuffer(gctx.batch.cmd, data(value).buffer, data(v_cache).buffer, 1, &v_region)
+	k_first := vk.BufferCopy{srcOffset = 0, dstOffset = first_dst, size = first_size}
+	v_first := vk.BufferCopy{srcOffset = 0, dstOffset = first_dst, size = first_size}
+	vk.CmdCopyBuffer(gctx.batch.cmd, data(key).buffer,   data(k_cache).buffer, 1, &k_first)
+	vk.CmdCopyBuffer(gctx.batch.cmd, data(value).buffer, data(v_cache).buffer, 1, &v_first)
+
+	if first_count < token_count {
+		wrap_src  := first_size
+		wrap_size := vk.DeviceSize(token_count - first_count) * row_bytes
+		k_wrap := vk.BufferCopy{srcOffset = wrap_src, dstOffset = 0, size = wrap_size}
+		v_wrap := vk.BufferCopy{srcOffset = wrap_src, dstOffset = 0, size = wrap_size}
+		vk.CmdCopyBuffer(gctx.batch.cmd, data(key).buffer,   data(k_cache).buffer, 1, &k_wrap)
+		vk.CmdCopyBuffer(gctx.batch.cmd, data(value).buffer, data(v_cache).buffer, 1, &v_wrap)
+	}
 
 	params := Attention_Cache_Params{
 		n_q_heads      = u32(variant.n_q_heads),
@@ -2342,6 +2355,7 @@ attention_cache_forward :: proc(op: ml.Operation) {
 		q_size         = u32(q_size),
 		kv_size        = u32(kv_size),
 		window         = u32(variant.window),
+		t_capacity     = u32(t_capacity),
 	}
 	bufs := [4]vk.Buffer{
 		data(query).buffer, data(k_cache).buffer, data(v_cache).buffer, data(output).buffer,

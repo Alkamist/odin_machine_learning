@@ -3098,16 +3098,26 @@ attention_cache_forward :: proc(op: ml.Operation) {
 	kv_size     := v.key.shape[1]
 	row_bytes   := kv_size * ml.data_type_size(v.key.type)
 	cache_pos   := v.cache_position
+	t_capacity  := v.k_cache.shape[0]
 
 	k_new_bytes := transmute([]byte)v.key.buffers     [.Data]
 	v_new_bytes := transmute([]byte)v.value.buffers   [.Data]
 	k_cache_bytes := transmute([]byte)v.k_cache.buffers[.Data]
 	v_cache_bytes := transmute([]byte)v.v_cache.buffers[.Data]
 
-	dst_offset := cache_pos * row_bytes
-	copy_bytes := token_count * row_bytes
-	builtin.copy(k_cache_bytes[dst_offset:dst_offset + copy_bytes], k_new_bytes[:copy_bytes])
-	builtin.copy(v_cache_bytes[dst_offset:dst_offset + copy_bytes], v_new_bytes[:copy_bytes])
+	first_phys := cache_pos % t_capacity
+	first_count := token_count
+	if first_phys + first_count > t_capacity { first_count = t_capacity - first_phys }
+	first_bytes := first_count * row_bytes
+	dst0 := first_phys * row_bytes
+	builtin.copy(k_cache_bytes[dst0:dst0 + first_bytes], k_new_bytes[:first_bytes])
+	builtin.copy(v_cache_bytes[dst0:dst0 + first_bytes], v_new_bytes[:first_bytes])
+
+	if first_count < token_count {
+		wrap_bytes := (token_count - first_count) * row_bytes
+		builtin.copy(k_cache_bytes[:wrap_bytes], k_new_bytes[first_bytes:first_bytes + wrap_bytes])
+		builtin.copy(v_cache_bytes[:wrap_bytes], v_new_bytes[first_bytes:first_bytes + wrap_bytes])
+	}
 
 	switch op.input.type {
 	case .F32:  attention_cache_forward_f32 (op)
@@ -3130,6 +3140,7 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 		kv_h        := h / group_size
 		cache_pos   := v.cache_position
 		window      := v.window
+		t_capacity  := v.k_cache.shape[0]
 		k_total     := cache_pos + token_count
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
@@ -3150,7 +3161,7 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 
 			max_score := math.NEG_INF_F32
 			for t_k in t_k_min ..< t_k_max {
-				k_offset := t_k * kv_size + kv_h * head_size
+				k_offset := (t_k % t_capacity) * kv_size + kv_h * head_size
 				score := _simd_dot_f32(q, k_ptr[k_offset:], head_size) * inv_sqrt_d
 				scores[t_k] = score
 				if score > max_score { max_score = score }
@@ -3169,7 +3180,7 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 				out_ptr[out_offset + d] = 0
 			}
 			for t_k in t_k_min ..< t_k_max {
-				v_offset := t_k * kv_size + kv_h * head_size
+				v_offset := (t_k % t_capacity) * kv_size + kv_h * head_size
 				_simd_axpy_f32(out_ptr[out_offset:], v_ptr[v_offset:], scores[t_k] * inv_sum, head_size)
 			}
 		}
@@ -3190,6 +3201,7 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 		kv_h        := h / group_size
 		cache_pos   := v.cache_position
 		window      := v.window
+		t_capacity  := v.k_cache.shape[0]
 		k_total     := cache_pos + token_count
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
@@ -3209,7 +3221,7 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 
 			max_score := math.NEG_INF_F32
 			for t_k in t_k_min ..< t_k_max {
-				k_offset := t_k * kv_size + kv_h * head_size
+				k_offset := (t_k % t_capacity) * kv_size + kv_h * head_size
 				score: f32
 				for d in 0 ..< head_size {
 					score += ml.bf16_to_f32(q_ptr[q_offset + d]) * ml.bf16_to_f32(k_ptr[k_offset + d])
@@ -3231,7 +3243,7 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 			for d in 0 ..< head_size {
 				acc: f32
 				for t_k in t_k_min ..< t_k_max {
-					v_offset := t_k * kv_size + kv_h * head_size
+					v_offset := (t_k % t_capacity) * kv_size + kv_h * head_size
 					acc += scores[t_k] * inv_sum * ml.bf16_to_f32(v_ptr[v_offset + d])
 				}
 				out_ptr[out_offset + d] = ml.bf16_from_f32(acc)

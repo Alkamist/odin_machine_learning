@@ -209,7 +209,7 @@ Attention_Back_D_Params :: struct {
 	n_q_heads, head_size, token_count, q_size: u32,
 }
 Attention_Cache_Params :: struct {
-	n_q_heads, n_kv_heads, head_size, q_token_count, cache_position, q_size, kv_size, window: u32,
+	n_q_heads, n_kv_heads, head_size, q_token_count, cache_position, q_size, kv_size, window, t_capacity: u32,
 }
 _attention_pipeline:              ^Pipeline
 _attention_back_d_pipeline:       ^Pipeline

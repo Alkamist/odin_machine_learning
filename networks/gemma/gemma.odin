@@ -328,17 +328,6 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 // runs per head, then reshape back. Q-norm weights are pre-baked at load time
 // with `sqrt(head_dim)` so the resulting Q absorbs the `1/sqrt(head_dim)`
 // scaling that `ml.attention` applies internally.
-// Extract rows `[start, start + count)` of a 2-D `[t_max, kv_size]` cache as
-// a fresh `[count, kv_size]` tensor. Implemented as flatten → 1-D slice →
-// reshape because we don't have a leading-axis slice op; the slice copies
-// `count * kv_size` contiguous floats out of the cache.
-@(require_results)
-_cache_row_slice :: proc(cache_buffer: ml.Tensor, start, count, kv_size: int) -> ml.Tensor {
-	flat        := ml.reshape(cache_buffer, []int{ml.len(cache_buffer)})
-	slice_flat  := ml.slice(flat, start * kv_size, (start + count) * kv_size)
-	return ml.reshape(slice_flat, []int{count, kv_size})
-}
-
 @(require_results)
 _qkv_norm :: proc(model: Gemma, x: ml.Tensor, weight: ml.Tensor, n_heads, head_dim: int, eps: f32) -> ml.Tensor {
 	token_count := x.shape[0]
@@ -350,10 +339,14 @@ _qkv_norm :: proc(model: Gemma, x: ml.Tensor, weight: ml.Tensor, n_heads, head_d
 }
 
 // Per-layer K/V cache for incremental decoding. Shared layers (the last
-// `num_kv_shared_layers`) carry empty handles — `forward_cached` reads from
-// the source layer's cache instead.
+// `num_kv_shared_layers`) carry empty handles — `forward_cached` reuses the
+// source layer's K/V tensors directly within a single forward.
+//
+// Sliding-attention layers store only `sliding_window` rows and are written
+// as a ring buffer (the attention op modulo-indexes by `t_capacity`). At
+// 128k context this cuts each sliding layer's cache from ~256MB to ~1MB.
 Layer_Cache :: struct {
-	k: ml.Tensor, // [t_max, num_kv_heads * head_dim] (F32; head_dim is layer-type dependent)
+	k: ml.Tensor, // [t_capacity, num_kv_heads * head_dim] (t_capacity = sliding_window for sliding layers, t_max otherwise)
 	v: ml.Tensor,
 }
 
@@ -372,10 +365,12 @@ cache_make :: proc(model: Gemma, t_max: int, allocator := context.allocator) -> 
 
 	for i in 0 ..< cfg.num_hidden_layers {
 		if is_kv_shared_layer(cfg, i) do continue
-		head_dim := config_head_dim(cfg, i)
-		kv_size  := cfg.num_key_value_heads * head_dim
-		cache.layers[i].k = ml.alloc(model.dtype, {t_max, kv_size}, persistent=true, buffers={.Data})
-		cache.layers[i].v = ml.alloc(model.dtype, {t_max, kv_size}, persistent=true, buffers={.Data})
+		head_dim   := config_head_dim(cfg, i)
+		kv_size    := cfg.num_key_value_heads * head_dim
+		is_sliding := cfg.layer_types[i] == .Sliding
+		t_cap      := cfg.sliding_window if is_sliding else t_max
+		cache.layers[i].k = ml.alloc(model.dtype, {t_cap, kv_size}, persistent=true, buffers={.Data})
+		cache.layers[i].v = ml.alloc(model.dtype, {t_cap, kv_size}, persistent=true, buffers={.Data})
 	}
 	return
 }
@@ -418,6 +413,12 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 	per_layer_inputs := _per_layer_inputs(model, new_tokens, inputs_embeds)
 	ple_dim := cfg.hidden_size_per_layer_input
 
+	// Per-layer K/V tensors produced in this forward. Shared layers reuse
+	// their source layer's K/V directly instead of slicing it back out of
+	// the (possibly ring-wrapped) cache buffer.
+	Step_KV :: struct { k, v: ml.Tensor }
+	step_kvs := builtin.make([]Step_KV, cfg.num_hidden_layers, context.temp_allocator)
+
 	residual := embeds
 
 	for layer, layer_idx in model.layers {
@@ -433,21 +434,19 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 		q  = _qkv_norm(model, q, layer.q_norm_weight, cfg.num_attention_heads, head_dim, cfg.rms_norm_eps)
 		q  = ml.rope(q, cfg.num_attention_heads, rope_base, cache_position, rope_fraction)
 
-		// Shared layers reuse the K/V cache of the source layer (the last
-		// non-shared layer of the same attention type). The source layer is
-		// always processed earlier in the loop, so by the time we hit a
-		// shared layer its cache row for this step is already populated. We
-		// extract it via a flatten → 1-D slice → reshape and feed it back to
-		// `attention_with_cache`, which re-writes the same bytes idempotently.
+		// Shared layers reuse the source layer's K/V tensors (computed
+		// earlier in this same forward) and write into the source layer's
+		// cache buffer — `attention_with_cache` re-writes the same rows
+		// idempotently.
 		cache_layer_idx := layer_idx if !is_kv_shared_layer(cfg, layer_idx) else kv_source_layer_idx(cfg, layer_idx)
 		k_cache := cache.layers[cache_layer_idx].k
 		v_cache := cache.layers[cache_layer_idx].v
-		kv_size := k_cache.shape[1]
 
 		k, v: ml.Tensor
 		if is_kv_shared_layer(cfg, layer_idx) {
-			k = _cache_row_slice(k_cache, cache_position, token_count, kv_size)
-			v = _cache_row_slice(v_cache, cache_position, token_count, kv_size)
+			source := kv_source_layer_idx(cfg, layer_idx)
+			k = step_kvs[source].k
+			v = step_kvs[source].v
 		} else {
 			k = ml.linear(hidden, layer.k_proj_weight)
 			k = _qkv_norm(model, k, layer.k_norm_weight, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
@@ -456,6 +455,8 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
 			v = ml.linear(hidden, layer.v_proj_weight)
 			v = _qkv_norm(model, v, v_norm_ones, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
+
+			step_kvs[layer_idx] = Step_KV{k = k, v = v}
 		}
 
 		attn := ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window)

@@ -642,10 +642,20 @@ attention_with_cache :: proc(
 	assert(query.type == k_cache.type && query.type == v_cache.type, "attention_with_cache cache dtype must match Q", loc=loc)
 	assert(query.type == .F32 || query.type == .Bf16, "attention_with_cache requires F32 or Bf16", loc=loc)
 
-	t_max := k_cache.shape[0]
-	assert(cache_position >= 0,                          "cache_position must be non-negative", loc=loc)
-	assert(cache_position + token_count <= t_max,        "cache overflow: cache_position + token_count > t_max", loc=loc)
-	assert(window >= 0,                                  "attention_with_cache window must be non-negative (0 means full attention)", loc=loc)
+	t_capacity := k_cache.shape[0]
+	assert(cache_position >= 0, "cache_position must be non-negative", loc=loc)
+	assert(window >= 0,         "attention_with_cache window must be non-negative (0 means full attention)", loc=loc)
+	if window == 0 {
+		// Full attention: cache must hold every absolute position.
+		assert(cache_position + token_count <= t_capacity, "cache overflow: cache_position + token_count > t_max", loc=loc)
+	} else {
+		// Sliding attention: cache acts as a ring of `t_capacity` rows. The
+		// sliding mask only needs the last `window` entries, so storage as
+		// small as `window` is sufficient. Each forward must still fit in
+		// the ring without overwriting itself.
+		assert(t_capacity   >= window, "attention_with_cache: sliding cache capacity must be >= window", loc=loc)
+		assert(token_count  <= t_capacity, "attention_with_cache: token_count exceeds ring capacity", loc=loc)
+	}
 
 	output = zeros(query.type, {token_count, q_size}, loc=loc)
 

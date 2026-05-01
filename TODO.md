@@ -122,32 +122,24 @@ Current status of the trunk:
     a dtype-agnostic byte-row copy; backward has a Bf16 branch with
     f32 accumulation. CPU bf16 chat would now work end-to-end (GPU
     is still preferred for speed).
+- Sliding-window-aware KV-cache eviction (ring buffer) — done.
+  `attention_with_cache` modulo-indexes K/V rows by
+  `t_capacity = k_cache.shape[0]` and the write splits at the wrap
+  (CPU memcpy and GPU `vkCmdCopyBuffer`). New `t_capacity` push
+  constant in `attention_cache{,_bf16}.comp`. `gemma.cache_make`
+  allocates `[sliding_window, kv_size]` for sliding layers and
+  `[t_max, kv_size]` for full layers, dropping each sliding layer's
+  cache from ~256MB to ~1MB at bf16 in 128k context. Shared layers
+  in Gemma now reuse the source layer's K/V tensor via an in-pass
+  carry array instead of slicing the (possibly wrapped) cache
+  buffer; `_cache_row_slice` removed. `tests/dtype_roundtrip` gains
+  a ring test where `k_cache.shape[0] == window` so writes wrap
+  repeatedly. Effective context is now bounded by full-layer
+  storage, not sliding storage.
 
 Remaining phases, in order:
 
-1. **Sliding-window-aware KV-cache eviction** (high priority before
-   long-context use). The current `Cache` lays out K/V as a flat
-   `[t_max, kv_size]` per layer. For sliding layers (`window=512`)
-   we only need the last 512 entries, but right now the cache grows
-   linearly with `cache_position` up to `t_max` and any rows past
-   `cache_position - window` are dead weight. The math stays
-   correct because `attention_with_cache` applies the sliding mask
-   even when stale entries are present, but at E4B's 128k context
-   the sliding layers' cache is ~256× larger than it needs to be.
-   Two implementation paths:
-   - **Ring buffer per sliding layer.** Cache size = `min(t_max, W)`,
-     with a circular-write strategy and an offset push-constant for
-     attention. Smallest memory footprint; requires
-     `attention_with_cache` to know about the ring base.
-   - **Compact-on-overflow.** Keep the flat layout; once
-     `cache_position > t_max`, shift the last `W` rows down to
-     positions `[0, W)` and resume from there. Simpler op
-     interface, occasional copy cost.
-   Plumb a `window` field through `Cache`/`Layer_Cache` so each
-   layer can choose its strategy (full-attention layers stay flat
-   with `window=0`; sliding layers use one of the above).
-
-2. **Gemma 4 E4B fine-tune** on a small corpus. Reuses the training
+1. **Gemma 4 E4B fine-tune** on a small corpus. Reuses the training
    loop from the stack-validation pretrain (run it second, point it
    at E4B weights). Note: `gemma.make` already supports
    `for_training=true` to allocate the full
@@ -155,14 +147,14 @@ Remaining phases, in order:
    weights at 8B params the optimizer state alone is ~96 GB and
    will need partial CPU/disk offload.
 
-3. **Stack-validation pretrain** at ~30–50M params. The mixed-precision
+2. **Stack-validation pretrain** at ~30–50M params. The mixed-precision
    training recipe; useful before fine-tuning E4B for real.
-4. **From-scratch pretrain at 160M+ scale** matching a published
+3. **From-scratch pretrain at 160M+ scale** matching a published
    recipe (Pythia-160M or SmolLM2-135M). The "trainable intelligence"
    claim landing.
-5. **Gemma 4 multimodal** (vision then audio). Conv1d/2d + FFT come in
+4. **Gemma 4 multimodal** (vision then audio). Conv1d/2d + FFT come in
    here. Audio is E2B/E4B only; vision exists across all dense sizes.
-6. Branch into one of {audio generation, world-model RL, MoE training}
+5. Branch into one of {audio generation, world-model RL, MoE training}
    — roughly equal effort off the same trunk. (Gemma 4 26B-A4B gives
    us a real MoE target in-family.)
 
@@ -437,11 +429,6 @@ drops cleanly, greedy-decode samples reflect the fine-tune corpus.
   which forces a `vkQueueWaitIdle` mid-frame. A `fill_constant.comp`
   and a Philox-style `fill_normal.comp` would keep initialization
   on-device.
-
-- **KV-cache ring buffer.** Cache is stored as a flat `[t_max, kv_size]`
-  buffer, so cache memory scales with `T` rather than the sliding
-  window `W`. Not a blocker for SmolLM2 (8k) or Gemma-class (32k) on a
-  24 GB card; revisit if longer contexts come up.
 
 ## GPU robustness
 
