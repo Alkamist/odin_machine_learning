@@ -77,6 +77,8 @@ main :: proc() {
 	case "attention_xfmr":    run_attention(artifacts_dir)
 	case "attention_gqa":     run_attention(artifacts_dir)
 	case "attention_gqa_big": run_attention(artifacts_dir)
+	case "attention_window":     run_attention(artifacts_dir)
+	case "attention_window_big": run_attention(artifacts_dir)
 	case "tied_embeddings":   run_tied_embeddings(artifacts_dir)
 	case "mlp_train":         run_mlp_train(artifacts_dir)
 	case "mlp_train_period12":run_mlp_train(artifacts_dir)
@@ -345,6 +347,8 @@ run_attention :: proc(dir: string) {
 	causal     := config[1] != 0
 	n_kv_heads := n_q_heads
 	if builtin.len(config) >= 3 { n_kv_heads = config[2] }
+	window := 0
+	if builtin.len(config) >= 4 { window = config[3] }
 
 	q_size  := x_shape[1] * n_q_heads  / (n_q_heads + 2 * n_kv_heads)
 	kv_size := x_shape[1] * n_kv_heads / (n_q_heads + 2 * n_kv_heads)
@@ -352,7 +356,7 @@ run_attention :: proc(dir: string) {
 	k := ml.slice_trailing(x, q_size,           q_size + kv_size)
 	v := ml.slice_trailing(x, q_size + kv_size, q_size + 2 * kv_size)
 
-	out := ml.attention(q, k, v, n_q_heads, n_kv_heads, causal=causal)
+	out := ml.attention(q, k, v, n_q_heads, n_kv_heads, causal=causal, window=window)
 	ml.backward()
 
 	out_shape := _shape_slice(out)

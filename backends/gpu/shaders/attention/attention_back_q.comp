@@ -27,6 +27,7 @@ layout(push_constant) uniform Params {
     uint q_size;
     uint kv_size;
     uint causal;
+    uint window;
 } p;
 
 shared float q_shared[256];
@@ -60,7 +61,8 @@ void main() {
     uint  my_d    = tid;
 
     uint t_k_max = (p.causal != 0u) ? (t_q + 1u) : T;
-    for (uint t_k = 0u; t_k < t_k_max; t_k += 1u) {
+    uint t_k_min = (p.window != 0u && t_k_max > p.window) ? (t_k_max - p.window) : 0u;
+    for (uint t_k = t_k_min; t_k < t_k_max; t_k += 1u) {
         uint k_base = t_k * p.kv_size + kv_h * D;
         uint v_base = t_k * p.kv_size + kv_h * D;
 

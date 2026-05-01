@@ -45,6 +45,7 @@ layout(push_constant) uniform Params {
     uint q_size;
     uint kv_size;
     uint causal;
+    uint window;
 } p;
 
 // All shared arrays are sized for the worst case head_size = MAX_D so the

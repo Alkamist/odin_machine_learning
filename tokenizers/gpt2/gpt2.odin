@@ -118,7 +118,6 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 }
 
 destroy :: proc(tok: Tokenizer) {
-	tok := tok
 	delete(tok.vocab)
 	delete(tok.id_to_piece)
 	delete(tok.merge_rank)

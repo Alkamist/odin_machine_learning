@@ -2144,6 +2144,7 @@ attention_forward :: proc(op: ml.Operation) {
 	if is_bf16 {
 		fmt.assertf(head_size % 2 == 0, "GPU bf16 attention requires even head_size (got %v)", head_size)
 	}
+	fmt.assertf(variant.window == 0 || variant.causal, "GPU attention window > 0 requires causal=true")
 
 	params := Attention_Params{
 		n_q_heads   = u32(variant.n_q_heads),
@@ -2153,6 +2154,7 @@ attention_forward :: proc(op: ml.Operation) {
 		q_size      = u32(q_size),
 		kv_size     = u32(kv_size),
 		causal      = variant.causal ? 1 : 0,
+		window      = u32(variant.window),
 	}
 	bufs := [5]vk.Buffer{
 		data(query).buffer, data(key).buffer, data(value).buffer,
@@ -2198,6 +2200,7 @@ attention_backward :: proc(op: ml.Operation) {
 	if is_bf16 {
 		fmt.assertf(head_size % 2 == 0, "GPU bf16 attention requires even head_size (got %v)", head_size)
 	}
+	fmt.assertf(variant.window == 0 || variant.causal, "GPU attention_backward window > 0 requires causal=true")
 
 	back_d_pipeline:  ^Pipeline
 	back_kv_pipeline: ^Pipeline
@@ -2247,6 +2250,7 @@ attention_backward :: proc(op: ml.Operation) {
 		q_size      = u32(q_size),
 		kv_size     = u32(kv_size),
 		causal      = variant.causal ? 1 : 0,
+		window      = u32(variant.window),
 	}
 	kv_bufs := [8]vk.Buffer{
 		data(query).buffer, data(key).buffer, data(value).buffer,
@@ -2322,6 +2326,7 @@ attention_cache_forward :: proc(op: ml.Operation) {
 		cache_position = u32(variant.cache_position),
 		q_size         = u32(q_size),
 		kv_size        = u32(kv_size),
+		window         = u32(variant.window),
 	}
 	bufs := [4]vk.Buffer{
 		data(query).buffer, data(k_cache).buffer, data(v_cache).buffer, data(output).buffer,

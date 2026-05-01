@@ -508,6 +508,7 @@ Attention :: struct {
 	n_q_heads:       int,
 	n_kv_heads:      int,
 	causal:          bool,
+	window:          int,
 	key:             Tensor,
 	value:           Tensor,
 	softmax_outputs: Tensor,
@@ -524,6 +525,7 @@ attention :: proc(
 	n_q_heads: int,
 	n_kv_heads := 0,
 	causal     := true,
+	window     := 0,
 	loc        := #caller_location,
 ) -> (output: Tensor) {
 	kv_heads := n_kv_heads if n_kv_heads > 0 else n_q_heads
@@ -548,6 +550,8 @@ attention :: proc(
 
 	assert(query.type == key.type && key.type == value.type, "attention Q/K/V must share dtype", loc=loc)
 	assert(query.type == .F32 || query.type == .Bf16, "attention requires F32 or Bf16 input", loc=loc)
+	assert(window >= 0, "attention window must be non-negative (0 means full attention)", loc=loc)
+	assert(window == 0 || causal, "attention window > 0 requires causal=true", loc=loc)
 
 	output           = zeros(query.type, {token_count, q_size}, loc=loc)
 	softmax_outputs := zeros(.F32, {n_q_heads, token_count, token_count}, loc=loc)
@@ -562,6 +566,7 @@ attention :: proc(
 			n_q_heads       = n_q_heads,
 			n_kv_heads      = kv_heads,
 			causal          = causal,
+			window          = window,
 			key             = key,
 			value           = value,
 			softmax_outputs = softmax_outputs,
@@ -580,6 +585,7 @@ Attention_Cache :: struct {
 	n_q_heads:      int,
 	n_kv_heads:     int,
 	cache_position: int,
+	window:         int,
 
 	key:     Tensor,
 	value:   Tensor,
@@ -597,6 +603,7 @@ attention_with_cache :: proc(
 	cache_position: int,
 	n_q_heads:      int,
 	n_kv_heads      := 0,
+	window          := 0,
 	loc             := #caller_location,
 ) -> (output: Tensor) {
 	kv_heads := n_kv_heads if n_kv_heads > 0 else n_q_heads
@@ -630,6 +637,7 @@ attention_with_cache :: proc(
 	t_max := k_cache.shape[0]
 	assert(cache_position >= 0,                          "cache_position must be non-negative", loc=loc)
 	assert(cache_position + token_count <= t_max,        "cache overflow: cache_position + token_count > t_max", loc=loc)
+	assert(window >= 0,                                  "attention_with_cache window must be non-negative (0 means full attention)", loc=loc)
 
 	output = zeros(query.type, {token_count, q_size}, loc=loc)
 
@@ -640,6 +648,7 @@ attention_with_cache :: proc(
 			n_q_heads      = n_q_heads,
 			n_kv_heads     = kv_heads,
 			cache_position = cache_position,
+			window         = window,
 			key            = key,
 			value          = value,
 			k_cache        = k_cache,

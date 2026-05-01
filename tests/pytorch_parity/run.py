@@ -528,7 +528,7 @@ def gen_rope(name: str, tokens: int, head_count: int, head_size: int, base: floa
     return test_dir, {"out": out.detach().numpy(), "grad_x": x.grad.numpy()}
 
 
-def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: bool, n_kv_heads: int = 0):
+def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: bool, n_kv_heads: int = 0, window: int = 0):
     rng = np.random.default_rng(SEED)
     test_dir = setup_test(name)
 
@@ -537,14 +537,12 @@ def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: b
     head_size = embed // n_q
     kv_embed  = n_kv * head_size
 
-    # The runner reads a single packed buffer [Q | K | V]; the values are
-    # arbitrary, so concatenate the three slabs in this order.
     q_np = rng.standard_normal((tokens, embed)).astype(np.float32) * 0.1
     k_np = rng.standard_normal((tokens, kv_embed)).astype(np.float32) * 0.1
     v_np = rng.standard_normal((tokens, kv_embed)).astype(np.float32) * 0.1
     x_np = np.concatenate([q_np, k_np, v_np], axis=1)
     write_tensor(test_dir / "input_x.bin", x_np)
-    write_int_array(test_dir / "config.bin", [n_q, 1 if causal else 0, n_kv])
+    write_int_array(test_dir / "config.bin", [n_q, 1 if causal else 0, n_kv, window])
 
     x = torch.tensor(x_np, requires_grad=True)
     q_flat = x[:, 0:embed]
@@ -555,7 +553,6 @@ def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: b
     k = k_flat.reshape(tokens, n_kv, head_size).permute(1, 0, 2)
     v = v_flat.reshape(tokens, n_kv, head_size).permute(1, 0, 2)
 
-    # Repeat K/V to match Q's head count for the reference matmul.
     if n_kv != n_q:
         repeat = n_q // n_kv
         k = k.repeat_interleave(repeat, dim=0)
@@ -565,6 +562,10 @@ def gen_attention(name: str, tokens: int, embed: int, head_count: int, causal: b
     if causal:
         mask = torch.triu(torch.ones(tokens, tokens, dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(mask, float("-inf"))
+    if window > 0:
+        idx = torch.arange(tokens)
+        window_mask = (idx.unsqueeze(0) < (idx.unsqueeze(1) - (window - 1)))
+        scores = scores.masked_fill(window_mask, float("-inf"))
     attn = torch.nn.functional.softmax(scores, dim=-1)
     out_per_head = torch.matmul(attn, v)
     out = out_per_head.permute(1, 0, 2).reshape(tokens, embed)
@@ -1046,6 +1047,8 @@ TESTS = [
     ("attention_xfmr",     lambda: gen_attention("attention_xfmr", tokens=64, embed=128, head_count=4, causal=True), verify_unary),
     ("attention_gqa",      lambda: gen_attention("attention_gqa",     tokens=8,  embed=16,  head_count=4, causal=True, n_kv_heads=2), verify_unary),
     ("attention_gqa_big",  lambda: gen_attention("attention_gqa_big", tokens=64, embed=144, head_count=9, causal=True, n_kv_heads=3), verify_unary),
+    ("attention_window",     lambda: gen_attention("attention_window",     tokens=12, embed=16,  head_count=4, causal=True, n_kv_heads=2, window=4),  verify_unary),
+    ("attention_window_big", lambda: gen_attention("attention_window_big", tokens=64, embed=144, head_count=9, causal=True, n_kv_heads=3, window=16), verify_unary),
     ("tied_embeddings",    lambda: gen_tied_embeddings("tied_embeddings", vocab=32, embed=8, n_tokens=12), verify_tied_embeddings),
     ("llama_train",        lambda: gen_llama_train("llama_train",
         config={

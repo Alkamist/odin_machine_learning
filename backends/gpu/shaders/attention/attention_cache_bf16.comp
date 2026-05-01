@@ -25,6 +25,7 @@ layout(push_constant) uniform Params {
     uint cache_position;
     uint q_size;
     uint kv_size;
+    uint window;
 } p;
 
 shared float q_shared[MAX_D];
@@ -59,6 +60,8 @@ void main() {
     uint kv_h = h * p.n_kv_heads / p.n_q_heads;
     float inv_sqrt_d = inversesqrt(float(D));
     uint t_k_max = p.cache_position + t_q + 1u;
+    uint t_k_min = (p.window != 0u && t_k_max > p.window) ? (t_k_max - p.window) : 0u;
+    uint t_k0_start = (t_k_min / BC) * BC;
 
     uint q_base = t_q * p.q_size + h * D;
     uint o_base = t_q * p.q_size + h * D;
@@ -74,10 +77,10 @@ void main() {
     float m_run = NEG_INF;
     float l_run = 0.0;
 
-    for (uint t_k0 = 0u; t_k0 < t_k_max; t_k0 += BC) {
+    for (uint t_k0 = t_k0_start; t_k0 < t_k_max; t_k0 += BC) {
         uint t_k = t_k0 + tid;
         float score = NEG_INF;
-        if (tid < BC && t_k < t_k_max) {
+        if (tid < BC && t_k < t_k_max && t_k >= t_k_min) {
             uint k_base = t_k * p.kv_size + kv_h * D;
             float dot = 0.0;
             for (uint d = 0u; d < D; d += 1u) {

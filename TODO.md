@@ -236,11 +236,39 @@ in `tests/dtype_roundtrip` plus the existing `kv_cache_decode`
 pytorch_parity test now pass on both backends.
 
 Deferred behind this:
-- Sliding-window attention. Needed for context > what fits in the
-  cache buffers; not blocking realistic chat at SmolLM2's 8k window
-  on a 24 GB card.
 - Stack-validation pretrain (was step 2 of the SmolLM2 plan).
 - SmolLM2 fine-tune (was step 5).
+
+### Sliding-window attention — DONE
+
+`ml.attention(window=W)` and `ml.attention_with_cache(window=W)` now
+support sliding-window causal attention. Each query at absolute
+position `i` attends only to keys in `[max(0, i-W+1), i]`; `window=0`
+means full causal attention (the default and the previous behavior).
+
+CPU forward + backward (F32 + Bf16) and CPU cache forward (F32 + Bf16)
+clamp the K range with `t_k_min` mirroring `t_k_max`. GPU mirrors the
+same logic across all 11 attention shaders: forward `attention.comp`
+/ `attention_bf16.comp`, cache forward `attention_cache.comp` /
+`attention_cache_bf16.comp`, and backward `attention_back_q*` /
+`attention_back_kv*`. The forward shaders round `t_k0` down to the
+nearest BC=64 boundary so the K-tile loop skips entirely-out-of-window
+tiles; the backward kv shader caps the t_q loop at `min(T, t_k+W)`
+since key `t_k` is only attended by queries in `[t_k, t_k+W)`. The
+disabled `attention_bf16_coopmat.comp` had `window` added to its push
+constant block to keep it compatible with `Attention_Params`; window
+logic in coopmat is deferred until that path is profitable.
+
+The KV cache is still stored as a flat `[t_max, kv_size]` buffer —
+the ring-buffer optimization that would let cache memory scale with
+`W` instead of `T` is deferred. For SmolLM2 (8k context) and
+Gemma-class (32k context) on a 24 GB card this is not yet a blocker.
+
+Coverage: pytorch_parity `attention_window` (T=12, GQA 4q/2kv, W=4)
+and `attention_window_big` (T=64, GQA 9q/3kv SmolLM2-shape, W=16) on
+both backends. dtype_roundtrip got two new sliding-window cache cases
+(F32 + Bf16) checking that prefill+decode through the cache with a
+window matches a non-cache reference.
 
 ### Earlier "watch it generate" milestone — DONE
 
