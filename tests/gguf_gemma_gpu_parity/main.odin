@@ -70,9 +70,15 @@ main :: proc() {
 	all_logits := make([]f32, builtin.len(tokens) * vocab_size)
 	defer delete(all_logits)
 
-	// Warm-up + per-token timing.
+	// Warm-up + per-token timing. Enable GPU timestamp queries from token 1
+	// onwards so the first-token pipeline-compilation cost doesn't pollute
+	// the per-pipeline averages.
 	t_total := time.tick_now()
 	for token, pos in tokens {
+		if pos == 1 {
+			gpu.enable_timing()
+			gpu.reset_timing()
+		}
 		t_step := time.tick_now()
 		logits := gemma.forward_cached(model, &cache, []int{token})
 		// Read this position's logits (should be vocab_size elements; M=1).
@@ -90,6 +96,10 @@ main :: proc() {
 	}
 	total_s := time.duration_seconds(time.tick_since(t_total))
 	fmt.printfln("Total: %.2f s for %v tokens (%.2f tok/s)", total_s, builtin.len(tokens), f64(builtin.len(tokens)) / total_s)
+
+	// Per-pipeline GPU timing aggregated over tokens 1..N (excludes warm-up).
+	fmt.println()
+	gpu.dump_timing()
 
 	any_failed := false
 	for position in 0 ..< builtin.len(tokens) {

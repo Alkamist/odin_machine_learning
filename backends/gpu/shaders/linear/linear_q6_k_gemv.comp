@@ -74,37 +74,47 @@ void main() {
 
             uint block_off = (n * num_blocks + b) * BLOCK_BYTES;
 
-            // d (fp16) lives at byte offset 208..209.
+            // d (fp16) at byte offset 208..209 — once per (block, row).
             uint d_bits = load_byte(block_off + 208u) | (load_byte(block_off + 209u) << 8u);
             float d = unpackHalf2x16(d_bits).x;
 
-            // Each thread emits 8 weights per block: (half, quadrant) ∈
-            // {0,1} × {0,1,2,3}, with l = tid in 0..31.
-            for (uint s = 0u; s < 8u; ++s) {
-                uint h        = s >> 2u;
-                uint quadrant = s & 3u;
-                uint l        = tid;
+            // Per-thread: 2 halves × 4 quadrants × l=tid. Hoist ql/qh and
+            // the 4 scales used by this thread outside the quadrant loop:
+            // ql at l and l+32 are reused for quadrants {0,2} and {1,3},
+            // qh at l is reused across all 4 quadrants, and within a half
+            // each thread touches scales sb_base + {0,2,4,6} where
+            // sb_base = h*8 + l/16.
+            for (uint h = 0u; h < 2u; ++h) {
+                uint ql_lo = load_byte(block_off + h * 64u +       tid);
+                uint ql_hi = load_byte(block_off + h * 64u + 32u + tid);
+                uint qh    = load_byte(block_off + 128u + h * 32u + tid);
 
-                // Sub-block index for the scale lookup. Within each half,
-                // l/16 picks lo/hi sub-block; quadrants 0..3 add 0,2,4,6.
-                uint sb         = h * 8u + (l >> 4u) + 2u * quadrant;
-                int  scale_i8   = load_i8(block_off + 192u + sb);
+                uint sb_base = h * 8u + (tid >> 4u);
+                int  sc0 = load_i8(block_off + 192u + sb_base + 0u);
+                int  sc1 = load_i8(block_off + 192u + sb_base + 2u);
+                int  sc2 = load_i8(block_off + 192u + sb_base + 4u);
+                int  sc3 = load_i8(block_off + 192u + sb_base + 6u);
 
-                uint ql_byte    = load_byte(block_off + h * 64u + (quadrant & 1u) * 32u + l);
-                uint qh_byte    = load_byte(block_off + 128u + h * 32u + l);
+                for (uint quadrant = 0u; quadrant < 4u; ++quadrant) {
+                    uint ql_byte   = ((quadrant & 1u) == 0u) ? ql_lo : ql_hi;
+                    uint ql_nibble = (ql_byte >> ((quadrant >> 1u) * 4u)) & 0x0Fu;
+                    uint qh_bits   = (qh      >>  (quadrant       * 2u)) & 0x03u;
+                    int  q         = int(ql_nibble | (qh_bits << 4u)) - 32;
 
-                uint ql_nibble  = (ql_byte >> ((quadrant >> 1u) * 4u)) & 0x0Fu;
-                uint qh_bits    = (qh_byte >> (quadrant * 2u))         & 0x03u;
-                int  q          = int(ql_nibble | (qh_bits << 4u)) - 32;
+                    int scale_i8 = (quadrant == 0u) ? sc0
+                                 : (quadrant == 1u) ? sc1
+                                 : (quadrant == 2u) ? sc2
+                                 :                    sc3;
 
-                uint e          = h * 128u + quadrant * 32u + l;
-                uint k          = b * BLOCK_K + e;
-                uint pkx        = x[k >> 1u];
-                float xv        = ((k & 1u) == 0u)
-                    ? bf16_expand( pkx        & 0xffffu)
-                    : bf16_expand((pkx >> 16) & 0xffffu);
+                    uint e   = h * 128u + quadrant * 32u + tid;
+                    uint k   = b * BLOCK_K + e;
+                    uint pkx = x[k >> 1u];
+                    float xv = ((k & 1u) == 0u)
+                        ? bf16_expand( pkx        & 0xffffu)
+                        : bf16_expand((pkx >> 16) & 0xffffu);
 
-                acc[r] += d * float(scale_i8) * float(q) * xv;
+                    acc[r] += d * float(scale_i8) * float(q) * xv;
+                }
             }
         }
     }

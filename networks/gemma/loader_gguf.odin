@@ -85,7 +85,7 @@ load_gguf :: proc(model: ^Gemma, path: string) -> bool {
 		      _load_norm_f32_to_dtype(loader, layer.post_per_layer_input_norm_weight, fmt.tprintf("%v.post_norm.weight",            prefix), 1.0) &&
 		      _load_norm_f32_to_dtype(loader, layer.q_norm_weight,                    fmt.tprintf("%v.attn_q_norm.weight",          prefix), q_norm_scale) &&
 		      _load_norm_f32_to_dtype(loader, layer.layer_scalar,                     fmt.tprintf("%v.layer_output_scale.weight",   prefix), 1.0) &&
-		      _load_rope_permuted_dequant(loader, &layer.q_proj_weight,               fmt.tprintf("%v.attn_q.weight",               prefix), cfg.num_attention_heads, head_dim) &&
+		      _load_rope_permuted_q(loader, &layer.q_proj_weight,               fmt.tprintf("%v.attn_q.weight",               prefix), cfg.num_attention_heads, head_dim) &&
 		      _load_quant_passthrough(loader, &layer.o_proj_weight,                   fmt.tprintf("%v.attn_output.weight",          prefix)) &&
 		      _load_quant_passthrough(loader, &layer.gate_proj_weight,                fmt.tprintf("%v.ffn_gate.weight",             prefix)) &&
 		      _load_quant_passthrough(loader, &layer.up_proj_weight,                  fmt.tprintf("%v.ffn_up.weight",               prefix)) &&
@@ -95,7 +95,7 @@ load_gguf :: proc(model: ^Gemma, path: string) -> bool {
 		if !ok do return false
 
 		if !is_kv_shared_layer(cfg, layer_idx) {
-			ok2 := _load_rope_permuted_dequant(loader, &layer.k_proj_weight,       fmt.tprintf("%v.attn_k.weight", prefix), cfg.num_key_value_heads, head_dim) &&
+			ok2 := _load_rope_permuted_q(loader, &layer.k_proj_weight,       fmt.tprintf("%v.attn_k.weight", prefix), cfg.num_key_value_heads, head_dim) &&
 			       _load_quant_passthrough(loader, &layer.v_proj_weight,           fmt.tprintf("%v.attn_v.weight",      prefix)) &&
 			       _load_norm_f32_to_dtype(loader, layer.k_norm_weight,            fmt.tprintf("%v.attn_k_norm.weight", prefix), 1.0)
 			if !ok2 do return false
@@ -157,15 +157,14 @@ _load_quant_passthrough :: proc(loader: gguf.Loader, target_ptr: ^ml.Tensor, nam
 // head), but ggml's neox-style RoPE — which is what our `ml.rope` op does —
 // expects interleaved-pair form. The convert_hf_to_gguf.py for Gemma 4 has
 // a comment noting it intentionally doesn't permute and uses ROPE_FREQS to
-// disable rotation on the unrotated dims; we instead permute on load to
-// match our existing forward.
+// disable rotation on the unrotated dims; we instead permute on load.
 //
-// The trade-off: Q4_K bytes can't be permuted without dequantizing, so this
-// path dequantizes to f32, applies the same permutation as
-// `_load_rope_permuted` in loader.odin, and writes Bf16. We lose Q4_K
-// compression for q_proj / k_proj (~500 MB on E4B). A `permuted Q4_K` form
-// could win that back later.
-_load_rope_permuted_dequant :: proc(loader: gguf.Loader, target_ptr: ^ml.Tensor, name: string, head_count, head_size: int) -> bool {
+// Q4_K (and Q6_K) quantize along the inner (input_size) axis into 256-element
+// super-blocks; the permutation reorders OUTPUT ROWS, leaving each row's
+// super-blocks untouched. So we can do this as a pure byte-level row shuffle
+// without dequantizing — preserving the Q4_K / Q6_K compression for q_proj
+// and k_proj (~500 MB win on E4B vs an f32-dequant-and-bf16-encode path).
+_load_rope_permuted_q :: proc(loader: gguf.Loader, target_ptr: ^ml.Tensor, name: string, head_count, head_size: int) -> bool {
 	info, info_ok := gguf.get_info(loader, name)
 	if !info_ok {
 		fmt.eprintfln("gemma.load_gguf: missing tensor %q", name)
@@ -184,47 +183,49 @@ _load_rope_permuted_dequant :: proc(loader: gguf.Loader, target_ptr: ^ml.Tensor,
 		return false
 	}
 
-	bytes, bytes_ok := gguf.get_bytes(loader, name)
-	if !bytes_ok do return false
-
-	count := ml.len(target)
-	source := builtin.make([]f32, count, context.temp_allocator)
+	new_dtype: ml.Data_Type
+	bytes_per_block: int
 	#partial switch info.type {
-	case .Q4_K: gguf.dequantize_q4_k(bytes, source)
-	case .Q6_K: gguf.dequantize_q6_k(bytes, source)
-	case .F32:
-		src := slice.from_ptr((^f32)(raw_data(bytes)), count)
-		builtin.copy(source, src)
+	case .Q4_K: new_dtype = .Q4_K; bytes_per_block = ml.Q4_K_BLOCK_BYTES
+	case .Q6_K: new_dtype = .Q6_K; bytes_per_block = ml.Q6_K_BLOCK_BYTES
 	case:
-		fmt.eprintfln("gemma.load_gguf: %q unsupported source dtype %v for permuted dequant", name, info.type)
+		fmt.eprintfln("gemma.load_gguf: %q unsupported source dtype %v for row-permuted load", name, info.type)
 		return false
 	}
 
-	// Permutation matches `_load_rope_permuted` in loader.odin: per head,
-	// pair (i, half_size + i) of the source becomes pair (2i, 2i+1) of
-	// the destination.
+	src_bytes, bytes_ok := gguf.get_bytes(loader, name)
+	if !bytes_ok do return false
+
 	embedding_size := target_shape[1]
 	half_size      := head_size / 2
-	permuted := builtin.make([]f32, count, context.temp_allocator)
+	if embedding_size % ml.K_QUANT_BLOCK_SIZE != 0 {
+		fmt.eprintfln("gemma.load_gguf: %q embedding_size=%v not a multiple of 256", name, embedding_size)
+		return false
+	}
+	row_bytes := (embedding_size / ml.K_QUANT_BLOCK_SIZE) * bytes_per_block
+	total_bytes := target_shape[0] * row_bytes
+	if builtin.len(src_bytes) != total_bytes {
+		fmt.eprintfln("gemma.load_gguf: %q byte count %v != expected %v", name, builtin.len(src_bytes), total_bytes)
+		return false
+	}
+
+	// Per head, src row `i` → dst row `2i`, src row `half_size + i` → dst row `2i+1`.
+	dst_bytes := builtin.make([]byte, total_bytes, context.temp_allocator)
 	for h in 0 ..< head_count {
-		head_offset := h * head_size * embedding_size
+		head_offset := h * head_size * row_bytes
 		for i in 0 ..< half_size {
-			even_dst := head_offset + (2 * i + 0)         * embedding_size
-			odd_dst  := head_offset + (2 * i + 1)         * embedding_size
-			even_src := head_offset + (i)                 * embedding_size
-			odd_src  := head_offset + (half_size + i)     * embedding_size
-			builtin.copy(permuted[even_dst:even_dst + embedding_size], source[even_src:even_src + embedding_size])
-			builtin.copy(permuted[odd_dst :odd_dst  + embedding_size], source[odd_src :odd_src  + embedding_size])
+			even_dst := head_offset + (2 * i + 0)     * row_bytes
+			odd_dst  := head_offset + (2 * i + 1)     * row_bytes
+			even_src := head_offset + (i)             * row_bytes
+			odd_src  := head_offset + (half_size + i) * row_bytes
+			builtin.copy(dst_bytes[even_dst:even_dst + row_bytes], src_bytes[even_src:even_src + row_bytes])
+			builtin.copy(dst_bytes[odd_dst :odd_dst  + row_bytes], src_bytes[odd_src :odd_src  + row_bytes])
 		}
 	}
 
-	// Replace the placeholder with a Bf16 tensor; encode floats and write.
 	ml.destroy(target)
-	new_t := ml.alloc(.Bf16, target_shape, persistent=true, buffers=ml.Buffer_Set{.Data})
-	bytes_out := builtin.make([]byte, count * 2, context.temp_allocator)
-	bf := ([^]ml.Bf16)(raw_data(bytes_out))
-	for v, i in permuted do bf[i] = ml.bf16_from_f32(v)
-	ml.set_data_bytes(new_t, bytes_out)
+	new_t := ml.alloc(new_dtype, target_shape, persistent=true, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(new_t, dst_bytes)
 	target_ptr^ = new_t
 	return true
 }

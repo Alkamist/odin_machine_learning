@@ -1,0 +1,77 @@
+// Bf16 GEMV specialization for M=1 decode-shape forwards. Mirrors
+// linear_q4_gemv.comp's structure (WG=32, ROWS_PER_WG=2, subgroupAdd
+// reduce) but reads bf16 weights directly without any dequantization.
+//
+// The tiled bf16 linear path (TILE_M=32) wastes 31/32 of M-dim compute
+// for M=1 decode; on Gemma 4 GGUF in particular `lm_head` is 1.34 GB of
+// bf16 weight, so the GEMV-shape shader cuts ~10× off that single op.
+//
+// Layout:
+//   x [1, K] bf16, packed (two halves per uint)
+//   w [N, K] bf16, packed (two halves per uint, row-major)
+//   y [1, N] bf16, packed
+// Requires: K % 2 == 0; N % ROWS_PER_WG == 0.
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "bf16.glsl"
+
+#define WG          32
+#define ROWS_PER_WG  2
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { uint x[]; };
+layout(set = 0, binding = 1) readonly  buffer W { uint w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { uint y[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+} p;
+
+void main() {
+    uint group_idx = gl_WorkGroupID.x;
+    uint n_base    = group_idx * ROWS_PER_WG;
+    uint tid       = gl_LocalInvocationID.x;
+
+    float acc[ROWS_PER_WG];
+    for (uint r = 0u; r < ROWS_PER_WG; ++r) acc[r] = 0.0;
+
+    uint half_K = p.K / 2u; // packed-uint count per row
+
+    // Each thread strides over the K dimension at stride WG (in uint units),
+    // processing one packed uint = 2 bf16 elements per inner iteration. The
+    // X vector is read once per group of K elements and reused across all
+    // ROWS_PER_WG output rows.
+    for (uint k_uint = tid; k_uint < half_K; k_uint += WG) {
+        uint pkx = x[k_uint];
+        float xv0 = bf16_expand( pkx        & 0xffffu);
+        float xv1 = bf16_expand((pkx >> 16) & 0xffffu);
+
+        for (uint r = 0u; r < ROWS_PER_WG; ++r) {
+            uint n = n_base + r;
+            if (n >= p.N) continue;
+
+            uint pkw = w[n * half_K + k_uint];
+            float wv0 = bf16_expand( pkw        & 0xffffu);
+            float wv1 = bf16_expand((pkw >> 16) & 0xffffu);
+
+            acc[r] += xv0 * wv0 + xv1 * wv1;
+        }
+    }
+
+    float total[ROWS_PER_WG];
+    for (uint r = 0u; r < ROWS_PER_WG; ++r) total[r] = subgroupAdd(acc[r]);
+
+    if (tid == 0u) {
+        for (uint pair = 0u; pair < ROWS_PER_WG / 2u; ++pair) {
+            uint n_lo = n_base + 2u * pair;
+            if (n_lo >= p.N) break;
+            uint n_hi = n_lo + 1u;
+            uint lo_b = bf16_round(total[2u * pair]);
+            uint hi_b = (n_hi < p.N) ? bf16_round(total[2u * pair + 1u]) : 0u;
+            y[n_lo >> 1u] = (hi_b << 16) | lo_b;
+        }
+    }
+}

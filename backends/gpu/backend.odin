@@ -1152,6 +1152,24 @@ linear_forward :: proc(op: ml.Operation) {
 			1,
 		)
 	case .Bf16:
+		// Decode (M=1) shape: use the GEMV-shape shader. The tiled bf16 path
+		// (TILE_M=32) wastes 31/32 of M-dim compute, which is the dominant
+		// cost on Gemma 4 GGUF — lm_head reads 1.34 GB of bf16 weight per
+		// token, plus q_proj/k_proj. One workgroup per pair of output rows
+		// so adjacent bf16-packed writes don't collide.
+		if count == 1 && input_size % 2 == 0 && output_size % LINEAR_BF16_GEMV_ROWS_PER == 0 {
+			if _linear_bf16_gemv_pipeline == nil {
+				_linear_bf16_gemv_pipeline = _make_pipeline(LINEAR_BF16_GEMV_SPIRV, 3, size_of(Linear_Params))
+			}
+			_dispatch(
+				_linear_bf16_gemv_pipeline, bufs[:], &params,
+				_div_up(output_size, LINEAR_BF16_GEMV_ROWS_PER),
+				1,
+				1,
+			)
+			return
+		}
+
 		coopmat_eligible := _gpu.coopmat_bf16 &&
 			count       % LINEAR_BF16_COOPMAT_BM == 0 &&
 			output_size % LINEAR_BF16_COOPMAT_BN == 0 &&

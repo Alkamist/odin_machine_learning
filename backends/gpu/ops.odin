@@ -27,6 +27,8 @@ LINEAR_BF16_LOCAL_Y :: 64   // must match TILE_N in shaders/linear_bf16.comp
 LINEAR_BF16_COOPMAT_BM :: 64
 LINEAR_BF16_COOPMAT_BN :: 64
 LINEAR_BF16_COOPMAT_BK :: 16
+LINEAR_BF16_GEMV_SPIRV    :: #load("shaders/linear/linear_bf16_gemv.spv", []u8)
+LINEAR_BF16_GEMV_ROWS_PER :: 2  // must match ROWS_PER_WG in shaders/linear_bf16_gemv.comp
 LINEAR_Q4_SPIRV         :: #load("shaders/linear/linear_q4.spv",      []u8)
 LINEAR_Q4_GEMV_SPIRV    :: #load("shaders/linear/linear_q4_gemv.spv", []u8)
 LINEAR_Q4_LOCAL_X       :: 32   // must match TILE_M in shaders/linear_q4.comp
@@ -40,6 +42,7 @@ Linear_Params :: struct { count, input_size, output_size: u32 }
 _linear_pipeline:              ^Pipeline
 _linear_bf16_pipeline:         ^Pipeline
 _linear_bf16_coopmat_pipeline: ^Pipeline
+_linear_bf16_gemv_pipeline:    ^Pipeline
 _linear_q4_pipeline:           ^Pipeline
 _linear_q4_gemv_pipeline:      ^Pipeline
 _linear_q4_k_gemv_pipeline:    ^Pipeline
