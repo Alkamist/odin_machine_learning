@@ -494,8 +494,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 		hidden := ml.rmsnorm(residual, layer.input_norm_weight, cfg.rms_norm_eps)
 
 		q := _linear(hidden, layer.q_proj_weight)
-		q  = _qkv_norm(model, q, layer.q_norm_weight, cfg.num_attention_heads, head_dim, cfg.rms_norm_eps)
-		q  = ml.rope(q, cfg.num_attention_heads, rope_base, cache_position, rope_fraction)
+		q  = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
 
 		// Shared layers reuse the source layer's K/V tensors (computed
 		// earlier in this same forward) and write into the source layer's
@@ -512,8 +511,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 			v = step_kvs[source].v
 		} else {
 			k = _linear(hidden, layer.k_proj_weight)
-			k = _qkv_norm(model, k, layer.k_norm_weight, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
-			k = ml.rope(k, cfg.num_key_value_heads, rope_base, cache_position, rope_fraction)
+			k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
 
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
 			v = _linear(hidden, layer.v_proj_weight)
@@ -525,9 +523,8 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 		attn := ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window)
 		attn  = _linear(attn, layer.o_proj_weight)
 		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
-		residual = ml.add(residual, attn)
-
-		mlp_in := ml.rmsnorm(residual, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
+		mlp_in: ml.Tensor
+		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
 		gate   := _linear(mlp_in, layer.gate_proj_weight)
 		up     := _linear(mlp_in, layer.up_proj_weight)
 		mlp    := _linear(ml.gelu_mul(gate, up), layer.down_proj_weight)
@@ -594,8 +591,7 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		hidden := ml.rmsnorm(residual, layer.input_norm_weight, cfg.rms_norm_eps)
 
 		q := _linear(hidden, layer.q_proj_weight)
-		q  = _qkv_norm(model, q, layer.q_norm_weight, cfg.num_attention_heads, head_dim, cfg.rms_norm_eps)
-		q  = ml.rope(q, cfg.num_attention_heads, rope_base, 0, rope_fraction)
+		q  = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, cfg.rms_norm_eps, rope_base, 0, rope_fraction)
 
 		k, v: ml.Tensor
 		if is_kv_shared_layer(cfg, layer_idx) {
@@ -604,8 +600,7 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 			v = shared_values[source]
 		} else {
 			k = _linear(hidden, layer.k_proj_weight)
-			k = _qkv_norm(model, k, layer.k_norm_weight, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
-			k = ml.rope(k, cfg.num_key_value_heads, rope_base, 0, rope_fraction)
+			k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, 0, rope_fraction)
 
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
 			v = _linear(hidden, layer.v_proj_weight)
@@ -619,10 +614,10 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		attn    := ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
 		attn     = _linear(attn, layer.o_proj_weight)
 		attn     = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
-		residual = ml.add(residual, attn)
 
 		// Feedforward.
-		mlp_in  := ml.rmsnorm(residual, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
+		mlp_in: ml.Tensor
+		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
 		gate    := _linear(mlp_in, layer.gate_proj_weight)
 		up      := _linear(mlp_in, layer.up_proj_weight)
 		mlp     := _linear(ml.gelu_mul(gate, up), layer.down_proj_weight)

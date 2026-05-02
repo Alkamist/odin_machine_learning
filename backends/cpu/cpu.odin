@@ -449,6 +449,8 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
+	case ml.Rmsnorm_Rope:       rmsnorm_rope_forward       (op)
+	case ml.Add_Rmsnorm:        add_rmsnorm_forward        (op)
 	case ml.Softmax:            softmax_forward            (op)
 	case ml.Entropy:            entropy_forward            (op)
 	case ml.Log_Softmax:        log_softmax_forward        (op)
@@ -491,6 +493,8 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
+	case ml.Rmsnorm_Rope:       fmt.panicf("CPU rmsnorm_rope_backward: fused rmsnorm+rope is forward-only (inference path)")
+	case ml.Add_Rmsnorm:        fmt.panicf("CPU add_rmsnorm_backward: fused add+rmsnorm is forward-only (inference path)")
 	case ml.Softmax:            softmax_backward           (op)
 	case ml.Entropy:            entropy_backward           (op)
 	case ml.Log_Softmax:        log_softmax_backward       (op)
@@ -1940,6 +1944,155 @@ rmsnorm_forward_bf16 :: proc(op: ml.Operation) {
 		}
 
 		data(rstd)[c] = s
+	}
+}
+
+rmsnorm_rope_forward :: proc(op: ml.Operation) {
+	#partial switch op.input.type {
+	case .F32:  rmsnorm_rope_forward_f32 (op)
+	case .Bf16: rmsnorm_rope_forward_bf16(op)
+	}
+}
+
+rmsnorm_rope_forward_f32 :: proc(op: ml.Operation) {
+	input             := op.input
+	output            := op.output
+	variant           := op.variant.(ml.Rmsnorm_Rope)
+	weight            := variant.weight
+	eps               := variant.eps
+	head_count        := variant.head_count
+	rope_base         := variant.base
+	pos_offset        := variant.position_offset
+	rotate_pair_count := variant.rotate_pair_count
+	token_count       := input.shape[0]
+	head_size         := input.shape[1] / head_count
+	half_head         := head_size / 2
+
+	for t in 0 ..< token_count {
+		for h in 0 ..< head_count {
+			head_offset := t * head_count * head_size + h * head_size
+
+			ms: f32
+			for i in 0 ..< head_size {
+				v := data(input)[head_offset + i]
+				ms += v * v
+			}
+			s: f32 = 1.0 / math.sqrt(ms / f32(head_size) + eps)
+
+			for i in 0 ..< rotate_pair_count {
+				theta   := f32(t + pos_offset) / math.pow(rope_base, f32(i * 2) / f32(head_size))
+				cos_val := math.cos(theta)
+				sin_val := math.sin(theta)
+				n0 := s * data(input)[head_offset + i * 2]     * data(weight)[i * 2]
+				n1 := s * data(input)[head_offset + i * 2 + 1] * data(weight)[i * 2 + 1]
+				data(output)[head_offset + i * 2]     = n0 * cos_val - n1 * sin_val
+				data(output)[head_offset + i * 2 + 1] = n0 * sin_val + n1 * cos_val
+			}
+			for i in rotate_pair_count ..< half_head {
+				data(output)[head_offset + i * 2]     = s * data(input)[head_offset + i * 2]     * data(weight)[i * 2]
+				data(output)[head_offset + i * 2 + 1] = s * data(input)[head_offset + i * 2 + 1] * data(weight)[i * 2 + 1]
+			}
+		}
+	}
+}
+
+rmsnorm_rope_forward_bf16 :: proc(op: ml.Operation) {
+	input             := op.input
+	output            := op.output
+	variant           := op.variant.(ml.Rmsnorm_Rope)
+	weight            := variant.weight
+	eps               := variant.eps
+	head_count        := variant.head_count
+	rope_base         := variant.base
+	pos_offset        := variant.position_offset
+	rotate_pair_count := variant.rotate_pair_count
+	token_count       := input.shape[0]
+	head_size         := input.shape[1] / head_count
+	half_head         := head_size / 2
+
+	x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
+	y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
+	w_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
+
+	for t in 0 ..< token_count {
+		for h in 0 ..< head_count {
+			head_offset := t * head_count * head_size + h * head_size
+
+			ms: f32
+			for i in 0 ..< head_size {
+				v := ml.bf16_to_f32(x_bf[head_offset + i])
+				ms += v * v
+			}
+			s: f32 = 1.0 / math.sqrt(ms / f32(head_size) + eps)
+
+			for i in 0 ..< rotate_pair_count {
+				theta   := f32(t + pos_offset) / math.pow(rope_base, f32(i * 2) / f32(head_size))
+				cos_val := math.cos(theta)
+				sin_val := math.sin(theta)
+				n0 := s * ml.bf16_to_f32(x_bf[head_offset + i * 2])     * ml.bf16_to_f32(w_bf[i * 2])
+				n1 := s * ml.bf16_to_f32(x_bf[head_offset + i * 2 + 1]) * ml.bf16_to_f32(w_bf[i * 2 + 1])
+				y_bf[head_offset + i * 2]     = ml.bf16_from_f32(n0 * cos_val - n1 * sin_val)
+				y_bf[head_offset + i * 2 + 1] = ml.bf16_from_f32(n0 * sin_val + n1 * cos_val)
+			}
+			for i in rotate_pair_count ..< half_head {
+				n0 := s * ml.bf16_to_f32(x_bf[head_offset + i * 2])     * ml.bf16_to_f32(w_bf[i * 2])
+				n1 := s * ml.bf16_to_f32(x_bf[head_offset + i * 2 + 1]) * ml.bf16_to_f32(w_bf[i * 2 + 1])
+				y_bf[head_offset + i * 2]     = ml.bf16_from_f32(n0)
+				y_bf[head_offset + i * 2 + 1] = ml.bf16_from_f32(n1)
+			}
+		}
+	}
+}
+
+add_rmsnorm_forward :: proc(op: ml.Operation) {
+	a       := op.input
+	normed  := op.output
+	variant := op.variant.(ml.Add_Rmsnorm)
+	b       := variant.b
+	weight  := variant.weight
+	resid   := variant.residual_out
+	eps     := variant.eps
+	size    := a.shape[a.rank - 1]
+	count   := ml.len(a) / size
+
+	#partial switch a.type {
+	case .F32:
+		for c in 0 ..< count {
+			offset := c * size
+
+			ms: f32
+			for i in 0 ..< size {
+				v := data(a)[offset + i] + data(b)[offset + i]
+				data(resid)[offset + i] = v
+				ms += v * v
+			}
+			s: f32 = 1.0 / math.sqrt(ms / f32(size) + eps)
+			for i in 0 ..< size {
+				data(normed)[offset + i] = s * data(resid)[offset + i] * data(weight)[i]
+			}
+		}
+	case .Bf16:
+		a_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Data]))
+		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
+		w_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
+		r_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)resid.buffers [.Data]))
+		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)normed.buffers[.Data]))
+		for c in 0 ..< count {
+			offset := c * size
+
+			ms: f32
+			for i in 0 ..< size {
+				v := ml.bf16_from_f32(ml.bf16_to_f32(a_bf[offset + i]) + ml.bf16_to_f32(b_bf[offset + i]))
+				r_bf[offset + i] = v
+				vf := ml.bf16_to_f32(v)
+				ms += vf * vf
+			}
+			s: f32 = 1.0 / math.sqrt(ms / f32(size) + eps)
+			for i in 0 ..< size {
+				y := s * ml.bf16_to_f32(r_bf[offset + i]) * ml.bf16_to_f32(w_bf[i])
+				y_bf[offset + i] = ml.bf16_from_f32(y)
+			}
+		}
 	}
 }
 

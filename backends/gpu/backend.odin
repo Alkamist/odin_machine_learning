@@ -320,6 +320,8 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
+	case ml.Rmsnorm_Rope:       rmsnorm_rope_forward       (op)
+	case ml.Add_Rmsnorm:        add_rmsnorm_forward        (op)
 	case ml.Softmax:            softmax_forward            (op)
 	case ml.Entropy:            entropy_forward            (op)
 	case ml.Log_Softmax:        log_softmax_forward        (op)
@@ -365,6 +367,8 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
+	case ml.Rmsnorm_Rope:       fmt.panicf("GPU rmsnorm_rope_backward: fused rmsnorm+rope is forward-only (inference path)")
+	case ml.Add_Rmsnorm:        fmt.panicf("GPU add_rmsnorm_backward: fused add+rmsnorm is forward-only (inference path)")
 	case ml.Softmax:            softmax_backward           (op)
 	case ml.Entropy:            entropy_backward           (op)
 	case ml.Log_Softmax:        log_softmax_backward       (op)
@@ -1604,6 +1608,58 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 	fwd_params := Rmsnorm_Params{count = u32(count), size = u32(size), eps = variant.eps}
 	fwd_bufs   := [3]vk.Buffer{data(input).buffer, data(variant.weight).buffer, data(output).buffer}
 	_dispatch(fwd_pipe, fwd_bufs[:], &fwd_params, u32(count))
+}
+
+rmsnorm_rope_forward :: proc(op: ml.Operation) {
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Rmsnorm_Rope)
+	fmt.assertf(input.type == .Bf16, "GPU rmsnorm_rope: only Bf16 implemented (got %v)", input.type)
+
+	token_count := input.shape[0]
+	head_size   := input.shape[1] / variant.head_count
+	fmt.assertf(head_size % 2 == 0, "GPU rmsnorm_rope requires even head_size (got %v)", head_size)
+
+	if _rmsnorm_rope_bf16_pipeline == nil {
+		_rmsnorm_rope_bf16_pipeline = _make_pipeline(RMSNORM_ROPE_BF16_SPIRV, 3, size_of(Rmsnorm_Rope_Bf16_Params))
+	}
+
+	params := Rmsnorm_Rope_Bf16_Params{
+		token_count       = u32(token_count),
+		head_count        = u32(variant.head_count),
+		head_size         = u32(head_size),
+		eps               = variant.eps,
+		base              = variant.base,
+		position_offset   = u32(variant.position_offset),
+		rotate_pair_count = u32(variant.rotate_pair_count),
+	}
+	bufs := [3]vk.Buffer{data(input).buffer, data(variant.weight).buffer, data(output).buffer}
+	_dispatch(_rmsnorm_rope_bf16_pipeline, bufs[:], &params, u32(token_count * variant.head_count))
+}
+
+add_rmsnorm_forward :: proc(op: ml.Operation) {
+	a       := op.input
+	normed  := op.output
+	variant := op.variant.(ml.Add_Rmsnorm)
+	fmt.assertf(a.type == .Bf16, "GPU add_rmsnorm: only Bf16 implemented (got %v)", a.type)
+
+	size  := a.shape[a.rank - 1]
+	count := ml.len(a) / size
+	fmt.assertf(size % 2 == 0, "GPU add_rmsnorm requires even trailing dim (got %v)", size)
+
+	if _add_rmsnorm_bf16_pipeline == nil {
+		_add_rmsnorm_bf16_pipeline = _make_pipeline(ADD_RMSNORM_BF16_SPIRV, 5, size_of(Add_Rmsnorm_Bf16_Params))
+	}
+
+	params := Add_Rmsnorm_Bf16_Params{count = u32(count), size = u32(size), eps = variant.eps}
+	bufs := [5]vk.Buffer{
+		data(a).buffer,
+		data(variant.b).buffer,
+		data(variant.weight).buffer,
+		data(variant.residual_out).buffer,
+		data(normed).buffer,
+	}
+	_dispatch(_add_rmsnorm_bf16_pipeline, bufs[:], &params, u32(count))
 }
 
 rmsnorm_backward :: proc(op: ml.Operation) {

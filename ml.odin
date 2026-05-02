@@ -458,6 +458,8 @@ Operation_Variant :: union {
 	Rope,
 	Layernorm,
 	Rmsnorm,
+	Rmsnorm_Rope,
+	Add_Rmsnorm,
 	Softmax,
 	Entropy,
 	Log_Softmax,
@@ -1247,6 +1249,96 @@ rmsnorm :: proc(input, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #c
 			weight = weight,
 			rstd   = rstd,
 			eps    = eps,
+		},
+	}
+	_current_ctx.backend.forward(op, loc)
+	append_operation(op, loc=loc)
+
+	return
+}
+
+// Fused rmsnorm-with-weight + rope. Inference-only. Input is laid out as
+// `[token_count, head_count * head_size]` (the rope shape); the rmsnorm runs
+// per-head (size = head_size) using `weight` of length head_size, then RoPE
+// rotates the first `rotate_pair_count` pairs of each head.
+Rmsnorm_Rope :: struct {
+	weight:            Tensor,
+	eps:               f32,
+	head_count:        int,
+	base:              f32,
+	position_offset:   int,
+	rotate_pair_count: int,
+}
+
+@(require_results)
+rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32, position_offset: int, rope_fraction: f32, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank == 2, "rmsnorm_rope requires rank-2 input [tokens, head_count*head_size]", loc=loc)
+	assert(weight.rank == 1, "rmsnorm_rope weight must be 1-D", loc=loc)
+	assert(input.type == weight.type, "rmsnorm_rope input and weight dtype must match", loc=loc)
+	assert(eps > 0, "rmsnorm_rope eps must be positive", loc=loc)
+	assert(rope_fraction > 0 && rope_fraction <= 1, "rope_fraction must be in (0, 1]", loc=loc)
+
+	input_size := input.shape[1]
+	assert(input_size % head_count == 0, "Trailing dim must be divisible by head count", loc=loc)
+	head_size := input_size / head_count
+	assert(head_size % 2 == 0, "Head size must be even", loc=loc)
+	assert(weight.shape[0] == head_size, "rmsnorm_rope weight length must equal head_size", loc=loc)
+
+	half_head         := head_size / 2
+	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
+	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
+
+	output = zeros_like(input, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Rmsnorm_Rope{
+			weight            = weight,
+			eps               = eps,
+			head_count        = head_count,
+			base              = base,
+			position_offset   = position_offset,
+			rotate_pair_count = rotate_pair_count,
+		},
+	}
+	_current_ctx.backend.forward(op, loc)
+	append_operation(op, loc=loc)
+
+	return
+}
+
+// Fused (residual = a + b) → rmsnorm-with-weight. Inference-only. Writes both
+// the new residual (for downstream consumers) and the normalized output. The
+// fused dispatch eliminates the standalone `add` shader and the residual
+// round-trip on the rmsnorm input read.
+Add_Rmsnorm :: struct {
+	b:            Tensor,
+	weight:       Tensor,
+	eps:          f32,
+	residual_out: Tensor,
+}
+
+@(require_results)
+add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #caller_location) -> (residual_new, normed: Tensor) {
+	assert(a.rank == b.rank, "add_rmsnorm a/b rank must match", loc=loc)
+	assert(a.type == b.type && a.type == weight.type, "add_rmsnorm a/b/weight dtypes must match", loc=loc)
+	assert(weight.rank == 1, "add_rmsnorm weight must be 1-D", loc=loc)
+	assert(weight.shape[0] == a.shape[a.rank - 1], "add_rmsnorm weight length must equal trailing dim", loc=loc)
+	assert(eps > 0, "add_rmsnorm eps must be positive", loc=loc)
+	for d in 0 ..< a.rank do assert(a.shape[d] == b.shape[d], "add_rmsnorm a/b shape must match", loc=loc)
+
+	residual_new = zeros_like(a, loc=loc)
+	normed       = zeros_like(a, loc=loc)
+
+	op := Operation{
+		input   = a,
+		output  = normed,
+		variant = Add_Rmsnorm{
+			b            = b,
+			weight       = weight,
+			eps          = eps,
+			residual_out = residual_new,
 		},
 	}
 	_current_ctx.backend.forward(op, loc)

@@ -312,6 +312,57 @@ intermediate fp16 round-trips fell out).
   the signed `dotPacked4x8EXT` directly rather than the mixed-signedness
   variant. Matches llama.cpp's `mul_mat_vecq_funcs.glsl` for Q4_K.
 
+## Op-fusion round 2 (rmsnorm+rope, add+rmsnorm)
+
+### Fused `rmsnorm + rope` for q_norm/k_norm
+
+`_qkv_norm` (rmsnorm-with-weight per head) immediately feeds `ml.rope` for
+q and k. Built `rmsnorm_rope_bf16.comp`: WG=128, one workgroup per
+(token, head). Per WG: stage 1 reads X, accumulates sum-of-squares, reduces
+in shared. Stage 2 re-reads X, multiplies by W and rstd, applies the RoPE
+rotation in registers, writes Y. Eliminates 60 dispatches per token
+(30 layers × {q,k}) plus the bf16 round-trip on the rmsnorm output.
+
+`Rmsnorm_Rope` op variant in `ml.odin`, GPU + CPU forwards, backward panics.
+
+A/B (3 runs each, median):
+- mmvq baseline:     43.82 tok/s (22.8 ms/tok)
+- rmsnorm+rope fused: 44.5 tok/s (22.5 ms/tok) → ~+1.6%
+
+### Fused `add + rmsnorm` for the post-attention residual
+
+Pattern in every layer: `residual = add(residual, attn); mlp_in =
+rmsnorm(residual, pre_ffn_norm, eps)`. Built `add_rmsnorm_bf16.comp`:
+5 bindings (A, B, W, R out, Y out). Stage 1 computes `r = bf16_round(a+b)`,
+stores it (downstream layer ops still need the new residual), and accumulates
+sum-of-squares over the rounded sum. Stage 2 re-derives the rounded sum from
+A, B (avoids the R round-trip) and emits Y = rstd * r * w. New `Add_Rmsnorm`
+variant returning two tensors (residual_new, normed). 30 dispatches saved
+per token plus the residual round-trip.
+
+A/B (3 runs each, median):
+- rmsnorm+rope only:  44.5 tok/s (22.5 ms/tok)
+- add+rmsnorm added:  44.0 tok/s (22.7 ms/tok) → wall wash
+
+Total GPU work across 128 tokens dropped 2364 → 2099 ms (-11%) but wall
+didn't move materially. The dispatch saved is short-lived per-element work;
+the per-dispatch CPU recording and queue submission tax probably stays
+roughly fixed. Logits unchanged (max abs 9.2171). Kept the fusion anyway —
+the GPU-work reduction is real and compounds with later dispatch-count
+reductions (e.g. pre-recorded command buffer).
+
+### Cumulative
+
+| stage | tok/s | ms/tok |
+|---|---|---|
+| mmvq (round-1 end)   | 43.82 | 22.8 |
+| + rmsnorm_rope fuse  | 44.5  | 22.5 |
+| + add_rmsnorm fuse   | 44.0  | 22.7 |
+
+About +0.5% wall throughput from this round, ~11% GPU-work reduction.
+The remaining wall slack is per-dispatch CPU/queue tax — the next leverage
+is pre-recorded command buffers (#5 in the original gap table).
+
 ## Things we tried that didn't matter (or backfired)
 
 - **Push descriptors** (`VK_KHR_push_descriptor`): replaced per-dispatch

@@ -162,6 +162,19 @@ _rmsnorm_stats_bf16_pipeline:       ^Pipeline
 _rmsnorm_back_input_bf16_pipeline:  ^Pipeline
 _rmsnorm_back_weight_bf16_pipeline: ^Pipeline
 
+RMSNORM_ROPE_BF16_SPIRV :: #load("shaders/rmsnorm/rmsnorm_rope_bf16.spv", []u8)
+Rmsnorm_Rope_Bf16_Params :: struct {
+	token_count, head_count, head_size: u32,
+	eps:                                f32,
+	base:                               f32,
+	position_offset, rotate_pair_count: u32,
+}
+_rmsnorm_rope_bf16_pipeline: ^Pipeline
+
+ADD_RMSNORM_BF16_SPIRV :: #load("shaders/rmsnorm/add_rmsnorm_bf16.spv", []u8)
+Add_Rmsnorm_Bf16_Params :: struct { count, size: u32, eps: f32 }
+_add_rmsnorm_bf16_pipeline: ^Pipeline
+
 SOFTMAX_SPIRV           :: #load("shaders/softmax/softmax.spv",           []u8)
 SOFTMAX_BACK_SPIRV      :: #load("shaders/softmax/softmax_back.spv",      []u8)
 SOFTMAX_BF16_SPIRV      :: #load("shaders/softmax/softmax_bf16.spv",      []u8)
