@@ -16,11 +16,6 @@ K_QUANT_BLOCK_SIZE      :: 256
 Q4_K_BLOCK_BYTES        :: 144
 Q6_K_BLOCK_BYTES        :: 210
 
-// `Q4_K` and `Q6_K` are GGUF "k-quant" block formats: 256 weights packed
-// into 144-byte (Q4_K) or 210-byte (Q6_K) super-blocks. A super-block bundles
-// the quants, the per-sub-block 6-bit scale + 6-bit min (Q4_K) or i8 scale
-// (Q6_K), and the fp16 super-scale together in one byte stream.
-// `data_type_size` returns 0 for these; use `_data_byte_count` to size buffers.
 Data_Type :: enum u8 {
 	Bf16,
 	F32,
@@ -110,9 +105,6 @@ Context :: struct {
 	operation_count: int,
 	operations:      [MAX_OPERATIONS]Operation,
 
-	// When true, `zeros` (and op-internal activation allocations) skip the
-	// `.Gradient` buffer. Backward will assert if called. Halves activation
-	// memory pressure for inference; wall-time impact is small.
 	inference_only: bool,
 
 	previous_ctx: ^Context,
@@ -474,6 +466,7 @@ Operation_Variant :: union {
 	Relu,
 	Sigmoid,
 	Gelu,
+	Gelu_Mul,
 	Silu,
 	Tanh,
 	Batched_Matmul,
@@ -759,6 +752,28 @@ mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		input   = a,
 		output  = output,
 		variant = Mul{b = b},
+	}
+	_current_ctx.backend.forward(op, loc)
+	append_operation(op, loc=loc)
+
+	return
+}
+
+Gelu_Mul :: struct {
+	b: Tensor,
+}
+
+@(require_results)
+gelu_mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(len(a) % len(b) == 0, "gelu_mul: A length must be divisible by B length", loc=loc)
+	assert(a.type == b.type, "gelu_mul inputs must have the same dtype", loc=loc)
+
+	output = zeros_like(a, loc=loc)
+
+	op := Operation{
+		input   = a,
+		output  = output,
+		variant = Gelu_Mul{b = b},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -1065,10 +1080,6 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 	return
 }
 
-// GGUF k-quant linear ops. The block format bundles the 4-bit (Q4_K) or
-// 6-bit (Q6_K) quants with their per-sub-block scales/mins and an fp16
-// super-scale into a single byte stream — there's no separate scales
-// tensor. The shader / CPU implementation unpacks on the fly.
 Linear_Q4_K :: struct {
 	weight: Tensor, // .Q4_K logical shape [output_size, input_size]; input_size % 256 == 0
 }
@@ -1323,8 +1334,6 @@ Cross_Entropy :: struct {
 	targets:       []int,
 }
 
-// Cross entropy performs softmax internally, so it expects the input
-// to not already be softmaxed.
 @(require_results)
 cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) -> (output: Tensor) {
 	sample_count := builtin.len(targets)

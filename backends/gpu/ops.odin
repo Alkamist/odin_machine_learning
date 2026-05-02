@@ -109,6 +109,10 @@ _gelu_back_pipeline:      ^Pipeline
 _gelu_bf16_pipeline:      ^Pipeline
 _gelu_back_bf16_pipeline: ^Pipeline
 
+GELU_MUL_BF16_SPIRV :: #load("shaders/gelu_mul/gelu_mul_bf16.spv", []u8)
+Gelu_Mul_Bf16_Params :: struct { n, n_b, pair_count: u32 }
+_gelu_mul_bf16_pipeline: ^Pipeline
+
 LAYERNORM_SPIRV                  :: #load("shaders/layernorm/layernorm.spv",                  []u8)
 LAYERNORM_STATS_SPIRV            :: #load("shaders/layernorm/layernorm_stats.spv",            []u8)
 LAYERNORM_BACK_INPUT_SPIRV       :: #load("shaders/layernorm/layernorm_back_input.spv",       []u8)

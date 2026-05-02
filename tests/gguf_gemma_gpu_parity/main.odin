@@ -63,7 +63,7 @@ main :: proc() {
 	}
 	fmt.printfln("Loaded GGUF in %.1f s.", time.duration_seconds(time.tick_since(t_load)))
 
-	cache := gemma.cache_make(model, 64)
+	cache := gemma.cache_make(model, 256)
 	defer gemma.cache_destroy(cache)
 
 	vocab_size := expected_shape[1]
@@ -102,6 +102,27 @@ main :: proc() {
 	}
 	total_s := time.duration_seconds(time.tick_since(t_total))
 	fmt.printfln("Total: %.2f s for %v tokens (%.2f tok/s)", total_s, builtin.len(tokens), f64(builtin.len(tokens)) / total_s)
+
+	// Steady-state decode benchmark. Drives forward_cached with the last
+	// token from the prompt; cache keeps growing past prompt length. The
+	// 5-token parity prompt is too short to measure small GPU changes
+	// reliably, so we follow up with a longer warm + timed run.
+	BENCH_WARMUP :: 32
+	BENCH_RUN    :: 128
+	last_tok := tokens[builtin.len(tokens) - 1]
+	for _ in 0 ..< BENCH_WARMUP {
+		_ = gemma.forward_cached(model, &cache, []int{last_tok})
+		ml.clear()
+	}
+	gpu.reset_timing()
+	t_bench := time.tick_now()
+	for _ in 0 ..< BENCH_RUN {
+		_ = gemma.forward_cached(model, &cache, []int{last_tok})
+		ml.clear()
+	}
+	bench_s := time.duration_seconds(time.tick_since(t_bench))
+	fmt.printfln("Bench: %v warmup + %v timed -> %.2f tok/s (%.2f ms/tok)",
+		BENCH_WARMUP, BENCH_RUN, f64(BENCH_RUN) / bench_s, 1000.0 * bench_s / f64(BENCH_RUN))
 
 	// Per-pipeline GPU timing aggregated over tokens 1..N (excludes warm-up).
 	fmt.println()

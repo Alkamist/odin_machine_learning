@@ -328,6 +328,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Relu:               relu_forward               (op)
 	case ml.Sigmoid:            sigmoid_forward            (op)
 	case ml.Gelu:               gelu_forward               (op)
+	case ml.Gelu_Mul:           gelu_mul_forward           (op)
 	case ml.Silu:               silu_forward               (op)
 	case ml.Tanh:               tanh_forward               (op)
 	case ml.Batched_Matmul:     batched_matmul_forward     (op)
@@ -372,6 +373,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Relu:               relu_backward              (op)
 	case ml.Sigmoid:            sigmoid_backward           (op)
 	case ml.Gelu:               gelu_backward              (op)
+	case ml.Gelu_Mul:           fmt.panicf("GPU gelu_mul_backward: fused gelu*mul is forward-only (inference path)")
 	case ml.Silu:               silu_backward              (op)
 	case ml.Tanh:               tanh_backward              (op)
 	case ml.Batched_Matmul:     batched_matmul_backward    (op)
@@ -1557,9 +1559,16 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 		fwd_pipe   = _rmsnorm_pipeline
 	}
 
-	stats_params := Rmsnorm_Stats_Params{count = u32(count), size = u32(size), eps = variant.eps}
-	stats_bufs   := [2]vk.Buffer{data(input).buffer, data(variant.rstd).buffer}
-	_dispatch(stats_pipe, stats_bufs[:], &stats_params, u32(count))
+	// The forward shader recomputes rstd internally — the stats dispatch
+	// only writes `variant.rstd` for the backward pass to consume. Skip
+	// it during inference.
+	if !ml.current_context().inference_only {
+		stats_params := Rmsnorm_Stats_Params{count = u32(count), size = u32(size), eps = variant.eps}
+		stats_bufs   := [2]vk.Buffer{data(input).buffer, data(variant.rstd).buffer}
+		_dispatch(stats_pipe, stats_bufs[:], &stats_params, u32(count))
+	} else {
+		_ = stats_pipe
+	}
 
 	fwd_params := Rmsnorm_Params{count = u32(count), size = u32(size), eps = variant.eps}
 	fwd_bufs   := [3]vk.Buffer{data(input).buffer, data(variant.weight).buffer, data(output).buffer}
@@ -1912,6 +1921,25 @@ gelu_forward :: proc(op: ml.Operation) {
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_gelu_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
 	}
+}
+
+gelu_mul_forward :: proc(op: ml.Operation) {
+	a      := op.input
+	output := op.output
+	b      := op.variant.(ml.Gelu_Mul).b
+	fmt.assertf(a.type == .Bf16, "GPU gelu_mul: only Bf16 implemented (got %v)", a.type)
+
+	if _gelu_mul_bf16_pipeline == nil {
+		_gelu_mul_bf16_pipeline = _make_pipeline(GELU_MUL_BF16_SPIRV, 3, size_of(Gelu_Mul_Bf16_Params))
+	}
+	pair_count := (ml.len(a) + 1) / 2
+	params := Gelu_Mul_Bf16_Params{
+		n          = u32(ml.len(a)),
+		n_b        = u32(ml.len(b)),
+		pair_count = u32(pair_count),
+	}
+	bufs := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
+	_dispatch(_gelu_mul_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
 }
 
 gelu_backward :: proc(op: ml.Operation) {

@@ -457,6 +457,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Relu:               relu_forward               (op)
 	case ml.Sigmoid:            sigmoid_forward            (op)
 	case ml.Gelu:               gelu_forward               (op)
+	case ml.Gelu_Mul:           gelu_mul_forward           (op)
 	case ml.Silu:               silu_forward               (op)
 	case ml.Tanh:               tanh_forward               (op)
 	case ml.Batched_Matmul:     batched_matmul_forward     (op)
@@ -498,6 +499,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Relu:               relu_backward              (op)
 	case ml.Sigmoid:            sigmoid_backward           (op)
 	case ml.Gelu:               gelu_backward              (op)
+	case ml.Gelu_Mul:           fmt.panicf("CPU gelu_mul_backward: fused gelu*mul is forward-only (inference path)")
 	case ml.Silu:               silu_backward              (op)
 	case ml.Tanh:               tanh_backward              (op)
 	case ml.Batched_Matmul:     batched_matmul_backward    (op)
@@ -2447,6 +2449,38 @@ gelu_backward :: proc(op: ml.Operation) {
 		sech_out := 1.0 / (cosh_out * cosh_out)
 		return 0.5 * (1.0 + tanh_out) + x * 0.5 * sech_out * f32(GELU_SCALING_FACTOR) * (1.0 + 3.0 * 0.044715 * x * x)
 	})
+}
+
+gelu_mul_forward :: proc(op: ml.Operation) {
+	a      := op.input
+	output := op.output
+	b      := op.variant.(ml.Gelu_Mul).b
+	stride := ml.len(a) / ml.len(b)
+
+	gelu :: proc(x: f32) -> f32 {
+		cube := f32(0.044715) * x * x * x
+		return 0.5 * x * (1.0 + math.tanh(f32(GELU_SCALING_FACTOR) * (x + cube)))
+	}
+
+	#partial switch a.type {
+	case .F32:
+		for i in 0 ..< stride {
+			for j in 0 ..< ml.len(b) {
+				o := i * ml.len(b) + j
+				data(output)[o] = gelu(data(a)[o]) * data(b)[j]
+			}
+		}
+	case .Bf16:
+		a_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Data]))
+		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
+		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
+		for i in 0 ..< stride {
+			for j in 0 ..< ml.len(b) {
+				o := i * ml.len(b) + j
+				o_bf[o] = ml.bf16_from_f32(gelu(ml.bf16_to_f32(a_bf[o])) * ml.bf16_to_f32(b_bf[j]))
+			}
+		}
+	}
 }
 
 silu_forward :: proc(op: ml.Operation) {

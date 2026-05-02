@@ -205,6 +205,59 @@ shared between quadrants {0,2}/{1,3}; qh at l is shared across all 4.
 Per-op: 61.8 → 57.0 µs (~8%). Q6_K is only 11% of GPU time so the wall
 impact is tiny.
 
+## Op-fusion round (this round)
+
+### Bench harness rebuild
+
+Before any A/B, the 5-token parity bench was discovered to be too noisy
+to measure single-digit-percent changes — three back-to-back runs varied
+27 → 35 tok/s with GPU work fluctuating 67 → 97 ms total (NVIDIA clock
+boost / driver state). Extended `tests/gguf_gemma_gpu_parity` with a
+post-parity decode loop: 32 warm-up tokens, 128 timed tokens of
+`forward_cached` against a fixed last token, KV cache bumped to 256
+slots. Three-run variance is now ±2%.
+
+### Skip rmsnorm stats during inference
+
+`backends/gpu/shaders/rmsnorm/rmsnorm_bf16.comp` computes the rsqrt
+in-shader from the input and only takes X/W/Y bindings — the `rstd`
+output of the separate `rmsnorm_stats_bf16` pass is consumed by the
+backward path, never by forward. In `rmsnorm_forward`, gate the stats
+dispatch on `!ml.current_context().inference_only`. Each rmsnorm site
+loses one dispatch.
+
+A/B (3 runs each, median):
+- with stats:    34.46 tok/s (29.0 ms/tok)
+- without stats: 36.66 tok/s (27.3 ms/tok) → **+6.4%, ~1.7 ms/tok saved**
+
+Logits unchanged (max abs diff 9.7327, identical to baseline).
+
+### Fused `gelu * b` op
+
+Gemma's MLP and PLE both do `mul(gelu(x), y)`. Fused into a single
+`gelu_mul_bf16.comp` shader that reads x and y, computes gelu(x)*y in
+registers, writes one bf16 output. New `Gelu_Mul` op variant in
+`ml.odin`, GPU + CPU forwards, backward panics (inference-only).
+Replaced all three call sites in `gemma.gemma.odin` (forward_cached + 2
+in `forward`).
+
+A/B on top of skip-stats (3 runs each, median):
+- before fusion: 36.66 tok/s (27.3 ms/tok)
+- after fusion:  37.20 tok/s (26.9 ms/tok) → **+1.5%, ~0.4 ms/tok saved**
+
+Bonus: max abs logit diff vs HF reference dropped 9.7327 → 8.9983
+(eliminated one bf16 round-trip on the gelu output).
+
+### Cumulative
+
+| stage | tok/s | ms/tok |
+|---|---|---|
+| baseline (round start) | 34.46 | 29.0 |
+| + skip rmsnorm stats   | 36.66 | 27.3 |
+| + gelu_mul fusion      | 37.20 | 26.9 |
+
+About +8% throughput from this round.
+
 ## Things we tried that didn't matter (or backfired)
 
 - **Push descriptors** (`VK_KHR_push_descriptor`): replaced per-dispatch
@@ -244,6 +297,22 @@ impact is tiny.
   the complexity wasn't earning anything. **Lesson: `linear_q4_gemv` is
   memory-bandwidth bound; restructuring the K-loop, vectorizing X loads,
   and going from 1 → 8 fmas/iter all leave wall time unchanged.**
+- **Skipping all pre-dispatch barriers** (env switch
+  `GPU_NO_BARRIERS=1` that no-ops the global SHADER+TRANSFER → SHADER
+  `vkCmdPipelineBarrier` in `_dispatch`): tested as the cheap evidence
+  step before building precise barrier tracking. **Result: removing
+  barriers regressed everything.** Decode 36.1 → 26.8 tok/s, GPU work
+  17.8 → 25.3 ms/tok, per-pipeline us/op went *up* across the board
+  (Q4_K GEMV 31.8 → 44.6, Q6_K GEMV 57.1 → 79.8, lm_head bf16 GEMV
+  1374 → 2514 µs). Logits corrupted as expected.
+  **Conclusion: the global barriers are net-positive on this driver.**
+  Likely the barrier acts as a write-retire/cache-flush hint that lets
+  the SM scheduler issue the next pass cleanly. Without it the driver
+  loses ordering and serializes worse, not better. The 4-5 ms "GPU
+  stalls" line in the breakdown is queue-wait / submit overhead, not
+  barrier cost. **Precise per-buffer barrier tracking would at best
+  break even and at worst regress — not worth building.** Reverted the
+  diagnostic switch. Pivoted to op fusion.
 
 ## Architecture insights worth remembering
 
@@ -290,7 +359,7 @@ Today: 25 ms/tok wall. Ollama: 7.5 ms/tok. Theoretical bandwidth floor:
 |---|---|---|---|
 | **No coopmat (tensor-core) Q4_K matmul path** | **5-7 ms** | large | mirror `linear_bf16_coopmat.comp` for in-shader-Q4_K-dequant feeding a coopmat tile accumulator. ggml's high-perf path. Requires tensor-core-friendly tile sizes; can do M=1 via padded-to-tile or a separate GEMV-style coopmat path. |
 | **No Q8_1 activation pre-quantization (mmvq)** | **3-4 ms** | medium | Quantize the bf16 activation to Q8_1 (per-32 i8 + scale) on the fly per layer, then do `int8 × int4 → int32` integer-dot inside the matmul. CUDA's `mul_mat_vec_q4_K_q8_1` is the reference. Wins from integer ALUs being faster than fp32 fma per cycle on Ampere/Ada. |
-| **~1500 dispatches/tok with global barriers** | **3-5 ms** | small/medium | Two angles: (a) **op fusion**: rmsnorm has separate stats+main, silu+mul are separate, residual adds are separate — fuse realistic candidates and halve dispatch count. (b) **precise barriers**: don't fire `SHADER+TRANSFER → SHADER` between every dispatch, only when consecutive ops share buffers. |
+| **~1500 dispatches/tok (op fusion only — barrier removal proven a wash)** | **2-4 ms** | small/medium | **Op fusion**: rmsnorm has separate stats+main, silu+mul are separate, residual adds are separate — fuse realistic candidates and halve dispatch count. (Precise-barrier idea was tested via a global no-barrier switch and regressed; see "Things we tried" above. Skip.) |
 | **Q4_K GEMV at 57% of theoretical bandwidth** | **0.5-1 ms** | small | 31 µs/op vs ~18 µs theoretical for ffn_gate. Most of the gap is per-dispatch barrier/queue tax (covered by row above), not shader-work tax. Compounds with #3. |
 | **Per-token recording cost** | **2-3 ms** | medium | Pre-recorded command buffer with push constants moved to a uniform buffer that gets updated host-side per token. Won't move the needle alone but compounds with #3 because re-recording 1500 commands is what we're doing today. |
 
