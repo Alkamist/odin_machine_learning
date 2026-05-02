@@ -111,8 +111,8 @@ Context :: struct {
 	operations:      [MAX_OPERATIONS]Operation,
 
 	// When true, `zeros` (and op-internal activation allocations) skip the
-	// gradient buffer. Backward will assert if called. Halves the activation
-	// buffer count per forward pass, which dominates per-token cost on GPU.
+	// `.Gradient` buffer. Backward will assert if called. Halves activation
+	// memory pressure for inference; wall-time impact is small.
 	inference_only: bool,
 
 	previous_ctx: ^Context,
@@ -1210,16 +1210,15 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 }
 
 Rmsnorm :: struct {
-	weight:      Tensor,
-	rstd:        Tensor,
-	eps:         f32,
-	unit_offset: bool, // Gemma idiom: y = x * rstd * (weight + 1)
+	weight: Tensor,
+	rstd:   Tensor,
+	eps:    f32,
 }
 
 RMSNORM_DEFAULT_EPS :: f32(1e-5)
 
 @(require_results)
-rmsnorm :: proc(input, weight: Tensor, unit_offset: bool = false, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #caller_location) -> (output: Tensor) {
+rmsnorm :: proc(input, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #caller_location) -> (output: Tensor) {
 	assert(weight.rank == 1, "rmsnorm weight must be 1-D", loc=loc)
 	assert(weight.shape[0] == input.shape[input.rank - 1], "rmsnorm weight length must equal input's trailing dim", loc=loc)
 	assert(eps > 0, "rmsnorm eps must be positive", loc=loc)
@@ -1234,10 +1233,9 @@ rmsnorm :: proc(input, weight: Tensor, unit_offset: bool = false, eps: f32 = RMS
 		input   = input,
 		output  = output,
 		variant = Rmsnorm{
-			weight      = weight,
-			rstd        = rstd,
-			eps         = eps,
-			unit_offset = unit_offset,
+			weight = weight,
+			rstd   = rstd,
+			eps    = eps,
 		},
 	}
 	_current_ctx.backend.forward(op, loc)

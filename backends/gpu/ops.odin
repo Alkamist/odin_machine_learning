@@ -138,9 +138,9 @@ RMSNORM_BF16_SPIRV             :: #load("shaders/rmsnorm/rmsnorm_bf16.spv",     
 RMSNORM_STATS_BF16_SPIRV       :: #load("shaders/rmsnorm/rmsnorm_stats_bf16.spv",       []u8)
 RMSNORM_BACK_INPUT_BF16_SPIRV  :: #load("shaders/rmsnorm/rmsnorm_back_input_bf16.spv",  []u8)
 RMSNORM_BACK_WEIGHT_BF16_SPIRV :: #load("shaders/rmsnorm/rmsnorm_back_weight_bf16.spv", []u8)
-Rmsnorm_Params                  :: struct { count, size: u32, weight_bias, eps: f32 }
+Rmsnorm_Params                  :: struct { count, size: u32, eps: f32 }
 Rmsnorm_Stats_Params            :: struct { count, size: u32, eps: f32 }
-Rmsnorm_Back_Params             :: struct { count, size: u32, weight_bias: f32 }
+Rmsnorm_Back_Params             :: struct { count, size: u32 }
 Rmsnorm_Back_Weight_Bf16_Params :: struct { count, size, pair_count: u32 }
 _rmsnorm_pipeline:                  ^Pipeline
 _rmsnorm_stats_pipeline:            ^Pipeline

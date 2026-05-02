@@ -1879,15 +1879,14 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 }
 
 rmsnorm_forward_f32 :: proc(op: ml.Operation) {
-	input        := op.input
-	output       := op.output
-	variant      := op.variant.(ml.Rmsnorm)
-	weight       := variant.weight
-	rstd         := variant.rstd
-	eps          := variant.eps
-	weight_bias  := f32(1.0) if variant.unit_offset else f32(0.0)
-	size         := input.shape[input.rank - 1]
-	count        := ml.len(input) / size
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Rmsnorm)
+	weight  := variant.weight
+	rstd    := variant.rstd
+	eps     := variant.eps
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1901,7 +1900,7 @@ rmsnorm_forward_f32 :: proc(op: ml.Operation) {
 
 		s: f32 = 1.0 / math.sqrt(ms + eps)
 		for i in 0 ..< size {
-			data(output)[offset + i] = s * data(input)[offset + i] * (data(weight)[i] + weight_bias)
+			data(output)[offset + i] = s * data(input)[offset + i] * data(weight)[i]
 		}
 
 		data(rstd)[c] = s
@@ -1909,15 +1908,14 @@ rmsnorm_forward_f32 :: proc(op: ml.Operation) {
 }
 
 rmsnorm_forward_bf16 :: proc(op: ml.Operation) {
-	input       := op.input
-	output      := op.output
-	variant     := op.variant.(ml.Rmsnorm)
-	weight      := variant.weight
-	rstd        := variant.rstd
-	eps         := variant.eps
-	weight_bias := f32(1.0) if variant.unit_offset else f32(0.0)
-	size        := input.shape[input.rank - 1]
-	count       := ml.len(input) / size
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Rmsnorm)
+	weight  := variant.weight
+	rstd    := variant.rstd
+	eps     := variant.eps
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
 
 	x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
 	y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
@@ -1935,7 +1933,7 @@ rmsnorm_forward_bf16 :: proc(op: ml.Operation) {
 
 		s: f32 = 1.0 / math.sqrt(ms + eps)
 		for i in 0 ..< size {
-			y := s * ml.bf16_to_f32(x_bf[offset + i]) * (ml.bf16_to_f32(w_bf[i]) + weight_bias)
+			y := s * ml.bf16_to_f32(x_bf[offset + i]) * ml.bf16_to_f32(w_bf[i])
 			y_bf[offset + i] = ml.bf16_from_f32(y)
 		}
 
@@ -1953,12 +1951,11 @@ rmsnorm_backward :: proc(op: ml.Operation) {
 rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
-	variant     := op.variant.(ml.Rmsnorm)
-	weight      := variant.weight
-	rstd        := variant.rstd
-	weight_bias := f32(1.0) if variant.unit_offset else f32(0.0)
-	size        := input.shape[input.rank - 1]
-	count       := ml.len(input) / size
+	variant := op.variant.(ml.Rmsnorm)
+	weight  := variant.weight
+	rstd    := variant.rstd
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1967,7 +1964,7 @@ rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 		dnorm_norm_mean: f32
 		for i in 0 ..< size {
 			norm  := data(input)[offset + i] * rstd_c
-			dnorm := (data(weight)[i] + weight_bias) * gradient(output)[offset + i]
+			dnorm := data(weight)[i] * gradient(output)[offset + i]
 			dnorm_norm_mean += dnorm * norm
 		}
 		dnorm_norm_mean /= f32(size)
@@ -1975,7 +1972,7 @@ rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 		for i in 0 ..< size {
 			x_v   := data(input)[offset + i]
 			dy_v  := gradient(output)[offset + i]
-			w_v   := data(weight)[i] + weight_bias
+			w_v   := data(weight)[i]
 			norm  := x_v * rstd_c
 			dnorm := w_v * dy_v
 
@@ -1990,12 +1987,11 @@ rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
-	variant     := op.variant.(ml.Rmsnorm)
-	weight      := variant.weight
-	rstd        := variant.rstd
-	weight_bias := f32(1.0) if variant.unit_offset else f32(0.0)
-	size        := input.shape[input.rank - 1]
-	count       := ml.len(input) / size
+	variant := op.variant.(ml.Rmsnorm)
+	weight  := variant.weight
+	rstd    := variant.rstd
+	size    := input.shape[input.rank - 1]
+	count   := ml.len(input) / size
 
 	x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
 	w_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
@@ -2010,7 +2006,7 @@ rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 		dnorm_norm_mean: f32
 		for i in 0 ..< size {
 			norm  := ml.bf16_to_f32(x_bf[offset + i]) * rstd_c
-			dnorm := (ml.bf16_to_f32(w_bf[i]) + weight_bias) * ml.bf16_to_f32(dy_bf[offset + i])
+			dnorm := ml.bf16_to_f32(w_bf[i]) * ml.bf16_to_f32(dy_bf[offset + i])
 			dnorm_norm_mean += dnorm * norm
 		}
 		dnorm_norm_mean /= f32(size)
@@ -2018,7 +2014,7 @@ rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 		for i in 0 ..< size {
 			x_v   := ml.bf16_to_f32(x_bf[offset + i])
 			dy_v  := ml.bf16_to_f32(dy_bf[offset + i])
-			w_v   := ml.bf16_to_f32(w_bf[i]) + weight_bias
+			w_v   := ml.bf16_to_f32(w_bf[i])
 			norm  := x_v * rstd_c
 			dnorm := w_v * dy_v
 

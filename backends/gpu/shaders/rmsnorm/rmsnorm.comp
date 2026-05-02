@@ -15,7 +15,6 @@ layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform Params {
     uint  count;
     uint  size;
-    float weight_bias; // 0.0 by default; 1.0 enables Gemma's `(w + 1)` idiom
     float eps;
 } p;
 
@@ -42,6 +41,6 @@ void main() {
     barrier();
 
     for (uint i = tid; i < p.size; i += WG) {
-        y[off + i] = x[off + i] * rstd * (w[i] + p.weight_bias);
+        y[off + i] = x[off + i] * rstd * w[i];
     }
 }

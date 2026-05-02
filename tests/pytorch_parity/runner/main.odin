@@ -69,8 +69,6 @@ main :: proc() {
 	case "layernorm":      run_layernorm(artifacts_dir)
 	case "rmsnorm":                  run_rmsnorm(artifacts_dir)
 	case "rmsnorm_big":              run_rmsnorm(artifacts_dir)
-	case "rmsnorm_unit_offset":      run_rmsnorm(artifacts_dir)
-	case "rmsnorm_unit_offset_big":  run_rmsnorm(artifacts_dir)
 	case "cross_entropy":  run_cross_entropy(artifacts_dir)
 	case "batched_matmul": run_batched_matmul(artifacts_dir)
 	case "permute":        run_permute(artifacts_dir)
@@ -239,7 +237,6 @@ run_layernorm :: proc(dir: string) {
 run_rmsnorm :: proc(dir: string) {
 	x_shape, x_data := load_tensor(_path(dir, "input_x.bin"))
 	w_shape, w_data := load_tensor(_path(dir, "input_w.bin"))
-	config          := load_int_array(_path(dir, "config.bin"))
 
 	x := ml.alloc(.F32, x_shape, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	defer ml.destroy(x)
@@ -249,8 +246,7 @@ run_rmsnorm :: proc(dir: string) {
 	ml.set_data(x, x_data)
 	ml.set_data(w, w_data)
 
-	unit_offset := len(config) >= 1 && config[0] == 1
-	out := ml.rmsnorm(x, w, unit_offset)
+	out := ml.rmsnorm(x, w)
 	ml.backward()
 
 	out_shape := _shape_slice(out)

@@ -1557,13 +1557,11 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 		fwd_pipe   = _rmsnorm_pipeline
 	}
 
-	weight_bias := f32(1.0) if variant.unit_offset else f32(0.0)
-
 	stats_params := Rmsnorm_Stats_Params{count = u32(count), size = u32(size), eps = variant.eps}
 	stats_bufs   := [2]vk.Buffer{data(input).buffer, data(variant.rstd).buffer}
 	_dispatch(stats_pipe, stats_bufs[:], &stats_params, u32(count))
 
-	fwd_params := Rmsnorm_Params{count = u32(count), size = u32(size), weight_bias = weight_bias, eps = variant.eps}
+	fwd_params := Rmsnorm_Params{count = u32(count), size = u32(size), eps = variant.eps}
 	fwd_bufs   := [3]vk.Buffer{data(input).buffer, data(variant.weight).buffer, data(output).buffer}
 	_dispatch(fwd_pipe, fwd_bufs[:], &fwd_params, u32(count))
 }
@@ -1585,7 +1583,7 @@ rmsnorm_backward :: proc(op: ml.Operation) {
 			_rmsnorm_back_weight_bf16_pipeline = _make_pipeline(RMSNORM_BACK_WEIGHT_BF16_SPIRV, 4, size_of(Rmsnorm_Back_Weight_Bf16_Params))
 		}
 
-		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size), weight_bias = f32(1.0) if variant.unit_offset else f32(0.0)}
+		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size)}
 		input_bufs := [5]vk.Buffer{
 			data(input).buffer, data(variant.weight).buffer, gradient(output).buffer,
 			data(variant.rstd).buffer, gradient(input).buffer,
@@ -1607,7 +1605,7 @@ rmsnorm_backward :: proc(op: ml.Operation) {
 			_rmsnorm_back_weight_pipeline = _make_pipeline(RMSNORM_BACK_WEIGHT_SPIRV, 4, size_of(Rmsnorm_Back_Params))
 		}
 
-		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size), weight_bias = f32(1.0) if variant.unit_offset else f32(0.0)}
+		params := Rmsnorm_Back_Params{count = u32(count), size = u32(size)}
 
 		input_bufs := [5]vk.Buffer{
 			data(input).buffer, data(variant.weight).buffer, gradient(output).buffer,

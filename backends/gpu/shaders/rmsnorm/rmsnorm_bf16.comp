@@ -6,7 +6,7 @@ layout(local_size_x = WG) in;
 layout(set = 0, binding = 0) readonly  buffer X { uint x[]; };
 layout(set = 0, binding = 1) readonly  buffer W { uint w[]; };
 layout(set = 0, binding = 2) writeonly buffer Y { uint y[]; };
-layout(push_constant) uniform Params { uint count; uint size; float weight_bias; float eps; } p;
+layout(push_constant) uniform Params { uint count; uint size; float eps; } p;
 
 shared float partial[WG];
 
@@ -37,8 +37,8 @@ void main() {
     for (uint pi = tid; pi < pair_count; pi += WG) {
         uint xp = x[pair_base + pi];
         uint wp = w[pi];
-        float v0 = bf16_expand(xp & 0xffffu)         * rstd * (bf16_expand(wp & 0xffffu)         + p.weight_bias);
-        float v1 = bf16_expand((xp >> 16) & 0xffffu) * rstd * (bf16_expand((wp >> 16) & 0xffffu) + p.weight_bias);
+        float v0 = bf16_expand(xp & 0xffffu)         * rstd * bf16_expand(wp & 0xffffu);
+        float v1 = bf16_expand((xp >> 16) & 0xffffu) * rstd * bf16_expand((wp >> 16) & 0xffffu);
         y[pair_base + pi] = (bf16_round(v1) << 16) | bf16_round(v0);
     }
 }
