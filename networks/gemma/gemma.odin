@@ -611,9 +611,9 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 			shared_values[layer_idx] = v
 		}
 
-		attn    := ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
-		attn     = _linear(attn, layer.o_proj_weight)
-		attn     = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
+		attn := ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
+		attn  = _linear(attn, layer.o_proj_weight)
+		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
 
 		// Feedforward.
 		mlp_in: ml.Tensor
