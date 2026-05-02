@@ -33,11 +33,21 @@ LINEAR_Q4_K_GEMV_SPIRV    :: #load("shaders/linear/linear_q4_k_gemv.spv", []u8)
 LINEAR_Q4_K_GEMV_ROWS_PER :: 2  // must match ROWS_PER_WG in shaders/linear_q4_k_gemv.comp
 LINEAR_Q4_K_MMVQ_SPIRV    :: #load("shaders/linear/linear_q4_k_mmvq.spv", []u8)
 LINEAR_Q4_K_MMVQ_ROWS_PER :: 2  // must match ROWS_PER_WG in shaders/linear_q4_k_mmvq.comp
+LINEAR_Q4_K_COOPMAT_SPIRV :: #load("shaders/linear/linear_q4_k_coopmat.spv", []u8)
+// must match BM/BN/BK in shaders/linear_q4_k_coopmat.comp
+LINEAR_Q4_K_COOPMAT_BM :: 64
+LINEAR_Q4_K_COOPMAT_BN :: 64
+LINEAR_Q4_K_COOPMAT_BK :: 32
 QUANTIZE_Q8_1_BF16_SPIRV  :: #load("shaders/linear/quantize_q8_1_bf16.spv", []u8)
 QUANTIZE_Q8_1_BF16_BLOCK  :: 32  // must match WG in shaders/quantize_q8_1_bf16.comp
 Quantize_Q8_1_Bf16_Params :: struct { K: u32 }
 LINEAR_Q6_K_GEMV_SPIRV    :: #load("shaders/linear/linear_q6_k_gemv.spv", []u8)
 LINEAR_Q6_K_GEMV_ROWS_PER :: 2  // must match ROWS_PER_WG in shaders/linear_q6_k_gemv.comp
+LINEAR_Q6_K_COOPMAT_SPIRV :: #load("shaders/linear/linear_q6_k_coopmat.spv", []u8)
+// must match BM/BN/BK in shaders/linear_q6_k_coopmat.comp
+LINEAR_Q6_K_COOPMAT_BM :: 64
+LINEAR_Q6_K_COOPMAT_BN :: 64
+LINEAR_Q6_K_COOPMAT_BK :: 32
 Linear_Params :: struct { count, input_size, output_size: u32 }
 _linear_pipeline:              ^Pipeline
 _linear_bf16_pipeline:         ^Pipeline
@@ -45,8 +55,10 @@ _linear_bf16_coopmat_pipeline: ^Pipeline
 _linear_bf16_gemv_pipeline:    ^Pipeline
 _linear_q4_k_gemv_pipeline:    ^Pipeline
 _linear_q4_k_mmvq_pipeline:    ^Pipeline
+_linear_q4_k_coopmat_pipeline: ^Pipeline
 _quantize_q8_1_bf16_pipeline:  ^Pipeline
 _linear_q6_k_gemv_pipeline:    ^Pipeline
+_linear_q6_k_coopmat_pipeline: ^Pipeline
 
 LINEAR_BACK_INPUT_SPIRV               :: #load("shaders/linear/linear_back_input.spv",               []u8)
 LINEAR_BACK_WEIGHT_SPIRV              :: #load("shaders/linear/linear_back_weight.spv",              []u8)

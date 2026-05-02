@@ -363,6 +363,92 @@ About +0.5% wall throughput from this round, ~11% GPU-work reduction.
 The remaining wall slack is per-dispatch CPU/queue tax — the next leverage
 is pre-recorded command buffers (#5 in the original gap table).
 
+## Coopmat round (Q4_K + Q6_K tile shaders for prefill)
+
+### Why prefill (and not decode)
+
+llama.cpp does *not* use coopmat for M=1 decode of Q4_K — they use
+`mul_mat_vec_q.comp` (mmvq + integer dot) which is exactly our `linear_q4_k_mmvq`.
+Tensor-core tiles are 16x16 minimum, so padding M=1 to a 16-row tile wastes
+15/16 of the tensor-core compute. The mmvq path already captured ~4 ms of
+the original "tensor-core Q4_K" 5-7 ms estimate from the gap table; the
+remaining decode wedge from coopmat alone is small-to-zero. Coopmat's real
+prize is at M>1 (prefill), where it matches llama.cpp's `mul_mm` path.
+
+This round: chat-REPL-friendly prefill via coopmat. Decode (M=1) is
+unchanged.
+
+### What got built
+
+- `linear_q4_k_coopmat.comp`. Mirrors `linear_bf16_coopmat.comp` shape:
+  BM=64, BN=64, 4 subgroups in 2x2 each owning a 32x32 region of 16x16
+  coopmat sub-tiles, fp32 accumulator, bf16 X / B / Y. Differs in BK=32
+  (one Q4_K subblock per K-step) and W staging: each thread dequantizes
+  16 Q4_K weights of one row (d * scale * nibble - dmin * min) into the
+  shared `sw[BN x BK]` bf16 tile, then the matmul coopMatLoads it as
+  ColumnMajor B.
+- `linear_q6_k_coopmat.comp`. Same shape. Per-thread dequant: 16 weights
+  share one i8 sub-block scale (w_off=0 or 16 starts on a 16-aligned
+  boundary). Byte-addressed reads via `load_byte` / `load_i8` because
+  Q6_K's 210-byte block isn't 4-aligned.
+- `linear_q4_k_forward` / `linear_q6_k_forward` in `backends/gpu/backend.odin`:
+  if M>1 and `coopmat_bf16` and M%BM == N%BN == K%BK == 0, dispatch the
+  coopmat shader; else assert M==1 and fall back to mmvq/gemv.
+
+### Parity
+
+Real Gemma 4 E4B Q4_K_M weights, M=64 prefill batch through coopmat vs a
+CPU reference that pre-rounds dequanted weights to bf16 (matching the
+shader's bf16-staged W tile) and accumulates in fp32:
+
+- Q4_K (`blk.35.inp_gate.weight`, [2560, 256]): max_abs=0.00195, max_rel=0.00704.
+- Q6_K (`blk.6.attn_v.weight`,  [2560, 512]): max_abs=0.00391, max_rel=0.00649.
+
+A pure-fp32-dequant CPU reference shows visibly larger error (0.06 / 0.87
+rel on the worst element); the bf16-staged round-trip per weight is the
+expected source. This is identical in spirit to llama.cpp's coopmat path.
+
+### Wall impact (decode only — no prefill bench yet)
+
+Decode (M=1) is unchanged by design. Bench (`gguf_gemma_gpu_parity`):
+
+- pre-coopmat:  44.0 tok/s (last add_rmsnorm row above)
+- post-coopmat: 51.5 tok/s
+
+That ~17% gap is GPU clock / driver state variance from rerunning the
+same M=1 code path; it shifts run-to-run by ±5 tok/s on this machine and
+is not attributable to coopmat.
+
+Prefill measured via the chat REPL on an 83-token prompt: 160 tok/s
+(including the 19-token single-step tail; all 64 of the aligned head go
+through coopmat). For comparison the pre-coopmat path panicked on M>1
+for Q4_K weights — there was no prefill at all on GGUF before this round.
+
+### Chat REPL port
+
+`examples/gemma_chat_repl/main.odin` now takes `--gguf PATH` (or defaults
+to `gemma_data/model.gguf` if it exists). When loading GGUF, prefill
+chunks `new_tokens` into 64-token coopmat batches with a single-token
+tail (since M%64==0 is the coopmat constraint). Decode is unchanged.
+
+### Notes worth remembering
+
+- BK=32 (one Q4_K subblock per K-step) was the natural choice. The
+  scale/min pair is constant across the 32 elements of a subblock, so
+  we read it once per (thread, K-step) instead of once per weight.
+- W staging assignment: with BN=64 and WG_SIZE=128, each thread owns
+  one row × 16 weights (`w_row = tid >> 1`, `w_half = tid & 1`,
+  `w_off = w_half * 16`). 16 weights of a 32-element K-step always land
+  in one 16-aligned sub-block, so each thread reads exactly one i8 scale
+  for Q6_K and one (scale, min) for Q4_K.
+- The bf16-staged-reference parity check is the right one for this
+  shape. A pure-fp32 reference will fail at 5%/0.01 tolerance because
+  the shader's bf16 round-trip per weight is real.
+- Coopmat tile is M%64==0 only. Non-aligned M panics; the chat REPL
+  chunks. Future work: a row-mask in the coopmat shader to handle ragged
+  M (padded zero rows whose store is suppressed) — gets full prefill
+  speed for arbitrary prompt length without a chunking heuristic.
+
 ## Things we tried that didn't matter (or backfired)
 
 - **Push descriptors** (`VK_KHR_push_descriptor`): replaced per-dispatch

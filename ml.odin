@@ -1257,10 +1257,6 @@ rmsnorm :: proc(input, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #c
 	return
 }
 
-// Fused rmsnorm-with-weight + rope. Inference-only. Input is laid out as
-// `[token_count, head_count * head_size]` (the rope shape); the rmsnorm runs
-// per-head (size = head_size) using `weight` of length head_size, then RoPE
-// rotates the first `rotate_pair_count` pairs of each head.
 Rmsnorm_Rope :: struct {
 	weight:            Tensor,
 	eps:               f32,
@@ -1308,10 +1304,6 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 	return
 }
 
-// Fused (residual = a + b) → rmsnorm-with-weight. Inference-only. Writes both
-// the new residual (for downstream consumers) and the normalized output. The
-// fused dispatch eliminates the standalone `add` shader and the residual
-// round-trip on the rmsnorm input read.
 Add_Rmsnorm :: struct {
 	b:            Tensor,
 	weight:       Tensor,

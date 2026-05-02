@@ -1215,7 +1215,6 @@ linear_q6_k_forward :: proc(op: ml.Operation) {
 
 	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "GPU linear_q6_k requires input_size %% 256 == 0, got %v", input_size)
 	fmt.assertf(output_size % LINEAR_Q6_K_GEMV_ROWS_PER == 0, "GPU linear_q6_k requires output_size %% %v == 0, got %v", LINEAR_Q6_K_GEMV_ROWS_PER, output_size)
-	fmt.assertf(count == 1, "GPU linear_q6_k_forward currently supports M=1 (decode); got M=%v", count)
 
 	params := Linear_Params{
 		count       = u32(count),
@@ -1227,6 +1226,24 @@ linear_q6_k_forward :: proc(op: ml.Operation) {
 		data(v.weight).buffer,
 		data(output)  .buffer,
 	}
+
+	if count > 1 && _gpu.coopmat_bf16 &&
+	   count       % LINEAR_Q6_K_COOPMAT_BM == 0 &&
+	   output_size % LINEAR_Q6_K_COOPMAT_BN == 0 &&
+	   input_size  % LINEAR_Q6_K_COOPMAT_BK == 0 {
+		if _linear_q6_k_coopmat_pipeline == nil {
+			_linear_q6_k_coopmat_pipeline = _make_pipeline(LINEAR_Q6_K_COOPMAT_SPIRV, 3, size_of(Linear_Params))
+		}
+		_dispatch(
+			_linear_q6_k_coopmat_pipeline, bufs[:], &params,
+			u32(count       / LINEAR_Q6_K_COOPMAT_BM),
+			u32(output_size / LINEAR_Q6_K_COOPMAT_BN),
+			1,
+		)
+		return
+	}
+
+	fmt.assertf(count == 1, "GPU linear_q6_k_forward supports M=1 (decode) or M%%64==0 with coopmat (prefill); got M=%v", count)
 
 	if _linear_q6_k_gemv_pipeline == nil {
 		_linear_q6_k_gemv_pipeline = _make_pipeline(LINEAR_Q6_K_GEMV_SPIRV, 3, size_of(Linear_Params))
@@ -1253,13 +1270,37 @@ linear_q4_k_forward :: proc(op: ml.Operation) {
 
 	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "GPU linear_q4_k requires input_size %% 256 == 0, got %v", input_size)
 	fmt.assertf(output_size % LINEAR_Q4_K_GEMV_ROWS_PER == 0, "GPU linear_q4_k requires output_size %% %v == 0, got %v", LINEAR_Q4_K_GEMV_ROWS_PER, output_size)
-	fmt.assertf(count == 1, "GPU linear_q4_k_forward currently supports M=1 (decode); got M=%v", count)
 
 	params := Linear_Params{
 		count       = u32(count),
 		input_size  = u32(input_size),
 		output_size = u32(output_size),
 	}
+
+	// Prefill (M>1): coopmat tile path. Mirrors linear_bf16_coopmat — reads X
+	// as bf16 and dequantizes Q4_K -> bf16 into shared memory each K-step.
+	if count > 1 && _gpu.coopmat_bf16 &&
+	   count       % LINEAR_Q4_K_COOPMAT_BM == 0 &&
+	   output_size % LINEAR_Q4_K_COOPMAT_BN == 0 &&
+	   input_size  % LINEAR_Q4_K_COOPMAT_BK == 0 {
+		if _linear_q4_k_coopmat_pipeline == nil {
+			_linear_q4_k_coopmat_pipeline = _make_pipeline(LINEAR_Q4_K_COOPMAT_SPIRV, 3, size_of(Linear_Params))
+		}
+		bufs := [3]vk.Buffer{
+			data(input)   .buffer,
+			data(v.weight).buffer,
+			data(output)  .buffer,
+		}
+		_dispatch(
+			_linear_q4_k_coopmat_pipeline, bufs[:], &params,
+			u32(count       / LINEAR_Q4_K_COOPMAT_BM),
+			u32(output_size / LINEAR_Q4_K_COOPMAT_BN),
+			1,
+		)
+		return
+	}
+
+	fmt.assertf(count == 1, "GPU linear_q4_k_forward supports M=1 (decode) or M%%64==0 with coopmat (prefill); got M=%v", count)
 
 	if _gpu.integer_dot8 {
 		// Q8_1 layout: 36 bytes per 32-element block (4 bytes ds + 32 bytes qs).

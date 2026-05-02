@@ -18,6 +18,7 @@ import tok   "../../tokenizers/gemma"
 
 DATA_DIR       :: "gemma_data"
 MODEL_PATH     :: DATA_DIR + "/model.safetensors"
+GGUF_PATH      :: DATA_DIR + "/model.gguf"
 TOKENIZER_PATH :: DATA_DIR + "/tokenizer.json"
 
 DEFAULT_MAX_TOKENS  :: 512
@@ -41,8 +42,9 @@ main :: proc() {
 	use_cpu        := false
 	cpu_arena      := DEFAULT_CPU_ARENA
 	threads        := DEFAULT_THREADS
+	gguf_path      := ""
 
-	parse_args(&max_new_tokens, &temperature, &top_k, &top_p, &t_max, &use_cpu, &cpu_arena, &threads)
+	parse_args(&max_new_tokens, &temperature, &top_k, &top_p, &t_max, &use_cpu, &cpu_arena, &threads, &gguf_path)
 
 	cpu.set_thread_count(threads)
 
@@ -66,7 +68,9 @@ main :: proc() {
 	}
 	defer tok.destroy(tokenizer)
 
-	fmt.printfln("Allocating Gemma 4 E4B (bf16, %v) ...", "CPU" if use_cpu else "GPU")
+	use_gguf := builtin.len(gguf_path) > 0 || os.exists(GGUF_PATH)
+	weights_label := "Q4_K_M GGUF" if use_gguf else "bf16 safetensors"
+	fmt.printfln("Allocating Gemma 4 E4B (%v, %v) ...", weights_label, "CPU" if use_cpu else "GPU")
 	cfg := gemma.make_e4b_config()
 	defer gemma.config_destroy(cfg)
 	model := gemma.make(cfg, .Bf16)
@@ -79,9 +83,17 @@ main :: proc() {
 	// chat process doesn't keep ~10+ GB of stale scratch for its lifetime.
 	{
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		if !gemma.load_safetensors(model, MODEL_PATH) {
-			fmt.eprintln("FAIL: weight loading failed.")
-			os.exit(1)
+		if use_gguf {
+			path := gguf_path if builtin.len(gguf_path) > 0 else GGUF_PATH
+			if !gemma.load_gguf(&model, path) {
+				fmt.eprintln("FAIL: GGUF weight loading failed.")
+				os.exit(1)
+			}
+		} else {
+			if !gemma.load_safetensors(model, MODEL_PATH) {
+				fmt.eprintln("FAIL: weight loading failed.")
+				os.exit(1)
+			}
 		}
 	}
 	fmt.printfln("  loaded in %.1f s", f64(time.duration_seconds(time.tick_since(t_load))))
@@ -147,13 +159,29 @@ main :: proc() {
 
 		append(&all_tokens, ..new_tokens)
 
-		ml.clear()
 		t_prefill := time.tick_now()
 		{
-			logits := gemma.forward_cached(model, &cache, new_tokens)
-			buf := make([]f32, ml.len(logits), context.temp_allocator)
-			ml.get_data(logits, buf)
-			copy(last_row, buf[(builtin.len(new_tokens) - 1) * vocab_size :])
+			// Q4_K/Q6_K coopmat prefill requires M % 64 == 0, so feed prefill
+			// in 64-token aligned chunks plus a single-token-per-step tail.
+			// (bf16 prefill works for any M but uses the same chunking — the
+			//  branching adds no real cost.)
+			PREFILL_CHUNK :: 64
+			pos := 0
+			n := builtin.len(new_tokens)
+			for pos < n {
+				ml.clear()
+				take := PREFILL_CHUNK
+				if pos + take > n do take = n - pos
+				if take != PREFILL_CHUNK do take = 1
+				chunk := new_tokens[pos : pos + take]
+				logits := gemma.forward_cached(model, &cache, chunk)
+				if pos + take == n {
+					buf := make([]f32, ml.len(logits), context.temp_allocator)
+					ml.get_data(logits, buf)
+					copy(last_row, buf[(take - 1) * vocab_size :])
+				}
+				pos += take
+			}
 		}
 		prefill_elapsed := f64(time.duration_seconds(time.tick_since(t_prefill)))
 
@@ -277,7 +305,7 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 	return indices[keep - 1]
 }
 
-parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, threads: ^int) {
+parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, threads: ^int, gguf_path: ^string) {
 	args := os.args[1:]
 	i := 0
 	for i < builtin.len(args) {
@@ -314,6 +342,10 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 			if i + 1 >= builtin.len(args) do _usage_exit()
 			threads^ = _parse_int(args[i + 1])
 			i += 2
+		case "--gguf":
+			if i + 1 >= builtin.len(args) do _usage_exit()
+			gguf_path^ = args[i + 1]
+			i += 2
 		case "--help", "-h":
 			_usage_exit()
 		case:
@@ -324,7 +356,7 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 }
 
 _usage_exit :: proc() {
-	fmt.eprintln("usage: gemma_chat_repl [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N]")
+	fmt.eprintln("usage: gemma_chat_repl [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N] [--gguf PATH]")
 	os.exit(1)
 }
 

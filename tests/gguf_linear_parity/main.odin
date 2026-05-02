@@ -65,6 +65,20 @@ main :: proc() {
 	}
 
 	{
+		fmt.println("== synthetic Q4_K on GPU (coopmat M=64) ==")
+		ctx := gpu.context_create()
+		defer gpu.context_destroy(ctx)
+		ml.context_scope(ctx)
+
+		w_bytes := _make_synthetic_q4_k_bytes(64)
+		defer delete(w_bytes)
+
+		_run_q4_k_gpu_coopmat_parity(w_bytes, &any_failed, "synthetic")
+
+		ml.clear()
+	}
+
+	{
 		fmt.println("== synthetic Q6_K on GPU ==")
 		ctx := gpu.context_create()
 		defer gpu.context_destroy(ctx)
@@ -74,6 +88,20 @@ main :: proc() {
 		defer delete(w_bytes)
 
 		_run_q6_k_gpu_parity(w_bytes, &any_failed, "synthetic")
+
+		ml.clear()
+	}
+
+	{
+		fmt.println("== synthetic Q6_K on GPU (coopmat M=64) ==")
+		ctx := gpu.context_create()
+		defer gpu.context_destroy(ctx)
+		ml.context_scope(ctx)
+
+		w_bytes := _make_synthetic_q6_k_bytes(64)
+		defer delete(w_bytes)
+
+		_run_q6_k_gpu_coopmat_parity(w_bytes, &any_failed, "synthetic")
 
 		ml.clear()
 	}
@@ -395,6 +423,58 @@ _run_q4_k_gpu_parity :: proc(w_bytes: []byte, any_failed: ^bool, label: string) 
 		rel_tol=0.20, abs_tol=0.30)
 }
 
+// M=64, N=64, K=256 (one Q4_K block). Exercises the coopmat tile path; weight
+// rows are dense in N so the BN=64 tile is fully utilized.
+_run_q4_k_gpu_coopmat_parity :: proc(w_bytes: []byte, any_failed: ^bool, label: string) {
+	M_CM :: 64
+	N_CM :: 64
+	K_CM :: 256
+
+	weight := ml.alloc(.Q4_K, {N_CM, K_CM}, persistent=true, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(weight, w_bytes)
+
+	x_buf := make([]ml.Bf16, M_CM * K_CM)
+	defer delete(x_buf)
+	state := u64(0xABCD_EF02)
+	for i in 0 ..< M_CM * K_CM {
+		raw := _lcg(&state)
+		v := (f32(i32(raw & 0xFFFF)) - 32768.0) / 32768.0
+		x_buf[i] = ml.bf16_from_f32(v)
+	}
+	x_t := ml.alloc(.Bf16, {M_CM, K_CM}, persistent=false, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(x_t, mem.slice_to_bytes(x_buf))
+
+	y := ml.linear_q4_k(x_t, weight)
+	got := make([]ml.Bf16, M_CM * N_CM)
+	defer delete(got)
+	ml.get_data_bytes(y, mem.slice_to_bytes(got))
+
+	expected := make([]ml.Bf16, M_CM * N_CM)
+	defer delete(expected)
+	row_bytes := (K_CM / ml.K_QUANT_BLOCK_SIZE) * ml.Q4_K_BLOCK_BYTES
+	dequant   := make([]f32, K_CM)
+	defer delete(dequant)
+	for o in 0 ..< N_CM {
+		w_row := w_bytes[o * row_bytes : (o + 1) * row_bytes]
+		gguf.dequantize_q4_k(w_row, dequant)
+		for c in 0 ..< M_CM {
+			total: f32
+			for k in 0 ..< K_CM {
+				total += dequant[k] * ml.bf16_to_f32(x_buf[c * K_CM + k])
+			}
+			expected[c * N_CM + o] = ml.bf16_from_f32(total)
+		}
+	}
+
+	// Synthetic weights run to ~10/element; coopmat stages dequanted weights
+	// through a bf16 shared-memory tile (one round-trip per weight) before
+	// the fp32 tensor-core accumulate, giving output-magnitude-dependent
+	// noise vs the f32 CPU reference. Real-tensor parity below uses the
+	// standard tolerance.
+	_compare_with_tolerance_eps(got, expected, fmt.tprintf("Q4_K GPU coopmat %v", label), any_failed,
+		rel_tol=0.20, abs_tol=0.50)
+}
+
 _run_q6_k_gpu_parity :: proc(w_bytes: []byte, any_failed: ^bool, label: string) {
 	weight := ml.alloc(.Q6_K, {N, K}, persistent=true, buffers=ml.Buffer_Set{.Data})
 	ml.set_data_bytes(weight, w_bytes)
@@ -409,6 +489,54 @@ _run_q6_k_gpu_parity :: proc(w_bytes: []byte, any_failed: ^bool, label: string) 
 
 	expected := _reference_q6_k_matmul_m1(w_bytes, x[:K])
 	_compare_with_tolerance(got[:], expected[:], fmt.tprintf("Q6_K GPU %v", label), any_failed)
+}
+
+// M=64, N=64, K=256 Q6_K coopmat parity. Mirrors the Q4_K coopmat case.
+_run_q6_k_gpu_coopmat_parity :: proc(w_bytes: []byte, any_failed: ^bool, label: string) {
+	M_CM :: 64
+	N_CM :: 64
+	K_CM :: 256
+
+	weight := ml.alloc(.Q6_K, {N_CM, K_CM}, persistent=true, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(weight, w_bytes)
+
+	x_buf := make([]ml.Bf16, M_CM * K_CM)
+	defer delete(x_buf)
+	state := u64(0xABCD_EF03)
+	for i in 0 ..< M_CM * K_CM {
+		raw := _lcg(&state)
+		v := (f32(i32(raw & 0xFFFF)) - 32768.0) / 32768.0
+		x_buf[i] = ml.bf16_from_f32(v)
+	}
+	x_t := ml.alloc(.Bf16, {M_CM, K_CM}, persistent=false, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(x_t, mem.slice_to_bytes(x_buf))
+
+	y := ml.linear_q6_k(x_t, weight)
+	got := make([]ml.Bf16, M_CM * N_CM)
+	defer delete(got)
+	ml.get_data_bytes(y, mem.slice_to_bytes(got))
+
+	expected := make([]ml.Bf16, M_CM * N_CM)
+	defer delete(expected)
+	row_bytes := (K_CM / ml.K_QUANT_BLOCK_SIZE) * ml.Q6_K_BLOCK_BYTES
+	dequant   := make([]f32, K_CM)
+	defer delete(dequant)
+	for o in 0 ..< N_CM {
+		w_row := w_bytes[o * row_bytes : (o + 1) * row_bytes]
+		gguf.dequantize_q6_k(w_row, dequant)
+		for k in 0 ..< K_CM {
+			dequant[k] = ml.bf16_to_f32(ml.bf16_from_f32(dequant[k]))
+		}
+		for c in 0 ..< M_CM {
+			total: f32
+			for k in 0 ..< K_CM {
+				total += dequant[k] * ml.bf16_to_f32(x_buf[c * K_CM + k])
+			}
+			expected[c * N_CM + o] = ml.bf16_from_f32(total)
+		}
+	}
+
+	_compare_with_tolerance(got, expected, fmt.tprintf("Q6_K GPU coopmat %v", label), any_failed)
 }
 
 _reference_q6_k_matmul_m1 :: proc(w_bytes: []byte, x: []ml.Bf16) -> [N]ml.Bf16 {
@@ -527,8 +655,156 @@ _run_real_gpu_parity :: proc(path: string, any_failed: ^bool) {
 
 	_run_real_gpu_for_type(loader, .Q4_K, any_failed)
 	_run_real_gpu_for_type(loader, .Q6_K, any_failed)
+	_run_real_gpu_coopmat_q4_k(loader, any_failed)
+	_run_real_gpu_coopmat_q6_k(loader, any_failed)
 
 	ml.clear()
+}
+
+// Real Gemma 4 Q4_K tensor through the coopmat path. Picks a tensor with
+// output_size and input_size both multiples of 64; runs M=64 activations.
+_run_real_gpu_coopmat_q4_k :: proc(loader: gguf.Loader, any_failed: ^bool) {
+	M_CM :: 64
+
+	chosen_name: string
+	chosen_info: gguf.Tensor_Info
+	found := false
+	for name, info in loader.tensors {
+		if info.type != .Q4_K do continue
+		if len(info.shape) != 2 do continue
+		if info.shape[0] % 64 != 0 do continue
+		if info.shape[1] % 64 != 0 do continue
+		if !found || info.shape[0] * info.shape[1] < chosen_info.shape[0] * chosen_info.shape[1] {
+			chosen_name = name
+			chosen_info = info
+			found = true
+		}
+	}
+	if !found {
+		fmt.println("(no Q4_K tensor with 64-aligned dims; skipping coopmat real parity)")
+		return
+	}
+
+	output_size := chosen_info.shape[0]
+	input_size  := chosen_info.shape[1]
+	w_bytes, _  := gguf.get_bytes(loader, chosen_name)
+
+	weight := ml.alloc(.Q4_K, {output_size, input_size}, persistent=true, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(weight, w_bytes)
+
+	x_buf := make([]ml.Bf16, M_CM * input_size)
+	defer delete(x_buf)
+	state := u64(0x1234_5679)
+	for i in 0 ..< M_CM * input_size {
+		raw := _lcg(&state)
+		v := (f32(i32(raw & 0xFFFF)) - 32768.0) / 32768.0
+		x_buf[i] = ml.bf16_from_f32(v)
+	}
+	x_t := ml.alloc(.Bf16, {M_CM, input_size}, persistent=false, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(x_t, mem.slice_to_bytes(x_buf))
+
+	y := ml.linear_q4_k(x_t, weight)
+
+	got := make([]ml.Bf16, M_CM * output_size)
+	defer delete(got)
+	ml.get_data_bytes(y, mem.slice_to_bytes(got))
+
+	expected := make([]ml.Bf16, M_CM * output_size)
+	defer delete(expected)
+	row_bytes := (input_size / ml.K_QUANT_BLOCK_SIZE) * ml.Q4_K_BLOCK_BYTES
+	dequant   := make([]f32, input_size)
+	defer delete(dequant)
+	for o in 0 ..< output_size {
+		w_row := w_bytes[o * row_bytes : (o + 1) * row_bytes]
+		gguf.dequantize_q4_k(w_row, dequant)
+		// Mirror the coopmat path: stage dequanted weights through bf16 in
+		// shared memory, then accumulate against bf16 activations in fp32.
+		for k in 0 ..< input_size {
+			dequant[k] = ml.bf16_to_f32(ml.bf16_from_f32(dequant[k]))
+		}
+		for c in 0 ..< M_CM {
+			total: f32
+			for k in 0 ..< input_size {
+				total += dequant[k] * ml.bf16_to_f32(x_buf[c * input_size + k])
+			}
+			expected[c * output_size + o] = ml.bf16_from_f32(total)
+		}
+	}
+
+	_compare_with_tolerance(got, expected,
+		fmt.tprintf("Q4_K GPU coopmat real %v shape=%v M=%v", chosen_name, chosen_info.shape, M_CM),
+		any_failed)
+}
+
+_run_real_gpu_coopmat_q6_k :: proc(loader: gguf.Loader, any_failed: ^bool) {
+	M_CM :: 64
+
+	chosen_name: string
+	chosen_info: gguf.Tensor_Info
+	found := false
+	for name, info in loader.tensors {
+		if info.type != .Q6_K do continue
+		if len(info.shape) != 2 do continue
+		if info.shape[0] % 64 != 0 do continue
+		if info.shape[1] % 64 != 0 do continue
+		if !found || info.shape[0] * info.shape[1] < chosen_info.shape[0] * chosen_info.shape[1] {
+			chosen_name = name
+			chosen_info = info
+			found = true
+		}
+	}
+	if !found {
+		fmt.println("(no Q6_K tensor with 64-aligned dims; skipping coopmat real parity)")
+		return
+	}
+
+	output_size := chosen_info.shape[0]
+	input_size  := chosen_info.shape[1]
+	w_bytes, _  := gguf.get_bytes(loader, chosen_name)
+
+	weight := ml.alloc(.Q6_K, {output_size, input_size}, persistent=true, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(weight, w_bytes)
+
+	x_buf := make([]ml.Bf16, M_CM * input_size)
+	defer delete(x_buf)
+	state := u64(0x1234_567A)
+	for i in 0 ..< M_CM * input_size {
+		raw := _lcg(&state)
+		v := (f32(i32(raw & 0xFFFF)) - 32768.0) / 32768.0
+		x_buf[i] = ml.bf16_from_f32(v)
+	}
+	x_t := ml.alloc(.Bf16, {M_CM, input_size}, persistent=false, buffers=ml.Buffer_Set{.Data})
+	ml.set_data_bytes(x_t, mem.slice_to_bytes(x_buf))
+
+	y := ml.linear_q6_k(x_t, weight)
+
+	got := make([]ml.Bf16, M_CM * output_size)
+	defer delete(got)
+	ml.get_data_bytes(y, mem.slice_to_bytes(got))
+
+	expected := make([]ml.Bf16, M_CM * output_size)
+	defer delete(expected)
+	row_bytes := (input_size / ml.K_QUANT_BLOCK_SIZE) * ml.Q6_K_BLOCK_BYTES
+	dequant   := make([]f32, input_size)
+	defer delete(dequant)
+	for o in 0 ..< output_size {
+		w_row := w_bytes[o * row_bytes : (o + 1) * row_bytes]
+		gguf.dequantize_q6_k(w_row, dequant)
+		for k in 0 ..< input_size {
+			dequant[k] = ml.bf16_to_f32(ml.bf16_from_f32(dequant[k]))
+		}
+		for c in 0 ..< M_CM {
+			total: f32
+			for k in 0 ..< input_size {
+				total += dequant[k] * ml.bf16_to_f32(x_buf[c * input_size + k])
+			}
+			expected[c * output_size + o] = ml.bf16_from_f32(total)
+		}
+	}
+
+	_compare_with_tolerance(got, expected,
+		fmt.tprintf("Q6_K GPU coopmat real %v shape=%v M=%v", chosen_name, chosen_info.shape, M_CM),
+		any_failed)
 }
 
 _run_real_gpu_for_type :: proc(loader: gguf.Loader, ty: gguf.Tensor_Type, any_failed: ^bool) {
