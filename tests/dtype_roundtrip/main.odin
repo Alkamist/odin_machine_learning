@@ -243,6 +243,112 @@ main :: proc() {
 			check(ok, fmt.tprintf("%v: Bf16 linear forward (multi-tile) matches f32 reference", label), any_failed)
 		}
 
+		// linear_q8 forward: bf16 reference vs symmetric per-channel int8.
+		// Tolerance is per-row absmax/127 worst-case rounding, scaled by K.
+		// CPU only — GPU kernel is not implemented yet.
+		if label == "cpu" {
+			M :: 8
+			K :: 64
+			N :: 32
+
+			x_src: [M * K]f32
+			for i in 0 ..< M * K {
+				x_src[i] = f32(((i * 7) % 13) - 6) * 0.1
+			}
+			w_src: [N * K]f32
+			for i in 0 ..< N * K {
+				w_src[i] = f32(((i * 11) % 17) - 8) * 0.05
+			}
+
+			x_f32 := ml.tensor(x_src[:])
+			w_f32 := ml.tensor(w_src[:])
+			x_bf  := ml.cast_to(ml.reshape(x_f32, {M, K}), .Bf16)
+			w_bf  := ml.cast_to(ml.reshape(w_f32, {N, K}), .Bf16)
+
+			y_ref := ml.cast_to(ml.linear(x_bf, w_bf), .F32)
+			ref: [M * N]f32
+			ml.get_data(y_ref, ref[:])
+
+			w_q8, w_scales := ml.quantize_int8(w_bf)
+			defer ml.destroy(w_q8)
+			defer ml.destroy(w_scales)
+
+			y_q8 := ml.cast_to(ml.linear_q8(x_bf, w_q8, w_scales), .F32)
+			got: [M * N]f32
+			ml.get_data(y_q8, got[:])
+
+			max_abs_err: f32
+			max_ref:     f32
+			for i in 0 ..< M * N {
+				e := got[i] - ref[i]
+				if e < 0 do e = -e
+				if e > max_abs_err do max_abs_err = e
+				r := ref[i]
+				if r < 0 do r = -r
+				if r > max_ref do max_ref = r
+			}
+			tol: f32 = max_ref * 0.05 + 0.01
+			check(max_abs_err < tol,
+				fmt.tprintf("%v: int8 linear_q8 forward matches bf16 reference (max_err=%.5f, tol=%.5f)", label, max_abs_err, tol),
+				any_failed)
+
+			// linear_q8 is forward-only; drop ops so a later backward() doesn't
+			// walk the Linear_Q8 op and panic.
+			ml.clear()
+		}
+
+		// linear_q4 forward: bf16 reference vs Q4_0-style group-of-32 int4.
+		// K must be a multiple of QUANT_GROUP_SIZE; tolerance is wider than int8
+		// because per-group quantization to 4 bits has ~16x the rounding error.
+		if label == "cpu" {
+			M :: 8
+			K :: 64
+			N :: 32
+
+			x_src: [M * K]f32
+			for i in 0 ..< M * K {
+				x_src[i] = f32(((i * 7) % 13) - 6) * 0.1
+			}
+			w_src: [N * K]f32
+			for i in 0 ..< N * K {
+				w_src[i] = f32(((i * 11) % 17) - 8) * 0.05
+			}
+
+			x_f32 := ml.tensor(x_src[:])
+			w_f32 := ml.tensor(w_src[:])
+			x_bf  := ml.cast_to(ml.reshape(x_f32, {M, K}), .Bf16)
+			w_bf  := ml.cast_to(ml.reshape(w_f32, {N, K}), .Bf16)
+
+			y_ref := ml.cast_to(ml.linear(x_bf, w_bf), .F32)
+			ref: [M * N]f32
+			ml.get_data(y_ref, ref[:])
+
+			w_q4, w_scales := ml.quantize_int4(w_bf)
+			defer ml.destroy(w_q4)
+			defer ml.destroy(w_scales)
+
+			y_q4 := ml.cast_to(ml.linear_q4(x_bf, w_q4, w_scales), .F32)
+			got: [M * N]f32
+			ml.get_data(y_q4, got[:])
+
+			max_abs_err: f32
+			max_ref:     f32
+			for i in 0 ..< M * N {
+				e := got[i] - ref[i]
+				if e < 0 do e = -e
+				if e > max_abs_err do max_abs_err = e
+				r := ref[i]
+				if r < 0 do r = -r
+				if r > max_ref do max_ref = r
+			}
+			tol: f32 = max_ref * 0.20 + 0.05
+			check(max_abs_err < tol,
+				fmt.tprintf("%v: int4 linear_q4 forward matches bf16 reference (max_err=%.5f, tol=%.5f)", label, max_abs_err, tol),
+				any_failed)
+
+			ml.clear()
+		}
+
 		// Bf16 linear backward — same {-1, 0, 1} value trick so the f32 reference
 		// gradients are bit-exact in bf16. backward() seeds dy = ones, so:
 		//   dx[c, k] = sum_o w[o, k]

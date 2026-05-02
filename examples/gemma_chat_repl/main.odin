@@ -26,6 +26,7 @@ DEFAULT_TOP_K       :: 40
 DEFAULT_TOP_P       :: f32(0.95)
 DEFAULT_T_MAX       :: 4096
 DEFAULT_CPU_ARENA   :: 2 * 1024 * 1024 * 1024
+DEFAULT_THREADS     :: 8
 
 EOS_TOKEN_ID     :: 1
 END_OF_TURN_TEXT :: "<turn|>"
@@ -39,10 +40,12 @@ main :: proc() {
 	t_max          := DEFAULT_T_MAX
 	use_cpu        := false
 	cpu_arena      := DEFAULT_CPU_ARENA
+	quant_mode     := gemma.Quant_Mode.None
+	threads        := DEFAULT_THREADS
 
-	parse_args(&max_new_tokens, &temperature, &top_k, &top_p, &t_max, &use_cpu, &cpu_arena)
+	parse_args(&max_new_tokens, &temperature, &top_k, &top_p, &t_max, &use_cpu, &cpu_arena, &quant_mode, &threads)
 
-	cpu.set_thread_count(24)
+	cpu.set_thread_count(threads)
 
 	ctx := cpu.context_create(cpu_arena) if use_cpu else gpu.context_create()
 	defer {
@@ -82,6 +85,21 @@ main :: proc() {
 		}
 	}
 	fmt.printfln("  loaded in %.1f s", f64(time.duration_seconds(time.tick_since(t_load))))
+
+	if quant_mode != .None {
+		mode_label: string
+		switch quant_mode {
+		case .None: mode_label = "None"
+		case .Int8: mode_label = "Int8"
+		case .Int4: mode_label = "Int4"
+		case .Q8_0: mode_label = "Q8_0"
+		}
+		fmt.printfln("Quantizing linear weights to %v ...", mode_label)
+		t_q := time.tick_now()
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		gemma.quantize_for_inference(&model, quant_mode)
+		fmt.printfln("  quantized in %.1f s", f64(time.duration_seconds(time.tick_since(t_q))))
+	}
 
 	cache := gemma.cache_make(model, t_max)
 	defer gemma.cache_destroy(cache)
@@ -269,7 +287,7 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 	return indices[keep - 1]
 }
 
-parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int) {
+parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, quant_mode: ^gemma.Quant_Mode, threads: ^int) {
 	args := os.args[1:]
 	i := 0
 	for i < builtin.len(args) {
@@ -302,6 +320,22 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 			if i + 1 >= builtin.len(args) do _usage_exit()
 			cpu_arena^ = _parse_int(args[i + 1])
 			i += 2
+		case "--threads":
+			if i + 1 >= builtin.len(args) do _usage_exit()
+			threads^ = _parse_int(args[i + 1])
+			i += 2
+		case "--quantize":
+			if i + 1 >= builtin.len(args) do _usage_exit()
+			switch args[i + 1] {
+			case "q8", "int8":  quant_mode^ = .Int8
+			case "q4", "int4":  quant_mode^ = .Int4
+			case "q8_0":         quant_mode^ = .Q8_0
+			case "none":         quant_mode^ = .None
+			case:
+				fmt.eprintfln("unknown --quantize value: %v (expected q8 | q4 | q8_0 | none)", args[i + 1])
+				_usage_exit()
+			}
+			i += 2
 		case "--help", "-h":
 			_usage_exit()
 		case:
@@ -312,7 +346,7 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 }
 
 _usage_exit :: proc() {
-	fmt.eprintln("usage: gemma_chat_repl [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--t-max N] [--cpu] [--cpu-arena BYTES]")
+	fmt.eprintln("usage: gemma_chat_repl [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N] [--quantize q8|q4|q8_0]")
 	os.exit(1)
 }
 

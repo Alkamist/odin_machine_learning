@@ -263,6 +263,76 @@ when intrinsics.has_target_feature("avx") {
 		}
 		return sum
 	}
+
+	when intrinsics.has_target_feature("avx2") {
+		I8x32  :: #simd[32]i8
+		U8x32  :: #simd[32]u8
+		I16x16 :: #simd[16]i16
+		I32x8  :: #simd[8]i32
+
+		@(default_calling_convention="none")
+		foreign _ {
+			@(link_name="llvm.x86.avx2.psign.b")
+			_avx2_psign_b :: proc(a, b: I8x32) -> I8x32 ---
+			@(link_name="llvm.x86.avx2.pmadd.ub.sw")
+			_avx2_pmadd_ub_sw :: proc(a: U8x32, b: I8x32) -> I16x16 ---
+			@(link_name="llvm.x86.avx2.pmadd.wd")
+			_avx2_pmadd_wd :: proc(a, b: I16x16) -> I32x8 ---
+		}
+
+		// Modern LLVM expresses integer->float SIMD conversion as generic IR
+		// `sitofp` rather than a target intrinsic, and Odin doesn't expose it
+		// directly. The unrolled per-lane conversion below reliably folds to
+		// a single vcvtdq2ps under -O2/-O3.
+		_i32x8_to_f32x8 :: #force_inline proc "contextless" (v: I32x8) -> F32x8 {
+			arr := simd.to_array(v)
+			out: [8]f32
+			#unroll for i in 0 ..< 8 {
+				out[i] = f32(arr[i])
+			}
+			return simd.from_array(out)
+		}
+
+		// One Q8_0 block dot: 32 int8 weights × 32 int8 activations -> i32x8 of
+		// 8 partial sums. AVX2 pmaddubsw + pmaddwd with the psign trick:
+		// abs(w) is unsigned in [0, 127], sign(x, w) bakes w's sign into x so
+		// the unsigned×signed multiply-add reproduces signed×signed semantics.
+		_avx2_q8_block_isum_v :: #force_inline proc "contextless" (w_q, x_q: [^]i8) -> I32x8 {
+			wv := intrinsics.unaligned_load((^I8x32)(w_q))
+			xv := intrinsics.unaligned_load((^I8x32)(x_q))
+			ax := transmute(U8x32)_avx2_psign_b(wv, wv)
+			sy := _avx2_psign_b(xv, wv)
+			p16 := _avx2_pmadd_ub_sw(ax, sy)
+			return _avx2_pmadd_wd(p16, I16x16(1))
+		}
+	}
+
+	// Dot product of an int8 weight row with a bf16 input row, accumulated in f32.
+	// Returns the unscaled sum; caller multiplies by the per-output-channel scale.
+	_simd_dot_int8_bf16_f32 :: #force_inline proc "contextless" (w: [^]i8, x: [^]ml.Bf16, n: int) -> f32 {
+		acc: F32x8
+		i := 0
+		for ; i + SIMD_LANES <= n; i += SIMD_LANES {
+			w_i8  := intrinsics.unaligned_load((^#simd[8]i8) (&w[i]))
+			x_u16 := intrinsics.unaligned_load((^#simd[8]u16)(&x[i]))
+			w_f := F32x8{
+				f32(intrinsics.simd_extract(w_i8, 0)),
+				f32(intrinsics.simd_extract(w_i8, 1)),
+				f32(intrinsics.simd_extract(w_i8, 2)),
+				f32(intrinsics.simd_extract(w_i8, 3)),
+				f32(intrinsics.simd_extract(w_i8, 4)),
+				f32(intrinsics.simd_extract(w_i8, 5)),
+				f32(intrinsics.simd_extract(w_i8, 6)),
+				f32(intrinsics.simd_extract(w_i8, 7)),
+			}
+			acc = simd.fma(w_f, _bf16x8_to_f32x8(x_u16), acc)
+		}
+		sum := simd.reduce_add_bisect(acc)
+		for ; i < n; i += 1 {
+			sum += f32(w[i]) * ml.bf16_to_f32(x[i])
+		}
+		return sum
+	}
 } else {
 	_simd_dot_f32 :: #force_inline proc "contextless" (a, b: [^]f32, n: int) -> f32 {
 		s0, s1, s2, s3: f32
@@ -298,6 +368,22 @@ when intrinsics.has_target_feature("avx") {
 		sum := (s0 + s1) + (s2 + s3)
 		for ; i < n; i += 1 {
 			sum += ml.bf16_to_f32(a[i]) * ml.bf16_to_f32(b[i])
+		}
+		return sum
+	}
+
+	_simd_dot_int8_bf16_f32 :: #force_inline proc "contextless" (w: [^]i8, x: [^]ml.Bf16, n: int) -> f32 {
+		s0, s1, s2, s3: f32
+		i := 0
+		for ; i + 4 <= n; i += 4 {
+			s0 += f32(w[i + 0]) * ml.bf16_to_f32(x[i + 0])
+			s1 += f32(w[i + 1]) * ml.bf16_to_f32(x[i + 1])
+			s2 += f32(w[i + 2]) * ml.bf16_to_f32(x[i + 2])
+			s3 += f32(w[i + 3]) * ml.bf16_to_f32(x[i + 3])
+		}
+		sum := (s0 + s1) + (s2 + s3)
+		for ; i < n; i += 1 {
+			sum += f32(w[i]) * ml.bf16_to_f32(x[i])
 		}
 		return sum
 	}
@@ -441,6 +527,9 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_forward     (op)
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
+	case ml.Linear_Q8:          linear_q8_forward          (op)
+	case ml.Linear_Q4:          linear_q4_forward          (op)
+	case ml.Linear_Q8_0:        linear_q8_0_forward        (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
@@ -480,6 +569,9 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
+	case ml.Linear_Q8:          fmt.panicf("CPU linear_q8_backward: linear_q8 is forward-only (inference path)")
+	case ml.Linear_Q4:          fmt.panicf("CPU linear_q4_backward: linear_q4 is forward-only (inference path)")
+	case ml.Linear_Q8_0:        fmt.panicf("CPU linear_q8_0_backward: linear_q8_0 is forward-only (inference path)")
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
@@ -525,12 +617,12 @@ _cast_bytes :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: 
 
 	for i in 0 ..< count {
 		v: f32
-		switch src_type {
+		#partial switch src_type {
 		case .F32:  v = src_f32 [i]
 		case .F16:  v = f32(src_f16[i])
 		case .Bf16: v = ml.bf16_to_f32(src_bf16[i])
 		}
-		switch dst_type {
+		#partial switch dst_type {
 		case .F32:  dst_f32 [i] = v
 		case .F16:  dst_f16 [i] = f16(v)
 		case .Bf16: dst_bf16[i] = ml.bf16_from_f32(v)
@@ -549,12 +641,12 @@ _cast_bytes_accumulate :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte,
 
 	for i in 0 ..< count {
 		v: f32
-		switch src_type {
+		#partial switch src_type {
 		case .F32:  v = src_f32 [i]
 		case .F16:  v = f32(src_f16[i])
 		case .Bf16: v = ml.bf16_to_f32(src_bf16[i])
 		}
-		switch dst_type {
+		#partial switch dst_type {
 		case .F32:  dst_f32 [i] += v
 		case .F16:  dst_f16 [i] += f16(v)
 		case .Bf16: dst_bf16[i]  = ml.bf16_from_f32(ml.bf16_to_f32(dst_bf16[i]) + v)
@@ -568,7 +660,7 @@ add_forward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
@@ -604,7 +696,7 @@ add_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
@@ -646,7 +738,7 @@ sub_forward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Sub).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
@@ -673,7 +765,7 @@ sub_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Sub).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
@@ -704,7 +796,7 @@ mul_forward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Mul).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
@@ -731,7 +823,7 @@ mul_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Mul).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
@@ -766,7 +858,7 @@ div_forward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Div).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
@@ -793,7 +885,7 @@ div_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Div).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
@@ -826,7 +918,7 @@ exp_forward :: proc(op: ml.Operation) {
 	input  := op.input
 	output := op.output
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for i in 0 ..< ml.len(input) {
 			data(output)[i] = math.exp(data(input)[i])
@@ -844,7 +936,7 @@ exp_forward :: proc(op: ml.Operation) {
 exp_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for i in 0 ..< ml.len(input) {
 			gradient(input)[i] += data(output)[i] * gradient(output)[i]
@@ -940,7 +1032,7 @@ max_backward :: proc(op: ml.Operation) {
 }
 
 mean_forward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  mean_forward_f32 (op)
 	case .Bf16: mean_forward_bf16(op)
 	case .F16:  fmt.panicf("CPU mean_forward: F16 not yet supported")
@@ -982,7 +1074,7 @@ mean_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 mean_backward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  mean_backward_f32 (op)
 	case .Bf16: mean_backward_bf16(op)
 	case .F16:  fmt.panicf("CPU mean_backward: F16 not yet supported")
@@ -1070,7 +1162,7 @@ select_backward :: proc(op: ml.Operation) {
 	indices := op.variant.(ml.Select).indices
 	size    := ml.len(output) / builtin.len(indices)
 
-	switch weight.type {
+	#partial switch weight.type {
 	case .F32:
 		for i in 0 ..< builtin.len(indices) {
 			for j in 0 ..< size {
@@ -1099,7 +1191,7 @@ slice_forward :: proc(op: ml.Operation) {
 	start   := variant.start
 	end     := variant.end
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		builtin.copy(data(output), data(input)[start:end])
 	case .Bf16:
@@ -1118,7 +1210,7 @@ slice_backward :: proc(op: ml.Operation) {
 	variant := op.variant.(ml.Slice)
 	start   := variant.start
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for i in 0 ..< ml.len(output) {
 			gradient(input)[start + i] += gradient(output)[i]
@@ -1144,7 +1236,7 @@ slice_trailing_forward :: proc(op: ml.Operation) {
 	new_trailing := output.shape[output.rank - 1]
 	leading      := ml._leading_count(input)
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for r in 0 ..< leading {
 			in_off  := r * trailing + start
@@ -1177,7 +1269,7 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 	new_trailing := output.shape[output.rank - 1]
 	leading      := ml._leading_count(input)
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for r in 0 ..< leading {
 			in_off  := r * trailing + start
@@ -1209,7 +1301,7 @@ concat_forward :: proc(op: ml.Operation) {
 	leading      := ml._leading_count(inputs[0])
 	out_trailing := output.shape[output.rank - 1]
 
-	switch output.type {
+	#partial switch output.type {
 	case .F32:
 		dst_col := 0
 		for input in inputs {
@@ -1251,7 +1343,7 @@ concat_backward :: proc(op: ml.Operation) {
 	leading      := ml._leading_count(inputs[0])
 	out_trailing := output.shape[output.rank - 1]
 
-	switch output.type {
+	#partial switch output.type {
 	case .F32:
 		src_col := 0
 		for input in inputs {
@@ -1286,7 +1378,7 @@ concat_backward :: proc(op: ml.Operation) {
 }
 
 linear_forward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  linear_forward_f32 (op)
 	case .Bf16: linear_forward_bf16(op)
 	case .F16:  fmt.panicf("CPU linear_forward: F16 not yet supported")
@@ -1353,8 +1445,206 @@ linear_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
+linear_q8_forward :: proc(op: ml.Operation) {
+	v := op.variant.(ml.Linear_Q8)
+	output_size := v.weight.shape[0]
+	count       := ml.len(op.input) / v.weight.shape[1]
+
+	Job_Data :: struct {
+		op:    ml.Operation,
+		count: int,
+	}
+	jd := Job_Data{op = op, count = count}
+
+	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+		op := jd.op
+		v := op.variant.(ml.Linear_Q8)
+		output_size := v.weight.shape[0]
+		input_size  := v.weight.shape[1]
+
+		x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers   [.Data]))
+		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers  [.Data]))
+		w_i8 := ([^]i8     )(raw_data(transmute([]byte)v.weight.buffers   [.Data]))
+		s_f32:= ([^]f32    )(raw_data(transmute([]byte)v.scales.buffers   [.Data]))
+
+		w_row := w_i8[o * input_size:]
+		scale := s_f32[o]
+		for c in 0 ..< jd.count {
+			x_row := x_bf[c * input_size:]
+			y_bf[c * output_size + o] = ml.bf16_from_f32(_simd_dot_int8_bf16_f32(w_row, x_row, input_size) * scale)
+		}
+	})
+}
+
+linear_q4_forward :: proc(op: ml.Operation) {
+	v := op.variant.(ml.Linear_Q4)
+	output_size := v.weight.shape[0]
+	input_size  := v.weight.shape[1]
+	count       := ml.len(op.input) / input_size
+
+	Job_Data :: struct {
+		op:    ml.Operation,
+		count: int,
+	}
+	jd := Job_Data{op = op, count = count}
+
+	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+		op := jd.op
+		v := op.variant.(ml.Linear_Q4)
+		output_size := v.weight.shape[0]
+		input_size  := v.weight.shape[1]
+		num_groups  := input_size / ml.QUANT_GROUP_SIZE
+		row_bytes   := input_size / 2
+
+		x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers   [.Data]))
+		y_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers  [.Data]))
+		w_pk  := ([^]u8     )(raw_data(transmute([]byte)v.weight.buffers   [.Data]))
+		s_f32 := ([^]f32    )(raw_data(transmute([]byte)v.scales.buffers   [.Data]))
+
+		w_row := w_pk[o * row_bytes:]
+		scale_row := s_f32[o * num_groups:]
+
+		for c in 0 ..< jd.count {
+			x_row := x_bf[c * input_size:]
+			total: f32
+
+			for g in 0 ..< num_groups {
+				scale := scale_row[g]
+				pack_base := g * (ml.QUANT_GROUP_SIZE / 2)
+				x_base    := g * ml.QUANT_GROUP_SIZE
+				group_sum: f32
+				for j in 0 ..< ml.QUANT_GROUP_SIZE / 2 {
+					byte := w_row[pack_base + j]
+					n0 := f32(i32(byte & 0x0F) - 8)
+					n1 := f32(i32(byte >> 4)   - 8)
+					group_sum += n0 * ml.bf16_to_f32(x_row[x_base + 2 * j + 0])
+					group_sum += n1 * ml.bf16_to_f32(x_row[x_base + 2 * j + 1])
+				}
+				total += group_sum * scale
+			}
+
+			y_bf[c * output_size + o] = ml.bf16_from_f32(total)
+		}
+	})
+}
+
+// Quantize one bf16 input row to Q8_0 blocks of 32: int8 quants + per-block f32 scale.
+// Mirrors ggml's quantize_row_q8_0 in semantics (symmetric, amax-based scaling).
+_q8_0_quantize_row :: proc(x_bf: [^]ml.Bf16, q_out: [^]i8, s_out: [^]f32, input_size: int) {
+	num_groups := input_size / ml.QUANT_GROUP_SIZE
+	for g in 0 ..< num_groups {
+		base := g * ml.QUANT_GROUP_SIZE
+		amax: f32
+		for k in 0 ..< ml.QUANT_GROUP_SIZE {
+			v := ml.bf16_to_f32(x_bf[base + k])
+			if v < 0 do v = -v
+			if v > amax do amax = v
+		}
+		s := amax / 127.0
+		if s == 0 do s = 1
+		s_out[g] = s
+		inv := 1.0 / s
+		for k in 0 ..< ml.QUANT_GROUP_SIZE {
+			r := math.round(ml.bf16_to_f32(x_bf[base + k]) * inv)
+			if r >  127 do r =  127
+			if r < -127 do r = -127
+			q_out[base + k] = i8(r)
+		}
+	}
+}
+
+// Q8_0 row dot: weight stored as int8 + per-block f32 scale, activation already
+// quantized the same way. Mirrors ggml's AVX2 ggml_vec_dot_q8_0_q8_0 — converts
+// each block's i32x8 partial sums to f32x8 once, FMAs into a vector accumulator
+// scaled by `d_w * d_x`, and reduces horizontally only at the end.
+_dot_q8_0_row :: #force_inline proc "contextless" (
+	w_q: [^]i8, w_s: [^]f32, x_q: [^]i8, x_s: [^]f32, num_blocks: int,
+) -> f32 {
+	when intrinsics.has_target_feature("avx2") {
+		acc: F32x8
+		for b in 0 ..< num_blocks {
+			isum := _avx2_q8_block_isum_v(&w_q[b * ml.QUANT_GROUP_SIZE], &x_q[b * ml.QUANT_GROUP_SIZE])
+			d := F32x8(w_s[b] * x_s[b])
+			acc = simd.fma(d, _i32x8_to_f32x8(isum), acc)
+		}
+		return simd.reduce_add_bisect(acc)
+	} else {
+		acc: f32
+		for b in 0 ..< num_blocks {
+			isum: i32
+			for k in 0 ..< ml.QUANT_GROUP_SIZE {
+				isum += i32(w_q[b * ml.QUANT_GROUP_SIZE + k]) * i32(x_q[b * ml.QUANT_GROUP_SIZE + k])
+			}
+			acc += f32(isum) * w_s[b] * x_s[b]
+		}
+		return acc
+	}
+}
+
+linear_q8_0_forward :: proc(op: ml.Operation) {
+	v := op.variant.(ml.Linear_Q8_0)
+	output_size := v.weight.shape[0]
+	input_size  := v.weight.shape[1]
+	count       := ml.len(op.input) / input_size
+	num_blocks  := input_size / ml.QUANT_GROUP_SIZE
+
+	x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers[.Data]))
+
+	// Quantize the activation once before fanning out across output rows. This
+	// is the whole point: without it, every (output_row, token) job would
+	// re-read the bf16 activation, defeating the bandwidth win.
+	x_q_buf := builtin.make([]i8,  count * input_size, context.temp_allocator)
+	x_s_buf := builtin.make([]f32, count * num_blocks, context.temp_allocator)
+	x_q := raw_data(x_q_buf)
+	x_s := raw_data(x_s_buf)
+	for c in 0 ..< count {
+		_q8_0_quantize_row(
+			x_bf[c * input_size:],
+			([^]i8)(x_q)[c * input_size:],
+			([^]f32)(x_s)[c * num_blocks:],
+			input_size,
+		)
+	}
+
+	Job_Data :: struct {
+		op:         ml.Operation,
+		count:      int,
+		num_blocks: int,
+		x_q:        [^]i8,
+		x_s:        [^]f32,
+	}
+	jd := Job_Data{op = op, count = count, num_blocks = num_blocks, x_q = x_q, x_s = x_s}
+
+	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+		op := jd.op
+		v := op.variant.(ml.Linear_Q8_0)
+		output_size := v.weight.shape[0]
+		input_size  := v.weight.shape[1]
+		num_blocks  := jd.num_blocks
+
+		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Data]))
+		w_i8 := ([^]i8     )(raw_data(transmute([]byte)v.weight.buffers [.Data]))
+		w_s  := ([^]f32    )(raw_data(transmute([]byte)v.scales.buffers [.Data]))
+
+		w_row := w_i8[o * input_size:]
+		s_row := w_s [o * num_blocks:]
+
+		for c in 0 ..< jd.count {
+			x_q_row := jd.x_q[c * input_size:]
+			x_s_row := jd.x_s[c * num_blocks:]
+			y_bf[c * output_size + o] = ml.bf16_from_f32(
+				_dot_q8_0_row(w_row, s_row, x_q_row, x_s_row, num_blocks),
+			)
+		}
+	})
+
+	// Caller (e.g. forward_cached) keeps live state on context.temp_allocator
+	// across our call, so we must not free_all. The repl wraps each forward in
+	// runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD which reclaims our scratch.
+}
+
 linear_backward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  linear_backward_f32 (op)
 	case .Bf16: linear_backward_bf16(op)
 	case .F16:  fmt.panicf("CPU linear_backward: F16 not yet supported")
@@ -1459,7 +1749,7 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 }
 
 rope_forward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  rope_forward_f32 (op)
 	case .Bf16: rope_forward_bf16(op)
 	case .F16:  fmt.panicf("CPU rope_forward: F16 not yet supported")
@@ -1562,7 +1852,7 @@ rope_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 rope_backward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  rope_backward_f32 (op)
 	case .Bf16: rope_backward_bf16(op)
 	case .F16:  fmt.panicf("CPU rope_backward: F16 not yet supported")
@@ -1649,7 +1939,7 @@ rope_backward_bf16 :: proc(op: ml.Operation) {
 LAYERNORM_EPSILON :: 1e-5
 
 layernorm_forward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  layernorm_forward_f32 (op)
 	case .Bf16: layernorm_forward_bf16(op)
 	case .F16:  fmt.panicf("CPU layernorm_forward: F16 not yet supported")
@@ -1736,7 +2026,7 @@ layernorm_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 layernorm_backward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  layernorm_backward_f32 (op)
 	case .Bf16: layernorm_backward_bf16(op)
 	case .F16:  fmt.panicf("CPU layernorm_backward: F16 not yet supported")
@@ -1834,7 +2124,7 @@ layernorm_backward_bf16 :: proc(op: ml.Operation) {
 }
 
 rmsnorm_forward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  rmsnorm_forward_f32 (op)
 	case .Bf16: rmsnorm_forward_bf16(op)
 	case .F16:  fmt.panicf("CPU rmsnorm_forward: F16 not yet supported")
@@ -1907,7 +2197,7 @@ rmsnorm_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 rmsnorm_backward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  rmsnorm_backward_f32 (op)
 	case .Bf16: rmsnorm_backward_bf16(op)
 	case .F16:  fmt.panicf("CPU rmsnorm_backward: F16 not yet supported")
@@ -2000,7 +2290,7 @@ softmax_forward :: proc(op: ml.Operation) {
 	size   := input.shape[input.rank - 1]
 	count  := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for sample in 0 ..< count {
 			max_value := math.NEG_INF_F32
@@ -2050,7 +2340,7 @@ softmax_backward :: proc(op: ml.Operation) {
 	size  := op.input.shape[op.input.rank - 1]
 	count := ml.len(op.input) / size
 
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:
 		parallelize(count, count, op, proc(index: int, op: ml.Operation) {
 			input, output := op.input, op.output
@@ -2096,7 +2386,7 @@ log_softmax_forward :: proc(op: ml.Operation) {
 	size   := input.shape[input.rank - 1]
 	count  := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for sample in 0 ..< count {
 			max_value := math.NEG_INF_F32
@@ -2143,7 +2433,7 @@ log_softmax_backward :: proc(op: ml.Operation) {
 	size  := input.shape[input.rank - 1]
 	count := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for sample in 0 ..< count {
 			gradient_sum: f32
@@ -2182,7 +2472,7 @@ entropy_forward :: proc(op: ml.Operation) {
 	size          := probabilities.shape[probabilities.rank - 1]
 	count         := ml.len(probabilities) / size
 
-	switch probabilities.type {
+	#partial switch probabilities.type {
 	case .F32:
 		for sample in 0 ..< count {
 			entropy_value: f32
@@ -2216,7 +2506,7 @@ entropy_backward :: proc(op: ml.Operation) {
 	size  := probabilities.shape[probabilities.rank - 1]
 	count := ml.len(probabilities) / size
 
-	switch probabilities.type {
+	#partial switch probabilities.type {
 	case .F32:
 		for sample in 0 ..< count {
 			for i in 0 ..< size {
@@ -2351,7 +2641,7 @@ cross_entropy_backward :: proc(op: ml.Operation) {
 
 _unary_forward_dispatch :: proc(op: ml.Operation, fwd_f32: proc(x: f32) -> f32) {
 	input, output := op.input, op.output
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for i in 0 ..< ml.len(input) {
 			data(output)[i] = fwd_f32(data(input)[i])
@@ -2368,7 +2658,7 @@ _unary_forward_dispatch :: proc(op: ml.Operation, fwd_f32: proc(x: f32) -> f32) 
 
 _unary_backward_dispatch :: proc(op: ml.Operation, local_grad_from_input: proc(x: f32) -> f32) {
 	input, output := op.input, op.output
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for i in 0 ..< ml.len(input) {
 			gradient(input)[i] += gradient(output)[i] * local_grad_from_input(data(input)[i])
@@ -2451,7 +2741,7 @@ tanh_backward :: proc(op: ml.Operation) {
 }
 
 batched_matmul_forward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  batched_matmul_forward_f32 (op)
 	case .Bf16: batched_matmul_forward_bf16(op)
 	case .F16:  fmt.panicf("CPU batched_matmul_forward: F16 not yet supported")
@@ -2524,7 +2814,7 @@ batched_matmul_forward_f32 :: proc(op: ml.Operation) {
 }
 
 batched_matmul_backward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  batched_matmul_backward_f32 (op)
 	case .Bf16: batched_matmul_backward_bf16(op)
 	case .F16:  fmt.panicf("CPU batched_matmul_backward: F16 not yet supported")
@@ -2658,7 +2948,7 @@ permute_forward :: proc(op: ml.Operation) {
 	out_shape  := [3]int{output.shape[0],           output.shape[1], output.shape[2]}
 	in_strides := [3]int{in_shape[1] * in_shape[2], in_shape[2],     1              }
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for i0 in 0 ..< out_shape[0] {
 			for i1 in 0 ..< out_shape[1] {
@@ -2706,7 +2996,7 @@ permute_backward :: proc(op: ml.Operation) {
 	out_shape  := [3]int{output.shape[0],           output.shape[1], output.shape[2]}
 	in_strides := [3]int{in_shape[1] * in_shape[2], in_shape[2],     1              }
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for i0 in 0 ..< out_shape[0] {
 			for i1 in 0 ..< out_shape[1] {
@@ -2753,7 +3043,7 @@ causal_mask_forward :: proc(op: ml.Operation) {
 	block_size := T * T
 	n_blocks   := ml.len(input) / block_size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for blk in 0 ..< n_blocks {
 			offset := blk * block_size
@@ -2797,7 +3087,7 @@ causal_mask_backward :: proc(op: ml.Operation) {
 	block_size := T * T
 	n_blocks   := ml.len(input) / block_size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		for blk in 0 ..< n_blocks {
 			offset := blk * block_size
@@ -2825,7 +3115,7 @@ causal_mask_backward :: proc(op: ml.Operation) {
 }
 
 attention_forward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  attention_forward_f32 (op)
 	case .Bf16: attention_forward_bf16(op)
 	case .F16:  fmt.panicf("CPU attention_forward: F16 not yet supported")
@@ -2979,7 +3269,7 @@ attention_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 attention_backward :: proc(op: ml.Operation) {
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  attention_backward_f32 (op)
 	case .Bf16: attention_backward_bf16(op)
 	case .F16:  fmt.panicf("CPU attention_backward: F16 not yet supported")
@@ -3170,7 +3460,7 @@ attention_cache_forward :: proc(op: ml.Operation) {
 		builtin.copy(v_cache_bytes[:wrap_bytes], v_new_bytes[first_bytes:first_bytes + wrap_bytes])
 	}
 
-	switch op.input.type {
+	#partial switch op.input.type {
 	case .F32:  attention_cache_forward_f32 (op)
 	case .Bf16: attention_cache_forward_bf16(op)
 	case .F16:  fmt.panicf("CPU attention_cache_forward: F16 not yet supported")

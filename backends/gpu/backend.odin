@@ -257,6 +257,9 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_forward     (op)
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
+	case ml.Linear_Q8:          fmt.panicf("GPU linear_q8_forward: not yet implemented (CPU-only for now)")
+	case ml.Linear_Q4:          fmt.panicf("GPU linear_q4_forward: not yet implemented (CPU-only for now)")
+	case ml.Linear_Q8_0:        fmt.panicf("GPU linear_q8_0_forward: not yet implemented (CPU-only for now)")
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
@@ -299,6 +302,9 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
+	case ml.Linear_Q8:          fmt.panicf("GPU linear_q8_backward: linear_q8 is forward-only (inference path)")
+	case ml.Linear_Q4:          fmt.panicf("GPU linear_q4_backward: linear_q4 is forward-only (inference path)")
+	case ml.Linear_Q8_0:        fmt.panicf("GPU linear_q8_0_backward: linear_q8_0 is forward-only (inference path)")
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
@@ -391,7 +397,7 @@ add_forward :: proc(op: ml.Operation) {
 	output := op.output
 	b      := op.variant.(ml.Add).b
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _add_pipeline == nil {
 			_add_pipeline = _make_pipeline(ADD_SPIRV, 3, size_of(Add_Params))
@@ -422,7 +428,7 @@ add_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _add_back_a_pipeline == nil {
 			_add_back_a_pipeline = _make_pipeline(ADD_BACK_A_SPIRV, 2, size_of(Add_Back_A_Params))
@@ -471,7 +477,7 @@ sub_forward :: proc(op: ml.Operation) {
 	output := op.output
 	b      := op.variant.(ml.Sub).b
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _sub_pipeline == nil {
 			_sub_pipeline = _make_pipeline(SUB_SPIRV, 3, size_of(Sub_Params))
@@ -498,7 +504,7 @@ sub_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Sub).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _sub_back_a_pipeline == nil {
 			_sub_back_a_pipeline = _make_pipeline(SUB_BACK_A_SPIRV, 2, size_of(Sub_Back_A_Params))
@@ -540,7 +546,7 @@ mul_forward :: proc(op: ml.Operation) {
 	output := op.output
 	b      := op.variant.(ml.Mul).b
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _mul_pipeline == nil {
 			_mul_pipeline = _make_pipeline(MUL_SPIRV, 3, size_of(Mul_Params))
@@ -567,7 +573,7 @@ mul_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Mul).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _mul_back_a_pipeline == nil {
 			_mul_back_a_pipeline = _make_pipeline(MUL_BACK_A_SPIRV, 3, size_of(Mul_Back_A_Params))
@@ -610,7 +616,7 @@ div_forward :: proc(op: ml.Operation) {
 	output := op.output
 	b      := op.variant.(ml.Div).b
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _div_pipeline == nil {
 			_div_pipeline = _make_pipeline(DIV_SPIRV, 3, size_of(Div_Params))
@@ -637,7 +643,7 @@ div_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Div).b
 	stride := ml.len(a) / ml.len(b)
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _div_back_a_pipeline == nil {
 			_div_back_a_pipeline = _make_pipeline(DIV_BACK_A_SPIRV, 3, size_of(Div_Back_A_Params))
@@ -759,7 +765,7 @@ mean_forward :: proc(op: ml.Operation) {
 	count  := ml.len(output)
 	size   := ml.len(input) / count
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _mean_pipeline == nil {
 			_mean_pipeline = _make_pipeline(MEAN_SPIRV, 2, size_of(Mean_Params))
@@ -784,7 +790,7 @@ mean_backward :: proc(op: ml.Operation) {
 	count := ml.len(output)
 	size  := ml.len(input) / count
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _mean_back_pipeline == nil {
 			_mean_back_pipeline = _make_pipeline(MEAN_BACK_SPIRV, 2, size_of(Mean_Params))
@@ -840,7 +846,7 @@ select_forward :: proc(op: ml.Operation) {
 
 	indices_buf, indices_mem := _upload_indices(indices)
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _select_pipeline == nil {
 			_select_pipeline = _make_pipeline(SELECT_SPIRV, 3, size_of(Select_Params))
@@ -887,7 +893,7 @@ slice_forward :: proc(op: ml.Operation) {
 	output  := op.output
 	variant := op.variant.(ml.Slice)
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _slice_pipeline == nil {
 			_slice_pipeline = _make_pipeline(SLICE_SPIRV, 2, size_of(Slice_Params))
@@ -912,7 +918,7 @@ slice_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 	variant := op.variant.(ml.Slice)
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _slice_back_pipeline == nil {
 			_slice_back_pipeline = _make_pipeline(SLICE_BACK_SPIRV, 2, size_of(Slice_Params))
@@ -942,7 +948,7 @@ slice_trailing_forward :: proc(op: ml.Operation) {
 	new_trailing := output.shape[output.rank - 1]
 	leading      := ml.len(input) / trailing
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _slice_trailing_pipeline == nil {
 			_slice_trailing_pipeline = _make_pipeline(SLICE_TRAILING_SPIRV, 2, size_of(Slice_Trailing_Params))
@@ -982,7 +988,7 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 	new_trailing := output.shape[output.rank - 1]
 	leading      := ml.len(input) / trailing
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _slice_trailing_back_pipeline == nil {
 			_slice_trailing_back_pipeline = _make_pipeline(SLICE_TRAILING_BACK_SPIRV, 2, size_of(Slice_Trailing_Back_Params))
@@ -1028,7 +1034,7 @@ concat_forward :: proc(op: ml.Operation) {
 	leading := ml.len(a) / t_a
 	total   := leading * (t_a + t_b + t_c)
 
-	switch output.type {
+	#partial switch output.type {
 	case .F32:
 		if _concat3_pipeline == nil {
 			_concat3_pipeline = _make_pipeline(CONCAT3_SPIRV, 4, size_of(Concat3_Params))
@@ -1065,7 +1071,7 @@ concat_backward :: proc(op: ml.Operation) {
 	t_c     := c.shape[c.rank - 1]
 	leading := ml.len(a) / t_a
 
-	switch output.type {
+	#partial switch output.type {
 	case .F32:
 		if _concat3_back_pipeline == nil {
 			_concat3_back_pipeline = _make_pipeline(CONCAT3_BACK_SPIRV, 4, size_of(Concat3_Back_Params))
@@ -1108,7 +1114,7 @@ linear_forward :: proc(op: ml.Operation) {
 	}
 	bufs := [3]vk.Buffer{data(input).buffer, data(weight).buffer, data(output).buffer}
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _linear_pipeline == nil {
 			_linear_pipeline = _make_pipeline(LINEAR_SPIRV, 3, size_of(Linear_Params))
@@ -1170,7 +1176,7 @@ linear_backward :: proc(op: ml.Operation) {
 	dx_bufs := [3]vk.Buffer{gradient(output).buffer, data(weight).buffer, gradient(input).buffer}
 	dw_bufs := [3]vk.Buffer{data(input).buffer, gradient(output).buffer, gradient(weight).buffer}
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _linear_back_input_pipeline == nil {
 			_linear_back_input_pipeline = _make_pipeline(LINEAR_BACK_INPUT_SPIRV, 3, size_of(Linear_Back_Params))
@@ -1265,7 +1271,7 @@ rope_forward :: proc(op: ml.Operation) {
 	bufs        := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 	total_pairs := token_count * variant.head_count * (head_size / 2)
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _rope_pipeline == nil {
 			_rope_pipeline = _make_pipeline(ROPE_SPIRV, 2, size_of(Rope_Params))
@@ -1299,7 +1305,7 @@ rope_backward :: proc(op: ml.Operation) {
 	bufs        := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
 	total_pairs := token_count * variant.head_count * (head_size / 2)
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _rope_back_pipeline == nil {
 			_rope_back_pipeline = _make_pipeline(ROPE_BACK_SPIRV, 2, size_of(Rope_Back_Params))
@@ -1520,7 +1526,7 @@ softmax_forward :: proc(op: ml.Operation) {
 	size   := input.shape[input.rank - 1]
 	count  := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _softmax_pipeline == nil {
 			_softmax_pipeline = _make_pipeline(SOFTMAX_SPIRV, 2, size_of(Softmax_Params))
@@ -1545,7 +1551,7 @@ softmax_backward :: proc(op: ml.Operation) {
 	size  := input.shape[input.rank - 1]
 	count := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _softmax_back_pipeline == nil {
 			_softmax_back_pipeline = _make_pipeline(SOFTMAX_BACK_SPIRV, 3, size_of(Softmax_Back_Params))
@@ -1571,7 +1577,7 @@ entropy_forward :: proc(op: ml.Operation) {
 	size   := input.shape[input.rank - 1]
 	count  := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _entropy_pipeline == nil {
 			_entropy_pipeline = _make_pipeline(ENTROPY_SPIRV, 2, size_of(Entropy_Params))
@@ -1599,7 +1605,7 @@ entropy_backward :: proc(op: ml.Operation) {
 	size  := input.shape[input.rank - 1]
 	count := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _entropy_back_pipeline == nil {
 			_entropy_back_pipeline = _make_pipeline(ENTROPY_BACK_SPIRV, 3, size_of(Entropy_Params))
@@ -1627,7 +1633,7 @@ log_softmax_forward :: proc(op: ml.Operation) {
 	size   := input.shape[input.rank - 1]
 	count  := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _log_softmax_pipeline == nil {
 			_log_softmax_pipeline = _make_pipeline(LOG_SOFTMAX_SPIRV, 2, size_of(Log_Softmax_Params))
@@ -1652,7 +1658,7 @@ log_softmax_backward :: proc(op: ml.Operation) {
 	size  := input.shape[input.rank - 1]
 	count := ml.len(input) / size
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _log_softmax_back_pipeline == nil {
 			_log_softmax_back_pipeline = _make_pipeline(LOG_SOFTMAX_BACK_SPIRV, 3, size_of(Log_Softmax_Params))
@@ -1741,7 +1747,7 @@ _unary_forward_gpu :: proc(input, output: ml.Tensor,
                            f32_spirv: []u8,  f32_pipe:  ^^Pipeline,
                            bf16_spirv: []u8, bf16_pipe: ^^Pipeline) {
 	n := ml.len(input)
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if f32_pipe^ == nil {
 			f32_pipe^ = _make_pipeline(f32_spirv, 2, size_of(Activation_Params))
@@ -1767,7 +1773,7 @@ _unary_backward_gpu :: proc(input, output: ml.Tensor, ref_is_output: bool,
                             bf16_spirv: []u8, bf16_pipe: ^^Pipeline) {
 	n := ml.len(input)
 	ref_buf := ref_is_output ? data(output).buffer : data(input).buffer
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if f32_pipe^ == nil {
 			f32_pipe^ = _make_pipeline(f32_spirv, 3, size_of(Activation_Params))
@@ -1800,7 +1806,7 @@ tanh_backward   :: proc(op: ml.Operation) { _unary_backward_gpu(op.input, op.out
 gelu_forward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 	n := ml.len(input)
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _gelu_pipeline == nil {
 			_gelu_pipeline = _make_pipeline(GELU_SPIRV, 2, size_of(Gelu_Params))
@@ -1824,7 +1830,7 @@ gelu_forward :: proc(op: ml.Operation) {
 gelu_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 	n := ml.len(input)
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _gelu_back_pipeline == nil {
 			_gelu_back_pipeline = _make_pipeline(GELU_BACK_SPIRV, 3, size_of(Gelu_Back_Params))
@@ -1862,7 +1868,7 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 	}
 	bufs := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _batched_matmul_pipeline == nil {
 			_batched_matmul_pipeline = _make_pipeline(BATCHED_MATMUL_SPIRV, 3, size_of(Batched_Matmul_Params))
@@ -1924,7 +1930,7 @@ batched_matmul_backward :: proc(op: ml.Operation) {
 	da_bufs := [3]vk.Buffer{gradient(output).buffer, data(b).buffer, gradient(a).buffer}
 	db_bufs := [3]vk.Buffer{data(a).buffer, gradient(output).buffer, gradient(b).buffer}
 
-	switch a.type {
+	#partial switch a.type {
 	case .F32:
 		if _batched_matmul_back_input_pipeline == nil {
 			_batched_matmul_back_input_pipeline = _make_pipeline(BATCHED_MATMUL_BACK_INPUT_SPIRV, 3, size_of(Batched_Matmul_Params))
@@ -2006,7 +2012,7 @@ permute_forward :: proc(op: ml.Operation) {
 	output := op.output
 	axes   := op.variant.(ml.Permute).axes
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _permute_pipeline == nil {
 			_permute_pipeline = _make_pipeline(PERMUTE_SPIRV, 2, size_of(Permute_Params))
@@ -2050,7 +2056,7 @@ permute_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 	axes := op.variant.(ml.Permute).axes
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _permute_back_pipeline == nil {
 			_permute_back_pipeline = _make_pipeline(PERMUTE_BACK_SPIRV, 2, size_of(Permute_Params))
@@ -2096,7 +2102,7 @@ causal_mask_forward :: proc(op: ml.Operation) {
 	output := op.output
 	T      := input.shape[input.rank - 1]
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _causal_mask_pipeline == nil {
 			_causal_mask_pipeline = _make_pipeline(CAUSAL_MASK_SPIRV, 2, size_of(Causal_Mask_Params))
@@ -2121,7 +2127,7 @@ causal_mask_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 	T := input.shape[input.rank - 1]
 
-	switch input.type {
+	#partial switch input.type {
 	case .F32:
 		if _causal_mask_back_pipeline == nil {
 			_causal_mask_back_pipeline = _make_pipeline(CAUSAL_MASK_BACK_SPIRV, 2, size_of(Causal_Mask_Params))

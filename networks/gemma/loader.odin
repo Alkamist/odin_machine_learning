@@ -121,7 +121,7 @@ _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma)
 	if !bytes_ok do return false
 
 	count := cfg.vocab_size * cfg.num_hidden_layers * cfg.hidden_size_per_layer_input
-	switch model.dtype {
+	#partial switch model.dtype {
 	case .Bf16:
 		switch info.dtype {
 		case "BF16":
@@ -192,7 +192,7 @@ _load_named :: proc(loader: safetensors.Loader, target: ml.Tensor, name: string)
 // and write. Bf16-source-Bf16-target is a direct byte copy.
 _write_target :: proc(target: ml.Tensor, info: safetensors.Tensor_Info, raw_bytes: []byte, name: string) -> bool {
 	count := ml.len(target)
-	switch target.type {
+	#partial switch target.type {
 	case .F32:
 		floats := builtin.make([]f32, count, context.temp_allocator)
 		if !_decode_dtype_bytes(info, raw_bytes, floats) do return false
@@ -274,7 +274,7 @@ _load_rope_permuted :: proc(loader: safetensors.Loader, target: ml.Tensor, name:
 _write_floats_to_target :: proc(target: ml.Tensor, src: []f32, name: string) {
 	count := ml.len(target)
 	assert(builtin.len(src) == count, name)
-	switch target.type {
+	#partial switch target.type {
 	case .F32:
 		ml.set_data(target, src)
 	case .Bf16:

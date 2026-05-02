@@ -9,6 +9,8 @@ ols.json
 *.pdb
 
 ggml/
+llama.cpp/
+ollama/
 
 .claude/
 
