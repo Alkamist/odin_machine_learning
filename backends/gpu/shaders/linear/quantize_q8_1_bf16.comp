@@ -1,0 +1,64 @@
+// bf16 X[K] -> Q8_1 blocks for the Q4_K mmvq path. Per-block layout matches
+// llama.cpp's `block_q8_1` (36 bytes / 32 weights / 9 uints):
+//   uint 0       packHalf2x16(d, s) where d = amax/127, s = d*sum(qs[i])
+//   uint 1..8    qs[32] as packed-4x8 signed int8 (4 quants per uint)
+//
+// One workgroup per Q8_1 block. Each thread quantizes one of the 32 elements;
+// subgroup reductions compute amax (for d) and the rounded-quant sum (for s).
+// Requires K % 32 == 0.
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "bf16.glsl"
+
+#define WG 32
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { uint x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { uint y[]; };
+
+layout(push_constant) uniform Params {
+    uint K;
+} p;
+
+shared int  s_qs[WG];
+
+void main() {
+    uint block_idx = gl_WorkGroupID.x;
+    uint tid       = gl_LocalInvocationID.x;
+
+    uint k    = block_idx * WG + tid;
+    uint pkx  = x[k >> 1u];
+    float xv  = ((k & 1u) == 0u)
+        ? bf16_expand( pkx        & 0xffffu)
+        : bf16_expand((pkx >> 16) & 0xffffu);
+
+    float amax = subgroupMax(abs(xv));
+    float d    = amax / 127.0;
+    float d_inv = (d != 0.0) ? (1.0 / d) : 0.0;
+    int   q     = int(round(xv * d_inv));
+    s_qs[tid]   = q;
+
+    int sum_q = subgroupAdd(q);
+
+    barrier();
+
+    // Pack 4 quants per uint into qs[0..7]. Eight threads write; the rest idle.
+    if (tid < 8u) {
+        uint base = tid * 4u;
+        int q0 = s_qs[base + 0u] & 0xff;
+        int q1 = s_qs[base + 1u] & 0xff;
+        int q2 = s_qs[base + 2u] & 0xff;
+        int q3 = s_qs[base + 3u] & 0xff;
+        uint packed = uint(q0) | (uint(q1) << 8) | (uint(q2) << 16) | (uint(q3) << 24);
+        y[block_idx * 9u + 1u + tid] = packed;
+    }
+
+    if (tid == 0u) {
+        float s = d * float(sum_q);
+        // Pack two fp16s as halves of a uint: low half = d, high half = s.
+        uint d_h = packHalf2x16(vec2(d, 0.0)) & 0xffffu;
+        uint s_h = packHalf2x16(vec2(s, 0.0)) & 0xffffu;
+        y[block_idx * 9u] = d_h | (s_h << 16);
+    }
+}

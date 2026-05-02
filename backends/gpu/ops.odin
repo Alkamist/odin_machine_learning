@@ -31,6 +31,11 @@ LINEAR_BF16_GEMV_SPIRV    :: #load("shaders/linear/linear_bf16_gemv.spv", []u8)
 LINEAR_BF16_GEMV_ROWS_PER :: 2  // must match ROWS_PER_WG in shaders/linear_bf16_gemv.comp
 LINEAR_Q4_K_GEMV_SPIRV    :: #load("shaders/linear/linear_q4_k_gemv.spv", []u8)
 LINEAR_Q4_K_GEMV_ROWS_PER :: 2  // must match ROWS_PER_WG in shaders/linear_q4_k_gemv.comp
+LINEAR_Q4_K_MMVQ_SPIRV    :: #load("shaders/linear/linear_q4_k_mmvq.spv", []u8)
+LINEAR_Q4_K_MMVQ_ROWS_PER :: 2  // must match ROWS_PER_WG in shaders/linear_q4_k_mmvq.comp
+QUANTIZE_Q8_1_BF16_SPIRV  :: #load("shaders/linear/quantize_q8_1_bf16.spv", []u8)
+QUANTIZE_Q8_1_BF16_BLOCK  :: 32  // must match WG in shaders/quantize_q8_1_bf16.comp
+Quantize_Q8_1_Bf16_Params :: struct { K: u32 }
 LINEAR_Q6_K_GEMV_SPIRV    :: #load("shaders/linear/linear_q6_k_gemv.spv", []u8)
 LINEAR_Q6_K_GEMV_ROWS_PER :: 2  // must match ROWS_PER_WG in shaders/linear_q6_k_gemv.comp
 Linear_Params :: struct { count, input_size, output_size: u32 }
@@ -39,6 +44,8 @@ _linear_bf16_pipeline:         ^Pipeline
 _linear_bf16_coopmat_pipeline: ^Pipeline
 _linear_bf16_gemv_pipeline:    ^Pipeline
 _linear_q4_k_gemv_pipeline:    ^Pipeline
+_linear_q4_k_mmvq_pipeline:    ^Pipeline
+_quantize_q8_1_bf16_pipeline:  ^Pipeline
 _linear_q6_k_gemv_pipeline:    ^Pipeline
 
 LINEAR_BACK_INPUT_SPIRV               :: #load("shaders/linear/linear_back_input.spv",               []u8)

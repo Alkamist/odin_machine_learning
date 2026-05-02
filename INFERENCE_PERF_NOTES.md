@@ -258,6 +258,60 @@ Bonus: max abs logit diff vs HF reference dropped 9.7327 → 8.9983
 
 About +8% throughput from this round.
 
+## mmvq round (Q8_1 + integer dot for Q4_K decode)
+
+### What got built
+
+- `_query_integer_dot8_support` in `backends/gpu/gpu.odin` queries
+  `VK_KHR_shader_integer_dot_product` plus the
+  `integerDotProduct4x8BitPackedSignedAccelerated` property bit, then enables
+  the extension and feature on device creation. Exposed as
+  `_gpu.integer_dot8`. On the 3090 Ti both query bits come back true.
+- `backends/gpu/shaders/linear/quantize_q8_1_bf16.comp`: one workgroup per
+  Q8_1 block (32 elements), `subgroupMax`/`subgroupAdd` reductions to compute
+  `d = amax/127` and `s = d * sum_q`. Block layout matches llama.cpp
+  `block_q8_1` exactly: 9 uints / 36 bytes (uint 0 = packed fp16 d/s,
+  uints 1..8 = qs[32] as packed-4x8 signed int8).
+- `backends/gpu/shaders/linear/linear_q4_k_mmvq.comp`: WG=32, ROWS_PER_WG=2
+  to mirror the existing GEMV. Each thread handles 2 of the 64 packed-4x8
+  chunks per Q4_K block; `dotPacked4x8EXT` does the inner product in one
+  instruction. Per-subblock dmin*min*ds_y correction pinned to inner==0 so
+  it fires exactly once per subblock.
+- `linear_q4_k_forward` in `backends/gpu/backend.odin` pulls a Q8_1 scratch
+  buffer from the activation pool (`K/32 * 36` bytes), dispatches the
+  quantize shader, then the mmvq shader. Falls back to `linear_q4_k_gemv`
+  when `_gpu.integer_dot8 == false`.
+
+### Result
+
+A/B on `tests/gguf_gemma_gpu_parity` (3 runs each, median):
+
+- gemv baseline:    37.20 tok/s (26.9 ms/tok)
+- mmvq:             43.82 tok/s (22.8 ms/tok) → **+17.8%, ~4.1 ms/tok saved**
+
+Right in the 3-4 ms estimate from the "what's between us and Ollama" table.
+
+Logits parity vs HF reference unchanged (max abs diff 8.9046, identical to
+the gelu_mul baseline 8.9983 — actually a hair better because of where
+intermediate fp16 round-trips fell out).
+
+### Notes worth remembering
+
+- Synthetic linear-parity test had to loosen its tolerance for the mmvq path:
+  the test uses `d=0.01, dmin=0.005, scale<=63, q4<=15` so per-element
+  weights run to ~10. Q8_1 round-trip per-element error is ~|w|/254, which
+  over 256 elements accumulates to ~0.1-0.3 abs on outputs that are
+  themselves ~0.5-1. Real Gemma 4 weights (per-element ~0.02 typical) come
+  through with `max_abs ~0.003` against the dequant reference — a clean pass
+  at the standard 5%/0.01 tolerance.
+- The `integerDotProduct4x8BitPackedSignedAccelerated` *property* (not just
+  the *feature*) is what we want — the feature only guarantees the
+  instruction exists, the property guarantees hardware acceleration. Without
+  the property bit it's emulated and would likely regress.
+- Q4 nibbles 0..15 are signed-i8 reinterpretable (max 15 < 128) so we use
+  the signed `dotPacked4x8EXT` directly rather than the mixed-signedness
+  variant. Matches llama.cpp's `mul_mat_vecq_funcs.glsl` for Q4_K.
+
 ## Things we tried that didn't matter (or backfired)
 
 - **Push descriptors** (`VK_KHR_push_descriptor`): replaced per-dispatch

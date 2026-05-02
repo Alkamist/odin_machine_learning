@@ -20,6 +20,7 @@ Gpu_Device :: struct {
 	memory_properties:  vk.PhysicalDeviceMemoryProperties,
 
 	coopmat_bf16:       bool,
+	integer_dot8:       bool,
 	timestamp_period_ns: f32,
 
 	pipelines:          [dynamic]^Pipeline,
@@ -150,8 +151,8 @@ _device_init_locked :: proc() {
 	_pick_physical_device()
 	_create_device()
 
-	fmt.printfln("gpu: %v (queue family %v, coopmat_bf16=%v)",
-		_gpu.device_name, _gpu.queue_family_index, _gpu.coopmat_bf16)
+	fmt.printfln("gpu: %v (queue family %v, coopmat_bf16=%v, integer_dot8=%v)",
+		_gpu.device_name, _gpu.queue_family_index, _gpu.coopmat_bf16, _gpu.integer_dot8)
 }
 
 device_destroy :: proc() {
@@ -293,12 +294,16 @@ _create_device :: proc() {
 	}
 
 	want_coopmat_bf16 := _query_coopmat_bf16_support()
+	want_integer_dot8 := _query_integer_dot8_support()
 
-	extensions := builtin.make([dynamic]cstring, 0, 3, context.temp_allocator)
+	extensions := builtin.make([dynamic]cstring, 0, 4, context.temp_allocator)
 	append(&extensions, cstring(vk.KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
 	if want_coopmat_bf16 {
 		append(&extensions, cstring(vk.KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))
 		append(&extensions, cstring(KHR_SHADER_BFLOAT16_EXTENSION_NAME))
+	}
+	if want_integer_dot8 {
+		append(&extensions, cstring(vk.KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME))
 	}
 
 	bf16_features := Physical_Device_Shader_Bfloat16_Features_KHR{
@@ -311,14 +316,28 @@ _create_device :: proc() {
 		pNext             = &bf16_features,
 		cooperativeMatrix = true,
 	}
+	int_dot_features := vk.PhysicalDeviceShaderIntegerDotProductFeatures{
+		sType                   = .PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+		shaderIntegerDotProduct = true,
+	}
 	v11_features := vk.PhysicalDeviceVulkan11Features{
 		sType                    = .PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-		pNext                    = &coopmat_features,
 		storageBuffer16BitAccess = true,
+	}
+	// Build pNext chain conditionally so unsupported features aren't passed.
+	chain_head: rawptr = nil
+	if want_coopmat_bf16 {
+		v11_features.pNext = chain_head
+		coopmat_features.pNext = &v11_features
+		chain_head = &coopmat_features
+	}
+	if want_integer_dot8 {
+		int_dot_features.pNext = chain_head
+		chain_head = &int_dot_features
 	}
 	features2 := vk.PhysicalDeviceFeatures2{
 		sType = .PHYSICAL_DEVICE_FEATURES_2,
-		pNext = &v11_features,
+		pNext = chain_head,
 	}
 
 	create_info := vk.DeviceCreateInfo{
@@ -328,7 +347,7 @@ _create_device :: proc() {
 		enabledExtensionCount   = u32(builtin.len(extensions)),
 		ppEnabledExtensionNames = raw_data(extensions[:]),
 	}
-	if want_coopmat_bf16 {
+	if chain_head != nil {
 		create_info.pNext = &features2
 	}
 
@@ -339,6 +358,7 @@ _create_device :: proc() {
 	vk.GetDeviceQueue(_gpu.device, _gpu.queue_family_index, 0, &_gpu.queue)
 
 	_gpu.coopmat_bf16 = want_coopmat_bf16
+	_gpu.integer_dot8 = want_integer_dot8
 }
 
 _query_coopmat_bf16_support :: proc() -> bool {
@@ -401,6 +421,49 @@ _query_coopmat_bf16_support :: proc() -> bool {
 		}
 	}
 	return false
+}
+
+// Q4_K mmvq (and any future int8-dot path) needs `shaderIntegerDotProduct`
+// plus hardware acceleration of the packed 4x8-bit signed dot. On NVIDIA
+// Ampere/Ada this maps to IDP4A; we require the property bit so we only
+// take the mmvq path when it's actually faster than the fp GEMV.
+_query_integer_dot8_support :: proc() -> bool {
+	pd := _gpu.physical_device
+
+	ext_count: u32
+	vk.EnumerateDeviceExtensionProperties(pd, nil, &ext_count, nil)
+	exts := builtin.make([]vk.ExtensionProperties, ext_count, context.temp_allocator)
+	vk.EnumerateDeviceExtensionProperties(pd, nil, &ext_count, raw_data(exts))
+
+	has_ext := false
+	for &e in exts {
+		name := string(cstring(raw_data(e.extensionName[:])))
+		if name == vk.KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME {
+			has_ext = true
+			break
+		}
+	}
+	if !has_ext { return false }
+
+	int_dot_features := vk.PhysicalDeviceShaderIntegerDotProductFeatures{
+		sType = .PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+	}
+	features2 := vk.PhysicalDeviceFeatures2{
+		sType = .PHYSICAL_DEVICE_FEATURES_2,
+		pNext = &int_dot_features,
+	}
+	vk.GetPhysicalDeviceFeatures2(pd, &features2)
+	if !int_dot_features.shaderIntegerDotProduct { return false }
+
+	int_dot_props := vk.PhysicalDeviceShaderIntegerDotProductProperties{
+		sType = .PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES,
+	}
+	props2 := vk.PhysicalDeviceProperties2{
+		sType = .PHYSICAL_DEVICE_PROPERTIES_2,
+		pNext = &int_dot_props,
+	}
+	vk.GetPhysicalDeviceProperties2(pd, &props2)
+	return bool(int_dot_props.integerDotProduct4x8BitPackedSignedAccelerated)
 }
 
 DESCRIPTOR_POOL_MAX_SETS    :: 4096

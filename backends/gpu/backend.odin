@@ -1235,8 +1235,10 @@ linear_q6_k_forward :: proc(op: ml.Operation) {
 	)
 }
 
-// GPU forward for the GGUF Q4_K linear op. M=1 (decode) only — dispatches
-// the GEMV-shape shader. M>1 is not yet implemented.
+// GPU forward for the GGUF Q4_K linear op. M=1 (decode) only. When the device
+// supports VK_KHR_shader_integer_dot_product (4x8 packed signed accelerated)
+// the activation is pre-quantized to Q8_1 and the matmul runs the mmvq shader
+// (`dotPacked4x8EXT`); otherwise it falls back to the bf16-input GEMV.
 linear_q4_k_forward :: proc(op: ml.Operation) {
 	input       := op.input
 	output      := op.output
@@ -1254,6 +1256,35 @@ linear_q4_k_forward :: proc(op: ml.Operation) {
 		input_size  = u32(input_size),
 		output_size = u32(output_size),
 	}
+
+	if _gpu.integer_dot8 {
+		// Q8_1 layout: 36 bytes per 32-element block (4 bytes ds + 32 bytes qs).
+		q8_block_count := input_size / QUANTIZE_Q8_1_BF16_BLOCK
+		q8_byte_count  := q8_block_count * 36
+		usage := vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
+		q8_buf, _, _ := _create_pooled_activation_buffer(vk.DeviceSize(q8_byte_count), usage, {.DEVICE_LOCAL})
+
+		if _quantize_q8_1_bf16_pipeline == nil {
+			_quantize_q8_1_bf16_pipeline = _make_pipeline(QUANTIZE_Q8_1_BF16_SPIRV, 2, size_of(Quantize_Q8_1_Bf16_Params))
+		}
+		quant_params := Quantize_Q8_1_Bf16_Params{ K = u32(input_size) }
+		quant_bufs := [2]vk.Buffer{ data(input).buffer, q8_buf }
+		_dispatch(
+			_quantize_q8_1_bf16_pipeline, quant_bufs[:], &quant_params,
+			u32(q8_block_count), 1, 1,
+		)
+
+		if _linear_q4_k_mmvq_pipeline == nil {
+			_linear_q4_k_mmvq_pipeline = _make_pipeline(LINEAR_Q4_K_MMVQ_SPIRV, 3, size_of(Linear_Params))
+		}
+		mmvq_bufs := [3]vk.Buffer{ q8_buf, data(v.weight).buffer, data(output).buffer }
+		_dispatch(
+			_linear_q4_k_mmvq_pipeline, mmvq_bufs[:], &params,
+			_div_up(output_size, LINEAR_Q4_K_MMVQ_ROWS_PER), 1, 1,
+		)
+		return
+	}
+
 	bufs := [3]vk.Buffer{
 		data(input)   .buffer,
 		data(v.weight).buffer,

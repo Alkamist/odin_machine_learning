@@ -1,5 +1,11 @@
-1. quantize_q8_1_bf16.comp — bf16 → Q8_1 blocks (had a draft, not on disk)
-2. linear_q4_k_mmvq.comp — Q4_K weight × Q8_1 activation, dotPacked4x8EXT
-3. Enable VK_KHR_shader_integer_dot_product at device init (verified hw-accelerated on the 3090 Ti)
-4. Plumb scratch buffer for the quantized X through linear_q4_k_forward
-5. A/B vs the 37.20 tok/s baseline; expect 3-4 ms/tok savings if it works
+Next round (op fusion, ~75 tok/s target):
+
+1. Fuse rms_norm + mul (the rmsnorm-with-weight pattern, every layer hits it
+   multiple times). One shader: read X, compute rsqrt+normalize, multiply by
+   weight, write Y. See llama.cpp `rms_norm.comp` with `RMS_NORM_MUL_FUSION`.
+2. Fuse rms_norm + mul + rope for q_norm/k_norm specifically — three dispatches
+   collapse to one. See llama.cpp `pipeline_rms_norm_mul_rope_f32_f32`.
+3. Residual-add fusion into next op's read (rare but cheap once 1+2 are in).
+
+Done:
+- mmvq (Q8_1 + integer dot) for Q4_K decode: 37.2 -> 43.8 tok/s (+17.8%, ~4.1 ms/tok).
