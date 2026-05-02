@@ -373,19 +373,19 @@ improve :: proc(model: ^Model) {
 			log_probabilities := ml.log_softmax(logits)
 			log_probability   := ml.select(log_probabilities, {int(frame.action)})
 
-			ratio         := ml.exp(ml.sub(log_probability, ml.scalar(frame.log_probability)))
+			ratio         := ml.exp(ml.sub(log_probability, ml.scalar(.F32, frame.log_probability)))
 			clipped_ratio := ml.clamp(ratio, 1.0 - CLIP_EPSILON, 1.0 + CLIP_EPSILON)
 
-			advantage         := ml.scalar(frame.advantage)
+			advantage         := ml.scalar(.F32, frame.advantage)
 			objective         := ml.mul(ratio,         advantage)
 			clipped_objective := ml.mul(clipped_ratio, advantage)
 
-			actor_loss := ml.mul(ml.min(objective, clipped_objective), ml.scalar(-1))
+			actor_loss := ml.mul(ml.min(objective, clipped_objective), ml.scalar(.F32, -1))
 
 			when ENTROPY > 0 {
 				probabilities := ml.softmax(logits)
 				entropy       := ml.entropy(probabilities)
-				entropy_loss  := ml.mul(entropy, ml.scalar(-ENTROPY))
+				entropy_loss  := ml.mul(entropy, ml.scalar(.F32, -ENTROPY))
 				actor_loss     = ml.add(actor_loss, entropy_loss)
 			}
 
@@ -397,7 +397,7 @@ improve :: proc(model: ^Model) {
 			value         := network_forward(model.critic, frame.embedding[:])
 			clipped_value := ml.clamp(value, frame.value - CLIP_EPSILON, frame.value + CLIP_EPSILON)
 
-			target := ml.scalar(frame.discounted_return)
+			target := ml.scalar(.F32, frame.discounted_return)
 
 			unclipped_loss := ml.mean_squared_error(value,         target)
 			clipped_loss   := ml.mean_squared_error(clipped_value, target)

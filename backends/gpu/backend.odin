@@ -146,26 +146,20 @@ buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Lo
 	usage := vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
 
 	gpu_buffer: Gpu_Buffer
-	needs_zero := true
 	if persist {
 		gpu_buffer.buffer, gpu_buffer.memory = _create_pooled_persistent_buffer(size, usage, {.DEVICE_LOCAL}, loc)
 		gctx.sizes[gpu_buffer.buffer] = byte_count
 	} else {
 		fresh: bool
 		gpu_buffer.buffer, gpu_buffer.memory, fresh = _create_pooled_activation_buffer(size, usage, {.DEVICE_LOCAL}, loc)
-		// Reused activation slots already have their `.sizes` entry from the
-		// original allocation; only fresh slots need a zero-fill (and they
-		// rely on it because the kernel may not write every byte).
 		if fresh {
 			gctx.sizes[gpu_buffer.buffer] = byte_count
-		} else {
-			needs_zero = false
 		}
 	}
 
-	if needs_zero {
-		_record_fill_zero(gpu_buffer.buffer, size, loc)
-	}
+	// Backward kernels accumulate into gradient buffers (`+=`), so any pooled
+	// slot — fresh or reused — must start at zero each forward pass.
+	_record_fill_zero(gpu_buffer.buffer, size, loc)
 
 	return transmute(ml.Backend_Buffer)gpu_buffer
 }

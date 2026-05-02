@@ -239,14 +239,12 @@ when intrinsics.has_target_feature("avx") {
 		}
 	}
 
-	// Widen 8 bf16 lanes to 8 f32 lanes by interleaving with zero u16s into the
-	// low half of each u32 (LE), so each bf16's bits land in bits 16..31 — which
-	// is exactly bf16 -> f32 reinterpretation.
 	_bf16x8_to_f32x8 :: #force_inline proc "contextless" (b: #simd[8]u16) -> F32x8 {
 		zeros: #simd[8]u16
 		wide := intrinsics.simd_shuffle(zeros, b,
-			0, 8, 1, 9, 2, 10, 3, 11,
-			4, 12, 5, 13, 6, 14, 7, 15)
+			0, 8,  1,  9, 2, 10, 3, 11,
+			4, 12, 5, 13, 6, 14, 7, 15,
+		)
 		return transmute(F32x8)wide
 	}
 
@@ -488,13 +486,13 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
-	case ml.Linear_Q4_K:        fmt.panicf("CPU linear_q4_k_backward: linear_q4_k is forward-only (inference path)")
-	case ml.Linear_Q6_K:        fmt.panicf("CPU linear_q6_k_backward: linear_q6_k is forward-only (inference path)")
+	case ml.Linear_Q4_K:        panic("CPU linear_q4_k_backward: linear_q4_k is forward-only")
+	case ml.Linear_Q6_K:        panic("CPU linear_q6_k_backward: linear_q6_k is forward-only")
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
-	case ml.Rmsnorm_Rope:       fmt.panicf("CPU rmsnorm_rope_backward: fused rmsnorm+rope is forward-only (inference path)")
-	case ml.Add_Rmsnorm:        fmt.panicf("CPU add_rmsnorm_backward: fused add+rmsnorm is forward-only (inference path)")
+	case ml.Rmsnorm_Rope:       panic("CPU rmsnorm_rope_backward: fused rmsnorm+rope is forward-only")
+	case ml.Add_Rmsnorm:        panic("CPU add_rmsnorm_backward: fused add+rmsnorm is forward-only")
 	case ml.Softmax:            softmax_backward           (op)
 	case ml.Entropy:            entropy_backward           (op)
 	case ml.Log_Softmax:        log_softmax_backward       (op)
@@ -503,7 +501,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Relu:               relu_backward              (op)
 	case ml.Sigmoid:            sigmoid_backward           (op)
 	case ml.Gelu:               gelu_backward              (op)
-	case ml.Gelu_Mul:           fmt.panicf("CPU gelu_mul_backward: fused gelu*mul is forward-only (inference path)")
+	case ml.Gelu_Mul:           panic("CPU gelu_mul_backward: fused gelu*mul is forward-only")
 	case ml.Silu:               silu_backward              (op)
 	case ml.Tanh:               tanh_backward              (op)
 	case ml.Batched_Matmul:     batched_matmul_backward    (op)
@@ -1026,11 +1024,11 @@ select_forward :: proc(op: ml.Operation) {
 	indices := op.variant.(ml.Select).indices
 	size    := ml.len(output) / builtin.len(indices)
 
-	// Pure byte-copy of `size`-element rows; works at any dtype.
-	elem_size  := ml.data_type_size(input.type)
-	row_bytes  := size * elem_size
-	src_bytes  := transmute([]byte)input.buffers [.Data]
-	dst_bytes  := transmute([]byte)output.buffers[.Data]
+	elem_size := ml.data_type_size(input.type)
+	row_bytes := size * elem_size
+	src_bytes := transmute([]byte)input.buffers [.Data]
+	dst_bytes := transmute([]byte)output.buffers[.Data]
+
 	for index, i in indices {
 		src_off := index * row_bytes
 		dst_off := i     * row_bytes
@@ -2477,14 +2475,12 @@ cross_entropy_forward :: proc(op: ml.Operation) {
 		offset := sample * class_size
 		target := targets[sample]
 
-		// Find the maximum value for numerical stability.
 		max_value := math.NEG_INF_F32
 		for i in 0 ..< class_size {
 			index := offset + i
 			max_value = math.max(max_value, data(input)[index])
 		}
 
-		// Compute exponentials and sum for softmax denominator.
 		sum: f32
 		for i in 0 ..< class_size {
 			index := offset + i
@@ -2493,13 +2489,11 @@ cross_entropy_forward :: proc(op: ml.Operation) {
 			sum += exp_val
 		}
 
-		// Normalize to get actual probabilities.
 		for i in 0 ..< class_size {
 			index := offset + i
 			data(probabilities)[index] /= sum
 		}
 
-		// Compute negative log likelihood.
 		target_index := offset + target
 		data(output)[sample] = -data(input)[target_index] + max_value + math.ln(sum)
 	}
@@ -3532,5 +3526,5 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 attention_cache_backward :: proc(op: ml.Operation) {
-	fmt.panicf("attention_with_cache is forward-only (inference path); backward is not implemented")
+	panic("attention_with_cache is forward-only; backward is not implemented")
 }

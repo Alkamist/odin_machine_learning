@@ -38,11 +38,13 @@ main :: proc() {
 		check(grad_a.buffer != 0,              "phase1: tensor a gradient buffer valid", &any_failed)
 		check(data_b.buffer != data_a.buffer,  "phase1: a/b have distinct data buffers", &any_failed)
 
-		// Each tensor allocates 2 buffers (Data + Gradient), so 4 total before clear.
+		// Each tensor allocates 2 buffers (Data + Gradient), so 4 slots claimed
+		// in the activation pool before clear. ml.clear rewinds the cursor to
+		// zero; pool slots themselves are recycled, not destroyed.
 		gctx := cast(^gpu.Context)ctx
-		check(len(gctx.activations) == 4,      "phase1: tracked activations before clear", &any_failed)
+		check(gctx.activation_cursor == 4,     "phase1: tracked activations before clear", &any_failed)
 		ml.clear()
-		check(len(gctx.activations) == 0,      "phase1: activations released by ml.clear", &any_failed)
+		check(gctx.activation_cursor == 0,     "phase1: activations released by ml.clear", &any_failed)
 	}
 
 	// --- Phase 2: ml.add forward + backward, CPU vs GPU ---

@@ -18,6 +18,7 @@ main :: proc() {
 
 	ctx := cpu.context_create(1024 * 1024)
 	defer cpu.context_destroy(ctx)
+
 	ml.context_scope(ctx)
 
 	model := model_make()

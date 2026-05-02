@@ -15,7 +15,7 @@ import "core:encoding/csv"
 
 import ml "../../"
 import cpu "../../backends/cpu"
-// import gpu "../../backend_gpu"
+import gpu "../../backends/gpu"
 import "../../networks/mlp"
 
 BATCH_SIZE :: 1000
@@ -25,8 +25,12 @@ main :: proc() {
 
 	cpu.set_thread_count(24)
 
-	ctx := cpu.context_create(1024 * 1024 * 256)
-	defer cpu.context_destroy(ctx)
+	// ctx := cpu.context_create(1024 * 1024 * 256)
+	// defer cpu.context_destroy(ctx)
+
+	ctx := gpu.context_create()
+	defer gpu.context_destroy(ctx)
+
 	ml.context_scope(ctx)
 
 	model := model_make()
