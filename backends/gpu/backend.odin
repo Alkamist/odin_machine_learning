@@ -315,9 +315,10 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_forward     (op)
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
-	case ml.Linear_Q8:          fmt.panicf("GPU linear_q8_forward: not yet implemented (CPU-only for now)")
 	case ml.Linear_Q4:          linear_q4_forward          (op)
 	case ml.Linear_Q8_0:        fmt.panicf("GPU linear_q8_0_forward: not yet implemented (CPU-only for now)")
+	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
+	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
@@ -360,9 +361,10 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
-	case ml.Linear_Q8:          fmt.panicf("GPU linear_q8_backward: linear_q8 is forward-only (inference path)")
 	case ml.Linear_Q4:          fmt.panicf("GPU linear_q4_backward: linear_q4 is forward-only (inference path)")
 	case ml.Linear_Q8_0:        fmt.panicf("GPU linear_q8_0_backward: linear_q8_0 is forward-only (inference path)")
+	case ml.Linear_Q4_K:        fmt.panicf("GPU linear_q4_k_backward: linear_q4_k is forward-only (inference path)")
+	case ml.Linear_Q6_K:        fmt.panicf("GPU linear_q6_k_backward: linear_q6_k is forward-only (inference path)")
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
@@ -475,8 +477,6 @@ add_forward :: proc(op: ml.Operation) {
 		}
 		bufs := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
 		_dispatch(_add_bf16_pipeline, bufs[:], &params, _div_up(pair_count, ADD_LOCAL_SIZE))
-	case .F16:
-		fmt.panicf("GPU add: F16 not yet supported")
 	}
 }
 
@@ -525,8 +525,6 @@ add_backward :: proc(op: ml.Operation) {
 		}
 		b_bufs := [2]vk.Buffer{gradient(output).buffer, gradient(b).buffer}
 		_dispatch(_add_back_b_bf16_pipeline, b_bufs[:], &b_params, _div_up(b_pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU add_backward: F16 not yet supported")
 	}
 }
 
@@ -551,8 +549,6 @@ sub_forward :: proc(op: ml.Operation) {
 		params := Sub_Bf16_Params{n = u32(ml.len(a)), n_b = u32(ml.len(b)), pair_count = u32(pair_count)}
 		bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
 		_dispatch(_sub_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU sub: F16 not yet supported")
 	}
 }
 
@@ -594,8 +590,6 @@ sub_backward :: proc(op: ml.Operation) {
 		b_params := Sub_Back_B_Bf16_Params{n_b = u32(ml.len(b)), stride = u32(stride), pair_count = u32(b_pair_count)}
 		b_bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(b).buffer}
 		_dispatch(_sub_back_b_bf16_pipeline, b_bufs[:], &b_params, _div_up(b_pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU sub_backward: F16 not yet supported")
 	}
 }
 
@@ -620,8 +614,6 @@ mul_forward :: proc(op: ml.Operation) {
 		params := Mul_Bf16_Params{n = u32(ml.len(a)), n_b = u32(ml.len(b)), pair_count = u32(pair_count)}
 		bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
 		_dispatch(_mul_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU mul: F16 not yet supported")
 	}
 }
 
@@ -664,8 +656,6 @@ mul_backward :: proc(op: ml.Operation) {
 		b_params := Mul_Back_B_Bf16_Params{n_b = u32(ml.len(b)), stride = u32(stride), pair_count = u32(b_pair_count)}
 		b_bufs   := [3]vk.Buffer{data(a).buffer, gradient(output).buffer, gradient(b).buffer}
 		_dispatch(_mul_back_b_bf16_pipeline, b_bufs[:], &b_params, _div_up(b_pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU mul_backward: F16 not yet supported")
 	}
 }
 
@@ -690,8 +680,6 @@ div_forward :: proc(op: ml.Operation) {
 		params := Div_Bf16_Params{n = u32(ml.len(a)), n_b = u32(ml.len(b)), pair_count = u32(pair_count)}
 		bufs   := [3]vk.Buffer{data(a).buffer, data(b).buffer, data(output).buffer}
 		_dispatch(_div_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU div: F16 not yet supported")
 	}
 }
 
@@ -733,8 +721,6 @@ div_backward :: proc(op: ml.Operation) {
 		b_params := Div_Back_B_Bf16_Params{n_b = u32(ml.len(b)), stride = u32(stride), pair_count = u32(b_pair_count)}
 		b_bufs   := [4]vk.Buffer{data(a).buffer, data(b).buffer, gradient(output).buffer, gradient(b).buffer}
 		_dispatch(_div_back_b_bf16_pipeline, b_bufs[:], &b_params, _div_up(b_pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU div_backward: F16 not yet supported")
 	}
 }
 
@@ -838,8 +824,6 @@ mean_forward :: proc(op: ml.Operation) {
 		params := Mean_Params{count = u32(count), size = u32(size)}
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_mean_bf16_pipeline, bufs[:], &params, u32(count))
-	case .F16:
-		fmt.panicf("GPU mean_forward: F16 not yet supported")
 	}
 }
 
@@ -864,8 +848,6 @@ mean_backward :: proc(op: ml.Operation) {
 		params := Mean_Back_Bf16_Params{count = u32(count), size = u32(size), pair_count = u32(pair_count)}
 		bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(input).buffer}
 		_dispatch(_mean_back_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU mean_backward: F16 not yet supported")
 	}
 }
 
@@ -921,8 +903,6 @@ select_forward :: proc(op: ml.Operation) {
 		params := Select_Params{n_indices = u32(builtin.len(indices)), size = u32(size)}
 		bufs   := [3]vk.Buffer{data(input).buffer, indices_buf, data(output).buffer}
 		_dispatch(_select_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256), u32(builtin.len(indices)), 1)
-	case .F16:
-		fmt.panicf("GPU select_forward: F16 not yet supported")
 	}
 
 	_queue_destroy_buffer(indices_buf, indices_mem)
@@ -967,8 +947,6 @@ slice_forward :: proc(op: ml.Operation) {
 		params := Slice_Bf16_Params{n = u32(ml.len(output)), start = u32(variant.start), pair_count = u32(pair_count)}
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_slice_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU slice_forward: F16 not yet supported")
 	}
 }
 
@@ -992,8 +970,6 @@ slice_backward :: proc(op: ml.Operation) {
 		params := Slice_Back_Bf16_Params{n = u32(ml.len(output)), start = u32(variant.start), dx_pair_count = u32(dx_pair_count)}
 		bufs   := [2]vk.Buffer{gradient(output).buffer, gradient(input).buffer}
 		_dispatch(_slice_back_bf16_pipeline, bufs[:], &params, _div_up(dx_pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU slice_backward: F16 not yet supported")
 	}
 }
 
@@ -1033,8 +1009,6 @@ slice_trailing_forward :: proc(op: ml.Operation) {
 		}
 		bufs := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_slice_trailing_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU slice_trailing_forward: F16 not yet supported")
 	}
 }
 
@@ -1073,8 +1047,6 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 		}
 		bufs := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
 		_dispatch(_slice_trailing_back_bf16_pipeline, bufs[:], &params, _div_up(dx_pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU slice_trailing_backward: F16 not yet supported")
 	}
 }
 
@@ -1111,8 +1083,6 @@ concat_forward :: proc(op: ml.Operation) {
 		}
 		bufs := [4]vk.Buffer{data(a).buffer, data(b).buffer, data(c).buffer, data(output).buffer}
 		_dispatch(_concat3_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU concat_forward: F16 not yet supported")
 	}
 }
 
@@ -1152,8 +1122,6 @@ concat_backward :: proc(op: ml.Operation) {
 		}
 		bufs := [4]vk.Buffer{gradient(a).buffer, gradient(b).buffer, gradient(c).buffer, gradient(output).buffer}
 		_dispatch(_concat3_back_bf16_pipeline, bufs[:], &params, _div_up(total_pairs, 256))
-	case .F16:
-		fmt.panicf("GPU concat_backward: F16 not yet supported")
 	}
 }
 
@@ -1213,8 +1181,6 @@ linear_forward :: proc(op: ml.Operation) {
 				1,
 			)
 		}
-	case .F16:
-		fmt.panicf("GPU linear: F16 not yet supported")
 	}
 }
 
@@ -1265,6 +1231,77 @@ linear_q4_forward :: proc(op: ml.Operation) {
 		_linear_q4_pipeline, bufs[:], &params,
 		_div_up(count,       LINEAR_Q4_LOCAL_X),
 		_div_up(output_size, LINEAR_Q4_LOCAL_Y),
+		1,
+	)
+}
+
+// GPU forward for the GGUF Q6_K linear op. M=1 (decode) only.
+linear_q6_k_forward :: proc(op: ml.Operation) {
+	input       := op.input
+	output      := op.output
+	v           := op.variant.(ml.Linear_Q6_K)
+	output_size := v.weight.shape[0]
+	input_size  := v.weight.shape[1]
+	count       := ml.len(input) / input_size
+
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "GPU linear_q6_k requires input_size %% 256 == 0, got %v", input_size)
+	fmt.assertf(output_size % LINEAR_Q6_K_GEMV_ROWS_PER == 0, "GPU linear_q6_k requires output_size %% %v == 0, got %v", LINEAR_Q6_K_GEMV_ROWS_PER, output_size)
+	fmt.assertf(count == 1, "GPU linear_q6_k_forward currently supports M=1 (decode); got M=%v", count)
+
+	params := Linear_Params{
+		count       = u32(count),
+		input_size  = u32(input_size),
+		output_size = u32(output_size),
+	}
+	bufs := [3]vk.Buffer{
+		data(input)   .buffer,
+		data(v.weight).buffer,
+		data(output)  .buffer,
+	}
+
+	if _linear_q6_k_gemv_pipeline == nil {
+		_linear_q6_k_gemv_pipeline = _make_pipeline(LINEAR_Q6_K_GEMV_SPIRV, 3, size_of(Linear_Params))
+	}
+	_dispatch(
+		_linear_q6_k_gemv_pipeline, bufs[:], &params,
+		_div_up(output_size, LINEAR_Q6_K_GEMV_ROWS_PER),
+		1,
+		1,
+	)
+}
+
+// GPU forward for the GGUF Q4_K linear op. M=1 (decode) only — dispatches
+// the GEMV-shape shader. M>1 is not yet implemented.
+linear_q4_k_forward :: proc(op: ml.Operation) {
+	input       := op.input
+	output      := op.output
+	v           := op.variant.(ml.Linear_Q4_K)
+	output_size := v.weight.shape[0]
+	input_size  := v.weight.shape[1]
+	count       := ml.len(input) / input_size
+
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "GPU linear_q4_k requires input_size %% 256 == 0, got %v", input_size)
+	fmt.assertf(output_size % LINEAR_Q4_K_GEMV_ROWS_PER == 0, "GPU linear_q4_k requires output_size %% %v == 0, got %v", LINEAR_Q4_K_GEMV_ROWS_PER, output_size)
+	fmt.assertf(count == 1, "GPU linear_q4_k_forward currently supports M=1 (decode); got M=%v", count)
+
+	params := Linear_Params{
+		count       = u32(count),
+		input_size  = u32(input_size),
+		output_size = u32(output_size),
+	}
+	bufs := [3]vk.Buffer{
+		data(input)   .buffer,
+		data(v.weight).buffer,
+		data(output)  .buffer,
+	}
+
+	if _linear_q4_k_gemv_pipeline == nil {
+		_linear_q4_k_gemv_pipeline = _make_pipeline(LINEAR_Q4_K_GEMV_SPIRV, 3, size_of(Linear_Params))
+	}
+	_dispatch(
+		_linear_q4_k_gemv_pipeline, bufs[:], &params,
+		_div_up(output_size, LINEAR_Q4_K_GEMV_ROWS_PER),
+		1,
 		1,
 	)
 }
@@ -1357,8 +1394,6 @@ linear_backward :: proc(op: ml.Operation) {
 				1,
 			)
 		}
-	case .F16:
-		fmt.panicf("GPU linear_backward: F16 not yet supported")
 	}
 }
 
@@ -1392,8 +1427,6 @@ rope_forward :: proc(op: ml.Operation) {
 			_rope_bf16_pipeline = _make_pipeline(ROPE_BF16_SPIRV, 2, size_of(Rope_Params))
 		}
 		_dispatch(_rope_bf16_pipeline, bufs[:], &params, _div_up(total_pairs, 256))
-	case .F16:
-		fmt.panicf("GPU rope_forward: F16 not yet supported")
 	}
 }
 
@@ -1426,8 +1459,6 @@ rope_backward :: proc(op: ml.Operation) {
 			_rope_back_bf16_pipeline = _make_pipeline(ROPE_BACK_BF16_SPIRV, 2, size_of(Rope_Back_Params))
 		}
 		_dispatch(_rope_back_bf16_pipeline, bufs[:], &params, _div_up(total_pairs, 256))
-	case .F16:
-		fmt.panicf("GPU rope_backward: F16 not yet supported")
 	}
 }
 
@@ -1651,7 +1682,6 @@ softmax_forward :: proc(op: ml.Operation) {
 		params := Softmax_Params{count = u32(count), size = u32(size)}
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_softmax_bf16_pipeline, bufs[:], &params, u32(count))
-	case .F16: fmt.panicf("GPU softmax: F16 not yet supported")
 	}
 }
 
@@ -1676,7 +1706,6 @@ softmax_backward :: proc(op: ml.Operation) {
 		params := Softmax_Back_Params{count = u32(count), size = u32(size)}
 		bufs   := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, gradient(input).buffer}
 		_dispatch(_softmax_back_bf16_pipeline, bufs[:], &params, u32(count))
-	case .F16: fmt.panicf("GPU softmax_backward: F16 not yet supported")
 	}
 }
 
@@ -1704,8 +1733,6 @@ entropy_forward :: proc(op: ml.Operation) {
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_entropy_bf16_pipeline, bufs[:], &params, u32(out_pair_count))
 		return
-	case .F16:
-		fmt.panicf("GPU entropy: F16 not yet supported")
 	}
 }
 
@@ -1731,8 +1758,6 @@ entropy_backward :: proc(op: ml.Operation) {
 		params := Entropy_Back_Bf16_Params{count = u32(count), size = u32(size), pair_count = u32(pair_count)}
 		bufs   := [3]vk.Buffer{data(input).buffer, gradient(output).buffer, gradient(input).buffer}
 		_dispatch(_entropy_back_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU entropy_backward: F16 not yet supported")
 	}
 }
 
@@ -1758,7 +1783,6 @@ log_softmax_forward :: proc(op: ml.Operation) {
 		params := Log_Softmax_Params{count = u32(count), size = u32(size)}
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_log_softmax_bf16_pipeline, bufs[:], &params, u32(count))
-	case .F16: fmt.panicf("GPU log_softmax: F16 not yet supported")
 	}
 }
 
@@ -1783,7 +1807,6 @@ log_softmax_backward :: proc(op: ml.Operation) {
 		params := Log_Softmax_Params{count = u32(count), size = u32(size)}
 		bufs   := [3]vk.Buffer{data(output).buffer, gradient(output).buffer, gradient(input).buffer}
 		_dispatch(_log_softmax_back_bf16_pipeline, bufs[:], &params, u32(count))
-	case .F16: fmt.panicf("GPU log_softmax_backward: F16 not yet supported")
 	}
 }
 
@@ -1872,8 +1895,6 @@ _unary_forward_gpu :: proc(input, output: ml.Tensor,
 		params := Activation_Bf16_Params{n = u32(n), pair_count = u32(pair_count)}
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(bf16_pipe^, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU unary forward: F16 not yet supported")
 	}
 }
 
@@ -1898,8 +1919,6 @@ _unary_backward_gpu :: proc(input, output: ml.Tensor, ref_is_output: bool,
 		params := Activation_Bf16_Params{n = u32(n), pair_count = u32(pair_count)}
 		bufs   := [3]vk.Buffer{ref_buf, gradient(output).buffer, gradient(input).buffer}
 		_dispatch(bf16_pipe^, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU unary backward: F16 not yet supported")
 	}
 }
 
@@ -1931,8 +1950,6 @@ gelu_forward :: proc(op: ml.Operation) {
 		params := Gelu_Bf16_Params{n = u32(n), pair_count = u32(pair_count)}
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_gelu_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU gelu: F16 not yet supported")
 	}
 }
 
@@ -1955,8 +1972,6 @@ gelu_backward :: proc(op: ml.Operation) {
 		params := Gelu_Bf16_Params{n = u32(n), pair_count = u32(pair_count)}
 		bufs   := [3]vk.Buffer{data(input).buffer, gradient(input).buffer, gradient(output).buffer}
 		_dispatch(_gelu_back_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU gelu_backward: F16 not yet supported")
 	}
 }
 
@@ -2017,8 +2032,6 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 				u32(batch_count),
 			)
 		}
-	case .F16:
-		fmt.panicf("GPU batched_matmul: F16 not yet supported")
 	}
 }
 
@@ -2111,8 +2124,6 @@ batched_matmul_backward :: proc(op: ml.Operation) {
 				u32(batch_count),
 			)
 		}
-	case .F16:
-		fmt.panicf("GPU batched_matmul_backward: F16 not yet supported")
 	}
 }
 
@@ -2156,8 +2167,6 @@ permute_forward :: proc(op: ml.Operation) {
 		}
 		bufs := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_permute_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU permute_forward: F16 not yet supported")
 	}
 }
 
@@ -2201,8 +2210,6 @@ permute_backward :: proc(op: ml.Operation) {
 		}
 		bufs := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
 		_dispatch(_permute_back_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU permute_backward: F16 not yet supported")
 	}
 }
 
@@ -2227,8 +2234,6 @@ causal_mask_forward :: proc(op: ml.Operation) {
 		params := Causal_Mask_Bf16_Params{total = u32(ml.len(input)), T = u32(T), pair_count = u32(pair_count)}
 		bufs   := [2]vk.Buffer{data(input).buffer, data(output).buffer}
 		_dispatch(_causal_mask_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU causal_mask_forward: F16 not yet supported")
 	}
 }
 
@@ -2252,8 +2257,6 @@ causal_mask_backward :: proc(op: ml.Operation) {
 		params := Causal_Mask_Bf16_Params{total = u32(ml.len(input)), T = u32(T), pair_count = u32(pair_count)}
 		bufs   := [2]vk.Buffer{gradient(input).buffer, gradient(output).buffer}
 		_dispatch(_causal_mask_back_bf16_pipeline, bufs[:], &params, _div_up(pair_count, 256))
-	case .F16:
-		fmt.panicf("GPU causal_mask_backward: F16 not yet supported")
 	}
 }
 

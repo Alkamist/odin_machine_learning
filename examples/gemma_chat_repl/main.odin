@@ -91,7 +91,6 @@ main :: proc() {
 		mode_label: string
 		switch quant_mode {
 		case .None: mode_label = "None"
-		case .Int8: mode_label = "Int8"
 		case .Int4: mode_label = "Int4"
 		case .Q8_0: mode_label = "Q8_0"
 		}
@@ -333,12 +332,11 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 		case "--quantize":
 			if i + 1 >= builtin.len(args) do _usage_exit()
 			switch args[i + 1] {
-			case "q8", "int8":  quant_mode^ = .Int8
 			case "q4", "int4":  quant_mode^ = .Int4
 			case "q8_0":         quant_mode^ = .Q8_0
 			case "none":         quant_mode^ = .None
 			case:
-				fmt.eprintfln("unknown --quantize value: %v (expected q8 | q4 | q8_0 | none)", args[i + 1])
+				fmt.eprintfln("unknown --quantize value: %v (expected q4 | q8_0 | none)", args[i + 1])
 				_usage_exit()
 			}
 			i += 2

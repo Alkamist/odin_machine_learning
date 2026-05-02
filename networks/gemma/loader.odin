@@ -162,9 +162,6 @@ _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma)
 			fmt.eprintfln("gemma.load: %q unsupported source dtype %q", name, info.dtype)
 			return false
 		}
-	case .F16:
-		fmt.eprintfln("gemma.load: F16 model dtype not supported")
-		return false
 	}
 	return true
 }
@@ -219,9 +216,6 @@ _write_target :: proc(target: ml.Tensor, info: safetensors.Tensor_Info, raw_byte
 			return false
 		}
 		ml.set_data_bytes(target, bytes)
-	case .F16:
-		fmt.eprintfln("gemma.load: %q F16 target dtype not yet supported", name)
-		return false
 	}
 	return true
 }
@@ -282,8 +276,6 @@ _write_floats_to_target :: proc(target: ml.Tensor, src: []f32, name: string) {
 		bf    := ([^]ml.Bf16)(raw_data(bytes))
 		for v, i in src do bf[i] = ml.bf16_from_f32(v)
 		ml.set_data_bytes(target, bytes)
-	case .F16:
-		fmt.eprintfln("gemma.load: %q F16 target dtype not yet supported", name)
 	}
 }
 

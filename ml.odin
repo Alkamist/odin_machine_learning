@@ -13,32 +13,49 @@ MAX_TENSOR_RANK         :: 6
 BACKEND_BUFFER_MAX_SIZE :: 16
 OP_ARENA_DEFAULT_SIZE   :: 1 * 1024 * 1024
 QUANT_GROUP_SIZE        :: 32
+K_QUANT_BLOCK_SIZE      :: 256
+Q4_K_BLOCK_BYTES        :: 144
+Q6_K_BLOCK_BYTES        :: 210
 
+// `Q4_K` and `Q6_K` are GGUF "k-quant" block formats: 256 weights packed
+// into 144-byte (Q4_K) or 210-byte (Q6_K) super-blocks. A super-block bundles
+// the quants, the per-sub-block 6-bit scale + 6-bit min (Q4_K) or i8 scale
+// (Q6_K), and the fp16 super-scale together in one byte stream.
+// `data_type_size` returns 0 for these; use `_data_byte_count` to size buffers.
 Data_Type :: enum u8 {
 	Bf16,
-	F16,
 	F32,
 	I4,
 	I8,
+	Q4_K,
+	Q6_K,
 }
 
 @(require_results)
 data_type_size :: #force_inline proc(t: Data_Type) -> int {
 	switch t {
 	case .Bf16: return size_of(Bf16)
-	case .F16:  return size_of(f16)
 	case .F32:  return size_of(f32)
 	case .I4:   return 0 // packed; see `_data_byte_count`
 	case .I8:   return size_of(i8)
+	case .Q4_K: return 0 // packed; see `_data_byte_count`
+	case .Q6_K: return 0 // packed; see `_data_byte_count`
 	}
 	return 0
 }
 
 @(require_results)
 _data_byte_count :: #force_inline proc(t: Data_Type, element_count: int) -> int {
-	if t == .I4 {
+	#partial switch t {
+	case .I4:
 		assert(element_count % 2 == 0, "I4 tensor element count must be even (two nibbles per byte)")
 		return element_count / 2
+	case .Q4_K:
+		assert(element_count % K_QUANT_BLOCK_SIZE == 0, "Q4_K tensor element count must be a multiple of 256")
+		return (element_count / K_QUANT_BLOCK_SIZE) * Q4_K_BLOCK_BYTES
+	case .Q6_K:
+		assert(element_count % K_QUANT_BLOCK_SIZE == 0, "Q6_K tensor element count must be a multiple of 256")
+		return (element_count / K_QUANT_BLOCK_SIZE) * Q6_K_BLOCK_BYTES
 	}
 	return element_count * data_type_size(t)
 }
@@ -248,8 +265,6 @@ scalar :: proc(type: Data_Type, value: f32, loc := #caller_location) -> (t: Tens
 	case .Bf16:
 		src := [1]Bf16{bf16_from_f32(value)}
 		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src[:]), loc)
-	case .F16:
-		fmt.panicf("ml.scalar: F16 not supported")
 	}
 	return
 }
@@ -358,12 +373,6 @@ fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
 			buf[i] = bf16_from_f32(rand.float32_normal(mean, std))
 		}
 		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
-	case .F16:
-		buf := builtin.make([]f16, n, allocator=context.temp_allocator)
-		for i in 0 ..< n {
-			buf[i] = f16(rand.float32_normal(mean, std))
-		}
-		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
 	}
 }
 
@@ -383,13 +392,6 @@ fill_value :: proc(t: Tensor, value: f32, loc := #caller_location) {
 		buf      := builtin.make([]Bf16, n, allocator=context.temp_allocator)
 		for i in 0 ..< n {
 			buf[i] = value_bf
-		}
-		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
-	case .F16:
-		value_f16 := f16(value)
-		buf       := builtin.make([]f16, n, allocator=context.temp_allocator)
-		for i in 0 ..< n {
-			buf[i] = value_f16
 		}
 		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
 	}
@@ -467,9 +469,10 @@ Operation_Variant :: union {
 	Slice_Trailing,
 	Concat,
 	Linear,
-	Linear_Q8,
 	Linear_Q4,
 	Linear_Q8_0,
+	Linear_Q4_K,
+	Linear_Q6_K,
 	Rope,
 	Layernorm,
 	Rmsnorm,
@@ -1072,88 +1075,6 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 	return
 }
 
-Linear_Q8 :: struct {
-	weight: Tensor, // .I8  [output_size, input_size]
-	scales: Tensor, // .F32 [output_size]
-}
-
-@(require_results)
-linear_q8 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank   >= 1, "linear_q8 input must have rank >= 1", loc=loc)
-	assert(weight.rank  == 2, "linear_q8 weight must be a 2-D tensor [output_size, input_size]", loc=loc)
-	assert(scales.rank  == 1, "linear_q8 scales must be a 1-D tensor [output_size]", loc=loc)
-	assert(weight.type  == .I8, "linear_q8 weight must be I8", loc=loc)
-	assert(scales.type  == .F32,  "linear_q8 scales must be F32",  loc=loc)
-	assert(input.type   == .Bf16, "linear_q8 input must be Bf16 (only supported activation dtype for now)", loc=loc)
-
-	output_size := weight.shape[0]
-	input_size  := weight.shape[1]
-	assert(scales.shape[0] == output_size, "linear_q8 scales length must equal weight's output dim", loc=loc)
-	assert(input.shape[input.rank - 1] == input_size, "linear_q8 input trailing dim must equal weight's input dim", loc=loc)
-
-	output = _zeros_replace_trailing(input, output_size, loc=loc)
-
-	op := Operation{
-		input   = input,
-		output  = output,
-		variant = Linear_Q8{
-			weight = weight,
-			scales = scales,
-		},
-	}
-	_current_ctx.backend.forward(op, loc)
-	append_operation(op, loc=loc)
-
-	return
-}
-
-@(require_results)
-quantize_int8 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_int8, scales: Tensor) {
-	assert(weight_bf16.rank == 2, "quantize_int8 expects a 2-D weight [output_size, input_size]", loc=loc)
-	assert(weight_bf16.type == .Bf16, "quantize_int8 expects a Bf16 weight", loc=loc)
-
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-
-	output_size := weight_bf16.shape[0]
-	input_size  := weight_bf16.shape[1]
-
-	src_bf := builtin.make([]Bf16, output_size * input_size, context.temp_allocator)
-	get_data_bytes(weight_bf16, mem.slice_to_bytes(src_bf), loc=loc)
-
-	scale_buf := builtin.make([]f32, output_size, context.temp_allocator)
-	int8_buf  := builtin.make([]i8,  output_size * input_size, context.temp_allocator)
-
-	for o in 0 ..< output_size {
-		row := src_bf[o * input_size : (o + 1) * input_size]
-		amax: f32
-		for v_bf in row {
-			v := bf16_to_f32(v_bf)
-			if v < 0 do v = -v
-			if v > amax do amax = v
-		}
-		s := amax / 127.0
-		if s == 0 do s = 1
-		scale_buf[o] = s
-		inv := 1.0 / s
-
-		row_out := int8_buf[o * input_size : (o + 1) * input_size]
-		for v_bf, k in row {
-			r := math.round(bf16_to_f32(v_bf) * inv)
-			if r >  127 do r =  127
-			if r < -127 do r = -127
-			row_out[k] = i8(r)
-		}
-	}
-
-	weight_int8 = alloc(.I8,  {output_size, input_size}, persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
-	scales      = alloc(.F32, {output_size},             persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
-
-	set_data_bytes(weight_int8, mem.slice_to_bytes(int8_buf), loc=loc)
-	set_data      (scales,      scale_buf,                    loc=loc)
-
-	return
-}
-
 Linear_Q8_0 :: struct {
 	weight: Tensor, // .I8  [output_size, input_size     ] (input_size % 32 == 0)
 	scales: Tensor, // .F32 [output_size, input_size / 32]
@@ -1334,6 +1255,68 @@ quantize_int4 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_i
 
 	set_data_bytes(weight_int4, packed_buf, loc=loc)
 	set_data      (scales,      scale_buf,  loc=loc)
+
+	return
+}
+
+// GGUF k-quant linear ops. The block format bundles the 4-bit (Q4_K) or
+// 6-bit (Q6_K) quants with their per-sub-block scales/mins and an fp16
+// super-scale into a single byte stream — there's no separate scales
+// tensor. The shader / CPU implementation unpacks on the fly.
+Linear_Q4_K :: struct {
+	weight: Tensor, // .Q4_K logical shape [output_size, input_size]; input_size % 256 == 0
+}
+
+@(require_results)
+linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank  >= 1, "linear_q4_k input must have rank >= 1", loc=loc)
+	assert(weight.rank == 2, "linear_q4_k weight must be a 2-D tensor [output_size, input_size]", loc=loc)
+	assert(weight.type == .Q4_K, "linear_q4_k weight must be Q4_K", loc=loc)
+	assert(input.type  == .Bf16, "linear_q4_k input must be Bf16", loc=loc)
+
+	output_size := weight.shape[0]
+	input_size  := weight.shape[1]
+	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "linear_q4_k input dim must be a multiple of 256", loc=loc)
+	assert(input.shape[input.rank - 1] == input_size, "linear_q4_k input trailing dim must equal weight's input dim", loc=loc)
+
+	output = _zeros_replace_trailing(input, output_size, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Linear_Q4_K{weight = weight},
+	}
+	_current_ctx.backend.forward(op, loc)
+	append_operation(op, loc=loc)
+
+	return
+}
+
+Linear_Q6_K :: struct {
+	weight: Tensor, // .Q6_K logical shape [output_size, input_size]; input_size % 256 == 0
+}
+
+@(require_results)
+linear_q6_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank  >= 1, "linear_q6_k input must have rank >= 1", loc=loc)
+	assert(weight.rank == 2, "linear_q6_k weight must be a 2-D tensor [output_size, input_size]", loc=loc)
+	assert(weight.type == .Q6_K, "linear_q6_k weight must be Q6_K", loc=loc)
+	assert(input.type  == .Bf16, "linear_q6_k input must be Bf16", loc=loc)
+
+	output_size := weight.shape[0]
+	input_size  := weight.shape[1]
+	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "linear_q6_k input dim must be a multiple of 256", loc=loc)
+	assert(input.shape[input.rank - 1] == input_size, "linear_q6_k input trailing dim must equal weight's input dim", loc=loc)
+
+	output = _zeros_replace_trailing(input, output_size, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Linear_Q6_K{weight = weight},
+	}
+	_current_ctx.backend.forward(op, loc)
+	append_operation(op, loc=loc)
 
 	return
 }

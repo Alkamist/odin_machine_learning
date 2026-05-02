@@ -12,6 +12,7 @@ import "core:sync"
 import "core:thread"
 
 import ml "../../"
+import "../../loaders/gguf"
 
 @(thread_local)
 _global_odin_context: runtime.Context
@@ -307,32 +308,6 @@ when intrinsics.has_target_feature("avx") {
 		}
 	}
 
-	// Dot product of an int8 weight row with a bf16 input row, accumulated in f32.
-	// Returns the unscaled sum; caller multiplies by the per-output-channel scale.
-	_simd_dot_int8_bf16_f32 :: #force_inline proc "contextless" (w: [^]i8, x: [^]ml.Bf16, n: int) -> f32 {
-		acc: F32x8
-		i := 0
-		for ; i + SIMD_LANES <= n; i += SIMD_LANES {
-			w_i8  := intrinsics.unaligned_load((^#simd[8]i8) (&w[i]))
-			x_u16 := intrinsics.unaligned_load((^#simd[8]u16)(&x[i]))
-			w_f := F32x8{
-				f32(intrinsics.simd_extract(w_i8, 0)),
-				f32(intrinsics.simd_extract(w_i8, 1)),
-				f32(intrinsics.simd_extract(w_i8, 2)),
-				f32(intrinsics.simd_extract(w_i8, 3)),
-				f32(intrinsics.simd_extract(w_i8, 4)),
-				f32(intrinsics.simd_extract(w_i8, 5)),
-				f32(intrinsics.simd_extract(w_i8, 6)),
-				f32(intrinsics.simd_extract(w_i8, 7)),
-			}
-			acc = simd.fma(w_f, _bf16x8_to_f32x8(x_u16), acc)
-		}
-		sum := simd.reduce_add_bisect(acc)
-		for ; i < n; i += 1 {
-			sum += f32(w[i]) * ml.bf16_to_f32(x[i])
-		}
-		return sum
-	}
 } else {
 	_simd_dot_f32 :: #force_inline proc "contextless" (a, b: [^]f32, n: int) -> f32 {
 		s0, s1, s2, s3: f32
@@ -372,21 +347,6 @@ when intrinsics.has_target_feature("avx") {
 		return sum
 	}
 
-	_simd_dot_int8_bf16_f32 :: #force_inline proc "contextless" (w: [^]i8, x: [^]ml.Bf16, n: int) -> f32 {
-		s0, s1, s2, s3: f32
-		i := 0
-		for ; i + 4 <= n; i += 4 {
-			s0 += f32(w[i + 0]) * ml.bf16_to_f32(x[i + 0])
-			s1 += f32(w[i + 1]) * ml.bf16_to_f32(x[i + 1])
-			s2 += f32(w[i + 2]) * ml.bf16_to_f32(x[i + 2])
-			s3 += f32(w[i + 3]) * ml.bf16_to_f32(x[i + 3])
-		}
-		sum := (s0 + s1) + (s2 + s3)
-		for ; i < n; i += 1 {
-			sum += f32(w[i]) * ml.bf16_to_f32(x[i])
-		}
-		return sum
-	}
 }
 
 Context :: struct {
@@ -527,9 +487,10 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_forward     (op)
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
-	case ml.Linear_Q8:          linear_q8_forward          (op)
 	case ml.Linear_Q4:          linear_q4_forward          (op)
 	case ml.Linear_Q8_0:        linear_q8_0_forward        (op)
+	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
+	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
@@ -569,9 +530,10 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
-	case ml.Linear_Q8:          fmt.panicf("CPU linear_q8_backward: linear_q8 is forward-only (inference path)")
 	case ml.Linear_Q4:          fmt.panicf("CPU linear_q4_backward: linear_q4 is forward-only (inference path)")
 	case ml.Linear_Q8_0:        fmt.panicf("CPU linear_q8_0_backward: linear_q8_0 is forward-only (inference path)")
+	case ml.Linear_Q4_K:        fmt.panicf("CPU linear_q4_k_backward: linear_q4_k is forward-only (inference path)")
+	case ml.Linear_Q6_K:        fmt.panicf("CPU linear_q6_k_backward: linear_q6_k is forward-only (inference path)")
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
@@ -609,22 +571,18 @@ cast_backward :: proc(op: ml.Operation) {
 _cast_bytes :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: ml.Data_Type, count: int) {
 	src_f32  := ([^]f32    )(raw_data(src))[:count] if src_type == .F32  else nil
 	src_bf16 := ([^]ml.Bf16)(raw_data(src))[:count] if src_type == .Bf16 else nil
-	src_f16  := ([^]f16    )(raw_data(src))[:count] if src_type == .F16  else nil
 
 	dst_f32  := ([^]f32    )(raw_data(dst))[:count] if dst_type == .F32  else nil
 	dst_bf16 := ([^]ml.Bf16)(raw_data(dst))[:count] if dst_type == .Bf16 else nil
-	dst_f16  := ([^]f16    )(raw_data(dst))[:count] if dst_type == .F16  else nil
 
 	for i in 0 ..< count {
 		v: f32
 		#partial switch src_type {
 		case .F32:  v = src_f32 [i]
-		case .F16:  v = f32(src_f16[i])
 		case .Bf16: v = ml.bf16_to_f32(src_bf16[i])
 		}
 		#partial switch dst_type {
 		case .F32:  dst_f32 [i] = v
-		case .F16:  dst_f16 [i] = f16(v)
 		case .Bf16: dst_bf16[i] = ml.bf16_from_f32(v)
 		}
 	}
@@ -633,22 +591,18 @@ _cast_bytes :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: 
 _cast_bytes_accumulate :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: ml.Data_Type, count: int) {
 	src_f32  := ([^]f32    )(raw_data(src))[:count] if src_type == .F32  else nil
 	src_bf16 := ([^]ml.Bf16)(raw_data(src))[:count] if src_type == .Bf16 else nil
-	src_f16  := ([^]f16    )(raw_data(src))[:count] if src_type == .F16  else nil
 
 	dst_f32  := ([^]f32    )(raw_data(dst))[:count] if dst_type == .F32  else nil
 	dst_bf16 := ([^]ml.Bf16)(raw_data(dst))[:count] if dst_type == .Bf16 else nil
-	dst_f16  := ([^]f16    )(raw_data(dst))[:count] if dst_type == .F16  else nil
 
 	for i in 0 ..< count {
 		v: f32
 		#partial switch src_type {
 		case .F32:  v = src_f32 [i]
-		case .F16:  v = f32(src_f16[i])
 		case .Bf16: v = ml.bf16_to_f32(src_bf16[i])
 		}
 		#partial switch dst_type {
 		case .F32:  dst_f32 [i] += v
-		case .F16:  dst_f16 [i] += f16(v)
 		case .Bf16: dst_bf16[i]  = ml.bf16_from_f32(ml.bf16_to_f32(dst_bf16[i]) + v)
 		}
 	}
@@ -676,16 +630,6 @@ add_forward :: proc(op: ml.Operation) {
 			for j in 0 ..< ml.len(b) {
 				o := i * ml.len(b) + j
 				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) + ml.bf16_to_f32(b_bf[j]))
-			}
-		}
-	case .F16:
-		a_h := ([^]f16)(raw_data(transmute([]byte)a.buffers     [.Data]))
-		b_h := ([^]f16)(raw_data(transmute([]byte)b.buffers     [.Data]))
-		o_h := ([^]f16)(raw_data(transmute([]byte)output.buffers[.Data]))
-		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
-				o_h[o] = f16(f32(a_h[o]) + f32(b_h[j]))
 			}
 		}
 	}
@@ -717,18 +661,6 @@ add_backward :: proc(op: ml.Operation) {
 				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) + dy)
 			}
 		}
-	case .F16:
-		da_h := ([^]f16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
-		db_h := ([^]f16)(raw_data(transmute([]byte)b.buffers     [.Gradient]))
-		dy_h := ([^]f16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
-				dy := f32(dy_h[o])
-				da_h[o] = f16(f32(da_h[o]) + dy)
-				db_h[j] = f16(f32(db_h[j]) + dy)
-			}
-		}
 	}
 }
 
@@ -756,7 +688,6 @@ sub_forward :: proc(op: ml.Operation) {
 				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) - ml.bf16_to_f32(b_bf[j]))
 			}
 		}
-	case .F16: fmt.panicf("CPU sub_forward: F16 not yet supported")
 	}
 }
 
@@ -786,7 +717,6 @@ sub_backward :: proc(op: ml.Operation) {
 				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) - dy)
 			}
 		}
-	case .F16: fmt.panicf("CPU sub_backward: F16 not yet supported")
 	}
 }
 
@@ -814,7 +744,6 @@ mul_forward :: proc(op: ml.Operation) {
 				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) * ml.bf16_to_f32(b_bf[j]))
 			}
 		}
-	case .F16: fmt.panicf("CPU mul_forward: F16 not yet supported")
 	}
 }
 
@@ -848,7 +777,6 @@ mul_backward :: proc(op: ml.Operation) {
 				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) + dy * a_v)
 			}
 		}
-	case .F16: fmt.panicf("CPU mul_backward: F16 not yet supported")
 	}
 }
 
@@ -876,7 +804,6 @@ div_forward :: proc(op: ml.Operation) {
 				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) / ml.bf16_to_f32(b_bf[j]))
 			}
 		}
-	case .F16: fmt.panicf("CPU div_forward: F16 not yet supported")
 	}
 }
 
@@ -910,7 +837,6 @@ div_backward :: proc(op: ml.Operation) {
 				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) + dy * (-a_v / (b_v * b_v)))
 			}
 		}
-	case .F16: fmt.panicf("CPU div_backward: F16 not yet supported")
 	}
 }
 
@@ -929,7 +855,6 @@ exp_forward :: proc(op: ml.Operation) {
 		for i in 0 ..< ml.len(input) {
 			y_bf[i] = ml.bf16_from_f32(math.exp(ml.bf16_to_f32(x_bf[i])))
 		}
-	case .F16: fmt.panicf("CPU exp_forward: F16 not yet supported")
 	}
 }
 
@@ -949,7 +874,6 @@ exp_backward :: proc(op: ml.Operation) {
 			dx_bf[i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[i]) +
 				ml.bf16_to_f32(y_bf[i]) * ml.bf16_to_f32(dy_bf[i]))
 		}
-	case .F16: fmt.panicf("CPU exp_backward: F16 not yet supported")
 	}
 }
 
@@ -1035,7 +959,6 @@ mean_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  mean_forward_f32 (op)
 	case .Bf16: mean_forward_bf16(op)
-	case .F16:  fmt.panicf("CPU mean_forward: F16 not yet supported")
 	}
 }
 
@@ -1077,7 +1000,6 @@ mean_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  mean_backward_f32 (op)
 	case .Bf16: mean_backward_bf16(op)
-	case .F16:  fmt.panicf("CPU mean_backward: F16 not yet supported")
 	}
 }
 
@@ -1179,8 +1101,6 @@ select_backward :: proc(op: ml.Operation) {
 				dw[dst_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dw[dst_idx]) + ml.bf16_to_f32(dy[src_idx]))
 			}
 		}
-	case .F16:
-		fmt.panicf("CPU select_backward: F16 not yet supported")
 	}
 }
 
@@ -1200,7 +1120,6 @@ slice_forward :: proc(op: ml.Operation) {
 		for i in 0 ..< ml.len(output) {
 			out_bf[i] = in_bf[start + i]
 		}
-	case .F16:  fmt.panicf("CPU slice_forward: F16 not yet supported")
 	}
 }
 
@@ -1222,7 +1141,6 @@ slice_backward :: proc(op: ml.Operation) {
 			idx := start + i
 			dx_bf[idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[idx]) + ml.bf16_to_f32(dy_bf[i]))
 		}
-	case .F16:  fmt.panicf("CPU slice_backward: F16 not yet supported")
 	}
 }
 
@@ -1255,7 +1173,6 @@ slice_trailing_forward :: proc(op: ml.Operation) {
 				out_bf[out_off + i] = in_bf[in_off + i]
 			}
 		}
-	case .F16: fmt.panicf("CPU slice_trailing_forward: F16 not yet supported")
 	}
 }
 
@@ -1289,7 +1206,6 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 				dx_bf[idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[idx]) + ml.bf16_to_f32(dy_bf[out_off + i]))
 			}
 		}
-	case .F16: fmt.panicf("CPU slice_trailing_backward: F16 not yet supported")
 	}
 }
 
@@ -1330,7 +1246,6 @@ concat_forward :: proc(op: ml.Operation) {
 			}
 			dst_col += in_trailing
 		}
-	case .F16:  fmt.panicf("CPU concat_forward: F16 not yet supported")
 	}
 }
 
@@ -1373,7 +1288,6 @@ concat_backward :: proc(op: ml.Operation) {
 			}
 			src_col += in_trailing
 		}
-	case .F16:  fmt.panicf("CPU concat_backward: F16 not yet supported")
 	}
 }
 
@@ -1381,7 +1295,6 @@ linear_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  linear_forward_f32 (op)
 	case .Bf16: linear_forward_bf16(op)
-	case .F16:  fmt.panicf("CPU linear_forward: F16 not yet supported")
 	}
 }
 
@@ -1445,37 +1358,6 @@ linear_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-linear_q8_forward :: proc(op: ml.Operation) {
-	v := op.variant.(ml.Linear_Q8)
-	output_size := v.weight.shape[0]
-	count       := ml.len(op.input) / v.weight.shape[1]
-
-	Job_Data :: struct {
-		op:    ml.Operation,
-		count: int,
-	}
-	jd := Job_Data{op = op, count = count}
-
-	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
-		op := jd.op
-		v := op.variant.(ml.Linear_Q8)
-		output_size := v.weight.shape[0]
-		input_size  := v.weight.shape[1]
-
-		x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers   [.Data]))
-		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers  [.Data]))
-		w_i8 := ([^]i8     )(raw_data(transmute([]byte)v.weight.buffers   [.Data]))
-		s_f32:= ([^]f32    )(raw_data(transmute([]byte)v.scales.buffers   [.Data]))
-
-		w_row := w_i8[o * input_size:]
-		scale := s_f32[o]
-		for c in 0 ..< jd.count {
-			x_row := x_bf[c * input_size:]
-			y_bf[c * output_size + o] = ml.bf16_from_f32(_simd_dot_int8_bf16_f32(w_row, x_row, input_size) * scale)
-		}
-	})
-}
-
 linear_q4_forward :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Linear_Q4)
 	output_size := v.weight.shape[0]
@@ -1523,6 +1405,91 @@ linear_q4_forward :: proc(op: ml.Operation) {
 				total += group_sum * scale
 			}
 
+			y_bf[c * output_size + o] = ml.bf16_from_f32(total)
+		}
+	})
+}
+
+// Reference CPU forward for the GGUF Q4_K linear op: dequantize the weight
+// row block-by-block and accumulate the dot product against the bf16
+// activation. Slow — intended as the parity baseline for the GPU shader,
+// not for production decode.
+linear_q4_k_forward :: proc(op: ml.Operation) {
+	v := op.variant.(ml.Linear_Q4_K)
+	output_size := v.weight.shape[0]
+	input_size  := v.weight.shape[1]
+	count       := ml.len(op.input) / input_size
+
+	Job_Data :: struct {
+		op:    ml.Operation,
+		count: int,
+	}
+	jd := Job_Data{op = op, count = count}
+
+	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+		op := jd.op
+		v := op.variant.(ml.Linear_Q4_K)
+		output_size := v.weight.shape[0]
+		input_size  := v.weight.shape[1]
+		num_blocks  := input_size / ml.K_QUANT_BLOCK_SIZE
+		row_bytes   := num_blocks * ml.Q4_K_BLOCK_BYTES
+
+		x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Data]))
+		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Data]))
+		w_pk := transmute([]byte)v.weight.buffers[.Data]
+
+		w_row   := w_pk[o * row_bytes : (o + 1) * row_bytes]
+		dequant := make([]f32, input_size)
+		defer delete(dequant)
+		gguf.dequantize_q4_k(w_row, dequant)
+
+		for c in 0 ..< jd.count {
+			x_row := x_bf[c * input_size:]
+			total: f32
+			for k in 0 ..< input_size {
+				total += dequant[k] * ml.bf16_to_f32(x_row[k])
+			}
+			y_bf[c * output_size + o] = ml.bf16_from_f32(total)
+		}
+	})
+}
+
+// Reference CPU forward for the GGUF Q6_K linear op. Same structure as Q4_K.
+linear_q6_k_forward :: proc(op: ml.Operation) {
+	v := op.variant.(ml.Linear_Q6_K)
+	output_size := v.weight.shape[0]
+	input_size  := v.weight.shape[1]
+	count       := ml.len(op.input) / input_size
+
+	Job_Data :: struct {
+		op:    ml.Operation,
+		count: int,
+	}
+	jd := Job_Data{op = op, count = count}
+
+	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+		op := jd.op
+		v := op.variant.(ml.Linear_Q6_K)
+		output_size := v.weight.shape[0]
+		input_size  := v.weight.shape[1]
+		num_blocks  := input_size / ml.K_QUANT_BLOCK_SIZE
+		row_bytes   := num_blocks * ml.Q6_K_BLOCK_BYTES
+
+		x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Data]))
+		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Data]))
+		w_pk := transmute([]byte)v.weight.buffers[.Data]
+
+		w_row   := w_pk[o * row_bytes : (o + 1) * row_bytes]
+		dequant := make([]f32, input_size)
+		defer delete(dequant)
+		gguf.dequantize_q6_k(w_row, dequant)
+
+		for c in 0 ..< jd.count {
+			x_row := x_bf[c * input_size:]
+			total: f32
+			for k in 0 ..< input_size {
+				total += dequant[k] * ml.bf16_to_f32(x_row[k])
+			}
 			y_bf[c * output_size + o] = ml.bf16_from_f32(total)
 		}
 	})
@@ -1647,7 +1614,6 @@ linear_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  linear_backward_f32 (op)
 	case .Bf16: linear_backward_bf16(op)
-	case .F16:  fmt.panicf("CPU linear_backward: F16 not yet supported")
 	}
 }
 
@@ -1752,7 +1718,6 @@ rope_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  rope_forward_f32 (op)
 	case .Bf16: rope_forward_bf16(op)
-	case .F16:  fmt.panicf("CPU rope_forward: F16 not yet supported")
 	}
 }
 
@@ -1855,7 +1820,6 @@ rope_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  rope_backward_f32 (op)
 	case .Bf16: rope_backward_bf16(op)
-	case .F16:  fmt.panicf("CPU rope_backward: F16 not yet supported")
 	}
 }
 
@@ -1942,7 +1906,6 @@ layernorm_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  layernorm_forward_f32 (op)
 	case .Bf16: layernorm_forward_bf16(op)
-	case .F16:  fmt.panicf("CPU layernorm_forward: F16 not yet supported")
 	}
 }
 
@@ -2029,7 +1992,6 @@ layernorm_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  layernorm_backward_f32 (op)
 	case .Bf16: layernorm_backward_bf16(op)
-	case .F16:  fmt.panicf("CPU layernorm_backward: F16 not yet supported")
 	}
 }
 
@@ -2127,7 +2089,6 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  rmsnorm_forward_f32 (op)
 	case .Bf16: rmsnorm_forward_bf16(op)
-	case .F16:  fmt.panicf("CPU rmsnorm_forward: F16 not yet supported")
 	}
 }
 
@@ -2200,7 +2161,6 @@ rmsnorm_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  rmsnorm_backward_f32 (op)
 	case .Bf16: rmsnorm_backward_bf16(op)
-	case .F16:  fmt.panicf("CPU rmsnorm_backward: F16 not yet supported")
 	}
 }
 
@@ -2332,7 +2292,6 @@ softmax_forward :: proc(op: ml.Operation) {
 			}
 		}
 		free_all(context.temp_allocator)
-	case .F16: fmt.panicf("CPU softmax_forward: F16 not yet supported")
 	}
 }
 
@@ -2376,7 +2335,6 @@ softmax_backward :: proc(op: ml.Operation) {
 				dx_bf[base + i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[base + i]) + y_v * (dy_v - dot))
 			}
 		}
-	case .F16: fmt.panicf("CPU softmax_backward: F16 not yet supported")
 	}
 }
 
@@ -2424,7 +2382,6 @@ log_softmax_forward :: proc(op: ml.Operation) {
 				y_bf[base + i] = ml.bf16_from_f32(ml.bf16_to_f32(x_bf[base + i]) - lse)
 			}
 		}
-	case .F16: fmt.panicf("CPU log_softmax_forward: F16 not yet supported")
 	}
 }
 
@@ -2462,7 +2419,6 @@ log_softmax_backward :: proc(op: ml.Operation) {
 				dx_bf[base + i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[base + i]) + dy_v - math.exp(y_v) * grad_sum)
 			}
 		}
-	case .F16: fmt.panicf("CPU log_softmax_backward: F16 not yet supported")
 	}
 }
 
@@ -2497,7 +2453,6 @@ entropy_forward :: proc(op: ml.Operation) {
 			}
 			o_bf[sample] = ml.bf16_from_f32(entropy_value)
 		}
-	case .F16: fmt.panicf("CPU entropy_forward: F16 not yet supported")
 	}
 }
 
@@ -2531,7 +2486,6 @@ entropy_backward :: proc(op: ml.Operation) {
 				dp_bf[base + i] = ml.bf16_from_f32(ml.bf16_to_f32(dp_bf[base + i]) + dout_v * grad)
 			}
 		}
-	case .F16: fmt.panicf("CPU entropy_backward: F16 not yet supported")
 	}
 }
 
@@ -2652,7 +2606,6 @@ _unary_forward_dispatch :: proc(op: ml.Operation, fwd_f32: proc(x: f32) -> f32) 
 		for i in 0 ..< ml.len(input) {
 			y_bf[i] = ml.bf16_from_f32(fwd_f32(ml.bf16_to_f32(x_bf[i])))
 		}
-	case .F16: fmt.panicf("CPU unary forward: F16 not yet supported")
 	}
 }
 
@@ -2672,7 +2625,6 @@ _unary_backward_dispatch :: proc(op: ml.Operation, local_grad_from_input: proc(x
 			dx_bf[i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[i]) +
 				ml.bf16_to_f32(dy_bf[i]) * local_grad_from_input(x_v))
 		}
-	case .F16: fmt.panicf("CPU unary backward: F16 not yet supported")
 	}
 }
 
@@ -2744,7 +2696,6 @@ batched_matmul_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  batched_matmul_forward_f32 (op)
 	case .Bf16: batched_matmul_forward_bf16(op)
-	case .F16:  fmt.panicf("CPU batched_matmul_forward: F16 not yet supported")
 	}
 }
 
@@ -2817,7 +2768,6 @@ batched_matmul_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  batched_matmul_backward_f32 (op)
 	case .Bf16: batched_matmul_backward_bf16(op)
-	case .F16:  fmt.panicf("CPU batched_matmul_backward: F16 not yet supported")
 	}
 }
 
@@ -2983,7 +2933,6 @@ permute_forward :: proc(op: ml.Operation) {
 				}
 			}
 		}
-	case .F16:  fmt.panicf("CPU permute_forward: F16 not yet supported")
 	}
 }
 
@@ -3031,7 +2980,6 @@ permute_backward :: proc(op: ml.Operation) {
 				}
 			}
 		}
-	case .F16:  fmt.panicf("CPU permute_backward: F16 not yet supported")
 	}
 }
 
@@ -3075,7 +3023,6 @@ causal_mask_forward :: proc(op: ml.Operation) {
 				}
 			}
 		}
-	case .F16:  fmt.panicf("CPU causal_mask_forward: F16 not yet supported")
 	}
 }
 
@@ -3110,7 +3057,6 @@ causal_mask_backward :: proc(op: ml.Operation) {
 				}
 			}
 		}
-	case .F16:  fmt.panicf("CPU causal_mask_backward: F16 not yet supported")
 	}
 }
 
@@ -3118,7 +3064,6 @@ attention_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  attention_forward_f32 (op)
 	case .Bf16: attention_forward_bf16(op)
-	case .F16:  fmt.panicf("CPU attention_forward: F16 not yet supported")
 	}
 }
 
@@ -3272,7 +3217,6 @@ attention_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  attention_backward_f32 (op)
 	case .Bf16: attention_backward_bf16(op)
-	case .F16:  fmt.panicf("CPU attention_backward: F16 not yet supported")
 	}
 }
 
@@ -3463,7 +3407,6 @@ attention_cache_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  attention_cache_forward_f32 (op)
 	case .Bf16: attention_cache_forward_bf16(op)
-	case .F16:  fmt.panicf("CPU attention_cache_forward: F16 not yet supported")
 	}
 }
 

@@ -1,0 +1,125 @@
+// Q6_K GEMV specialization for M=1 decode-shape forwards. One workgroup per
+// `ROWS_PER_WG` output rows. Q6_K block is 210 bytes / 256 weights:
+//   ql      bytes   0..127 (low 4 bits of each 6-bit quant, two nibbles per byte)
+//   qh      bytes 128..191 (upper 2 bits of each 6-bit quant, four per byte)
+//   scales  bytes 192..207 (16 i8 sub-block scales, one per 16 weights)
+//   d       bytes 208..209 (fp16 super-block scale)
+//
+// Block size 210 is not a multiple of 4, so the byte stream is read via a
+// `load_byte` helper that indexes into a uint[] view: one uint load + shift +
+// mask per byte. Adjacent threads' byte fetches land in the same cache line,
+// so this is fine.
+//
+// Dequant per element e in block (matching `dequantize_row_q6_K`):
+//   q(e) = (ql_nibble(e) | (qh_2bits(e) << 4)) - 32
+//   w(e) = d * scales[e/16] * q(e)
+//
+// The reference loop walks two halves; within each half 32 lanes (l = tid)
+// each emit four quants q1..q4 covering offsets 0,32,64,96 within the half.
+// We map the 8-iteration outer loop to (h ∈ {0,1}) × (quadrant ∈ {0..3}),
+// where h selects the half (`half` is a GLSL reserved word).
+//
+// Layout:
+//   x [1, K] bf16, packed (two halves per uint)
+//   w [N, K] Q6_K, raw bytes read as a uint stream (K % 256 == 0)
+//   y [1, N] bf16, packed
+// Requires: K % 256 == 0; N % ROWS_PER_WG == 0.
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "bf16.glsl"
+
+#define WG          32
+#define ROWS_PER_WG  2
+#define BLOCK_K    256
+#define BLOCK_BYTES 210
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { uint x[]; };
+layout(set = 0, binding = 1) readonly  buffer W { uint w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { uint y[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+} p;
+
+uint load_byte(uint byte_offset) {
+    uint u = w[byte_offset >> 2u];
+    return (u >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}
+
+int load_i8(uint byte_offset) {
+    uint b = load_byte(byte_offset);
+    int  s = int(b);
+    if ((b & 0x80u) != 0u) s -= 256;
+    return s;
+}
+
+void main() {
+    uint group_idx = gl_WorkGroupID.x;
+    uint n_base    = group_idx * ROWS_PER_WG;
+    uint tid       = gl_LocalInvocationID.x;
+
+    uint num_blocks = p.K / BLOCK_K;
+
+    float acc[ROWS_PER_WG];
+    for (uint r = 0u; r < ROWS_PER_WG; ++r) acc[r] = 0.0;
+
+    for (uint b = 0u; b < num_blocks; ++b) {
+        for (uint r = 0u; r < ROWS_PER_WG; ++r) {
+            uint n = n_base + r;
+            if (n >= p.N) continue;
+
+            uint block_off = (n * num_blocks + b) * BLOCK_BYTES;
+
+            // d (fp16) lives at byte offset 208..209.
+            uint d_bits = load_byte(block_off + 208u) | (load_byte(block_off + 209u) << 8u);
+            float d = unpackHalf2x16(d_bits).x;
+
+            // Each thread emits 8 weights per block: (half, quadrant) ∈
+            // {0,1} × {0,1,2,3}, with l = tid in 0..31.
+            for (uint s = 0u; s < 8u; ++s) {
+                uint h        = s >> 2u;
+                uint quadrant = s & 3u;
+                uint l        = tid;
+
+                // Sub-block index for the scale lookup. Within each half,
+                // l/16 picks lo/hi sub-block; quadrants 0..3 add 0,2,4,6.
+                uint sb         = h * 8u + (l >> 4u) + 2u * quadrant;
+                int  scale_i8   = load_i8(block_off + 192u + sb);
+
+                uint ql_byte    = load_byte(block_off + h * 64u + (quadrant & 1u) * 32u + l);
+                uint qh_byte    = load_byte(block_off + 128u + h * 32u + l);
+
+                uint ql_nibble  = (ql_byte >> ((quadrant >> 1u) * 4u)) & 0x0Fu;
+                uint qh_bits    = (qh_byte >> (quadrant * 2u))         & 0x03u;
+                int  q          = int(ql_nibble | (qh_bits << 4u)) - 32;
+
+                uint e          = h * 128u + quadrant * 32u + l;
+                uint k          = b * BLOCK_K + e;
+                uint pkx        = x[k >> 1u];
+                float xv        = ((k & 1u) == 0u)
+                    ? bf16_expand( pkx        & 0xffffu)
+                    : bf16_expand((pkx >> 16) & 0xffffu);
+
+                acc[r] += d * float(scale_i8) * float(q) * xv;
+            }
+        }
+    }
+
+    float total[ROWS_PER_WG];
+    for (uint r = 0u; r < ROWS_PER_WG; ++r) total[r] = subgroupAdd(acc[r]);
+
+    if (tid == 0u) {
+        for (uint pair = 0u; pair < ROWS_PER_WG / 2u; ++pair) {
+            uint n_lo = n_base + 2u * pair;
+            if (n_lo >= p.N) break;
+            uint n_hi = n_lo + 1u;
+            uint lo_b = bf16_round(total[2u * pair]);
+            uint hi_b = (n_hi < p.N) ? bf16_round(total[2u * pair + 1u]) : 0u;
+            y[n_lo >> 1u] = (hi_b << 16) | lo_b;
+        }
+    }
+}

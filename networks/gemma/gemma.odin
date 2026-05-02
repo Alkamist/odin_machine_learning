@@ -148,7 +148,7 @@ Layer :: struct {
 	// Optional per-output-channel f32 scales paired with each projection above.
 	// Populated by `quantize_for_inference`; backend == nil means the matching
 	// `*_proj_weight` is still in its original Bf16/F32 dtype and `_linear`
-	// dispatches to ml.linear instead of ml.linear_q8.
+	// dispatches to ml.linear instead of a quantized linear op.
 	q_proj_scales:               ml.Tensor,
 	k_proj_scales:               ml.Tensor,
 	v_proj_scales:               ml.Tensor,
@@ -296,7 +296,7 @@ _make_const_scalar :: proc(dtype: ml.Data_Type, value: f32) -> ml.Tensor {
 	case .Bf16:
 		src := [1]ml.Bf16{ml.bf16_from_f32(value)}
 		ml.set_data_bytes(t, mem.slice_to_bytes(src[:]))
-	case .I4, .I8, .F16:
+	case .I4, .I8, .Q4_K, .Q6_K:
 		fmt.panicf("_make_const_scalar: unsupported dtype %v", dtype)
 	}
 	return t
@@ -373,26 +373,23 @@ destroy :: proc(model: Gemma) {
 
 Quant_Mode :: enum {
 	None,
-	Int8,
 	Int4,
 	Q8_0,
 }
 
-// Dispatch a linear projection. If `scales` is set, the weight is quantized
-// and we route to the matching ml.linear_q* op based on weight dtype + scales
-// rank (Q8_0 uses Int8 weight + 2-D scales, Int8 uses Int8 weight + 1-D scales).
+// Dispatch a linear projection on the weight tensor's dtype. The two
+// k-quant formats (Q4_K, Q6_K — used by the GGUF loader) bundle scales
+// into the weight bytes and ignore the `scales` parameter; the older
+// in-process Q4_0 / Q8_0 paths still need it.
 @(require_results)
 _linear :: proc(input, weight, scales: ml.Tensor) -> ml.Tensor {
-	if scales.backend == nil {
-		return ml.linear(input, weight)
+	#partial switch weight.type {
+	case .Q4_K: return ml.linear_q4_k(input, weight)
+	case .Q6_K: return ml.linear_q6_k(input, weight)
+	case .I4:   return ml.linear_q4   (input, weight, scales)
+	case .I8:   return ml.linear_q8_0 (input, weight, scales)
 	}
-	if weight.type == .I4 {
-		return ml.linear_q4(input, weight, scales)
-	}
-	if scales.rank == 2 {
-		return ml.linear_q8_0(input, weight, scales)
-	}
-	return ml.linear_q8(input, weight, scales)
+	return ml.linear(input, weight)
 }
 
 // Replace `weight` with empty (zero-filled) quantized buffers of the right
@@ -412,18 +409,12 @@ _fake_quantize_in_place :: proc(mode: Quant_Mode, weight, scales: ^ml.Tensor) {
 	scale_shape_1: int
 	switch mode {
 	case .None: return
-	case .Int8: new_w_type = .I8; scale_shape_1 = 1
 	case .Int4: new_w_type = .I4; scale_shape_1 = num_groups
 	case .Q8_0: new_w_type = .I8; scale_shape_1 = num_groups
 	}
 
 	new_w := ml.alloc(new_w_type, {output_size, input_size},  persistent=true, buffers=ml.Buffer_Set{.Data})
-	new_s: ml.Tensor
-	if scale_shape_1 == 1 {
-		new_s = ml.alloc(.F32, {output_size},                 persistent=true, buffers=ml.Buffer_Set{.Data})
-	} else {
-		new_s = ml.alloc(.F32, {output_size, scale_shape_1},  persistent=true, buffers=ml.Buffer_Set{.Data})
-	}
+	new_s := ml.alloc(.F32, {output_size, scale_shape_1},     persistent=true, buffers=ml.Buffer_Set{.Data})
 
 	ml.destroy(weight^)
 	weight^ = new_w
@@ -460,7 +451,6 @@ _quantize_in_place :: proc(mode: Quant_Mode, weight, scales: ^ml.Tensor) {
 	q_w, q_s: ml.Tensor
 	switch mode {
 	case .None: return
-	case .Int8: q_w, q_s = ml.quantize_int8(weight^)
 	case .Int4: q_w, q_s = ml.quantize_int4(weight^)
 	case .Q8_0: q_w, q_s = ml.quantize_q8_0(weight^)
 	}
