@@ -57,15 +57,55 @@ _pick_memory_type :: proc(type_bits: u32, required: vk.MemoryPropertyFlags, loc 
 	fmt.panicf("no memory type matches type_bits=0x%x required=%v", type_bits, required, loc=loc)
 }
 
-// Sub-allocate an activation (non-persistent) buffer from the context's
-// activation arenas. The VkBuffer is destroyed on `clear()` and the arena
-// space is reset to 0 — no exact-size cache, no per-buffer `vkAllocateMemory`.
+// Sub-allocate an activation (non-persistent) buffer. VkBuffer handles are
+// pooled and reused across forward passes: the Nth alloc in a forward returns
+// the Nth slot's buffer, with arena.used bumped to match the original binding.
+// On size mismatch the slot is destroyed and recreated; on first encounter a
+// new buffer is bound and appended to the pool.
 _create_pooled_activation_buffer :: proc(
 	size: vk.DeviceSize,
 	usage: vk.BufferUsageFlags,
 	mem_flags: vk.MemoryPropertyFlags,
 	loc := #caller_location,
-) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {
+) -> (buffer: vk.Buffer, memory: vk.DeviceMemory, fresh: bool) {
+	gctx := _gctx(loc)
+
+	if gctx.activation_cursor < len(gctx.activation_pool) {
+		slot := gctx.activation_pool[gctx.activation_cursor]
+		if slot.size == size {
+			arena := &gctx.activation_arenas[slot.arena_idx]
+			aligned := (arena.used + slot.alignment - 1) & ~(slot.alignment - 1)
+			if aligned == slot.offset {
+				arena.used = aligned + size
+				gctx.activation_cursor += 1
+				return slot.buf, 0, false
+			}
+		}
+		// Either size differs or arena.used has drifted (an earlier slot was
+		// rebuilt at a different size). Every slot from here on has stale
+		// offsets — destroy them all and rebuild the tail.
+		for i in gctx.activation_cursor ..< len(gctx.activation_pool) {
+			doomed := gctx.activation_pool[i]
+			vk.DestroyBuffer(_gpu.device, doomed.buf, nil)
+			delete_key(&gctx.sizes, doomed.buf)
+		}
+		resize(&gctx.activation_pool, gctx.activation_cursor)
+	}
+
+	new_buf, new_slot := _alloc_activation_slot(size, usage, mem_flags, loc)
+	append(&gctx.activation_pool, new_slot)
+	gctx.activation_cursor += 1
+	return new_buf, 0, true
+}
+
+// Create a fresh VkBuffer + bind it into the next free slice of an arena
+// (allocating a new arena block if the existing arenas are full).
+_alloc_activation_slot :: proc(
+	size: vk.DeviceSize,
+	usage: vk.BufferUsageFlags,
+	mem_flags: vk.MemoryPropertyFlags,
+	loc := #caller_location,
+) -> (buffer: vk.Buffer, slot: Activation_Slot) {
 	gctx := _gctx(loc)
 
 	info := vk.BufferCreateInfo{
@@ -81,14 +121,20 @@ _create_pooled_activation_buffer :: proc(
 	vk.GetBufferMemoryRequirements(_gpu.device, buffer, &reqs)
 	mem_type_idx := _pick_memory_type(reqs.memoryTypeBits, mem_flags, loc)
 
-	for &arena in gctx.activation_arenas {
+	for &arena, idx in gctx.activation_arenas {
 		if arena.mem_type_idx != mem_type_idx do continue
 		aligned := (arena.used + reqs.alignment - 1) & ~(reqs.alignment - 1)
 		if aligned + reqs.size <= arena.size {
 			res = vk.BindBufferMemory(_gpu.device, buffer, arena.memory, aligned)
 			fmt.assertf(res == .SUCCESS, "vkBindBufferMemory (activation reuse) failed: %v", res, loc=loc)
 			arena.used = aligned + reqs.size
-			return buffer, 0
+			return buffer, Activation_Slot{
+				buf       = buffer,
+				arena_idx = idx,
+				offset    = aligned,
+				size      = size,
+				alignment = reqs.alignment,
+			}
 		}
 	}
 
@@ -104,6 +150,7 @@ _create_pooled_activation_buffer :: proc(
 	fmt.assertf(res == .SUCCESS, "vkAllocateMemory (activation arena, %v MB) failed: %v",
 		f64(block_size) / (1024 * 1024), res, loc=loc)
 
+	new_arena_idx := len(gctx.activation_arenas)
 	append(&gctx.activation_arenas, Pool_Block{
 		memory       = new_block_memory,
 		size         = block_size,
@@ -113,7 +160,13 @@ _create_pooled_activation_buffer :: proc(
 
 	res = vk.BindBufferMemory(_gpu.device, buffer, new_block_memory, 0)
 	fmt.assertf(res == .SUCCESS, "vkBindBufferMemory (activation arena first) failed: %v", res, loc=loc)
-	return buffer, 0
+	return buffer, Activation_Slot{
+		buf       = buffer,
+		arena_idx = new_arena_idx,
+		offset    = 0,
+		size      = size,
+		alignment = reqs.alignment,
+	}
 }
 
 // Sub-allocate a persistent buffer from the context's pool. Each pool block

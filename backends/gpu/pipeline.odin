@@ -22,7 +22,6 @@ Batch :: struct {
 	active:           bool,
 	cmd:              vk.CommandBuffer,
 	dispatch_count:   int,
-	descriptor_sets:  [dynamic]vk.DescriptorSet,
 	pending_buffers:  [dynamic]vk.Buffer,
 	pending_memories: [dynamic]vk.DeviceMemory,
 	staging_offset:   vk.DeviceSize,
@@ -58,6 +57,12 @@ begin_batch :: proc(loc := #caller_location) {
 	gctx.batch.active         = true
 	gctx.batch.dispatch_count = 0
 	gctx.batch.staging_offset = 0
+
+	if gctx.timing_enabled && gctx.query_pool != 0 {
+		vk.CmdResetQueryPool(gctx.batch.cmd, gctx.query_pool, 0, gctx.query_capacity)
+		gctx.query_used = 0
+		builtin.clear(&gctx.pending_queries)
+	}
 }
 
 end_batch :: proc(loc := #caller_location) {
@@ -87,19 +92,31 @@ end_batch :: proc(loc := #caller_location) {
 		builtin.clear(&gctx.pending_downloads)
 	}
 
+	if gctx.timing_enabled && gctx.query_pool != 0 && len(gctx.pending_queries) > 0 {
+		results := builtin.make([]u64, gctx.query_used, context.temp_allocator)
+		_ = vk.GetQueryPoolResults(
+			_gpu.device, gctx.query_pool, 0, gctx.query_used,
+			builtin.len(results) * size_of(u64),
+			raw_data(results), size_of(u64),
+			{._64, .WAIT},
+		)
+		period := f64(_gpu.timestamp_period_ns)
+		for q in gctx.pending_queries {
+			delta_ticks := results[q.end_idx] - results[q.start_idx]
+			ns := i64(f64(delta_ticks) * period)
+			stat := gctx.timing_totals[q.pipeline]
+			stat.total_ns += ns
+			stat.count    += 1
+			gctx.timing_totals[q.pipeline] = stat
+		}
+		builtin.clear(&gctx.pending_queries)
+	}
+
 	vk.FreeCommandBuffers(_gpu.device, gctx.command_pool, 1, &cmd)
 
-	if builtin.len(gctx.batch.descriptor_sets) > 0 {
-		vk.FreeDescriptorSets(
-			_gpu.device, gctx.descriptor_pool,
-			u32(builtin.len(gctx.batch.descriptor_sets)),
-			raw_data(gctx.batch.descriptor_sets[:]),
-		)
-	}
 	for buf in gctx.batch.pending_buffers  { vk.DestroyBuffer(_gpu.device, buf, nil) }
 	for m   in gctx.batch.pending_memories { vk.FreeMemory(_gpu.device, m, nil)      }
 
-	builtin.clear(&gctx.batch.descriptor_sets)
 	builtin.clear(&gctx.batch.pending_buffers)
 	builtin.clear(&gctx.batch.pending_memories)
 	gctx.batch.active         = false
@@ -145,6 +162,7 @@ _make_pipeline :: proc(spirv: []u8, num_buffers: u32, push_constant_size: u32, l
 	}
 	dsl_info := vk.DescriptorSetLayoutCreateInfo{
 		sType        = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		flags        = {.PUSH_DESCRIPTOR_KHR},
 		bindingCount = num_buffers,
 		pBindings    = raw_data(bindings),
 	}
@@ -206,16 +224,17 @@ _dispatch :: proc(
 
 	gctx := _gctx(loc)
 
-	dsl := p.descriptor_set_layout
-	ds_alloc := vk.DescriptorSetAllocateInfo{
-		sType              = .DESCRIPTOR_SET_ALLOCATE_INFO,
-		descriptorPool     = gctx.descriptor_pool,
-		descriptorSetCount = 1,
-		pSetLayouts        = &dsl,
+	if !gctx.batch.active {
+		begin_batch(loc)
 	}
-	set: vk.DescriptorSet
-	res := vk.AllocateDescriptorSets(_gpu.device, &ds_alloc, &set)
-	fmt.assertf(res == .SUCCESS, "vkAllocateDescriptorSets failed: %v", res, loc=loc)
+
+	timing := gctx.timing_enabled && gctx.query_pool != 0 && gctx.query_used + 2 <= gctx.query_capacity
+	start_idx, end_idx: u32
+	if timing {
+		start_idx = gctx.query_used
+		end_idx   = start_idx + 1
+		gctx.query_used += 2
+	}
 
 	buf_infos := builtin.make([]vk.DescriptorBufferInfo, p.num_buffers, context.temp_allocator)
 	writes    := builtin.make([]vk.WriteDescriptorSet,   p.num_buffers, context.temp_allocator)
@@ -227,17 +246,11 @@ _dispatch :: proc(
 		}
 		writes[i] = vk.WriteDescriptorSet{
 			sType           = .WRITE_DESCRIPTOR_SET,
-			dstSet          = set,
 			dstBinding      = i,
 			descriptorCount = 1,
 			descriptorType  = .STORAGE_BUFFER,
 			pBufferInfo     = &buf_infos[i],
 		}
-	}
-	vk.UpdateDescriptorSets(_gpu.device, p.num_buffers, raw_data(writes), 0, nil)
-
-	if !gctx.batch.active {
-		begin_batch(loc)
 	}
 
 	// Insert a memory barrier before every dispatch so prior shader writes
@@ -259,13 +272,19 @@ _dispatch :: proc(
 		0, nil,
 	)
 	vk.CmdBindPipeline(cmd, .COMPUTE, p.pipeline)
-	vk.CmdBindDescriptorSets(cmd, .COMPUTE, p.pipeline_layout, 0, 1, &set, 0, nil)
+	vk.CmdPushDescriptorSetKHR(cmd, .COMPUTE, p.pipeline_layout, 0, p.num_buffers, raw_data(writes))
 	if p.push_constant_size > 0 {
 		vk.CmdPushConstants(cmd, p.pipeline_layout, {.COMPUTE}, 0, p.push_constant_size, push_constants)
 	}
+	if timing {
+		vk.CmdWriteTimestamp(cmd, {.TOP_OF_PIPE},    gctx.query_pool, start_idx)
+	}
 	vk.CmdDispatch(cmd, group_count_x, group_count_y, group_count_z)
+	if timing {
+		vk.CmdWriteTimestamp(cmd, {.BOTTOM_OF_PIPE}, gctx.query_pool, end_idx)
+		append(&gctx.pending_queries, Pending_Query{pipeline = p, start_idx = start_idx, end_idx = end_idx})
+	}
 
-	append(&gctx.batch.descriptor_sets, set)
 	gctx.batch.dispatch_count += 1
 }
 

@@ -5,7 +5,10 @@ package machine_learning_network_gemma
 // See `tools/gemma_dump.py` for the reference logits the loader+forward target.
 
 import "base:builtin"
+
+import "core:fmt"
 import "core:math"
+import "core:mem"
 
 import ml "../../"
 
@@ -38,8 +41,8 @@ Config :: struct {
 }
 
 @(require_results)
-make_e4b_config :: proc(allocator := context.allocator) -> Config {
-	cfg := Config{
+make_e4b_config :: proc(allocator := context.allocator) -> (cfg: Config) {
+	cfg = {
 		num_hidden_layers           = 42,
 		hidden_size                 = 2560,
 		intermediate_size           = 10240,
@@ -52,8 +55,8 @@ make_e4b_config :: proc(allocator := context.allocator) -> Config {
 		sliding_window              = 512,
 		hidden_size_per_layer_input = 256,
 		num_kv_shared_layers        = 18,
-		rope_base_sliding           = 10_000,
-		rope_base_full              = 1_000_000,
+		rope_base_sliding           = 10000,
+		rope_base_full              = 1000000,
 		rope_fraction_full          = 0.25,
 		rms_norm_eps                = 1e-6,
 		final_logit_softcapping     = 30,
@@ -65,7 +68,8 @@ make_e4b_config :: proc(allocator := context.allocator) -> Config {
 	for i in 0 ..< cfg.num_hidden_layers {
 		cfg.layer_types[i] = .Full if (i + 1) % 6 == 0 else .Sliding
 	}
-	return cfg
+
+	return
 }
 
 config_destroy :: proc(cfg: Config) {
@@ -113,47 +117,47 @@ is_kv_shared_layer :: proc(cfg: Config, layer_idx: int) -> bool {
 
 Layer :: struct {
 	// Pre/post norms around attention and the feedforward.
-	input_norm_weight:                  ml.Tensor, // [hidden_size]
-	post_attention_norm_weight:         ml.Tensor, // [hidden_size]
-	pre_feedforward_norm_weight:        ml.Tensor, // [hidden_size]
-	post_feedforward_norm_weight:       ml.Tensor, // [hidden_size]
+	input_norm_weight:            ml.Tensor, // [hidden_size]
+	post_attention_norm_weight:   ml.Tensor, // [hidden_size]
+	pre_feedforward_norm_weight:  ml.Tensor, // [hidden_size]
+	post_feedforward_norm_weight: ml.Tensor, // [hidden_size]
 
 	// Attention. q/k/v_proj output widths follow the layer's head_dim.
-	q_proj_weight:                      ml.Tensor, // [num_attention_heads * head_dim, hidden_size]
-	q_norm_weight:                      ml.Tensor, // [head_dim] — pre-baked with sqrt(head_dim) for `scaling=1.0`
-	k_proj_weight:                      ml.Tensor, // [num_kv_heads * head_dim, hidden_size] (omitted for shared layers)
-	k_norm_weight:                      ml.Tensor, // [head_dim] (omitted for shared layers)
-	v_proj_weight:                      ml.Tensor, // [num_kv_heads * head_dim, hidden_size] (omitted for shared layers)
-	o_proj_weight:                      ml.Tensor, // [hidden_size, num_attention_heads * head_dim]
+	q_proj_weight: ml.Tensor, // [num_attention_heads * head_dim, hidden_size]
+	q_norm_weight: ml.Tensor, // [head_dim] — pre-baked with sqrt(head_dim) for `scaling=1.0`
+	k_proj_weight: ml.Tensor, // [num_kv_heads * head_dim, hidden_size] (omitted for shared layers)
+	k_norm_weight: ml.Tensor, // [head_dim] (omitted for shared layers)
+	v_proj_weight: ml.Tensor, // [num_kv_heads * head_dim, hidden_size] (omitted for shared layers)
+	o_proj_weight: ml.Tensor, // [hidden_size, num_attention_heads * head_dim]
 
 	// Feedforward (GeGLU with tanh-approx GeLU).
-	gate_proj_weight:                   ml.Tensor, // [intermediate_size, hidden_size]
-	up_proj_weight:                     ml.Tensor, // [intermediate_size, hidden_size]
-	down_proj_weight:                   ml.Tensor, // [hidden_size, intermediate_size]
+	gate_proj_weight: ml.Tensor, // [intermediate_size, hidden_size]
+	up_proj_weight:   ml.Tensor, // [intermediate_size, hidden_size]
+	down_proj_weight: ml.Tensor, // [hidden_size, intermediate_size]
 
 	// Per-Layer Embedding (PLE) block.
-	per_layer_input_gate_weight:        ml.Tensor, // [hidden_size_per_layer_input, hidden_size]
-	per_layer_projection_weight:        ml.Tensor, // [hidden_size, hidden_size_per_layer_input]
-	post_per_layer_input_norm_weight:   ml.Tensor, // [hidden_size]
+	per_layer_input_gate_weight:      ml.Tensor, // [hidden_size_per_layer_input, hidden_size]
+	per_layer_projection_weight:      ml.Tensor, // [hidden_size, hidden_size_per_layer_input]
+	post_per_layer_input_norm_weight: ml.Tensor, // [hidden_size]
 
 	// Per-layer trained scale applied to the block's residual at the very end.
 	// HF: `hidden_states *= self.layer_scalar`. Shape `[1]` in the checkpoint;
 	// stored as a scalar in our forward.
-	layer_scalar:                       ml.Tensor, // [1]
+	layer_scalar: ml.Tensor, // [1]
 
 	// Optional per-output-channel f32 scales paired with each projection above.
 	// Populated by `quantize_for_inference`; backend == nil means the matching
 	// `*_proj_weight` is still in its original Bf16/F32 dtype and `_linear`
 	// dispatches to ml.linear instead of ml.linear_q8.
-	q_proj_scales:                      ml.Tensor,
-	k_proj_scales:                      ml.Tensor,
-	v_proj_scales:                      ml.Tensor,
-	o_proj_scales:                      ml.Tensor,
-	gate_proj_scales:                   ml.Tensor,
-	up_proj_scales:                     ml.Tensor,
-	down_proj_scales:                   ml.Tensor,
-	per_layer_input_gate_scales:        ml.Tensor,
-	per_layer_projection_scales:        ml.Tensor,
+	q_proj_scales:               ml.Tensor,
+	k_proj_scales:               ml.Tensor,
+	v_proj_scales:               ml.Tensor,
+	o_proj_scales:               ml.Tensor,
+	gate_proj_scales:            ml.Tensor,
+	up_proj_scales:              ml.Tensor,
+	down_proj_scales:            ml.Tensor,
+	per_layer_input_gate_scales: ml.Tensor,
+	per_layer_projection_scales: ml.Tensor,
 }
 
 Gemma :: struct {
@@ -189,6 +193,17 @@ Gemma :: struct {
 	// so we don't need a no-scale variant of the op. Created per head_dim used.
 	v_norm_ones_sliding: ml.Tensor, // [head_dim_sliding]
 	v_norm_ones_full:    ml.Tensor, // [head_dim_full]
+
+	// Persistent shape-[1] tensors holding constants used every forward pass.
+	// Without these we'd build a fresh `ml.scalar(...)` each call, which forces
+	// a synchronous host-to-device upload (= submit + waitidle) inside the
+	// forward graph and dominates per-token latency.
+	embed_scale:         ml.Tensor, // sqrt(hidden_size)
+	ple_token_scale:     ml.Tensor, // sqrt(ple_dim)
+	ple_ctx_scale:       ml.Tensor, // 1 / sqrt(hidden_size)
+	ple_combine_scale:   ml.Tensor, // 1 / sqrt(2)
+	softcap_inv:         ml.Tensor, // 1 / final_logit_softcapping (only if > 0)
+	softcap:             ml.Tensor, // final_logit_softcapping     (only if > 0)
 }
 
 @(require_results)
@@ -260,7 +275,31 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 		layer.layer_scalar                     = make_w(dtype, {1}, buffers)
 	}
 
+	model.embed_scale       = _make_const_scalar(dtype, math.sqrt(f32(config.hidden_size)))
+	model.ple_token_scale   = _make_const_scalar(dtype, math.sqrt(f32(config.hidden_size_per_layer_input)))
+	model.ple_ctx_scale     = _make_const_scalar(dtype, 1.0 / math.sqrt(f32(config.hidden_size)))
+	model.ple_combine_scale = _make_const_scalar(dtype, 1.0 / math.sqrt(f32(2)))
+	if config.final_logit_softcapping > 0 {
+		model.softcap_inv = _make_const_scalar(dtype, 1.0 / config.final_logit_softcapping)
+		model.softcap     = _make_const_scalar(dtype, config.final_logit_softcapping)
+	}
+
 	return
+}
+
+_make_const_scalar :: proc(dtype: ml.Data_Type, value: f32) -> ml.Tensor {
+	t := ml.alloc(dtype, {1}, persistent=true, buffers=ml.Buffer_Set{.Data})
+	switch dtype {
+	case .F32:
+		src := [1]f32{value}
+		ml.set_data_bytes(t, mem.slice_to_bytes(src[:]))
+	case .Bf16:
+		src := [1]ml.Bf16{ml.bf16_from_f32(value)}
+		ml.set_data_bytes(t, mem.slice_to_bytes(src[:]))
+	case .I4, .I8, .F16:
+		fmt.panicf("_make_const_scalar: unsupported dtype %v", dtype)
+	}
+	return t
 }
 
 destroy :: proc(model: Gemma) {
@@ -287,6 +326,13 @@ destroy :: proc(model: Gemma) {
 
 	ml.destroy(model.v_norm_ones_sliding)
 	ml.destroy(model.v_norm_ones_full)
+
+	_destroy_if_set(model.embed_scale)
+	_destroy_if_set(model.ple_token_scale)
+	_destroy_if_set(model.ple_ctx_scale)
+	_destroy_if_set(model.ple_combine_scale)
+	_destroy_if_set(model.softcap_inv)
+	_destroy_if_set(model.softcap)
 
 	for layer, layer_idx in model.layers {
 		ml.destroy(layer.input_norm_weight)
@@ -340,13 +386,72 @@ _linear :: proc(input, weight, scales: ml.Tensor) -> ml.Tensor {
 	if scales.backend == nil {
 		return ml.linear(input, weight)
 	}
-	if weight.type == .Int4 {
+	if weight.type == .I4 {
 		return ml.linear_q4(input, weight, scales)
 	}
 	if scales.rank == 2 {
 		return ml.linear_q8_0(input, weight, scales)
 	}
 	return ml.linear_q8(input, weight, scales)
+}
+
+// Replace `weight` with empty (zero-filled) quantized buffers of the right
+// shape, without doing any actual quantization math. Intended for benchmarks
+// that don't care about output values — produces a model whose forward pass
+// has the exact same dispatch shape and bandwidth as a real quantized model
+// but skips the multi-minute weight conversion at startup.
+_fake_quantize_in_place :: proc(mode: Quant_Mode, weight, scales: ^ml.Tensor) {
+	if mode == .None do return
+	assert(weight^.rank == 2, "_fake_quantize_in_place expects a 2-D weight")
+	output_size := weight^.shape[0]
+	input_size  := weight^.shape[1]
+	assert(input_size % ml.QUANT_GROUP_SIZE == 0, "_fake_quantize_in_place input dim must be a multiple of 32")
+	num_groups := input_size / ml.QUANT_GROUP_SIZE
+
+	new_w_type:    ml.Data_Type
+	scale_shape_1: int
+	switch mode {
+	case .None: return
+	case .Int8: new_w_type = .I8; scale_shape_1 = 1
+	case .Int4: new_w_type = .I4; scale_shape_1 = num_groups
+	case .Q8_0: new_w_type = .I8; scale_shape_1 = num_groups
+	}
+
+	new_w := ml.alloc(new_w_type, {output_size, input_size},  persistent=true, buffers=ml.Buffer_Set{.Data})
+	new_s: ml.Tensor
+	if scale_shape_1 == 1 {
+		new_s = ml.alloc(.F32, {output_size},                 persistent=true, buffers=ml.Buffer_Set{.Data})
+	} else {
+		new_s = ml.alloc(.F32, {output_size, scale_shape_1},  persistent=true, buffers=ml.Buffer_Set{.Data})
+	}
+
+	ml.destroy(weight^)
+	weight^ = new_w
+	scales^ = new_s
+}
+
+quantize_for_inference_fake :: proc(model: ^Gemma, mode: Quant_Mode) {
+	if mode == .None do return
+	if model.config.tie_word_embeddings {
+		shape := model.embed_tokens_weight.shape
+		copy_w := ml.alloc(.Bf16, shape[:model.embed_tokens_weight.rank], persistent=true, buffers=ml.Buffer_Set{.Data})
+		model.lm_head_weight = copy_w
+	}
+	_fake_quantize_in_place(mode, &model.lm_head_weight, &model.lm_head_scales)
+	_fake_quantize_in_place(mode, &model.per_layer_model_projection_weight, &model.per_layer_model_projection_scales)
+	for &layer, layer_idx in model.layers {
+		_fake_quantize_in_place(mode, &layer.q_proj_weight,                &layer.q_proj_scales)
+		_fake_quantize_in_place(mode, &layer.o_proj_weight,                &layer.o_proj_scales)
+		if !is_kv_shared_layer(model.config, layer_idx) {
+			_fake_quantize_in_place(mode, &layer.k_proj_weight,            &layer.k_proj_scales)
+			_fake_quantize_in_place(mode, &layer.v_proj_weight,            &layer.v_proj_scales)
+		}
+		_fake_quantize_in_place(mode, &layer.gate_proj_weight,             &layer.gate_proj_scales)
+		_fake_quantize_in_place(mode, &layer.up_proj_weight,               &layer.up_proj_scales)
+		_fake_quantize_in_place(mode, &layer.down_proj_weight,             &layer.down_proj_scales)
+		_fake_quantize_in_place(mode, &layer.per_layer_input_gate_weight,  &layer.per_layer_input_gate_scales)
+		_fake_quantize_in_place(mode, &layer.per_layer_projection_weight,  &layer.per_layer_projection_scales)
+	}
 }
 
 // Replace one Bf16 weight tensor with its quantized form + scales, freeing
@@ -424,11 +529,11 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	}
 	token_identity := ml.alloc(model.dtype, {token_count, ple_total}, persistent=false, buffers={.Data})
 	ml.set_data_bytes(token_identity, lookup_buf)
-	token_identity = ml.mul(token_identity, ml.scalar(math.sqrt(f32(ple_dim)), model.dtype))
+	token_identity = ml.mul(token_identity, model.ple_token_scale)
 
 	// Context-aware component: project inputs_embeds, scale by 1/sqrt(hidden), reshape, RMSNorm.
 	ctx_proj := _linear(inputs_embeds, model.per_layer_model_projection_weight, model.per_layer_model_projection_scales)
-	ctx_proj  = ml.mul(ctx_proj, ml.scalar(1.0 / math.sqrt(f32(cfg.hidden_size)), model.dtype))
+	ctx_proj  = ml.mul(ctx_proj, model.ple_ctx_scale)
 
 	// rmsnorm operates on the trailing dim. View as [T*num_layers, ple_dim] so the
 	// norm runs across each layer-slice independently.
@@ -438,7 +543,7 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	ctx_proj    = ml.reshape(ctx_proj, []int{token_count, ple_total})
 
 	combined := ml.add(ctx_proj, token_identity)
-	combined  = ml.mul(combined, ml.scalar(1.0 / math.sqrt(f32(2)), model.dtype))
+	combined  = ml.mul(combined, model.ple_combine_scale)
 	return combined
 }
 
@@ -526,7 +631,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 	cache_position := cache.length
 
 	embeds := ml.select(model.embed_tokens_weight, new_tokens)
-	embeds  = ml.mul(embeds, ml.scalar(math.sqrt(f32(cfg.hidden_size)), model.dtype))
+	embeds  = ml.mul(embeds, model.embed_scale)
 	inputs_embeds := embeds
 
 	per_layer_inputs := _per_layer_inputs(model, new_tokens, inputs_embeds)
@@ -603,10 +708,9 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 	final_hidden := ml.rmsnorm(residual, model.output_norm_weight, false, cfg.rms_norm_eps)
 	logits = _linear(final_hidden, model.lm_head_weight, model.lm_head_scales)
 	if cfg.final_logit_softcapping > 0 {
-		cap := cfg.final_logit_softcapping
-		logits = ml.mul(logits, ml.scalar(1.0 / cap, model.dtype))
+		logits = ml.mul(logits, model.softcap_inv)
 		logits = ml.tanh(logits)
-		logits = ml.mul(logits, ml.scalar(cap, model.dtype))
+		logits = ml.mul(logits, model.softcap)
 	}
 	if model.dtype != .F32 do logits = ml.cast_to(logits, .F32)
 
@@ -622,7 +726,7 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 
 	// Scaled token embedding.
 	embeds := ml.select(model.embed_tokens_weight, tokens)
-	embeds  = ml.mul(embeds, ml.scalar(math.sqrt(f32(cfg.hidden_size)), model.dtype))
+	embeds  = ml.mul(embeds, model.embed_scale)
 	inputs_embeds := embeds
 
 	// Per-Layer Embedding inputs, shared across the layer loop.
@@ -673,17 +777,17 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 			shared_values[layer_idx] = v
 		}
 
-		attn := ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
-		attn  = _linear(attn, layer.o_proj_weight, layer.o_proj_scales)
-		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, false, cfg.rms_norm_eps)
+		attn    := ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
+		attn     = _linear(attn, layer.o_proj_weight, layer.o_proj_scales)
+		attn     = ml.rmsnorm(attn, layer.post_attention_norm_weight, false, cfg.rms_norm_eps)
 		residual = ml.add(residual, attn)
 
 		// Feedforward.
-		mlp_in := ml.rmsnorm(residual, layer.pre_feedforward_norm_weight, false, cfg.rms_norm_eps)
-		gate   := _linear(mlp_in, layer.gate_proj_weight, layer.gate_proj_scales)
-		up     := _linear(mlp_in, layer.up_proj_weight,   layer.up_proj_scales)
-		mlp    := _linear(ml.mul(ml.gelu(gate), up), layer.down_proj_weight, layer.down_proj_scales)
-		mlp     = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, false, cfg.rms_norm_eps)
+		mlp_in  := ml.rmsnorm(residual, layer.pre_feedforward_norm_weight, false, cfg.rms_norm_eps)
+		gate    := _linear(mlp_in, layer.gate_proj_weight, layer.gate_proj_scales)
+		up      := _linear(mlp_in, layer.up_proj_weight,   layer.up_proj_scales)
+		mlp     := _linear(ml.mul(ml.gelu(gate), up), layer.down_proj_weight, layer.down_proj_scales)
+		mlp      = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, false, cfg.rms_norm_eps)
 		residual = ml.add(residual, mlp)
 
 		// Per-Layer Embedding residual block.
@@ -701,14 +805,14 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 	final_hidden = ml.rmsnorm(residual, model.output_norm_weight, false, cfg.rms_norm_eps)
 	logits        = _linear(final_hidden, model.lm_head_weight, model.lm_head_scales)
 	if cfg.final_logit_softcapping > 0 {
-		cap := cfg.final_logit_softcapping
-		logits = ml.mul(logits, ml.scalar(1.0 / cap, model.dtype))
+		logits = ml.mul(logits, model.softcap_inv)
 		logits = ml.tanh(logits)
-		logits = ml.mul(logits, ml.scalar(cap, model.dtype))
+		logits = ml.mul(logits, model.softcap)
 	}
 	if model.dtype != .F32 {
 		final_hidden = ml.cast_to(final_hidden, .F32)
 		logits       = ml.cast_to(logits,       .F32)
 	}
+
 	return
 }

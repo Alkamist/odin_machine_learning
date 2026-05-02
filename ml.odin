@@ -12,36 +12,32 @@ MAX_OPERATIONS          :: 4096
 MAX_TENSOR_RANK         :: 6
 BACKEND_BUFFER_MAX_SIZE :: 16
 OP_ARENA_DEFAULT_SIZE   :: 1 * 1024 * 1024
+QUANT_GROUP_SIZE        :: 32
 
 Data_Type :: enum u8 {
-	F32,
-	F16,
 	Bf16,
-	Int8,
-	// Q4_0-style 4-bit packed weights, two nibbles per byte. The bit-width
-	// is fractional so `data_type_size` returns 0 as a sentinel and `alloc`
-	// special-cases this dtype to compute the byte count from element count.
-	Int4,
+	F16,
+	F32,
+	I4,
+	I8,
 }
-
-QUANT_GROUP_SIZE :: 32
 
 @(require_results)
 data_type_size :: #force_inline proc(t: Data_Type) -> int {
 	switch t {
-	case .F32:  return size_of(f32)
-	case .F16:  return size_of(f16)
 	case .Bf16: return size_of(Bf16)
-	case .Int8: return size_of(i8)
-	case .Int4: return 0 // packed; see `_data_byte_count`
+	case .F16:  return size_of(f16)
+	case .F32:  return size_of(f32)
+	case .I4:   return 0 // packed; see `_data_byte_count`
+	case .I8:   return size_of(i8)
 	}
 	return 0
 }
 
 @(require_results)
 _data_byte_count :: #force_inline proc(t: Data_Type, element_count: int) -> int {
-	if t == .Int4 {
-		assert(element_count % 2 == 0, "Int4 tensor element count must be even (two nibbles per byte)")
+	if t == .I4 {
+		assert(element_count % 2 == 0, "I4 tensor element count must be even (two nibbles per byte)")
 		return element_count / 2
 	}
 	return element_count * data_type_size(t)
@@ -87,7 +83,7 @@ Backend :: struct #all_or_none {
 	clear:    proc(loc: runtime.Source_Code_Location),
 	forward:  proc(op: Operation, loc: runtime.Source_Code_Location),
 	backward: proc(op: Operation, loc: runtime.Source_Code_Location),
-	update:   proc(opt: Optimizer, t: ^Tensor, loc: runtime.Source_Code_Location),
+	update:   proc(opt: Optimizer, t: Tensor, loc: runtime.Source_Code_Location),
 
 	buffer_alloc: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> Backend_Buffer,
 	buffer_free:  proc(buffer: Backend_Buffer, loc: runtime.Source_Code_Location),
@@ -104,6 +100,11 @@ Context :: struct {
 
 	operation_count: int,
 	operations:      [MAX_OPERATIONS]Operation,
+
+	// When true, `zeros` (and op-internal activation allocations) skip the
+	// gradient buffer. Backward will assert if called. Halves the activation
+	// buffer count per forward pass, which dominates per-token cost on GPU.
+	inference_only: bool,
 
 	previous_ctx: ^Context,
 }
@@ -122,10 +123,7 @@ _context_init :: proc(ctx: ^Context, backend: Backend, allocator: mem.Allocator,
 
 _context_destroy :: proc(ctx: ^Context, loc: runtime.Source_Code_Location) {
 	assert(_current_ctx != ctx, "context_destroy called on the active context", loc=loc)
-
-	if ctx._op_arena_buf != nil {
-		builtin.delete(ctx._op_arena_buf, loc=loc)
-	}
+	builtin.delete(ctx._op_arena_buf, loc=loc)
 }
 
 context_begin :: proc(ctx: ^Context) {
@@ -212,7 +210,16 @@ alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_S
 
 @(require_results)
 zeros :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> (t: Tensor) {
-	return alloc(type, shape, persistent=false, buffers=DEFAULT_ACTIVATION_BUFFERS, loc=loc)
+	buffers := DEFAULT_ACTIVATION_BUFFERS
+	if _current_ctx != nil && _current_ctx.inference_only {
+		buffers = Buffer_Set{.Data}
+	}
+	return alloc(type, shape, persistent=false, buffers=buffers, loc=loc)
+}
+
+set_inference_only :: proc(enabled: bool, loc := #caller_location) {
+	assert(_current_ctx != nil, "set_inference_only called with no active context", loc=loc)
+	_current_ctx.inference_only = enabled
 }
 
 @(require_results)
@@ -231,7 +238,7 @@ tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 }
 
 @(require_results)
-scalar :: proc(value: f32, type: Data_Type = .F32, loc := #caller_location) -> (t: Tensor) {
+scalar :: proc(type: Data_Type, value: f32, loc := #caller_location) -> (t: Tensor) {
 	shape := [1]int{1}
 	t = zeros(type, shape[:], loc=loc)
 	#partial switch type {
@@ -335,6 +342,8 @@ set_data_bytes :: proc(t: Tensor, src: []byte, loc := #caller_location) {
 }
 
 fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+
 	n := len(t)
 	#partial switch t.type {
 	case .F32:
@@ -359,6 +368,8 @@ fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
 }
 
 fill_value :: proc(t: Tensor, value: f32, loc := #caller_location) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+
 	n := len(t)
 	#partial switch t.type {
 	case .F32:
@@ -437,8 +448,7 @@ optimize :: proc(
 }
 
 update :: proc(opt: Optimizer, t: Tensor, loc := #caller_location) {
-	t := t
-	t.backend.update(opt, &t, loc)
+	t.backend.update(opt, t, loc)
 }
 
 Operation_Variant :: union {
@@ -497,6 +507,8 @@ backward :: proc(loc := #caller_location) {
 	if _current_ctx == nil || _current_ctx.operation_count <= 0 {
 		return
 	}
+
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	backend := _current_ctx.backend
 
@@ -667,13 +679,8 @@ attention_with_cache :: proc(
 	assert(cache_position >= 0, "cache_position must be non-negative", loc=loc)
 	assert(window >= 0, "attention_with_cache window must be non-negative (0 means full attention)", loc=loc)
 	if window == 0 {
-		// Full attention: cache must hold every absolute position.
 		assert(cache_position + token_count <= t_capacity, "cache overflow: cache_position + token_count > t_max", loc=loc)
 	} else {
-		// Sliding attention: cache acts as a ring of `t_capacity` rows. The
-		// sliding mask only needs the last `window` entries, so storage as
-		// small as `window` is sufficient. Each forward must still fit in
-		// the ring without overwriting itself.
 		assert(t_capacity >= window, "attention_with_cache: sliding cache capacity must be >= window", loc=loc)
 		assert(token_count <= t_capacity, "attention_with_cache: token_count exceeds ring capacity", loc=loc)
 	}
@@ -1066,8 +1073,8 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 }
 
 Linear_Q8 :: struct {
-	weight: Tensor, // .Int8, shape [output_size, input_size]
-	scales: Tensor, // .F32,  shape [output_size]
+	weight: Tensor, // .I8  [output_size, input_size]
+	scales: Tensor, // .F32 [output_size]
 }
 
 @(require_results)
@@ -1075,7 +1082,7 @@ linear_q8 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (ou
 	assert(input.rank   >= 1, "linear_q8 input must have rank >= 1", loc=loc)
 	assert(weight.rank  == 2, "linear_q8 weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 	assert(scales.rank  == 1, "linear_q8 scales must be a 1-D tensor [output_size]", loc=loc)
-	assert(weight.type  == .Int8, "linear_q8 weight must be Int8", loc=loc)
+	assert(weight.type  == .I8, "linear_q8 weight must be I8", loc=loc)
 	assert(scales.type  == .F32,  "linear_q8 scales must be F32",  loc=loc)
 	assert(input.type   == .Bf16, "linear_q8 input must be Bf16 (only supported activation dtype for now)", loc=loc)
 
@@ -1100,13 +1107,12 @@ linear_q8 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (ou
 	return
 }
 
-// Symmetric per-output-channel int8 quantization of a Bf16 weight matrix.
-// Returns (weight_int8, scales_f32) as persistent inference-only parameters
-// (no gradient/adam buffers). The caller owns both and must ml.destroy them.
 @(require_results)
 quantize_int8 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_int8, scales: Tensor) {
 	assert(weight_bf16.rank == 2, "quantize_int8 expects a 2-D weight [output_size, input_size]", loc=loc)
 	assert(weight_bf16.type == .Bf16, "quantize_int8 expects a Bf16 weight", loc=loc)
+
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	output_size := weight_bf16.shape[0]
 	input_size  := weight_bf16.shape[1]
@@ -1139,17 +1145,18 @@ quantize_int8 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_i
 		}
 	}
 
-	weight_int8 = alloc(.Int8, {output_size, input_size}, persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
-	scales      = alloc(.F32,  {output_size},             persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
+	weight_int8 = alloc(.I8,  {output_size, input_size}, persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
+	scales      = alloc(.F32, {output_size},             persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
 
 	set_data_bytes(weight_int8, mem.slice_to_bytes(int8_buf), loc=loc)
-	set_data      (scales,      scale_buf,                  loc=loc)
+	set_data      (scales,      scale_buf,                    loc=loc)
+
 	return
 }
 
 Linear_Q8_0 :: struct {
-	weight: Tensor, // .Int8, shape [output_size, input_size] (input_size % 32 == 0)
-	scales: Tensor, // .F32,  shape [output_size, input_size / 32]
+	weight: Tensor, // .I8  [output_size, input_size     ] (input_size % 32 == 0)
+	scales: Tensor, // .F32 [output_size, input_size / 32]
 }
 
 @(require_results)
@@ -1157,7 +1164,7 @@ linear_q8_0 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (
 	assert(input.rank   >= 1, "linear_q8_0 input must have rank >= 1", loc=loc)
 	assert(weight.rank  == 2, "linear_q8_0 weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 	assert(scales.rank  == 2, "linear_q8_0 scales must be a 2-D tensor [output_size, input_size / 32]", loc=loc)
-	assert(weight.type  == .Int8, "linear_q8_0 weight must be Int8", loc=loc)
+	assert(weight.type  == .I8, "linear_q8_0 weight must be I8", loc=loc)
 	assert(scales.type  == .F32,  "linear_q8_0 scales must be F32",  loc=loc)
 	assert(input.type   == .Bf16, "linear_q8_0 input must be Bf16 (only supported activation dtype for now)", loc=loc)
 
@@ -1184,13 +1191,12 @@ linear_q8_0 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (
 	return
 }
 
-// Q8_0-style symmetric int8 quantization with groups of 32 along the input
-// dimension. One F32 scale per group, signed int8 quants in [-127, 127].
-// Mirrors ggml's block_q8_0 (separated weight/scale tensors here).
 @(require_results)
 quantize_q8_0 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_int8, scales: Tensor) {
 	assert(weight_bf16.rank == 2, "quantize_q8_0 expects a 2-D weight [output_size, input_size]", loc=loc)
 	assert(weight_bf16.type == .Bf16, "quantize_q8_0 expects a Bf16 weight", loc=loc)
+
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	output_size := weight_bf16.shape[0]
 	input_size  := weight_bf16.shape[1]
@@ -1229,7 +1235,7 @@ quantize_q8_0 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_i
 		}
 	}
 
-	weight_int8 = alloc(.Int8, {output_size, input_size},      persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
+	weight_int8 = alloc(.I8, {output_size, input_size},      persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
 	scales      = alloc(.F32,  {output_size, num_groups},      persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
 
 	set_data_bytes(weight_int8, mem.slice_to_bytes(int8_buf), loc=loc)
@@ -1238,18 +1244,18 @@ quantize_q8_0 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_i
 }
 
 Linear_Q4 :: struct {
-	weight: Tensor, // .Int4, logical shape [output_size, input_size] (input_size % 32 == 0)
-	scales: Tensor, // .F32,  shape [output_size, input_size / 32]
+	weight: Tensor, // .I4  logical shape [output_size, input_size     ] (input_size % 32 == 0)
+	scales: Tensor, // .F32         shape [output_size, input_size / 32]
 }
 
 @(require_results)
 linear_q4 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank   >= 1, "linear_q4 input must have rank >= 1", loc=loc)
-	assert(weight.rank  == 2, "linear_q4 weight must be a 2-D tensor [output_size, input_size]", loc=loc)
-	assert(scales.rank  == 2, "linear_q4 scales must be a 2-D tensor [output_size, input_size / 32]", loc=loc)
-	assert(weight.type  == .Int4, "linear_q4 weight must be Int4", loc=loc)
-	assert(scales.type  == .F32,  "linear_q4 scales must be F32",  loc=loc)
-	assert(input.type   == .Bf16, "linear_q4 input must be Bf16 (only supported activation dtype for now)", loc=loc)
+	assert(input.rank >= 1, "linear_q4 input must have rank >= 1", loc=loc)
+	assert(weight.rank == 2, "linear_q4 weight must be a 2-D tensor [output_size, input_size]", loc=loc)
+	assert(scales.rank == 2, "linear_q4 scales must be a 2-D tensor [output_size, input_size / 32]", loc=loc)
+	assert(weight.type == .I4, "linear_q4 weight must be I4", loc=loc)
+	assert(scales.type == .F32,  "linear_q4 scales must be F32", loc=loc)
+	assert(input.type == .Bf16, "linear_q4 input must be Bf16 (only supported activation dtype for now)", loc=loc)
 
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
@@ -1274,15 +1280,12 @@ linear_q4 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (ou
 	return
 }
 
-// Q4_0-style symmetric int4 quantization with groups of 32 along the input
-// dimension. Each group has one F32 scale; nibbles are stored unsigned in
-// [0, 15] with logical signed value `nibble - 8` and dequant `(nibble-8) * scale`.
-// Two consecutive weights (k=2j, k=2j+1) share byte j of the packed buffer:
-//   byte = (nibble[2j] & 0x0F) | (nibble[2j+1] << 4)
 @(require_results)
 quantize_int4 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_int4, scales: Tensor) {
 	assert(weight_bf16.rank == 2, "quantize_int4 expects a 2-D weight [output_size, input_size]", loc=loc)
 	assert(weight_bf16.type == .Bf16, "quantize_int4 expects a Bf16 weight", loc=loc)
+
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	output_size := weight_bf16.shape[0]
 	input_size  := weight_bf16.shape[1]
@@ -1326,19 +1329,20 @@ quantize_int4 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_i
 		}
 	}
 
-	weight_int4 = alloc(.Int4, {output_size, input_size},        persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
-	scales      = alloc(.F32,  {output_size, num_groups},        persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
+	weight_int4 = alloc(.I4,  {output_size, input_size}, persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
+	scales      = alloc(.F32, {output_size, num_groups}, persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
 
 	set_data_bytes(weight_int4, packed_buf, loc=loc)
 	set_data      (scales,      scale_buf,  loc=loc)
+
 	return
 }
 
 Rope :: struct {
-	head_count:         int,
-	base:               f32,
-	position_offset:    int,
-	rotate_pair_count:  int, // pairs in [0, rotate_pair_count) are rotated; the rest pass through
+	head_count:        int,
+	base:              f32,
+	position_offset:   int,
+	rotate_pair_count: int, // pairs in [0, rotate_pair_count) are rotated; the rest pass through
 
 	cos_cache: Tensor,
 	sin_cache: Tensor,

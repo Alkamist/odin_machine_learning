@@ -6,6 +6,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:sync"
+import "core:time"
 
 import vk "vendor:vulkan"
 
@@ -50,10 +51,10 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	// be active here. If it is, the user dropped state on the floor.
 	fmt.assertf(!gctx.batch.active, "context_destroy called with an active batch; missed a flush?", loc=loc)
 
-	for buffer in gctx.activations {
-		_destroy_gpu_buffer(buffer)
+	for slot in gctx.activation_pool {
+		vk.DestroyBuffer(_gpu.device, slot.buf, nil)
 	}
-	builtin.delete(gctx.activations)
+	builtin.delete(gctx.activation_pool)
 
 	for arena in gctx.activation_arenas {
 		vk.FreeMemory(_gpu.device, arena.memory, nil)
@@ -76,9 +77,14 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	}
 	builtin.delete(gctx.pending_downloads)
 
-	builtin.delete(gctx.batch.descriptor_sets)
 	builtin.delete(gctx.batch.pending_buffers)
 	builtin.delete(gctx.batch.pending_memories)
+
+	if gctx.query_pool != 0 {
+		vk.DestroyQueryPool(_gpu.device, gctx.query_pool, nil)
+	}
+	delete(gctx.timing_totals)
+	builtin.delete(gctx.pending_queries)
 
 	if gctx.descriptor_pool != 0 {
 		vk.DestroyDescriptorPool(_gpu.device, gctx.descriptor_pool, nil)
@@ -100,17 +106,38 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 		end_batch(loc)
 	}
 
-	for buffer in gctx.activations {
-		delete_key(&gctx.sizes, buffer.buffer)
-		_destroy_gpu_buffer(buffer)
-	}
-	builtin.clear(&gctx.activations)
+	gctx.activation_cursor = 0
 	for &arena in gctx.activation_arenas {
 		arena.used = 0
 	}
 }
 
+_alloc_count: int
+_alloc_ns:    i64
+_upload_count: int
+_upload_ns:    i64
+
+reset_alloc_stats :: proc() {
+	_alloc_count  = 0
+	_alloc_ns     = 0
+	_upload_count = 0
+	_upload_ns    = 0
+}
+
+alloc_stats :: proc() -> (count: int, ns: i64) {
+	return _alloc_count, _alloc_ns
+}
+
+upload_stats :: proc() -> (count: int, ns: i64) {
+	return _upload_count, _upload_ns
+}
+
 buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+	t_start := time.tick_now()
+	defer {
+		_alloc_count += 1
+		_alloc_ns    += i64(time.tick_since(t_start))
+	}
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 
@@ -119,17 +146,25 @@ buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Lo
 	usage := vk.BufferUsageFlags{.STORAGE_BUFFER, .TRANSFER_SRC, .TRANSFER_DST}
 
 	gpu_buffer: Gpu_Buffer
+	needs_zero := true
 	if persist {
 		gpu_buffer.buffer, gpu_buffer.memory = _create_pooled_persistent_buffer(size, usage, {.DEVICE_LOCAL}, loc)
+		gctx.sizes[gpu_buffer.buffer] = byte_count
 	} else {
-		gpu_buffer.buffer, gpu_buffer.memory = _create_pooled_activation_buffer(size, usage, {.DEVICE_LOCAL}, loc)
+		fresh: bool
+		gpu_buffer.buffer, gpu_buffer.memory, fresh = _create_pooled_activation_buffer(size, usage, {.DEVICE_LOCAL}, loc)
+		// Reused activation slots already have their `.sizes` entry from the
+		// original allocation; only fresh slots need a zero-fill (and they
+		// rely on it because the kernel may not write every byte).
+		if fresh {
+			gctx.sizes[gpu_buffer.buffer] = byte_count
+		} else {
+			needs_zero = false
+		}
 	}
-	gctx.sizes[gpu_buffer.buffer] = byte_count
 
-	_record_fill_zero(gpu_buffer.buffer, size, loc)
-
-	if !persist {
-		append(&gctx.activations, gpu_buffer)
+	if needs_zero {
+		_record_fill_zero(gpu_buffer.buffer, size, loc)
 	}
 
 	return transmute(ml.Backend_Buffer)gpu_buffer
@@ -157,6 +192,11 @@ buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_C
 }
 
 buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location) {
+	t_start := time.tick_now()
+	defer {
+		_upload_count += 1
+		_upload_ns    += i64(time.tick_since(t_start))
+	}
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 
@@ -205,14 +245,14 @@ adam_v :: #force_inline proc(t: ml.Tensor) -> Gpu_Buffer {
 	return transmute(Gpu_Buffer)t.buffers[.Adam_V]
 }
 
-update :: proc(opt: ml.Optimizer, t: ^ml.Tensor, loc: runtime.Source_Code_Location) {
+update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) {
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 
-	d := data(t^)
-	g := gradient(t^)
-	m := adam_m(t^)
-	v := adam_v(t^)
+	d := data(t)
+	g := gradient(t)
+	m := adam_m(t)
+	v := adam_v(t)
 
 	fmt.assertf(d.buffer != 0, "update: tensor Data buffer missing",     loc=loc)
 	fmt.assertf(g.buffer != 0, "update: tensor Gradient buffer missing", loc=loc)
@@ -222,7 +262,7 @@ update :: proc(opt: ml.Optimizer, t: ^ml.Tensor, loc: runtime.Source_Code_Locati
 	if _adam_step_pipeline == nil {
 		_adam_step_pipeline = _make_pipeline(ADAM_STEP_SPIRV, 4, size_of(Adam_Params))
 	}
-	n := ml.len(t^)
+	n := ml.len(t)
 	params := Adam_Params{
 		n     = u32(n),
 		lr    = opt.learning_rate,
@@ -237,9 +277,27 @@ update :: proc(opt: ml.Optimizer, t: ^ml.Tensor, loc: runtime.Source_Code_Locati
 	_dispatch(_adam_step_pipeline, bufs[:], &params, _div_up(n, 256))
 }
 
+_forward_op_count: int
+_forward_op_ns:    i64
+
+reset_forward_stats :: proc() {
+	_forward_op_count = 0
+	_forward_op_ns    = 0
+}
+
+forward_stats :: proc() -> (count: int, ns: i64) {
+	return _forward_op_count, _forward_op_ns
+}
+
 forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
+
+	t_start := time.tick_now()
+	defer {
+		_forward_op_count += 1
+		_forward_op_ns    += i64(time.tick_since(t_start))
+	}
 
 	switch _ in op.variant {
 	case ml.Add:                add_forward                (op)
@@ -258,7 +316,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
 	case ml.Linear_Q8:          fmt.panicf("GPU linear_q8_forward: not yet implemented (CPU-only for now)")
-	case ml.Linear_Q4:          fmt.panicf("GPU linear_q4_forward: not yet implemented (CPU-only for now)")
+	case ml.Linear_Q4:          linear_q4_forward          (op)
 	case ml.Linear_Q8_0:        fmt.panicf("GPU linear_q8_0_forward: not yet implemented (CPU-only for now)")
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
@@ -1158,6 +1216,57 @@ linear_forward :: proc(op: ml.Operation) {
 	case .F16:
 		fmt.panicf("GPU linear: F16 not yet supported")
 	}
+}
+
+linear_q4_forward :: proc(op: ml.Operation) {
+	input       := op.input
+	output      := op.output
+	v           := op.variant.(ml.Linear_Q4)
+	output_size := v.weight.shape[0]
+	input_size  := v.weight.shape[1]
+	count       := ml.len(input) / input_size
+
+	fmt.assertf(input_size  % ml.QUANT_GROUP_SIZE == 0, "GPU linear_q4 requires input_size %% %v == 0, got %v", ml.QUANT_GROUP_SIZE, input_size)
+	fmt.assertf(output_size % 2 == 0,                   "GPU linear_q4 requires even output_size, got %v",     output_size)
+
+	params := Linear_Params{
+		count       = u32(count),
+		input_size  = u32(input_size),
+		output_size = u32(output_size),
+	}
+	bufs := [4]vk.Buffer{
+		data(input)   .buffer,
+		data(v.weight).buffer,
+		data(v.scales).buffer,
+		data(output)  .buffer,
+	}
+
+	if count == 1 {
+		// Decode (M=1): use the GEMV-shape shader; the tiled path wastes 31/32
+		// of its compute in the M dimension. One workgroup per pair of output
+		// rows so adjacent bf16-packed writes don't collide.
+		fmt.assertf(output_size % 2 == 0, "GPU linear_q4 GEMV requires even output_size, got %v", output_size)
+		if _linear_q4_gemv_pipeline == nil {
+			_linear_q4_gemv_pipeline = _make_pipeline(LINEAR_Q4_GEMV_SPIRV, 4, size_of(Linear_Params))
+		}
+		_dispatch(
+			_linear_q4_gemv_pipeline, bufs[:], &params,
+			_div_up(output_size, LINEAR_Q4_GEMV_ROWS_PER),
+			1,
+			1,
+		)
+		return
+	}
+
+	if _linear_q4_pipeline == nil {
+		_linear_q4_pipeline = _make_pipeline(LINEAR_Q4_SPIRV, 4, size_of(Linear_Params))
+	}
+	_dispatch(
+		_linear_q4_pipeline, bufs[:], &params,
+		_div_up(count,       LINEAR_Q4_LOCAL_X),
+		_div_up(output_size, LINEAR_Q4_LOCAL_Y),
+		1,
+	)
 }
 
 linear_backward :: proc(op: ml.Operation) {
@@ -2382,6 +2491,69 @@ attention_cache_forward :: proc(op: ml.Operation) {
 
 attention_cache_backward :: proc(op: ml.Operation) {
 	fmt.panicf("attention_with_cache is forward-only (inference path); backward is not implemented")
+}
+
+enable_timing :: proc(capacity: u32 = 4096, loc := #caller_location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+	gctx := _gctx(loc)
+	if gctx.timing_enabled do return
+	info := vk.QueryPoolCreateInfo{
+		sType      = .QUERY_POOL_CREATE_INFO,
+		queryType  = .TIMESTAMP,
+		queryCount = capacity,
+	}
+	res := vk.CreateQueryPool(_gpu.device, &info, nil, &gctx.query_pool)
+	fmt.assertf(res == .SUCCESS, "vkCreateQueryPool failed: %v", res, loc=loc)
+	gctx.query_capacity  = capacity
+	gctx.query_used      = 0
+	gctx.timing_enabled  = true
+}
+
+reset_timing :: proc(loc := #caller_location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+	gctx := _gctx(loc)
+	builtin.clear(&gctx.timing_totals)
+}
+
+Timing_Entry :: struct {
+	pipeline: ^Pipeline,
+	total_ns: i64,
+	count:    int,
+}
+
+dump_timing :: proc(loc := #caller_location) {
+	sync.mutex_lock(&_gpu_mutex)
+	defer sync.mutex_unlock(&_gpu_mutex)
+	gctx := _gctx(loc)
+	if builtin.len(gctx.timing_totals) == 0 {
+		fmt.println("(no timing data)")
+		return
+	}
+	entries := builtin.make([dynamic]Timing_Entry, 0, builtin.len(gctx.timing_totals), context.temp_allocator)
+	for p, stat in gctx.timing_totals {
+		append(&entries, Timing_Entry{pipeline = p, total_ns = stat.total_ns, count = stat.count})
+	}
+	// Insertion sort by total_ns desc — small N (≤ ~50 unique pipelines).
+	for i in 1 ..< builtin.len(entries) {
+		j := i
+		for j > 0 && entries[j].total_ns > entries[j - 1].total_ns {
+			entries[j], entries[j - 1] = entries[j - 1], entries[j]
+			j -= 1
+		}
+	}
+	total_ns: i64
+	for e in entries do total_ns += e.total_ns
+	fmt.printfln("--- GPU timing (total %.2f ms across %v unique pipelines) ---",
+		f64(total_ns) / 1e6, builtin.len(entries))
+	fmt.println("  rank   total_ms     %    count   us/op   pipeline_id")
+	for e, i in entries {
+		pct := 100.0 * f64(e.total_ns) / f64(total_ns)
+		us_per := f64(e.total_ns) / f64(e.count) / 1e3
+		fmt.printfln("  %4v   %8.2f  %5.1f  %6v  %6.1f   %p",
+			i + 1, f64(e.total_ns) / 1e6, pct, e.count, us_per, e.pipeline)
+	}
 }
 
 upload_tensor :: proc(t: ml.Tensor, src: []f32, loc := #caller_location) {

@@ -65,20 +65,20 @@ load_safetensors :: proc(model: Gemma, path: string) -> bool {
 		head_dim := config_head_dim(cfg, layer_idx)
 		prefix   := fmt.tprintf("model.language_model.layers.%v", layer_idx)
 
-		ok := _load_named         (loader, layer.input_norm_weight,             fmt.tprintf("%v.input_layernorm.weight",            prefix)) &&
-		      _load_named         (loader, layer.post_attention_norm_weight,    fmt.tprintf("%v.post_attention_layernorm.weight",   prefix)) &&
-		      _load_named         (loader, layer.pre_feedforward_norm_weight,   fmt.tprintf("%v.pre_feedforward_layernorm.weight",  prefix)) &&
-		      _load_named         (loader, layer.post_feedforward_norm_weight,  fmt.tprintf("%v.post_feedforward_layernorm.weight", prefix)) &&
-		      _load_rope_permuted (loader, layer.q_proj_weight,                 fmt.tprintf("%v.self_attn.q_proj.weight",           prefix), cfg.num_attention_heads, head_dim) &&
-		      _load_named         (loader, layer.o_proj_weight,                 fmt.tprintf("%v.self_attn.o_proj.weight",           prefix)) &&
-		      _load_per_head_dim_permuted(loader, layer.q_norm_weight,          fmt.tprintf("%v.self_attn.q_norm.weight",           prefix), head_dim, math.sqrt(f32(head_dim))) &&
-		      _load_named         (loader, layer.gate_proj_weight,              fmt.tprintf("%v.mlp.gate_proj.weight",              prefix)) &&
-		      _load_named         (loader, layer.up_proj_weight,                fmt.tprintf("%v.mlp.up_proj.weight",                prefix)) &&
-		      _load_named         (loader, layer.down_proj_weight,              fmt.tprintf("%v.mlp.down_proj.weight",              prefix)) &&
-		      _load_named         (loader, layer.per_layer_input_gate_weight,   fmt.tprintf("%v.per_layer_input_gate.weight",       prefix)) &&
-		      _load_named         (loader, layer.per_layer_projection_weight,   fmt.tprintf("%v.per_layer_projection.weight",       prefix)) &&
-		      _load_named         (loader, layer.post_per_layer_input_norm_weight, fmt.tprintf("%v.post_per_layer_input_norm.weight", prefix)) &&
-		      _load_named         (loader, layer.layer_scalar,                  fmt.tprintf("%v.layer_scalar",                      prefix))
+		ok := _load_named         (loader, layer.input_norm_weight,                fmt.tprintf("%v.input_layernorm.weight",            prefix)) &&
+		      _load_named         (loader, layer.post_attention_norm_weight,       fmt.tprintf("%v.post_attention_layernorm.weight",   prefix)) &&
+		      _load_named         (loader, layer.pre_feedforward_norm_weight,      fmt.tprintf("%v.pre_feedforward_layernorm.weight",  prefix)) &&
+		      _load_named         (loader, layer.post_feedforward_norm_weight,     fmt.tprintf("%v.post_feedforward_layernorm.weight", prefix)) &&
+		      _load_rope_permuted (loader, layer.q_proj_weight,                    fmt.tprintf("%v.self_attn.q_proj.weight",           prefix), cfg.num_attention_heads, head_dim) &&
+		      _load_named         (loader, layer.o_proj_weight,                    fmt.tprintf("%v.self_attn.o_proj.weight",           prefix)) &&
+		      _load_per_head_dim_permuted(loader, layer.q_norm_weight,             fmt.tprintf("%v.self_attn.q_norm.weight",           prefix), head_dim, math.sqrt(f32(head_dim))) &&
+		      _load_named         (loader, layer.gate_proj_weight,                 fmt.tprintf("%v.mlp.gate_proj.weight",              prefix)) &&
+		      _load_named         (loader, layer.up_proj_weight,                   fmt.tprintf("%v.mlp.up_proj.weight",                prefix)) &&
+		      _load_named         (loader, layer.down_proj_weight,                 fmt.tprintf("%v.mlp.down_proj.weight",              prefix)) &&
+		      _load_named         (loader, layer.per_layer_input_gate_weight,      fmt.tprintf("%v.per_layer_input_gate.weight",       prefix)) &&
+		      _load_named         (loader, layer.per_layer_projection_weight,      fmt.tprintf("%v.per_layer_projection.weight",       prefix)) &&
+		      _load_named         (loader, layer.post_per_layer_input_norm_weight, fmt.tprintf("%v.post_per_layer_input_norm.weight",  prefix)) &&
+		      _load_named         (loader, layer.layer_scalar,                     fmt.tprintf("%v.layer_scalar",                      prefix))
 		if !ok do return false
 
 		// K/V projection + K-norm only exist for non-shared layers in our model.

@@ -57,6 +57,7 @@ main :: proc() {
 	}
 
 	ml.context_scope(ctx)
+	ml.set_inference_only(true)
 
 	fmt.println("Loading tokenizer ...")
 	tokenizer, tokenizer_ok := tok.load(TOKENIZER_PATH)
@@ -163,12 +164,14 @@ main :: proc() {
 		append(&all_tokens, ..new_tokens)
 
 		ml.clear()
+		t_prefill := time.tick_now()
 		{
 			logits := gemma.forward_cached(model, &cache, new_tokens)
 			buf := make([]f32, ml.len(logits), context.temp_allocator)
 			ml.get_data(logits, buf)
 			copy(last_row, buf[(builtin.len(new_tokens) - 1) * vocab_size :])
 		}
+		prefill_elapsed := f64(time.duration_seconds(time.tick_since(t_prefill)))
 
 		reply_start := builtin.len(all_tokens)
 		previous_decoded_length := 0
@@ -208,8 +211,11 @@ main :: proc() {
 
 		fmt.println()
 		elapsed := f64(time.duration_seconds(time.tick_since(t_generate)))
-		fmt.printfln("  [%v tokens, %.2f s, %.1f tok/s]",
-			generated, elapsed, f64(generated) / elapsed if elapsed > 0 else 0)
+		prompt_rate := f64(builtin.len(new_tokens)) / prefill_elapsed if prefill_elapsed > 0 else 0
+		decode_rate := f64(generated) / elapsed if elapsed > 0 else 0
+		fmt.printfln("  [prefill %v tok / %.2f s = %.1f tok/s   decode %v tok / %.2f s = %.1f tok/s]",
+			builtin.len(new_tokens), prefill_elapsed, prompt_rate,
+			generated, elapsed, decode_rate)
 		fmt.println()
 	}
 }

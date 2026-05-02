@@ -20,6 +20,7 @@ Gpu_Device :: struct {
 	memory_properties:  vk.PhysicalDeviceMemoryProperties,
 
 	coopmat_bf16:       bool,
+	timestamp_period_ns: f32,
 
 	pipelines:          [dynamic]^Pipeline,
 
@@ -48,16 +49,16 @@ Context :: struct {
 	descriptor_pool: vk.DescriptorPool,
 	batch:           Batch,
 
-	// Activation buffers live for one forward pass (reset on `clear()`).
-	// `activation_arenas` are big VkDeviceMemory blocks; each activation
-	// VkBuffer is bump-allocated at an offset within an arena, then destroyed
-	// on `clear()` while the arena memory is retained for the next forward.
-	// This avoids one `vkAllocateMemory` per activation (NVIDIA's Windows
-	// driver reserves multi-MB minimum per allocation, and per-step prompt
-	// growth in `forward()` makes activation sizes vary, defeating any
-	// exact-size pool).
-	activations:       [dynamic]Gpu_Buffer,
-	activation_arenas: [dynamic]Pool_Block,
+	// Activation buffers are sub-allocated from `activation_arenas` (big
+	// VkDeviceMemory blocks). VkBuffer handles are pooled in `activation_pool`
+	// and recycled across forward passes: `clear()` rewinds the cursor without
+	// destroying buffers, so the next forward replays the same alloc sequence
+	// and reuses the same VkBuffers at the same arena offsets. A pool slot
+	// is only torn down + recreated when its size changes (e.g., between
+	// prefill and decode).
+	activation_pool:    [dynamic]Activation_Slot,
+	activation_cursor:  int,
+	activation_arenas:  [dynamic]Pool_Block,
 
 	// Sub-allocator for persistent buffers (model weights). Each block is one
 	// VkDeviceMemory allocation backing many VkBuffers via offset binding.
@@ -74,6 +75,28 @@ Context :: struct {
 
 	staging:           Staging,
 	pending_downloads: [dynamic]Pending_Download,
+
+	// Optional per-dispatch GPU timing. When `timing_enabled`, every _dispatch
+	// brackets its CmdDispatch with two vkCmdWriteTimestamp calls; end_batch
+	// reads back the query pool and folds the deltas into `timing_totals`,
+	// keyed by pipeline pointer.
+	timing_enabled:   bool,
+	query_pool:       vk.QueryPool,
+	query_capacity:   u32,
+	query_used:       u32,
+	pending_queries:  [dynamic]Pending_Query,
+	timing_totals:    map[^Pipeline]Timing_Stat,
+}
+
+Pending_Query :: struct {
+	pipeline:  ^Pipeline,
+	start_idx: u32,
+	end_idx:   u32,
+}
+
+Timing_Stat :: struct {
+	total_ns: i64,
+	count:    int,
 }
 
 Staging :: struct {
@@ -94,6 +117,14 @@ Pool_Block :: struct {
 	size:         vk.DeviceSize,
 	used:         vk.DeviceSize,
 	mem_type_idx: u32,
+}
+
+Activation_Slot :: struct {
+	buf:       vk.Buffer,
+	arena_idx: int,
+	offset:    vk.DeviceSize,
+	size:      vk.DeviceSize,
+	alignment: vk.DeviceSize,
 }
 
 POOL_BLOCK_SIZE :: vk.DeviceSize(256 * 1024 * 1024)
@@ -230,7 +261,8 @@ _pick_physical_device :: proc() {
 
 	props: vk.PhysicalDeviceProperties
 	vk.GetPhysicalDeviceProperties(best, &props)
-	_gpu.device_name = strings.clone_from_cstring(cstring(raw_data(props.deviceName[:])))
+	_gpu.device_name         = strings.clone_from_cstring(cstring(raw_data(props.deviceName[:])))
+	_gpu.timestamp_period_ns = props.limits.timestampPeriod
 
 	vk.GetPhysicalDeviceMemoryProperties(best, &_gpu.memory_properties)
 }
@@ -262,7 +294,8 @@ _create_device :: proc() {
 
 	want_coopmat_bf16 := _query_coopmat_bf16_support()
 
-	extensions := builtin.make([dynamic]cstring, 0, 2, context.temp_allocator)
+	extensions := builtin.make([dynamic]cstring, 0, 3, context.temp_allocator)
+	append(&extensions, cstring(vk.KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
 	if want_coopmat_bf16 {
 		append(&extensions, cstring(vk.KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))
 		append(&extensions, cstring(KHR_SHADER_BFLOAT16_EXTENSION_NAME))
@@ -289,14 +322,14 @@ _create_device :: proc() {
 	}
 
 	create_info := vk.DeviceCreateInfo{
-		sType                = .DEVICE_CREATE_INFO,
-		queueCreateInfoCount = 1,
-		pQueueCreateInfos    = &queue_info,
+		sType                   = .DEVICE_CREATE_INFO,
+		queueCreateInfoCount    = 1,
+		pQueueCreateInfos       = &queue_info,
+		enabledExtensionCount   = u32(builtin.len(extensions)),
+		ppEnabledExtensionNames = raw_data(extensions[:]),
 	}
 	if want_coopmat_bf16 {
-		create_info.pNext                   = &features2
-		create_info.enabledExtensionCount   = u32(builtin.len(extensions))
-		create_info.ppEnabledExtensionNames = raw_data(extensions[:])
+		create_info.pNext = &features2
 	}
 
 	res := vk.CreateDevice(_gpu.physical_device, &create_info, nil, &_gpu.device)

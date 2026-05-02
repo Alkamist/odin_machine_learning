@@ -1,0 +1,76 @@
+// Q4_0 GEMV specialization for M=1 decode-shape forwards. One subgroup per
+// `ROWS_PER_WG` output rows: the X vector is read once per group of K
+// elements and reused across all rows in the workgroup, while each thread
+// keeps `ROWS_PER_WG` partial-sum accumulators that get subgroup-reduced at
+// the end. `ROWS_PER_WG` must be even so the bf16-packed two-cells-per-uint
+// store never collides with a neighboring workgroup.
+//
+// Layout:
+//   x [1, K] bf16, packed (two halves per uint)
+//   w [N, K] int4, packed (two nibbles per byte → eight nibbles per uint)
+//   s [N, K/32] f32 (one scale per quant group)
+//   y [1, N] bf16, packed
+// Requires: K % 32 == 0; N % ROWS_PER_WG == 0.
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "bf16.glsl"
+
+#define WG           32
+#define ROWS_PER_WG  2
+#define QUANT_GROUP  32
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly  buffer X { uint  x[]; };
+layout(set = 0, binding = 1) readonly  buffer W { uint  w[]; };
+layout(set = 0, binding = 2) readonly  buffer S { float s[]; };
+layout(set = 0, binding = 3) writeonly buffer Y { uint  y[]; };
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint K;
+    uint N;
+} p;
+
+void main() {
+    uint group_idx = gl_WorkGroupID.x;
+    uint n_base    = group_idx * ROWS_PER_WG;
+    uint tid       = gl_LocalInvocationID.x;
+
+    uint num_groups = p.K / QUANT_GROUP;
+    float acc[ROWS_PER_WG];
+    for (uint r = 0u; r < ROWS_PER_WG; ++r) acc[r] = 0.0;
+
+    for (uint g = 0u; g < num_groups; ++g) {
+        uint k = g * QUANT_GROUP + tid;
+
+        uint pkx = x[k >> 1u];
+        float xv = ((k & 1u) == 0u)
+            ? bf16_expand(pkx & 0xffffu)
+            : bf16_expand((pkx >> 16) & 0xffffu);
+
+        for (uint r = 0u; r < ROWS_PER_WG; ++r) {
+            uint n = n_base + r;
+            if (n >= p.N) continue;
+            float scale  = s[n * num_groups + g];
+            uint  nib_id = n * p.K + k;
+            uint  w_word = w[nib_id >> 3u];
+            uint  nib    = (w_word >> ((nib_id & 7u) * 4u)) & 0x0fu;
+            acc[r] += (float(int(nib)) - 8.0) * scale * xv;
+        }
+    }
+
+    float total[ROWS_PER_WG];
+    for (uint r = 0u; r < ROWS_PER_WG; ++r) total[r] = subgroupAdd(acc[r]);
+
+    if (tid == 0u) {
+        for (uint pair = 0u; pair < ROWS_PER_WG / 2u; ++pair) {
+            uint n_lo = n_base + 2u * pair;
+            if (n_lo >= p.N) break;
+            uint n_hi = n_lo + 1u;
+            uint lo_b = bf16_round(total[2u * pair]);
+            uint hi_b = (n_hi < p.N) ? bf16_round(total[2u * pair + 1u]) : 0u;
+            y[n_lo >> 1u] = (hi_b << 16) | lo_b;
+        }
+    }
+}

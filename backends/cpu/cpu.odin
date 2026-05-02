@@ -485,11 +485,11 @@ buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Locati
 	builtin.copy(transmute([]byte)dst, transmute([]byte)src)
 }
 
-update :: proc(opt: ml.Optimizer, t: ^ml.Tensor, loc: runtime.Source_Code_Location) {
-	d := data(t^)
-	g := gradient(t^)
-	m := adam_m(t^)
-	v := adam_v(t^)
+update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) {
+	d := data(t)
+	g := gradient(t)
+	m := adam_m(t)
+	v := adam_v(t)
 
 	assert(d != nil, "Tensor Data is nil", loc=loc)
 	assert(g != nil, "Tensor Gradient is nil", loc=loc)
