@@ -144,20 +144,6 @@ Layer :: struct {
 	// HF: `hidden_states *= self.layer_scalar`. Shape `[1]` in the checkpoint;
 	// stored as a scalar in our forward.
 	layer_scalar: ml.Tensor, // [1]
-
-	// Optional per-output-channel f32 scales paired with each projection above.
-	// Populated by `quantize_for_inference`; backend == nil means the matching
-	// `*_proj_weight` is still in its original Bf16/F32 dtype and `_linear`
-	// dispatches to ml.linear instead of a quantized linear op.
-	q_proj_scales:               ml.Tensor,
-	k_proj_scales:               ml.Tensor,
-	v_proj_scales:               ml.Tensor,
-	o_proj_scales:               ml.Tensor,
-	gate_proj_scales:            ml.Tensor,
-	up_proj_scales:              ml.Tensor,
-	down_proj_scales:            ml.Tensor,
-	per_layer_input_gate_scales: ml.Tensor,
-	per_layer_projection_scales: ml.Tensor,
 }
 
 Gemma :: struct {
@@ -183,11 +169,6 @@ Gemma :: struct {
 	embed_tokens_per_layer_row_bytes:  int, // bytes per vocab row
 	per_layer_model_projection_weight: ml.Tensor, // [num_hidden_layers * ple_dim, hidden_size]
 	per_layer_projection_norm_weight:  ml.Tensor, // [hidden_size_per_layer_input]
-
-	// Optional Int8 quantization scales for the model-level linear projections
-	// (see comment on Layer).
-	per_layer_model_projection_scales: ml.Tensor,
-	lm_head_scales:                    ml.Tensor,
 
 	// V-norm has `with_scale=False` in HF — we feed `ml.rmsnorm` an all-ones constant
 	// so we don't need a no-scale variant of the op. Created per head_dim used.
@@ -296,7 +277,7 @@ _make_const_scalar :: proc(dtype: ml.Data_Type, value: f32) -> ml.Tensor {
 	case .Bf16:
 		src := [1]ml.Bf16{ml.bf16_from_f32(value)}
 		ml.set_data_bytes(t, mem.slice_to_bytes(src[:]))
-	case .I4, .I8, .Q4_K, .Q6_K:
+	case .Q4_K, .Q6_K:
 		fmt.panicf("_make_const_scalar: unsupported dtype %v", dtype)
 	}
 	return t
@@ -309,19 +290,10 @@ destroy :: proc(model: Gemma) {
 
 	ml.destroy(model.embed_tokens_weight)
 	if !model.config.tie_word_embeddings do ml.destroy(model.lm_head_weight)
-	// When tied, lm_head_weight points at embed_tokens_weight unless
-	// quantize_for_inference replaced it with a fresh Int8 copy. The scales
-	// tensor is the unambiguous tell: present iff lm_head was quantized into
-	// its own buffer.
-	if model.config.tie_word_embeddings && model.lm_head_scales.backend != nil {
-		ml.destroy(model.lm_head_weight)
-	}
-	_destroy_if_set(model.lm_head_scales)
 	ml.destroy(model.output_norm_weight)
 
 	delete(model.embed_tokens_per_layer_bytes)
 	ml.destroy(model.per_layer_model_projection_weight)
-	_destroy_if_set(model.per_layer_model_projection_scales)
 	ml.destroy(model.per_layer_projection_norm_weight)
 
 	ml.destroy(model.v_norm_ones_sliding)
@@ -343,159 +315,36 @@ destroy :: proc(model: Gemma) {
 		ml.destroy(layer.q_proj_weight)
 		ml.destroy(layer.q_norm_weight)
 		ml.destroy(layer.o_proj_weight)
-		_destroy_if_set(layer.q_proj_scales)
-		_destroy_if_set(layer.o_proj_scales)
 
 		if !is_kv_shared_layer(model.config, layer_idx) {
 			ml.destroy(layer.k_proj_weight)
 			ml.destroy(layer.k_norm_weight)
 			ml.destroy(layer.v_proj_weight)
-			_destroy_if_set(layer.k_proj_scales)
-			_destroy_if_set(layer.v_proj_scales)
 		}
 
 		ml.destroy(layer.gate_proj_weight)
 		ml.destroy(layer.up_proj_weight)
 		ml.destroy(layer.down_proj_weight)
-		_destroy_if_set(layer.gate_proj_scales)
-		_destroy_if_set(layer.up_proj_scales)
-		_destroy_if_set(layer.down_proj_scales)
 
 		ml.destroy(layer.per_layer_input_gate_weight)
 		ml.destroy(layer.per_layer_projection_weight)
 		ml.destroy(layer.post_per_layer_input_norm_weight)
 		ml.destroy(layer.layer_scalar)
-		_destroy_if_set(layer.per_layer_input_gate_scales)
-		_destroy_if_set(layer.per_layer_projection_scales)
 	}
 	delete(model.layers)
 }
 
-Quant_Mode :: enum {
-	None,
-	Int4,
-	Q8_0,
-}
-
 // Dispatch a linear projection on the weight tensor's dtype. The two
 // k-quant formats (Q4_K, Q6_K — used by the GGUF loader) bundle scales
-// into the weight bytes and ignore the `scales` parameter; the older
-// in-process Q4_0 / Q8_0 paths still need it.
+// into the weight bytes; for unquantized weights we fall through to
+// the dense `ml.linear` op.
 @(require_results)
-_linear :: proc(input, weight, scales: ml.Tensor) -> ml.Tensor {
+_linear :: proc(input, weight: ml.Tensor) -> ml.Tensor {
 	#partial switch weight.type {
 	case .Q4_K: return ml.linear_q4_k(input, weight)
 	case .Q6_K: return ml.linear_q6_k(input, weight)
-	case .I4:   return ml.linear_q4   (input, weight, scales)
-	case .I8:   return ml.linear_q8_0 (input, weight, scales)
 	}
 	return ml.linear(input, weight)
-}
-
-// Replace `weight` with empty (zero-filled) quantized buffers of the right
-// shape, without doing any actual quantization math. Intended for benchmarks
-// that don't care about output values — produces a model whose forward pass
-// has the exact same dispatch shape and bandwidth as a real quantized model
-// but skips the multi-minute weight conversion at startup.
-_fake_quantize_in_place :: proc(mode: Quant_Mode, weight, scales: ^ml.Tensor) {
-	if mode == .None do return
-	assert(weight^.rank == 2, "_fake_quantize_in_place expects a 2-D weight")
-	output_size := weight^.shape[0]
-	input_size  := weight^.shape[1]
-	assert(input_size % ml.QUANT_GROUP_SIZE == 0, "_fake_quantize_in_place input dim must be a multiple of 32")
-	num_groups := input_size / ml.QUANT_GROUP_SIZE
-
-	new_w_type:    ml.Data_Type
-	scale_shape_1: int
-	switch mode {
-	case .None: return
-	case .Int4: new_w_type = .I4; scale_shape_1 = num_groups
-	case .Q8_0: new_w_type = .I8; scale_shape_1 = num_groups
-	}
-
-	new_w := ml.alloc(new_w_type, {output_size, input_size},  persistent=true, buffers=ml.Buffer_Set{.Data})
-	new_s := ml.alloc(.F32, {output_size, scale_shape_1},     persistent=true, buffers=ml.Buffer_Set{.Data})
-
-	ml.destroy(weight^)
-	weight^ = new_w
-	scales^ = new_s
-}
-
-quantize_for_inference_fake :: proc(model: ^Gemma, mode: Quant_Mode) {
-	if mode == .None do return
-	if model.config.tie_word_embeddings {
-		shape := model.embed_tokens_weight.shape
-		copy_w := ml.alloc(.Bf16, shape[:model.embed_tokens_weight.rank], persistent=true, buffers=ml.Buffer_Set{.Data})
-		model.lm_head_weight = copy_w
-	}
-	_fake_quantize_in_place(mode, &model.lm_head_weight, &model.lm_head_scales)
-	_fake_quantize_in_place(mode, &model.per_layer_model_projection_weight, &model.per_layer_model_projection_scales)
-	for &layer, layer_idx in model.layers {
-		_fake_quantize_in_place(mode, &layer.q_proj_weight,                &layer.q_proj_scales)
-		_fake_quantize_in_place(mode, &layer.o_proj_weight,                &layer.o_proj_scales)
-		if !is_kv_shared_layer(model.config, layer_idx) {
-			_fake_quantize_in_place(mode, &layer.k_proj_weight,            &layer.k_proj_scales)
-			_fake_quantize_in_place(mode, &layer.v_proj_weight,            &layer.v_proj_scales)
-		}
-		_fake_quantize_in_place(mode, &layer.gate_proj_weight,             &layer.gate_proj_scales)
-		_fake_quantize_in_place(mode, &layer.up_proj_weight,               &layer.up_proj_scales)
-		_fake_quantize_in_place(mode, &layer.down_proj_weight,             &layer.down_proj_scales)
-		_fake_quantize_in_place(mode, &layer.per_layer_input_gate_weight,  &layer.per_layer_input_gate_scales)
-		_fake_quantize_in_place(mode, &layer.per_layer_projection_weight,  &layer.per_layer_projection_scales)
-	}
-}
-
-// Replace one Bf16 weight tensor with its quantized form + scales, freeing
-// the original Bf16 buffer.
-_quantize_in_place :: proc(mode: Quant_Mode, weight, scales: ^ml.Tensor) {
-	q_w, q_s: ml.Tensor
-	switch mode {
-	case .None: return
-	case .Int4: q_w, q_s = ml.quantize_int4(weight^)
-	case .Q8_0: q_w, q_s = ml.quantize_q8_0(weight^)
-	}
-	ml.destroy(weight^)
-	weight^ = q_w
-	scales^ = q_s
-}
-
-// Convert all linear-projection weights in `model` from Bf16 to the requested
-// quantized format (Int8 or Int4). Embeddings, RMSNorm weights, and the
-// per-layer-input lookup table are left in their original dtype since they're
-// either accessed via `select` (no matmul) or are tiny.
-//
-// If the model has tied embeddings, the LM head is first detached into a
-// fresh Bf16 copy so it can be quantized independently of `embed_tokens_weight`
-// (which `select` still uses at original precision).
-quantize_for_inference :: proc(model: ^Gemma, mode: Quant_Mode) {
-	if mode == .None do return
-	assert(model.dtype == .Bf16, "quantize_for_inference currently expects a Bf16 model")
-
-	if model.config.tie_word_embeddings {
-		shape := model.embed_tokens_weight.shape
-		copy_w := ml.alloc(.Bf16, shape[:model.embed_tokens_weight.rank], persistent=true, buffers=ml.Buffer_Set{.Data})
-		raw_bytes := builtin.make([]byte, ml.len(model.embed_tokens_weight) * 2, context.temp_allocator)
-		ml.get_data_bytes(model.embed_tokens_weight, raw_bytes)
-		ml.set_data_bytes(copy_w, raw_bytes)
-		model.lm_head_weight = copy_w
-	}
-	_quantize_in_place(mode, &model.lm_head_weight, &model.lm_head_scales)
-
-	_quantize_in_place(mode, &model.per_layer_model_projection_weight, &model.per_layer_model_projection_scales)
-
-	for &layer, layer_idx in model.layers {
-		_quantize_in_place(mode, &layer.q_proj_weight,                &layer.q_proj_scales)
-		_quantize_in_place(mode, &layer.o_proj_weight,                &layer.o_proj_scales)
-		if !is_kv_shared_layer(model.config, layer_idx) {
-			_quantize_in_place(mode, &layer.k_proj_weight,            &layer.k_proj_scales)
-			_quantize_in_place(mode, &layer.v_proj_weight,            &layer.v_proj_scales)
-		}
-		_quantize_in_place(mode, &layer.gate_proj_weight,             &layer.gate_proj_scales)
-		_quantize_in_place(mode, &layer.up_proj_weight,               &layer.up_proj_scales)
-		_quantize_in_place(mode, &layer.down_proj_weight,             &layer.down_proj_scales)
-		_quantize_in_place(mode, &layer.per_layer_input_gate_weight,  &layer.per_layer_input_gate_scales)
-		_quantize_in_place(mode, &layer.per_layer_projection_weight,  &layer.per_layer_projection_scales)
-	}
 }
 
 // Compute the per-layer-input table once per forward, mirroring
@@ -522,7 +371,7 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	token_identity = ml.mul(token_identity, model.ple_token_scale)
 
 	// Context-aware component: project inputs_embeds, scale by 1/sqrt(hidden), reshape, RMSNorm.
-	ctx_proj := _linear(inputs_embeds, model.per_layer_model_projection_weight, model.per_layer_model_projection_scales)
+	ctx_proj := _linear(inputs_embeds, model.per_layer_model_projection_weight)
 	ctx_proj  = ml.mul(ctx_proj, model.ple_ctx_scale)
 
 	// rmsnorm operates on the trailing dim. View as [T*num_layers, ple_dim] so the
@@ -644,7 +493,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 
 		hidden := ml.rmsnorm(residual, layer.input_norm_weight, false, cfg.rms_norm_eps)
 
-		q := _linear(hidden, layer.q_proj_weight, layer.q_proj_scales)
+		q := _linear(hidden, layer.q_proj_weight)
 		q  = _qkv_norm(model, q, layer.q_norm_weight, cfg.num_attention_heads, head_dim, cfg.rms_norm_eps)
 		q  = ml.rope(q, cfg.num_attention_heads, rope_base, cache_position, rope_fraction)
 
@@ -662,33 +511,33 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 			k = step_kvs[source].k
 			v = step_kvs[source].v
 		} else {
-			k = _linear(hidden, layer.k_proj_weight, layer.k_proj_scales)
+			k = _linear(hidden, layer.k_proj_weight)
 			k = _qkv_norm(model, k, layer.k_norm_weight, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
 			k = ml.rope(k, cfg.num_key_value_heads, rope_base, cache_position, rope_fraction)
 
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
-			v = _linear(hidden, layer.v_proj_weight, layer.v_proj_scales)
+			v = _linear(hidden, layer.v_proj_weight)
 			v = _qkv_norm(model, v, v_norm_ones, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
 
 			step_kvs[layer_idx] = Step_KV{k = k, v = v}
 		}
 
 		attn := ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window)
-		attn  = _linear(attn, layer.o_proj_weight, layer.o_proj_scales)
+		attn  = _linear(attn, layer.o_proj_weight)
 		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, false, cfg.rms_norm_eps)
 		residual = ml.add(residual, attn)
 
 		mlp_in := ml.rmsnorm(residual, layer.pre_feedforward_norm_weight, false, cfg.rms_norm_eps)
-		gate   := _linear(mlp_in, layer.gate_proj_weight, layer.gate_proj_scales)
-		up     := _linear(mlp_in, layer.up_proj_weight,   layer.up_proj_scales)
-		mlp    := _linear(ml.mul(ml.gelu(gate), up), layer.down_proj_weight, layer.down_proj_scales)
+		gate   := _linear(mlp_in, layer.gate_proj_weight)
+		up     := _linear(mlp_in, layer.up_proj_weight)
+		mlp    := _linear(ml.mul(ml.gelu(gate), up), layer.down_proj_weight)
 		mlp     = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, false, cfg.rms_norm_eps)
 		residual = ml.add(residual, mlp)
 
 		ple_input := ml.slice_trailing(per_layer_inputs, layer_idx * ple_dim, (layer_idx + 1) * ple_dim)
-		ple       := _linear(residual, layer.per_layer_input_gate_weight, layer.per_layer_input_gate_scales)
+		ple       := _linear(residual, layer.per_layer_input_gate_weight)
 		ple        = ml.mul(ml.gelu(ple), ple_input)
-		ple        = _linear(ple, layer.per_layer_projection_weight, layer.per_layer_projection_scales)
+		ple        = _linear(ple, layer.per_layer_projection_weight)
 		ple        = ml.rmsnorm(ple, layer.post_per_layer_input_norm_weight, false, cfg.rms_norm_eps)
 		residual   = ml.add(residual, ple)
 
@@ -696,7 +545,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 	}
 
 	final_hidden := ml.rmsnorm(residual, model.output_norm_weight, false, cfg.rms_norm_eps)
-	logits = _linear(final_hidden, model.lm_head_weight, model.lm_head_scales)
+	logits = _linear(final_hidden, model.lm_head_weight)
 	if cfg.final_logit_softcapping > 0 {
 		logits = ml.mul(logits, model.softcap_inv)
 		logits = ml.tanh(logits)
@@ -744,7 +593,7 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		// Pre-attn norm.
 		hidden := ml.rmsnorm(residual, layer.input_norm_weight, false, cfg.rms_norm_eps)
 
-		q := _linear(hidden, layer.q_proj_weight, layer.q_proj_scales)
+		q := _linear(hidden, layer.q_proj_weight)
 		q  = _qkv_norm(model, q, layer.q_norm_weight, cfg.num_attention_heads, head_dim, cfg.rms_norm_eps)
 		q  = ml.rope(q, cfg.num_attention_heads, rope_base, 0, rope_fraction)
 
@@ -754,12 +603,12 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 			k = shared_keys  [source]
 			v = shared_values[source]
 		} else {
-			k = _linear(hidden, layer.k_proj_weight, layer.k_proj_scales)
+			k = _linear(hidden, layer.k_proj_weight)
 			k = _qkv_norm(model, k, layer.k_norm_weight, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
 			k = ml.rope(k, cfg.num_key_value_heads, rope_base, 0, rope_fraction)
 
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
-			v = _linear(hidden, layer.v_proj_weight, layer.v_proj_scales)
+			v = _linear(hidden, layer.v_proj_weight)
 			v = _qkv_norm(model, v, v_norm_ones, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
 
 			// Stash for any later shared layer of the same type.
@@ -768,23 +617,23 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		}
 
 		attn    := ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
-		attn     = _linear(attn, layer.o_proj_weight, layer.o_proj_scales)
+		attn     = _linear(attn, layer.o_proj_weight)
 		attn     = ml.rmsnorm(attn, layer.post_attention_norm_weight, false, cfg.rms_norm_eps)
 		residual = ml.add(residual, attn)
 
 		// Feedforward.
 		mlp_in  := ml.rmsnorm(residual, layer.pre_feedforward_norm_weight, false, cfg.rms_norm_eps)
-		gate    := _linear(mlp_in, layer.gate_proj_weight, layer.gate_proj_scales)
-		up      := _linear(mlp_in, layer.up_proj_weight,   layer.up_proj_scales)
-		mlp     := _linear(ml.mul(ml.gelu(gate), up), layer.down_proj_weight, layer.down_proj_scales)
+		gate    := _linear(mlp_in, layer.gate_proj_weight)
+		up      := _linear(mlp_in, layer.up_proj_weight)
+		mlp     := _linear(ml.mul(ml.gelu(gate), up), layer.down_proj_weight)
 		mlp      = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, false, cfg.rms_norm_eps)
 		residual = ml.add(residual, mlp)
 
 		// Per-Layer Embedding residual block.
 		ple_input := ml.slice_trailing(per_layer_inputs, layer_idx * ple_dim, (layer_idx + 1) * ple_dim)
-		ple       := _linear(residual, layer.per_layer_input_gate_weight, layer.per_layer_input_gate_scales)
+		ple       := _linear(residual, layer.per_layer_input_gate_weight)
 		ple        = ml.mul(ml.gelu(ple), ple_input)
-		ple        = _linear(ple, layer.per_layer_projection_weight, layer.per_layer_projection_scales)
+		ple        = _linear(ple, layer.per_layer_projection_weight)
 		ple        = ml.rmsnorm(ple, layer.post_per_layer_input_norm_weight, false, cfg.rms_norm_eps)
 		residual   = ml.add(residual, ple)
 
@@ -793,7 +642,7 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 	}
 
 	final_hidden = ml.rmsnorm(residual, model.output_norm_weight, false, cfg.rms_norm_eps)
-	logits        = _linear(final_hidden, model.lm_head_weight, model.lm_head_scales)
+	logits        = _linear(final_hidden, model.lm_head_weight)
 	if cfg.final_logit_softcapping > 0 {
 		logits = ml.mul(logits, model.softcap_inv)
 		logits = ml.tanh(logits)

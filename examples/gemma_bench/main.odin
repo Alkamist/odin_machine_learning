@@ -47,10 +47,9 @@ main :: proc() {
 	use_cpu      := false
 	cpu_arena    := DEFAULT_CPU_ARENA
 	threads      := DEFAULT_THREADS
-	quant_mode   := gemma.Quant_Mode.None
 	skip_weights := false
 
-	parse_args(&prompt_text, &prompt_file, &gen_tokens, &reps, &warmup, &t_max, &use_cpu, &cpu_arena, &threads, &quant_mode, &skip_weights)
+	parse_args(&prompt_text, &prompt_file, &gen_tokens, &reps, &warmup, &t_max, &use_cpu, &cpu_arena, &threads, &skip_weights)
 
 	if prompt_file != "" {
 		bytes, err := os.read_entire_file_from_path(prompt_file, context.allocator)
@@ -83,9 +82,6 @@ main :: proc() {
 
 	if skip_weights {
 		fmt.println("Skipping weight load (--skip-weights); model will produce garbage tokens but timing is valid.")
-		if quant_mode != .None {
-			gemma.quantize_for_inference_fake(&model, quant_mode)
-		}
 	} else {
 		fmt.println("Loading weights ...")
 		t_load := time.tick_now()
@@ -97,14 +93,6 @@ main :: proc() {
 			}
 		}
 		fmt.printfln("  loaded in %.1f s", f64(time.duration_seconds(time.tick_since(t_load))))
-
-		if quant_mode != .None {
-			fmt.printfln("Quantizing linear weights to %v ...", quant_label(quant_mode))
-			t_q := time.tick_now()
-			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-			gemma.quantize_for_inference(&model, quant_mode)
-			fmt.printfln("  quantized in %.1f s", f64(time.duration_seconds(time.tick_since(t_q))))
-		}
 	}
 
 	cache := gemma.cache_make(model, t_max)
@@ -130,8 +118,8 @@ main :: proc() {
 	last_row := builtin.make([]f32, vocab_size)
 	defer delete(last_row)
 
-	fmt.printfln("\nbench: prompt=%v tok, generate=%v tok, warmup=%v, reps=%v, quant=%v\n",
-		builtin.len(prompt_ids), gen_tokens, warmup, reps, quant_label(quant_mode))
+	fmt.printfln("\nbench: prompt=%v tok, generate=%v tok, warmup=%v, reps=%v\n",
+		builtin.len(prompt_ids), gen_tokens, warmup, reps)
 
 	results := make([]Run_Result, reps, context.temp_allocator)
 
@@ -272,20 +260,11 @@ median :: proc(values: []f64) -> f64 {
 	return 0.5 * (tmp[n / 2 - 1] + tmp[n / 2])
 }
 
-quant_label :: proc(mode: gemma.Quant_Mode) -> string {
-	switch mode {
-	case .None: return "None"
-	case .Int4: return "Int4"
-	case .Q8_0: return "Q8_0"
-	}
-	return "?"
-}
-
 parse_args :: proc(
 	prompt_text: ^string, prompt_file: ^string,
 	gen_tokens: ^int, reps: ^int, warmup: ^int,
 	t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, threads: ^int,
-	quant_mode: ^gemma.Quant_Mode, skip_weights: ^bool,
+	skip_weights: ^bool,
 ) {
 	args := os.args[1:]
 	i := 0
@@ -327,17 +306,6 @@ parse_args :: proc(
 			if i + 1 >= builtin.len(args) do _usage_exit()
 			threads^ = _parse_int(args[i + 1])
 			i += 2
-		case "--quantize":
-			if i + 1 >= builtin.len(args) do _usage_exit()
-			switch args[i + 1] {
-			case "q4", "int4":  quant_mode^ = .Int4
-			case "q8_0":         quant_mode^ = .Q8_0
-			case "none":         quant_mode^ = .None
-			case:
-				fmt.eprintfln("unknown --quantize value: %v", args[i + 1])
-				_usage_exit()
-			}
-			i += 2
 		case "--skip-weights":
 			skip_weights^ = true
 			i += 1
@@ -351,7 +319,7 @@ parse_args :: proc(
 }
 
 _usage_exit :: proc() {
-	fmt.eprintln("usage: gemma_bench [--prompt TEXT] [--prompt-file PATH] [--gen-tokens N] [--reps N] [--warmup N] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N] [--quantize q8|q4|q8_0|none] [--skip-weights]")
+	fmt.eprintln("usage: gemma_bench [--prompt TEXT] [--prompt-file PATH] [--gen-tokens N] [--reps N] [--warmup N] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N] [--skip-weights]")
 	os.exit(1)
 }
 

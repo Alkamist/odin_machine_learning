@@ -315,8 +315,6 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_forward     (op)
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
-	case ml.Linear_Q4:          linear_q4_forward          (op)
-	case ml.Linear_Q8_0:        fmt.panicf("GPU linear_q8_0_forward: not yet implemented (CPU-only for now)")
 	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
 	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
 	case ml.Rope:               rope_forward               (op)
@@ -361,8 +359,6 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
-	case ml.Linear_Q4:          fmt.panicf("GPU linear_q4_backward: linear_q4 is forward-only (inference path)")
-	case ml.Linear_Q8_0:        fmt.panicf("GPU linear_q8_0_backward: linear_q8_0 is forward-only (inference path)")
 	case ml.Linear_Q4_K:        fmt.panicf("GPU linear_q4_k_backward: linear_q4_k is forward-only (inference path)")
 	case ml.Linear_Q6_K:        fmt.panicf("GPU linear_q6_k_backward: linear_q6_k is forward-only (inference path)")
 	case ml.Rope:               rope_backward              (op)
@@ -1200,57 +1196,6 @@ linear_forward :: proc(op: ml.Operation) {
 			)
 		}
 	}
-}
-
-linear_q4_forward :: proc(op: ml.Operation) {
-	input       := op.input
-	output      := op.output
-	v           := op.variant.(ml.Linear_Q4)
-	output_size := v.weight.shape[0]
-	input_size  := v.weight.shape[1]
-	count       := ml.len(input) / input_size
-
-	fmt.assertf(input_size  % ml.QUANT_GROUP_SIZE == 0, "GPU linear_q4 requires input_size %% %v == 0, got %v", ml.QUANT_GROUP_SIZE, input_size)
-	fmt.assertf(output_size % 2 == 0,                   "GPU linear_q4 requires even output_size, got %v",     output_size)
-
-	params := Linear_Params{
-		count       = u32(count),
-		input_size  = u32(input_size),
-		output_size = u32(output_size),
-	}
-	bufs := [4]vk.Buffer{
-		data(input)   .buffer,
-		data(v.weight).buffer,
-		data(v.scales).buffer,
-		data(output)  .buffer,
-	}
-
-	if count == 1 {
-		// Decode (M=1): use the GEMV-shape shader; the tiled path wastes 31/32
-		// of its compute in the M dimension. One workgroup per pair of output
-		// rows so adjacent bf16-packed writes don't collide.
-		fmt.assertf(output_size % 2 == 0, "GPU linear_q4 GEMV requires even output_size, got %v", output_size)
-		if _linear_q4_gemv_pipeline == nil {
-			_linear_q4_gemv_pipeline = _make_pipeline(LINEAR_Q4_GEMV_SPIRV, 4, size_of(Linear_Params))
-		}
-		_dispatch(
-			_linear_q4_gemv_pipeline, bufs[:], &params,
-			_div_up(output_size, LINEAR_Q4_GEMV_ROWS_PER),
-			1,
-			1,
-		)
-		return
-	}
-
-	if _linear_q4_pipeline == nil {
-		_linear_q4_pipeline = _make_pipeline(LINEAR_Q4_SPIRV, 4, size_of(Linear_Params))
-	}
-	_dispatch(
-		_linear_q4_pipeline, bufs[:], &params,
-		_div_up(count,       LINEAR_Q4_LOCAL_X),
-		_div_up(output_size, LINEAR_Q4_LOCAL_Y),
-		1,
-	)
 }
 
 // GPU forward for the GGUF Q6_K linear op. M=1 (decode) only.

@@ -12,7 +12,6 @@ MAX_OPERATIONS          :: 4096
 MAX_TENSOR_RANK         :: 6
 BACKEND_BUFFER_MAX_SIZE :: 16
 OP_ARENA_DEFAULT_SIZE   :: 1 * 1024 * 1024
-QUANT_GROUP_SIZE        :: 32
 K_QUANT_BLOCK_SIZE      :: 256
 Q4_K_BLOCK_BYTES        :: 144
 Q6_K_BLOCK_BYTES        :: 210
@@ -25,8 +24,6 @@ Q6_K_BLOCK_BYTES        :: 210
 Data_Type :: enum u8 {
 	Bf16,
 	F32,
-	I4,
-	I8,
 	Q4_K,
 	Q6_K,
 }
@@ -36,8 +33,6 @@ data_type_size :: #force_inline proc(t: Data_Type) -> int {
 	switch t {
 	case .Bf16: return size_of(Bf16)
 	case .F32:  return size_of(f32)
-	case .I4:   return 0 // packed; see `_data_byte_count`
-	case .I8:   return size_of(i8)
 	case .Q4_K: return 0 // packed; see `_data_byte_count`
 	case .Q6_K: return 0 // packed; see `_data_byte_count`
 	}
@@ -47,9 +42,6 @@ data_type_size :: #force_inline proc(t: Data_Type) -> int {
 @(require_results)
 _data_byte_count :: #force_inline proc(t: Data_Type, element_count: int) -> int {
 	#partial switch t {
-	case .I4:
-		assert(element_count % 2 == 0, "I4 tensor element count must be even (two nibbles per byte)")
-		return element_count / 2
 	case .Q4_K:
 		assert(element_count % K_QUANT_BLOCK_SIZE == 0, "Q4_K tensor element count must be a multiple of 256")
 		return (element_count / K_QUANT_BLOCK_SIZE) * Q4_K_BLOCK_BYTES
@@ -469,8 +461,6 @@ Operation_Variant :: union {
 	Slice_Trailing,
 	Concat,
 	Linear,
-	Linear_Q4,
-	Linear_Q8_0,
 	Linear_Q4_K,
 	Linear_Q6_K,
 	Rope,
@@ -1071,190 +1061,6 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
-
-	return
-}
-
-Linear_Q8_0 :: struct {
-	weight: Tensor, // .I8  [output_size, input_size     ] (input_size % 32 == 0)
-	scales: Tensor, // .F32 [output_size, input_size / 32]
-}
-
-@(require_results)
-linear_q8_0 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank   >= 1, "linear_q8_0 input must have rank >= 1", loc=loc)
-	assert(weight.rank  == 2, "linear_q8_0 weight must be a 2-D tensor [output_size, input_size]", loc=loc)
-	assert(scales.rank  == 2, "linear_q8_0 scales must be a 2-D tensor [output_size, input_size / 32]", loc=loc)
-	assert(weight.type  == .I8, "linear_q8_0 weight must be I8", loc=loc)
-	assert(scales.type  == .F32,  "linear_q8_0 scales must be F32",  loc=loc)
-	assert(input.type   == .Bf16, "linear_q8_0 input must be Bf16 (only supported activation dtype for now)", loc=loc)
-
-	output_size := weight.shape[0]
-	input_size  := weight.shape[1]
-	assert(input_size % QUANT_GROUP_SIZE == 0, "linear_q8_0 input dim must be a multiple of QUANT_GROUP_SIZE (32)", loc=loc)
-	assert(scales.shape[0] == output_size, "linear_q8_0 scales rows must equal weight's output dim", loc=loc)
-	assert(scales.shape[1] == input_size / QUANT_GROUP_SIZE, "linear_q8_0 scales cols must equal input_size / 32", loc=loc)
-	assert(input.shape[input.rank - 1] == input_size, "linear_q8_0 input trailing dim must equal weight's input dim", loc=loc)
-
-	output = _zeros_replace_trailing(input, output_size, loc=loc)
-
-	op := Operation{
-		input   = input,
-		output  = output,
-		variant = Linear_Q8_0{
-			weight = weight,
-			scales = scales,
-		},
-	}
-	_current_ctx.backend.forward(op, loc)
-	append_operation(op, loc=loc)
-
-	return
-}
-
-@(require_results)
-quantize_q8_0 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_int8, scales: Tensor) {
-	assert(weight_bf16.rank == 2, "quantize_q8_0 expects a 2-D weight [output_size, input_size]", loc=loc)
-	assert(weight_bf16.type == .Bf16, "quantize_q8_0 expects a Bf16 weight", loc=loc)
-
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-
-	output_size := weight_bf16.shape[0]
-	input_size  := weight_bf16.shape[1]
-	assert(input_size % QUANT_GROUP_SIZE == 0, "quantize_q8_0 input dim must be a multiple of QUANT_GROUP_SIZE (32)", loc=loc)
-	num_groups := input_size / QUANT_GROUP_SIZE
-
-	src_bf := builtin.make([]Bf16, output_size * input_size, context.temp_allocator)
-	get_data_bytes(weight_bf16, mem.slice_to_bytes(src_bf), loc=loc)
-
-	scale_buf := builtin.make([]f32, output_size * num_groups, context.temp_allocator)
-	int8_buf  := builtin.make([]i8,  output_size * input_size, context.temp_allocator)
-
-	for o in 0 ..< output_size {
-		row := src_bf[o * input_size : (o + 1) * input_size]
-		for g in 0 ..< num_groups {
-			group := row[g * QUANT_GROUP_SIZE : (g + 1) * QUANT_GROUP_SIZE]
-
-			amax: f32
-			for v_bf in group {
-				v := bf16_to_f32(v_bf)
-				if v < 0 do v = -v
-				if v > amax do amax = v
-			}
-			s := amax / 127.0
-			if s == 0 do s = 1
-			scale_buf[o * num_groups + g] = s
-			inv := 1.0 / s
-
-			out := int8_buf[o * input_size + g * QUANT_GROUP_SIZE : o * input_size + (g + 1) * QUANT_GROUP_SIZE]
-			for v_bf, k in group {
-				r := math.round(bf16_to_f32(v_bf) * inv)
-				if r >  127 do r =  127
-				if r < -127 do r = -127
-				out[k] = i8(r)
-			}
-		}
-	}
-
-	weight_int8 = alloc(.I8, {output_size, input_size},      persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
-	scales      = alloc(.F32,  {output_size, num_groups},      persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
-
-	set_data_bytes(weight_int8, mem.slice_to_bytes(int8_buf), loc=loc)
-	set_data      (scales,      scale_buf,                  loc=loc)
-	return
-}
-
-Linear_Q4 :: struct {
-	weight: Tensor, // .I4  logical shape [output_size, input_size     ] (input_size % 32 == 0)
-	scales: Tensor, // .F32         shape [output_size, input_size / 32]
-}
-
-@(require_results)
-linear_q4 :: proc(input, weight, scales: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank >= 1, "linear_q4 input must have rank >= 1", loc=loc)
-	assert(weight.rank == 2, "linear_q4 weight must be a 2-D tensor [output_size, input_size]", loc=loc)
-	assert(scales.rank == 2, "linear_q4 scales must be a 2-D tensor [output_size, input_size / 32]", loc=loc)
-	assert(weight.type == .I4, "linear_q4 weight must be I4", loc=loc)
-	assert(scales.type == .F32,  "linear_q4 scales must be F32", loc=loc)
-	assert(input.type == .Bf16, "linear_q4 input must be Bf16 (only supported activation dtype for now)", loc=loc)
-
-	output_size := weight.shape[0]
-	input_size  := weight.shape[1]
-	assert(input_size % QUANT_GROUP_SIZE == 0, "linear_q4 input dim must be a multiple of QUANT_GROUP_SIZE (32)", loc=loc)
-	assert(scales.shape[0] == output_size, "linear_q4 scales rows must equal weight's output dim", loc=loc)
-	assert(scales.shape[1] == input_size / QUANT_GROUP_SIZE, "linear_q4 scales cols must equal input_size / 32", loc=loc)
-	assert(input.shape[input.rank - 1] == input_size, "linear_q4 input trailing dim must equal weight's input dim", loc=loc)
-
-	output = _zeros_replace_trailing(input, output_size, loc=loc)
-
-	op := Operation{
-		input   = input,
-		output  = output,
-		variant = Linear_Q4{
-			weight = weight,
-			scales = scales,
-		},
-	}
-	_current_ctx.backend.forward(op, loc)
-	append_operation(op, loc=loc)
-
-	return
-}
-
-@(require_results)
-quantize_int4 :: proc(weight_bf16: Tensor, loc := #caller_location) -> (weight_int4, scales: Tensor) {
-	assert(weight_bf16.rank == 2, "quantize_int4 expects a 2-D weight [output_size, input_size]", loc=loc)
-	assert(weight_bf16.type == .Bf16, "quantize_int4 expects a Bf16 weight", loc=loc)
-
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-
-	output_size := weight_bf16.shape[0]
-	input_size  := weight_bf16.shape[1]
-	assert(input_size % QUANT_GROUP_SIZE == 0, "quantize_int4 input dim must be a multiple of QUANT_GROUP_SIZE (32)", loc=loc)
-	num_groups := input_size / QUANT_GROUP_SIZE
-
-	src_bf := builtin.make([]Bf16, output_size * input_size, context.temp_allocator)
-	get_data_bytes(weight_bf16, mem.slice_to_bytes(src_bf), loc=loc)
-
-	scale_buf  := builtin.make([]f32,  output_size * num_groups, context.temp_allocator)
-	packed_buf := builtin.make([]byte, output_size * input_size / 2, context.temp_allocator)
-
-	for o in 0 ..< output_size {
-		row := src_bf[o * input_size : (o + 1) * input_size]
-		for g in 0 ..< num_groups {
-			group := row[g * QUANT_GROUP_SIZE : (g + 1) * QUANT_GROUP_SIZE]
-
-			amax: f32
-			for v_bf in group {
-				v := bf16_to_f32(v_bf)
-				if v < 0 do v = -v
-				if v > amax do amax = v
-			}
-			s := amax / 7.0
-			if s == 0 do s = 1
-			scale_buf[o * num_groups + g] = s
-			inv := 1.0 / s
-
-			pack_base := (o * input_size + g * QUANT_GROUP_SIZE) / 2
-			for j in 0 ..< QUANT_GROUP_SIZE / 2 {
-				w0 := math.round(bf16_to_f32(group[2 * j + 0]) * inv)
-				w1 := math.round(bf16_to_f32(group[2 * j + 1]) * inv)
-				if w0 >  7 do w0 =  7
-				if w0 < -7 do w0 = -7
-				if w1 >  7 do w1 =  7
-				if w1 < -7 do w1 = -7
-				n0 := u8(int(w0) + 8) & 0x0F
-				n1 := u8(int(w1) + 8) & 0x0F
-				packed_buf[pack_base + j] = n0 | (n1 << 4)
-			}
-		}
-	}
-
-	weight_int4 = alloc(.I4,  {output_size, input_size}, persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
-	scales      = alloc(.F32, {output_size, num_groups}, persistent=true, buffers=Buffer_Set{.Data}, loc=loc)
-
-	set_data_bytes(weight_int4, packed_buf, loc=loc)
-	set_data      (scales,      scale_buf,  loc=loc)
 
 	return
 }

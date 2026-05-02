@@ -81,7 +81,8 @@ main :: proc() {
 		}
 		t_step := time.tick_now()
 		logits := gemma.forward_cached(model, &cache, []int{token})
-		// Read this position's logits (should be vocab_size elements; M=1).
+		t_record := time.tick_since(t_step)
+		// Read this position's logits — this is what triggers submit + wait.
 		row := all_logits[pos * vocab_size : (pos + 1) * vocab_size]
 		if logits.type == .F32 {
 			ml.get_data(logits, row)
@@ -91,8 +92,13 @@ main :: proc() {
 			ml.get_data_bytes(logits, slice.bytes_from_ptr(raw_data(bf), vocab_size * 2))
 			for v, i in bf do row[i] = ml.bf16_to_f32(v)
 		}
+		t_total := time.tick_since(t_step)
 		ml.clear()
-		fmt.printfln("  token %v (id=%v): %.3f s", pos, token, time.duration_seconds(time.tick_since(t_step)))
+		fmt.printfln("  token %v (id=%v): record=%.2f ms  sync+read=%.2f ms  total=%.2f ms",
+			pos, token,
+			time.duration_milliseconds(t_record),
+			time.duration_milliseconds(t_total - t_record),
+			time.duration_milliseconds(t_total))
 	}
 	total_s := time.duration_seconds(time.tick_since(t_total))
 	fmt.printfln("Total: %.2f s for %v tokens (%.2f tok/s)", total_s, builtin.len(tokens), f64(builtin.len(tokens)) / total_s)

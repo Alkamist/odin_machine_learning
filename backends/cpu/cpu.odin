@@ -265,49 +265,6 @@ when intrinsics.has_target_feature("avx") {
 		return sum
 	}
 
-	when intrinsics.has_target_feature("avx2") {
-		I8x32  :: #simd[32]i8
-		U8x32  :: #simd[32]u8
-		I16x16 :: #simd[16]i16
-		I32x8  :: #simd[8]i32
-
-		@(default_calling_convention="none")
-		foreign _ {
-			@(link_name="llvm.x86.avx2.psign.b")
-			_avx2_psign_b :: proc(a, b: I8x32) -> I8x32 ---
-			@(link_name="llvm.x86.avx2.pmadd.ub.sw")
-			_avx2_pmadd_ub_sw :: proc(a: U8x32, b: I8x32) -> I16x16 ---
-			@(link_name="llvm.x86.avx2.pmadd.wd")
-			_avx2_pmadd_wd :: proc(a, b: I16x16) -> I32x8 ---
-		}
-
-		// Modern LLVM expresses integer->float SIMD conversion as generic IR
-		// `sitofp` rather than a target intrinsic, and Odin doesn't expose it
-		// directly. The unrolled per-lane conversion below reliably folds to
-		// a single vcvtdq2ps under -O2/-O3.
-		_i32x8_to_f32x8 :: #force_inline proc "contextless" (v: I32x8) -> F32x8 {
-			arr := simd.to_array(v)
-			out: [8]f32
-			#unroll for i in 0 ..< 8 {
-				out[i] = f32(arr[i])
-			}
-			return simd.from_array(out)
-		}
-
-		// One Q8_0 block dot: 32 int8 weights × 32 int8 activations -> i32x8 of
-		// 8 partial sums. AVX2 pmaddubsw + pmaddwd with the psign trick:
-		// abs(w) is unsigned in [0, 127], sign(x, w) bakes w's sign into x so
-		// the unsigned×signed multiply-add reproduces signed×signed semantics.
-		_avx2_q8_block_isum_v :: #force_inline proc "contextless" (w_q, x_q: [^]i8) -> I32x8 {
-			wv := intrinsics.unaligned_load((^I8x32)(w_q))
-			xv := intrinsics.unaligned_load((^I8x32)(x_q))
-			ax := transmute(U8x32)_avx2_psign_b(wv, wv)
-			sy := _avx2_psign_b(xv, wv)
-			p16 := _avx2_pmadd_ub_sw(ax, sy)
-			return _avx2_pmadd_wd(p16, I16x16(1))
-		}
-	}
-
 } else {
 	_simd_dot_f32 :: #force_inline proc "contextless" (a, b: [^]f32, n: int) -> f32 {
 		s0, s1, s2, s3: f32
@@ -487,8 +444,6 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_forward     (op)
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
-	case ml.Linear_Q4:          linear_q4_forward          (op)
-	case ml.Linear_Q8_0:        linear_q8_0_forward        (op)
 	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
 	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
 	case ml.Rope:               rope_forward               (op)
@@ -530,8 +485,6 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
-	case ml.Linear_Q4:          fmt.panicf("CPU linear_q4_backward: linear_q4 is forward-only (inference path)")
-	case ml.Linear_Q8_0:        fmt.panicf("CPU linear_q8_0_backward: linear_q8_0 is forward-only (inference path)")
 	case ml.Linear_Q4_K:        fmt.panicf("CPU linear_q4_k_backward: linear_q4_k is forward-only (inference path)")
 	case ml.Linear_Q6_K:        fmt.panicf("CPU linear_q6_k_backward: linear_q6_k is forward-only (inference path)")
 	case ml.Rope:               rope_backward              (op)
@@ -1358,58 +1311,6 @@ linear_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-linear_q4_forward :: proc(op: ml.Operation) {
-	v := op.variant.(ml.Linear_Q4)
-	output_size := v.weight.shape[0]
-	input_size  := v.weight.shape[1]
-	count       := ml.len(op.input) / input_size
-
-	Job_Data :: struct {
-		op:    ml.Operation,
-		count: int,
-	}
-	jd := Job_Data{op = op, count = count}
-
-	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
-		op := jd.op
-		v := op.variant.(ml.Linear_Q4)
-		output_size := v.weight.shape[0]
-		input_size  := v.weight.shape[1]
-		num_groups  := input_size / ml.QUANT_GROUP_SIZE
-		row_bytes   := input_size / 2
-
-		x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers   [.Data]))
-		y_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers  [.Data]))
-		w_pk  := ([^]u8     )(raw_data(transmute([]byte)v.weight.buffers   [.Data]))
-		s_f32 := ([^]f32    )(raw_data(transmute([]byte)v.scales.buffers   [.Data]))
-
-		w_row := w_pk[o * row_bytes:]
-		scale_row := s_f32[o * num_groups:]
-
-		for c in 0 ..< jd.count {
-			x_row := x_bf[c * input_size:]
-			total: f32
-
-			for g in 0 ..< num_groups {
-				scale := scale_row[g]
-				pack_base := g * (ml.QUANT_GROUP_SIZE / 2)
-				x_base    := g * ml.QUANT_GROUP_SIZE
-				group_sum: f32
-				for j in 0 ..< ml.QUANT_GROUP_SIZE / 2 {
-					byte := w_row[pack_base + j]
-					n0 := f32(i32(byte & 0x0F) - 8)
-					n1 := f32(i32(byte >> 4)   - 8)
-					group_sum += n0 * ml.bf16_to_f32(x_row[x_base + 2 * j + 0])
-					group_sum += n1 * ml.bf16_to_f32(x_row[x_base + 2 * j + 1])
-				}
-				total += group_sum * scale
-			}
-
-			y_bf[c * output_size + o] = ml.bf16_from_f32(total)
-		}
-	})
-}
-
 // Reference CPU forward for the GGUF Q4_K linear op: dequantize the weight
 // row block-by-block and accumulate the dot product against the bf16
 // activation. Slow — intended as the parity baseline for the GPU shader,
@@ -1493,121 +1394,6 @@ linear_q6_k_forward :: proc(op: ml.Operation) {
 			y_bf[c * output_size + o] = ml.bf16_from_f32(total)
 		}
 	})
-}
-
-// Quantize one bf16 input row to Q8_0 blocks of 32: int8 quants + per-block f32 scale.
-// Mirrors ggml's quantize_row_q8_0 in semantics (symmetric, amax-based scaling).
-_q8_0_quantize_row :: proc(x_bf: [^]ml.Bf16, q_out: [^]i8, s_out: [^]f32, input_size: int) {
-	num_groups := input_size / ml.QUANT_GROUP_SIZE
-	for g in 0 ..< num_groups {
-		base := g * ml.QUANT_GROUP_SIZE
-		amax: f32
-		for k in 0 ..< ml.QUANT_GROUP_SIZE {
-			v := ml.bf16_to_f32(x_bf[base + k])
-			if v < 0 do v = -v
-			if v > amax do amax = v
-		}
-		s := amax / 127.0
-		if s == 0 do s = 1
-		s_out[g] = s
-		inv := 1.0 / s
-		for k in 0 ..< ml.QUANT_GROUP_SIZE {
-			r := math.round(ml.bf16_to_f32(x_bf[base + k]) * inv)
-			if r >  127 do r =  127
-			if r < -127 do r = -127
-			q_out[base + k] = i8(r)
-		}
-	}
-}
-
-// Q8_0 row dot: weight stored as int8 + per-block f32 scale, activation already
-// quantized the same way. Mirrors ggml's AVX2 ggml_vec_dot_q8_0_q8_0 — converts
-// each block's i32x8 partial sums to f32x8 once, FMAs into a vector accumulator
-// scaled by `d_w * d_x`, and reduces horizontally only at the end.
-_dot_q8_0_row :: #force_inline proc "contextless" (
-	w_q: [^]i8, w_s: [^]f32, x_q: [^]i8, x_s: [^]f32, num_blocks: int,
-) -> f32 {
-	when intrinsics.has_target_feature("avx2") {
-		acc: F32x8
-		for b in 0 ..< num_blocks {
-			isum := _avx2_q8_block_isum_v(&w_q[b * ml.QUANT_GROUP_SIZE], &x_q[b * ml.QUANT_GROUP_SIZE])
-			d := F32x8(w_s[b] * x_s[b])
-			acc = simd.fma(d, _i32x8_to_f32x8(isum), acc)
-		}
-		return simd.reduce_add_bisect(acc)
-	} else {
-		acc: f32
-		for b in 0 ..< num_blocks {
-			isum: i32
-			for k in 0 ..< ml.QUANT_GROUP_SIZE {
-				isum += i32(w_q[b * ml.QUANT_GROUP_SIZE + k]) * i32(x_q[b * ml.QUANT_GROUP_SIZE + k])
-			}
-			acc += f32(isum) * w_s[b] * x_s[b]
-		}
-		return acc
-	}
-}
-
-linear_q8_0_forward :: proc(op: ml.Operation) {
-	v := op.variant.(ml.Linear_Q8_0)
-	output_size := v.weight.shape[0]
-	input_size  := v.weight.shape[1]
-	count       := ml.len(op.input) / input_size
-	num_blocks  := input_size / ml.QUANT_GROUP_SIZE
-
-	x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers[.Data]))
-
-	// Quantize the activation once before fanning out across output rows. This
-	// is the whole point: without it, every (output_row, token) job would
-	// re-read the bf16 activation, defeating the bandwidth win.
-	x_q_buf := builtin.make([]i8,  count * input_size, context.temp_allocator)
-	x_s_buf := builtin.make([]f32, count * num_blocks, context.temp_allocator)
-	x_q := raw_data(x_q_buf)
-	x_s := raw_data(x_s_buf)
-	for c in 0 ..< count {
-		_q8_0_quantize_row(
-			x_bf[c * input_size:],
-			([^]i8)(x_q)[c * input_size:],
-			([^]f32)(x_s)[c * num_blocks:],
-			input_size,
-		)
-	}
-
-	Job_Data :: struct {
-		op:         ml.Operation,
-		count:      int,
-		num_blocks: int,
-		x_q:        [^]i8,
-		x_s:        [^]f32,
-	}
-	jd := Job_Data{op = op, count = count, num_blocks = num_blocks, x_q = x_q, x_s = x_s}
-
-	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
-		op := jd.op
-		v := op.variant.(ml.Linear_Q8_0)
-		output_size := v.weight.shape[0]
-		input_size  := v.weight.shape[1]
-		num_blocks  := jd.num_blocks
-
-		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Data]))
-		w_i8 := ([^]i8     )(raw_data(transmute([]byte)v.weight.buffers [.Data]))
-		w_s  := ([^]f32    )(raw_data(transmute([]byte)v.scales.buffers [.Data]))
-
-		w_row := w_i8[o * input_size:]
-		s_row := w_s [o * num_blocks:]
-
-		for c in 0 ..< jd.count {
-			x_q_row := jd.x_q[c * input_size:]
-			x_s_row := jd.x_s[c * num_blocks:]
-			y_bf[c * output_size + o] = ml.bf16_from_f32(
-				_dot_q8_0_row(w_row, s_row, x_q_row, x_s_row, num_blocks),
-			)
-		}
-	})
-
-	// Caller (e.g. forward_cached) keeps live state on context.temp_allocator
-	// across our call, so we must not free_all. The repl wraps each forward in
-	// runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD which reclaims our scratch.
 }
 
 linear_backward :: proc(op: ml.Operation) {
