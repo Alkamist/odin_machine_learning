@@ -15,6 +15,7 @@ Config :: struct {
 	vocabulary_size:   int,
 	rope_base:         f32,
 	tied_embeddings:   bool,
+	use_qk_norm:       bool,
 }
 
 SMOLLM2_135M_CONFIG :: Config{
@@ -35,6 +36,8 @@ Layer :: struct {
 	k_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, embedding_size]
 	v_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, embedding_size]
 	o_proj_weight:         ml.Tensor, // [embedding_size, n_q_heads * head_size]
+	q_norm_weight:         ml.Tensor, // [head_size]; only allocated when config.use_qk_norm
+	k_norm_weight:         ml.Tensor, // [head_size]; only allocated when config.use_qk_norm
 	post_attn_norm_weight: ml.Tensor, // [embedding_size]
 	gate_proj_weight:      ml.Tensor, // [intermediate_size, embedding_size]
 	up_proj_weight:        ml.Tensor, // [intermediate_size, embedding_size]
@@ -66,6 +69,10 @@ make :: proc(config: Config, allocator := context.allocator) -> (model: Llama) {
 		layer.k_proj_weight         = ml.make(.F32, {kv_size, config.embedding_size})
 		layer.v_proj_weight         = ml.make(.F32, {kv_size, config.embedding_size})
 		layer.o_proj_weight         = ml.make(.F32, {config.embedding_size, q_size})
+		if config.use_qk_norm {
+			layer.q_norm_weight = ml.make(.F32, {config.head_size})
+			layer.k_norm_weight = ml.make(.F32, {config.head_size})
+		}
 		layer.post_attn_norm_weight = ml.make(.F32, {config.embedding_size})
 		layer.gate_proj_weight      = ml.make(.F32, {config.intermediate_size, config.embedding_size})
 		layer.up_proj_weight        = ml.make(.F32, {config.intermediate_size, config.embedding_size})
@@ -93,6 +100,8 @@ destroy :: proc(model: Llama) {
 		ml.destroy(layer.k_proj_weight)
 		ml.destroy(layer.v_proj_weight)
 		ml.destroy(layer.o_proj_weight)
+		ml.destroy(layer.q_norm_weight)
+		ml.destroy(layer.k_norm_weight)
 		ml.destroy(layer.post_attn_norm_weight)
 		ml.destroy(layer.gate_proj_weight)
 		ml.destroy(layer.up_proj_weight)
@@ -116,6 +125,10 @@ copy :: proc(dst, src: Llama) {
 		ml.copy(dst.layers[i].k_proj_weight,         src.layers[i].k_proj_weight)
 		ml.copy(dst.layers[i].v_proj_weight,         src.layers[i].v_proj_weight)
 		ml.copy(dst.layers[i].o_proj_weight,         src.layers[i].o_proj_weight)
+		if dst.config.use_qk_norm {
+			ml.copy(dst.layers[i].q_norm_weight, src.layers[i].q_norm_weight)
+			ml.copy(dst.layers[i].k_norm_weight, src.layers[i].k_norm_weight)
+		}
 		ml.copy(dst.layers[i].post_attn_norm_weight, src.layers[i].post_attn_norm_weight)
 		ml.copy(dst.layers[i].gate_proj_weight,      src.layers[i].gate_proj_weight)
 		ml.copy(dst.layers[i].up_proj_weight,        src.layers[i].up_proj_weight)
@@ -140,6 +153,11 @@ randomize :: proc(model: Llama) {
 		ml.fill_normal(layer.k_proj_weight, 0, 0.02)
 		ml.fill_normal(layer.v_proj_weight, 0, 0.02)
 		ml.fill_normal(layer.o_proj_weight, 0, residual_scale)
+
+		if model.config.use_qk_norm {
+			ml.fill_value(layer.q_norm_weight, 1)
+			ml.fill_value(layer.k_norm_weight, 1)
+		}
 
 		ml.fill_value(layer.post_attn_norm_weight, 1)
 		ml.fill_normal(layer.gate_proj_weight, 0, 0.02)
@@ -192,6 +210,15 @@ cache_reset :: proc(cache: ^Cache) {
 }
 
 @(require_results)
+_per_head_rmsnorm :: proc(x: ml.Tensor, weight: ml.Tensor, head_count: int) -> ml.Tensor {
+	token_count := x.shape[0]
+	head_size   := x.shape[1] / head_count
+	view        := ml.reshape(x, {token_count * head_count, head_size})
+	normed      := ml.rmsnorm(view, weight)
+	return ml.reshape(normed, {token_count, head_count * head_size})
+}
+
+@(require_results)
 forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int) -> (output: ml.Tensor) {
 	token_count := builtin.len(new_tokens)
 	assert(token_count > 0,                          "forward_cached requires at least one new token")
@@ -210,6 +237,11 @@ forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int) -> (outpu
 		q := ml.linear(normed, layer.q_proj_weight)
 		k := ml.linear(normed, layer.k_proj_weight)
 		v := ml.linear(normed, layer.v_proj_weight)
+
+		if model.config.use_qk_norm {
+			q = _per_head_rmsnorm(q, layer.q_norm_weight, model.config.n_q_heads)
+			k = _per_head_rmsnorm(k, layer.k_norm_weight, model.config.n_kv_heads)
+		}
 
 		q = ml.rope(q, model.config.n_q_heads,  model.config.rope_base, cache_position)
 		k = ml.rope(k, model.config.n_kv_heads, model.config.rope_base, cache_position)
@@ -238,6 +270,7 @@ forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int) -> (outpu
 	output = ml.linear(output, model.lm_head_weight)
 
 	cache.length += token_count
+
 	return
 }
 
@@ -253,6 +286,11 @@ forward :: proc(model: Llama, tokens: []int) -> (output: ml.Tensor) {
 		q := ml.linear(normed, layer.q_proj_weight)
 		k := ml.linear(normed, layer.k_proj_weight)
 		v := ml.linear(normed, layer.v_proj_weight)
+
+		if model.config.use_qk_norm {
+			q = _per_head_rmsnorm(q, layer.q_norm_weight, model.config.n_q_heads)
+			k = _per_head_rmsnorm(k, layer.k_norm_weight, model.config.n_kv_heads)
+		}
 
 		q = ml.rope(q, model.config.n_q_heads,  model.config.rope_base)
 		k = ml.rope(k, model.config.n_kv_heads, model.config.rope_base)
@@ -285,6 +323,10 @@ update :: proc(opt: ml.Optimizer, model: Llama) {
 		ml.update(opt, layer.k_proj_weight)
 		ml.update(opt, layer.v_proj_weight)
 		ml.update(opt, layer.o_proj_weight)
+		if model.config.use_qk_norm {
+			ml.update(opt, layer.q_norm_weight)
+			ml.update(opt, layer.k_norm_weight)
+		}
 		ml.update(opt, layer.post_attn_norm_weight)
 		ml.update(opt, layer.gate_proj_weight)
 		ml.update(opt, layer.up_proj_weight)

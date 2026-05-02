@@ -13,8 +13,8 @@ import "core:os"
 import "core:time"
 
 import ml    "../../"
-// import gpu   "../../backends/gpu"
-import cpu   "../../backends/cpu"
+import gpu   "../../backends/gpu"
+// import cpu   "../../backends/cpu"
 import llama "../../networks/llama"
 
 DATA_PATH :: "../data/shakespeare.txt"
@@ -31,21 +31,33 @@ SAMPLE_TOP_K :: 40
 
 LEARNING_RATE :: 3e-4
 WEIGHT_DECAY  :: 0.1
+SEED          :: u64(0xC0FFEE)
 
-CONFIG :: llama.Config{
-	layer_count       = 6,
-	n_q_heads         = 6,
-	n_kv_heads        = 6,
-	head_size         = 64,
-	embedding_size    = 384,
-	intermediate_size = 1024,
-	vocabulary_size   = VOCAB_SIZE,
-	rope_base         = 10000,
-	tied_embeddings   = true,
+base_config :: proc(use_qk_norm: bool) -> llama.Config {
+	return llama.Config{
+		layer_count       = 6,
+		n_q_heads         = 6,
+		n_kv_heads        = 6,
+		head_size         = 64,
+		embedding_size    = 384,
+		intermediate_size = 1024,
+		vocabulary_size   = VOCAB_SIZE,
+		rope_base         = 10000,
+		tied_embeddings   = true,
+		use_qk_norm       = use_qk_norm,
+	}
 }
 
 main :: proc() {
 	defer fmt.println("Finished")
+
+	use_qk_norm := false
+	if builtin.len(os.args) > 1 && os.args[1] == "qknorm" {
+		use_qk_norm = true
+	}
+	rand.reset(SEED)
+	config := base_config(use_qk_norm)
+	fmt.printfln("Variant: use_qk_norm = %v", use_qk_norm)
 
 	corpus := load_corpus(DATA_PATH)
 	defer delete(corpus)
@@ -62,20 +74,20 @@ main :: proc() {
 	train_set := corpus[:split]
 	val_set   := corpus[split:]
 
-	cpu.set_thread_count(24)
+	// cpu.set_thread_count(24)
 
-	ctx := cpu.context_create(1024 * 1024 * 1024)
-	defer cpu.context_destroy(ctx)
+	// ctx := cpu.context_create(1024 * 1024 * 1024)
+	// defer cpu.context_destroy(ctx)
 
-	// ctx := gpu.context_create()
-	// defer gpu.context_destroy(ctx)
+	ctx := gpu.context_create()
+	defer gpu.context_destroy(ctx)
 
 	ml.context_scope(ctx)
 
-	model := llama.make(CONFIG)
+	model := llama.make(config)
 	defer llama.destroy(model)
 
-	param_count := count_parameters(CONFIG)
+	param_count := count_parameters(config)
 	fmt.printfln("Model: %v parameters.", param_count)
 
 	opt: ml.Optimizer
