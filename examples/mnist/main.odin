@@ -25,11 +25,11 @@ main :: proc() {
 
 	cpu.set_thread_count(24)
 
-	// ctx := cpu.context_create(1024 * 1024 * 256)
-	// defer cpu.context_destroy(ctx)
+	ctx := cpu.context_create(1024 * 1024 * 256)
+	defer cpu.context_destroy(ctx)
 
-	ctx := gpu.context_create()
-	defer gpu.context_destroy(ctx)
+	// ctx := gpu.context_create()
+	// defer gpu.context_destroy(ctx)
 
 	ml.context_scope(ctx)
 
@@ -50,7 +50,7 @@ main :: proc() {
 		order[i] = i
 	}
 
-	for epoch in 0 ..< 50 {
+	for epoch in 0 ..< 10 {
 		defer free_all(context.temp_allocator)
 
 		rand.shuffle(order)

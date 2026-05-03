@@ -14,10 +14,9 @@ import "core:thread"
 import ml "../../"
 import "../../loaders/gguf"
 
-@(thread_local)
-_global_odin_context: runtime.Context
-
 when thread.IS_SUPPORTED {
+	_thread_pool_context: runtime.Context
+
 	Worker :: struct {
 		thread:    ^thread.Thread,
 		id:        int,
@@ -63,17 +62,16 @@ when thread.IS_SUPPORTED {
 	}
 
 	_startup_thread_pool :: proc(thread_count: int) {
-		_global_odin_context = context
+		_thread_pool_context = context
 
 		_shutdown = false
 		n := thread_count - 1
 		_workers = builtin.make([]^Worker, n)
 		for i in 0 ..< n {
-			w                    := builtin.new(Worker)
-			w.id                  = i + 1
-			w.thread              = thread.create(_worker_proc)
-			w.thread.data         = w
-			w.thread.init_context = _global_odin_context
+			w            := builtin.new(Worker)
+			w.id          = i + 1
+			w.thread      = thread.create(_worker_proc)
+			w.thread.data = w
 
 			thread.start(w.thread)
 
@@ -132,8 +130,7 @@ when thread.IS_SUPPORTED {
 			return
 		}
 
-		context = _global_odin_context
-
+		context = _thread_pool_context
 		_cleanup_thread_pool()
 	}
 
@@ -1121,7 +1118,7 @@ slice_trailing_forward :: proc(op: ml.Operation) {
 			}
 		}
 	case .Bf16:
-		in_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input .buffers[.Data]))
+		in_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
 		out_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		for r in 0 ..< leading {
 			in_off  := r * trailing + start
@@ -1153,7 +1150,7 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 			}
 		}
 	case .Bf16:
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input .buffers[.Gradient]))
+		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
 		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
 		for r in 0 ..< leading {
 			in_off  := r * trailing + start
@@ -1317,8 +1314,8 @@ linear_forward_bf16 :: proc(op: ml.Operation) {
 
 // Reference CPU forward for the GGUF Q4_K linear op: dequantize the weight
 // row block-by-block and accumulate the dot product against the bf16
-// activation. Slow — intended as the parity baseline for the GPU shader,
-// not for production decode.
+// activation. This is slow and intended as the parity baseline for the 
+// GPU shader, not for production decode.
 linear_q4_k_forward :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Linear_Q4_K)
 	output_size := v.weight.shape[0]
@@ -2209,6 +2206,8 @@ softmax_forward :: proc(op: ml.Operation) {
 		x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
 		y_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		for sample in 0 ..< count {
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+
 			base := sample * size
 			max_value := math.NEG_INF_F32
 			for i in 0 ..< size {
@@ -2226,7 +2225,6 @@ softmax_forward :: proc(op: ml.Operation) {
 				y_bf[base + i] = ml.bf16_from_f32(scratch[i] / sum)
 			}
 		}
-		free_all(context.temp_allocator)
 	}
 }
 
@@ -2257,7 +2255,7 @@ softmax_backward :: proc(op: ml.Operation) {
 	case .Bf16:
 		y_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Data]))
 		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input .buffers[.Gradient]))
+		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Gradient]))
 		for sample in 0 ..< count {
 			base := sample * size
 			dot:  f32
@@ -2341,7 +2339,7 @@ log_softmax_backward :: proc(op: ml.Operation) {
 	case .Bf16:
 		y_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input .buffers[.Gradient]))
+		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
 		for sample in 0 ..< count {
 			base := sample * size
 			grad_sum: f32
@@ -2377,7 +2375,7 @@ entropy_forward :: proc(op: ml.Operation) {
 		}
 	case .Bf16:
 		p_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)probabilities.buffers[.Data]))
-		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output       .buffers[.Data]))
+		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers       [.Data]))
 		for sample in 0 ..< count {
 			entropy_value: f32
 			base := sample * size
@@ -2410,7 +2408,7 @@ entropy_backward :: proc(op: ml.Operation) {
 	case .Bf16:
 		p_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)probabilities.buffers[.Data]))
 		dp_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)probabilities.buffers[.Gradient]))
-		do_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output       .buffers[.Gradient]))
+		do_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers       [.Gradient]))
 		for sample in 0 ..< count {
 			base    := sample * size
 			dout_v  := ml.bf16_to_f32(do_bf[sample])
@@ -3374,6 +3372,8 @@ attention_cache_forward :: proc(op: ml.Operation) {
 }
 
 attention_cache_forward_f32 :: proc(op: ml.Operation) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+
 	v := op.variant.(ml.Attention_Cache)
 
 	token_count := op.input.shape[0]
@@ -3450,6 +3450,8 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 }
 
 attention_cache_forward_bf16 :: proc(op: ml.Operation) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+
 	v := op.variant.(ml.Attention_Cache)
 
 	token_count := op.input.shape[0]
