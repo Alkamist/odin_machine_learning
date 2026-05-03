@@ -29,8 +29,9 @@ SAMPLE_DIR  :: DATA_DIR + "/mnist_flow_samples"
 
 IMAGE_SIZE     :: 784 // 28 * 28
 TIME_EMBED_DIM :: 32
-HIDDEN_SIZE    :: 1024
-HIDDEN_LAYERS  :: 3
+HIDDEN_SIZE    :: 512
+HIDDEN_LAYERS  :: 4
+FF_MULT        :: 4   // MLP expansion factor inside each AdaLN-Zero block
 
 BATCH_SIZE   :: 256
 TOTAL_STEPS  :: 40000
@@ -121,74 +122,117 @@ main :: proc() {
 	}
 }
 
-// --- Model ----------------------------------------------------------------
+// --- Model (DiT-style with AdaLN-Zero blocks) -----------------------------
+
+// Each block produces (shift, scale, gate) from the conditioning vector via
+// a zero-initialized linear, so at init scale=0, shift=0, gate=0 and the
+// block is the identity. The output projection is also zero-initialized,
+// so the network predicts zero velocity at init and learns to deviate.
+
+Flow_Block :: struct {
+	ada_w: ml.Tensor,    // [3 * HIDDEN_SIZE, HIDDEN_SIZE], zero-init
+	ada_b: ml.Tensor,    // [3 * HIDDEN_SIZE], zero-init
+	ff1_w: ml.Tensor,    // [FF_MULT * HIDDEN_SIZE, HIDDEN_SIZE]
+	ff1_b: ml.Tensor,    // [FF_MULT * HIDDEN_SIZE]
+	ff2_w: ml.Tensor,    // [HIDDEN_SIZE, FF_MULT * HIDDEN_SIZE]
+	ff2_b: ml.Tensor,    // [HIDDEN_SIZE]
+}
 
 Flow_Model :: struct {
-	in_weight:   ml.Tensor,
-	in_bias:     ml.Tensor,
-	hidden_w:    [HIDDEN_LAYERS]ml.Tensor,
-	hidden_b:    [HIDDEN_LAYERS]ml.Tensor,
-	out_weight:  ml.Tensor,
-	out_bias:    ml.Tensor,
-	time_w1:     ml.Tensor,
-	time_b1:     ml.Tensor,
-	time_w2:     ml.Tensor,
-	time_b2:     ml.Tensor,
+	in_weight:     ml.Tensor,
+	in_bias:       ml.Tensor,
+	norm_w:        ml.Tensor,    // shared LayerNorm gain, init to 1
+	blocks:        [HIDDEN_LAYERS]Flow_Block,
+	final_ada_w:   ml.Tensor,    // [2 * HIDDEN_SIZE, HIDDEN_SIZE], zero-init
+	final_ada_b:   ml.Tensor,    // [2 * HIDDEN_SIZE], zero-init
+	out_weight:    ml.Tensor,    // zero-init per DiT
+	out_bias:      ml.Tensor,
+	time_w1:       ml.Tensor,
+	time_b1:       ml.Tensor,
+	time_w2:       ml.Tensor,
+	time_b2:       ml.Tensor,
 }
 
 flow_model_make :: proc() -> (model: Flow_Model) {
-	model.in_weight  = ml.make(.F32, {HIDDEN_SIZE, IMAGE_SIZE})
-	model.in_bias    = ml.make(.F32, {HIDDEN_SIZE})
-	model.out_weight = ml.make(.F32, {IMAGE_SIZE, HIDDEN_SIZE})
-	model.out_bias   = ml.make(.F32, {IMAGE_SIZE})
-	model.time_w1    = ml.make(.F32, {HIDDEN_SIZE, TIME_EMBED_DIM})
-	model.time_b1    = ml.make(.F32, {HIDDEN_SIZE})
-	model.time_w2    = ml.make(.F32, {HIDDEN_SIZE, HIDDEN_SIZE})
-	model.time_b2    = ml.make(.F32, {HIDDEN_SIZE})
+	model.in_weight   = ml.make(.F32, {HIDDEN_SIZE, IMAGE_SIZE})
+	model.in_bias     = ml.make(.F32, {HIDDEN_SIZE})
+	model.norm_w      = ml.make(.F32, {HIDDEN_SIZE})
+	model.final_ada_w = ml.make(.F32, {2 * HIDDEN_SIZE, HIDDEN_SIZE})
+	model.final_ada_b = ml.make(.F32, {2 * HIDDEN_SIZE})
+	model.out_weight  = ml.make(.F32, {IMAGE_SIZE, HIDDEN_SIZE})
+	model.out_bias    = ml.make(.F32, {IMAGE_SIZE})
+	model.time_w1     = ml.make(.F32, {HIDDEN_SIZE, TIME_EMBED_DIM})
+	model.time_b1     = ml.make(.F32, {HIDDEN_SIZE})
+	model.time_w2     = ml.make(.F32, {HIDDEN_SIZE, HIDDEN_SIZE})
+	model.time_b2     = ml.make(.F32, {HIDDEN_SIZE})
 	for i in 0 ..< HIDDEN_LAYERS {
-		model.hidden_w[i] = ml.make(.F32, {HIDDEN_SIZE, HIDDEN_SIZE})
-		model.hidden_b[i] = ml.make(.F32, {HIDDEN_SIZE})
+		model.blocks[i].ada_w = ml.make(.F32, {3 * HIDDEN_SIZE,       HIDDEN_SIZE})
+		model.blocks[i].ada_b = ml.make(.F32, {3 * HIDDEN_SIZE})
+		model.blocks[i].ff1_w = ml.make(.F32, {FF_MULT * HIDDEN_SIZE, HIDDEN_SIZE})
+		model.blocks[i].ff1_b = ml.make(.F32, {FF_MULT * HIDDEN_SIZE})
+		model.blocks[i].ff2_w = ml.make(.F32, {HIDDEN_SIZE,           FF_MULT * HIDDEN_SIZE})
+		model.blocks[i].ff2_b = ml.make(.F32, {HIDDEN_SIZE})
 	}
 
-	ml.he_initialization(model.in_weight,  IMAGE_SIZE)
-	ml.he_initialization(model.out_weight, HIDDEN_SIZE)
-	ml.he_initialization(model.time_w1,    TIME_EMBED_DIM)
-	ml.he_initialization(model.time_w2,    HIDDEN_SIZE)
-	ml.fill_value(model.in_bias,   0)
-	ml.fill_value(model.out_bias,  0)
-	ml.fill_value(model.time_b1,   0)
-	ml.fill_value(model.time_b2,   0)
+	ml.he_initialization(model.in_weight, IMAGE_SIZE)
+	ml.fill_value       (model.in_bias,   0)
+	ml.fill_value       (model.norm_w,    1)
+	ml.fill_value       (model.final_ada_w, 0)
+	ml.fill_value       (model.final_ada_b, 0)
+	ml.fill_value       (model.out_weight, 0)
+	ml.fill_value       (model.out_bias,   0)
+	ml.he_initialization(model.time_w1,   TIME_EMBED_DIM)
+	ml.fill_value       (model.time_b1,   0)
+	ml.he_initialization(model.time_w2,   HIDDEN_SIZE)
+	ml.fill_value       (model.time_b2,   0)
 	for i in 0 ..< HIDDEN_LAYERS {
-		ml.he_initialization(model.hidden_w[i], HIDDEN_SIZE)
-		ml.fill_value(model.hidden_b[i], 0)
+		ml.fill_value       (model.blocks[i].ada_w, 0)
+		ml.fill_value       (model.blocks[i].ada_b, 0)
+		ml.he_initialization(model.blocks[i].ff1_w, HIDDEN_SIZE)
+		ml.fill_value       (model.blocks[i].ff1_b, 0)
+		ml.he_initialization(model.blocks[i].ff2_w, FF_MULT * HIDDEN_SIZE)
+		ml.fill_value       (model.blocks[i].ff2_b, 0)
 	}
 	return
 }
 
 flow_model_destroy :: proc(model: Flow_Model) {
-	ml.destroy(model.in_weight);  ml.destroy(model.in_bias)
-	ml.destroy(model.out_weight); ml.destroy(model.out_bias)
-	ml.destroy(model.time_w1);    ml.destroy(model.time_b1)
-	ml.destroy(model.time_w2);    ml.destroy(model.time_b2)
+	ml.destroy(model.in_weight);   ml.destroy(model.in_bias)
+	ml.destroy(model.norm_w)
+	ml.destroy(model.final_ada_w); ml.destroy(model.final_ada_b)
+	ml.destroy(model.out_weight);  ml.destroy(model.out_bias)
+	ml.destroy(model.time_w1);     ml.destroy(model.time_b1)
+	ml.destroy(model.time_w2);     ml.destroy(model.time_b2)
 	for i in 0 ..< HIDDEN_LAYERS {
-		ml.destroy(model.hidden_w[i])
-		ml.destroy(model.hidden_b[i])
+		ml.destroy(model.blocks[i].ada_w); ml.destroy(model.blocks[i].ada_b)
+		ml.destroy(model.blocks[i].ff1_w); ml.destroy(model.blocks[i].ff1_b)
+		ml.destroy(model.blocks[i].ff2_w); ml.destroy(model.blocks[i].ff2_b)
 	}
 }
 
 flow_model_params :: proc(model: Flow_Model) -> []ml.Tensor {
-	out := make([]ml.Tensor, 8 + HIDDEN_LAYERS * 2, context.temp_allocator)
-	out[0] = model.in_weight
-	out[1] = model.in_bias
-	out[2] = model.out_weight
-	out[3] = model.out_bias
-	out[4] = model.time_w1
-	out[5] = model.time_b1
-	out[6] = model.time_w2
-	out[7] = model.time_b2
+	per_block :: 6
+	count := 11 + HIDDEN_LAYERS * per_block
+	out   := make([]ml.Tensor, count, context.temp_allocator)
+	out[0]  = model.in_weight
+	out[1]  = model.in_bias
+	out[2]  = model.norm_w
+	out[3]  = model.final_ada_w
+	out[4]  = model.final_ada_b
+	out[5]  = model.out_weight
+	out[6]  = model.out_bias
+	out[7]  = model.time_w1
+	out[8]  = model.time_b1
+	out[9]  = model.time_w2
+	out[10] = model.time_b2
 	for i in 0 ..< HIDDEN_LAYERS {
-		out[8 + i * 2]     = model.hidden_w[i]
-		out[8 + i * 2 + 1] = model.hidden_b[i]
+		base := 11 + i * per_block
+		out[base + 0] = model.blocks[i].ada_w
+		out[base + 1] = model.blocks[i].ada_b
+		out[base + 2] = model.blocks[i].ff1_w
+		out[base + 3] = model.blocks[i].ff1_b
+		out[base + 4] = model.blocks[i].ff2_w
+		out[base + 5] = model.blocks[i].ff2_b
 	}
 	return out
 }
@@ -199,31 +243,58 @@ flow_model_update :: proc(opt: ml.Optimizer, model: Flow_Model) {
 	}
 }
 
+// modulate(x, shift, scale) = LN(x) * (1 + scale) + shift
+modulate :: proc(normed, shift, scale: ml.Tensor) -> ml.Tensor {
+	one      := ml.scalar(.F32, 1.0)
+	scale_p1 := ml.add(scale, one)
+	scaled   := ml.mul(normed, scale_p1)
+	return ml.add(scaled, shift)
+}
+
 flow_model_forward :: proc(model: Flow_Model, image, time_emb: ml.Tensor) -> ml.Tensor {
 	t_hidden := ml.linear(time_emb, model.time_w1)
 	t_hidden  = ml.add(t_hidden, model.time_b1)
 	t_hidden  = ml.silu(t_hidden)
 	t_hidden  = ml.linear(t_hidden, model.time_w2)
 	t_hidden  = ml.add(t_hidden, model.time_b2)
-	t_hidden  = ml.silu(t_hidden)
 
 	h := ml.linear(image, model.in_weight)
 	h  = ml.add(h, model.in_bias)
-	h  = ml.add(h, t_hidden)
-	h  = ml.silu(h)
 
 	for i in 0 ..< HIDDEN_LAYERS {
-		residual := h
-		h = ml.linear(h, model.hidden_w[i])
-		h = ml.add(h, model.hidden_b[i])
-		h = ml.add(h, t_hidden)
-		h = ml.silu(h)
-		h = ml.add(h, residual)
+		c   := ml.silu(t_hidden)
+		ada := ml.linear(c, model.blocks[i].ada_w)
+		ada  = ml.add(ada, model.blocks[i].ada_b)
+
+		shift := ml.slice_trailing(ada, 0,               HIDDEN_SIZE)
+		scale := ml.slice_trailing(ada, HIDDEN_SIZE,     2 * HIDDEN_SIZE)
+		gate  := ml.slice_trailing(ada, 2 * HIDDEN_SIZE, 3 * HIDDEN_SIZE)
+
+		normed   := ml.layernorm(h, model.norm_w)
+		modulated := modulate(normed, shift, scale)
+
+		ff := ml.linear(modulated, model.blocks[i].ff1_w)
+		ff  = ml.add(ff, model.blocks[i].ff1_b)
+		ff  = ml.silu(ff)
+		ff  = ml.linear(ff, model.blocks[i].ff2_w)
+		ff  = ml.add(ff, model.blocks[i].ff2_b)
+
+		gated := ml.mul(ff, gate)
+		h      = ml.add(h, gated)
 	}
 
-	h = ml.linear(h, model.out_weight)
-	h = ml.add(h, model.out_bias)
-	return h
+	c_final   := ml.silu(t_hidden)
+	ada_final := ml.linear(c_final, model.final_ada_w)
+	ada_final  = ml.add(ada_final, model.final_ada_b)
+	shift_f := ml.slice_trailing(ada_final, 0,               HIDDEN_SIZE)
+	scale_f := ml.slice_trailing(ada_final, HIDDEN_SIZE, 2 * HIDDEN_SIZE)
+
+	normed_final   := ml.layernorm(h, model.norm_w)
+	modulated_final := modulate(normed_final, shift_f, scale_f)
+
+	out := ml.linear(modulated_final, model.out_weight)
+	out  = ml.add(out, model.out_bias)
+	return out
 }
 
 // --- EMA ------------------------------------------------------------------
