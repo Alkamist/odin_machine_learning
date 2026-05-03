@@ -1,6 +1,8 @@
-// Train a small Llama-style decoder from scratch on the
-// Tiny Shakespeare corpus, byte-level. Proof of concept for
-// the training path through the GPU backend.
+// Train a ~50M-param Llama+QK-norm decoder on TinyStories with the
+// SmolLM2 GPT-2 BPE tokenizer (vocab=49152). Tokens are pre-encoded
+// by `tools/tinystories_dump.py` into flat int32 binaries.
+//
+// odin run examples/tinystories -o:speed
 
 package main
 
@@ -14,82 +16,74 @@ import "core:time"
 
 import ml    "../../"
 import gpu   "../../backends/gpu"
-// import cpu   "../../backends/cpu"
 import llama "../../networks/llama"
+import gpt2  "../../tokenizers/gpt2"
 
-DATA_PATH :: "../data/shakespeare.txt"
+DATA_DIR       :: "examples/data"
+TRAIN_TOKENS   :: DATA_DIR + "/tinystories_train.bin"
+VALID_TOKENS   :: DATA_DIR + "/tinystories_valid.bin"
+TOKENIZER_PATH :: "smollm_data/tokenizer.json"
 
-VOCAB_SIZE   :: 256
-SEQ_LEN      :: 128
+VOCAB_SIZE   :: 49152
+SEQ_LEN      :: 512
 ACCUM_STEPS  :: 8
-TOTAL_STEPS  :: 5000
-LOG_EVERY    :: 50
-SAMPLE_EVERY :: 500
-SAMPLE_LEN   :: 400
+TOTAL_STEPS  :: 30000
+LOG_EVERY    :: 200
+SAMPLE_EVERY :: 3000
+VAL_BATCHES  :: 16
+SAMPLE_LEN   :: 200
 SAMPLE_TEMP  :: 0.8
 SAMPLE_TOP_K :: 40
 
-LEARNING_RATE :: 6e-4
+LEARNING_RATE :: f32(6e-4)
 MIN_LR_FRAC   :: f32(0.1)
-WARMUP_STEPS  :: 100
-WEIGHT_DECAY  :: 0.1
+WARMUP_STEPS  :: 200
+WEIGHT_DECAY  :: f32(0.1)
 SEED          :: u64(0xC0FFEE)
 
-base_config :: proc(use_qk_norm: bool) -> llama.Config {
-	return llama.Config{
-		layer_count       = 6,
-		n_q_heads         = 6,
-		n_kv_heads        = 6,
-		head_size         = 64,
-		embedding_size    = 384,
-		intermediate_size = 1024,
-		vocabulary_size   = VOCAB_SIZE,
-		rope_base         = 10000,
-		tied_embeddings   = true,
-		use_qk_norm       = use_qk_norm,
-	}
+CONFIG :: llama.Config{
+	layer_count       = 6,
+	n_q_heads         = 8,
+	n_kv_heads        = 2,
+	head_size         = 64,
+	embedding_size    = 512,
+	intermediate_size = 2048,
+	vocabulary_size   = VOCAB_SIZE,
+	rope_base         = 10000,
+	tied_embeddings   = true,
+	use_qk_norm       = true,
 }
+
+SAMPLE_PROMPT :: "Once upon a time, there was a little girl"
 
 main :: proc() {
 	defer fmt.println("Finished")
 
-	use_qk_norm := false
-	if builtin.len(os.args) > 1 && os.args[1] == "qknorm" {
-		use_qk_norm = true
-	}
 	rand.reset(SEED)
-	config := base_config(use_qk_norm)
-	fmt.printfln("Variant: use_qk_norm = %v", use_qk_norm)
 
-	corpus := load_corpus(DATA_PATH)
-	defer delete(corpus)
-	fmt.printfln("Corpus: %v bytes.", builtin.len(corpus))
+	fmt.println("Loading tokens ...")
+	train_set := load_tokens(TRAIN_TOKENS)
+	defer delete(train_set)
+	valid_set := load_tokens(VALID_TOKENS)
+	defer delete(valid_set)
+	fmt.printfln("  train = %v tokens, valid = %v tokens", builtin.len(train_set), builtin.len(valid_set))
 
-	// Bytes that never appear as targets get no signal to push their
-	// logits down, so we mask them out at sampling time.
-	valid_bytes: [VOCAB_SIZE]bool
-	for b in corpus {
-		valid_bytes[b] = true
+	fmt.println("Loading tokenizer ...")
+	tokenizer, tokenizer_ok := gpt2.load(TOKENIZER_PATH)
+	if !tokenizer_ok {
+		fmt.eprintln("FAIL: could not load tokenizer.")
+		os.exit(1)
 	}
-
-	split    := (builtin.len(corpus) * 9) / 10
-	train_set := corpus[:split]
-	val_set   := corpus[split:]
-
-	// cpu.set_thread_count(24)
-
-	// ctx := cpu.context_create(1024 * 1024 * 1024)
-	// defer cpu.context_destroy(ctx)
+	defer gpt2.destroy(tokenizer)
 
 	ctx := gpu.context_create()
 	defer gpu.context_destroy(ctx)
-
 	ml.context_scope(ctx)
 
-	model := llama.make(config)
+	model := llama.make(CONFIG)
 	defer llama.destroy(model)
 
-	param_count := count_parameters(config)
+	param_count := count_parameters(CONFIG)
 	fmt.printfln("Model: %v parameters.", param_count)
 
 	opt: ml.Optimizer
@@ -134,28 +128,44 @@ main :: proc() {
 		}
 
 		if step % SAMPLE_EVERY == 0 {
-			val_loss := evaluate(model, val_set, 32)
+			val_loss := evaluate(model, valid_set, VAL_BATCHES)
 			fmt.printfln("           val_loss   = %.4f", val_loss)
 			fmt.println("---- sample ----")
-			sample(model, "ROMEO:", SAMPLE_LEN, valid_bytes[:])
+			sample(model, &tokenizer, SAMPLE_PROMPT, SAMPLE_LEN)
 			fmt.println("\n----------------")
 		}
 	}
 }
 
-load_corpus :: proc(path: string) -> []int {
+load_tokens :: proc(path: string) -> []int {
 	bytes, err := os.read_entire_file_from_path(path, context.allocator)
 	if err != nil {
-		fmt.eprintfln("Failed to read %v", path)
+		fmt.eprintfln("FAIL: could not read %v", path)
 		os.exit(1)
 	}
 	defer delete(bytes)
 
-	out := make([]int, builtin.len(bytes))
-	for i in 0 ..< builtin.len(bytes) {
-		out[i] = int(bytes[i])
+	count := int((^u32le)(raw_data(bytes))^)
+	expected_bytes := 4 + count * 4
+	if expected_bytes > builtin.len(bytes) {
+		fmt.eprintfln("FAIL: %v has %v bytes but header claims %v tokens", path, builtin.len(bytes), count)
+		os.exit(1)
+	}
+
+	out := make([]int, count)
+	for i in 0 ..< count {
+		out[i] = int((^i32)(&bytes[4 + i * 4])^)
 	}
 	return out
+}
+
+sample_window :: proc(corpus: []int, inputs, targets: []int) {
+	max_offset := builtin.len(corpus) - builtin.len(inputs) - 1
+	offset     := rand.int_max(max_offset)
+	for i in 0 ..< builtin.len(inputs) {
+		inputs[i]  = corpus[offset + i]
+		targets[i] = corpus[offset + i + 1]
+	}
 }
 
 learning_rate_at :: proc(step, total_steps, warmup_steps: int, max_lr, min_lr_frac: f32) -> f32 {
@@ -168,15 +178,6 @@ learning_rate_at :: proc(step, total_steps, warmup_steps: int, max_lr, min_lr_fr
 	}
 	cosine := 0.5 * (1 + math.cos(math.PI * progress))
 	return max_lr * (min_lr_frac + (1 - min_lr_frac) * cosine)
-}
-
-sample_window :: proc(corpus: []int, inputs, targets: []int) {
-	max_offset := builtin.len(corpus) - builtin.len(inputs) - 1
-	offset     := rand.int_max(max_offset)
-	for i in 0 ..< builtin.len(inputs) {
-		inputs[i]  = corpus[offset + i]
-		targets[i] = corpus[offset + i + 1]
-	}
 }
 
 read_mean_loss :: proc(loss_tensor: ml.Tensor) -> f32 {
@@ -211,53 +212,54 @@ evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
 	return total / f32(batches)
 }
 
-sample :: proc(model: llama.Llama, prompt: string, gen_count: int, valid_bytes: []bool) {
+sample :: proc(model: llama.Llama, tokenizer: ^gpt2.Tokenizer, prompt: string, gen_count: int) {
 	ml.set_inference_only(true)
 	defer ml.set_inference_only(false)
 
-	t_max := builtin.len(prompt) + gen_count + 4
+	prompt_tokens := gpt2.encode(tokenizer, prompt, context.temp_allocator)
+	if builtin.len(prompt_tokens) == 0 {
+		fmt.println("(empty prompt tokenization)")
+		return
+	}
+
+	t_max := builtin.len(prompt_tokens) + gen_count + 4
 	cache := llama.cache_make(model, t_max)
 	defer llama.cache_destroy(cache)
 
-	prompt_tokens := make([]int, builtin.len(prompt), context.temp_allocator)
-	for i in 0 ..< builtin.len(prompt) {
-		prompt_tokens[i] = int(prompt[i])
-	}
+	last_logits := make([]f32, VOCAB_SIZE)
+	defer delete(last_logits)
 
 	ml.clear()
 	logits := llama.forward_cached(model, &cache, prompt_tokens)
-
-	last_logits := make([]f32, VOCAB_SIZE)
-	defer delete(last_logits)
-	logits_buf  := make([]f32, ml.len(logits), context.temp_allocator)
+	logits_buf := make([]f32, ml.len(logits), context.temp_allocator)
 	ml.get_data(logits, logits_buf)
 	last_offset := (logits.shape[0] - 1) * VOCAB_SIZE
-	copy(last_logits, logits_buf[last_offset:last_offset + VOCAB_SIZE])
+	copy(last_logits, logits_buf[last_offset : last_offset + VOCAB_SIZE])
 
-	fmt.print(prompt)
+	all_tokens: [dynamic]int
+	all_tokens.allocator = context.temp_allocator
+	append(&all_tokens, ..prompt_tokens)
 
-	mask_invalid(last_logits, valid_bytes)
-	next_token := sample_token(last_logits, SAMPLE_TEMP, SAMPLE_TOP_K)
-	fmt.print(rune(next_token))
+	previous_decoded_length := 0
+	prompt_text := gpt2.decode(tokenizer, prompt_tokens, context.temp_allocator)
+	fmt.print(prompt_text)
+	previous_decoded_length = builtin.len(prompt_text)
 
-	for _ in 0 ..< gen_count - 1 {
-		defer free_all(context.temp_allocator)
+	for _ in 0 ..< gen_count {
+		next_token := sample_token(last_logits, SAMPLE_TEMP, SAMPLE_TOP_K)
+		append(&all_tokens, next_token)
+
+		decoded := gpt2.decode(tokenizer, all_tokens[:], context.temp_allocator)
+		if builtin.len(decoded) > previous_decoded_length {
+			fmt.print(decoded[previous_decoded_length:])
+			os.flush(os.stdout)
+			previous_decoded_length = builtin.len(decoded)
+		}
 
 		ml.clear()
-		step_logits := llama.forward_cached(model, &cache, {next_token})
+		single := [1]int{next_token}
+		step_logits := llama.forward_cached(model, &cache, single[:])
 		ml.get_data(step_logits, last_logits)
-
-		mask_invalid(last_logits, valid_bytes)
-		next_token = sample_token(last_logits, SAMPLE_TEMP, SAMPLE_TOP_K)
-		fmt.print(rune(next_token))
-	}
-}
-
-mask_invalid :: proc(logits: []f32, valid_bytes: []bool) {
-	for i in 0 ..< builtin.len(logits) {
-		if !valid_bytes[i] {
-			logits[i] = -1e30
-		}
 	}
 }
 
@@ -323,6 +325,10 @@ count_parameters :: proc(c: llama.Config) -> int {
 		c.intermediate_size * c.embedding_size +
 		c.intermediate_size * c.embedding_size +
 		c.embedding_size * c.intermediate_size
+
+	if c.use_qk_norm {
+		per_layer += c.head_size * 2
+	}
 
 	output_params := c.embedding_size
 	if !c.tied_embeddings {
