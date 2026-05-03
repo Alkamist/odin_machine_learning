@@ -271,6 +271,31 @@ update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Locatio
 	_dispatch(_adam_step_pipeline, bufs[:], &params, _div_up(n, 256))
 }
 
+lerp_assign_forward :: proc(op: ml.Operation) {
+	dst    := op.output
+	source := op.variant.(ml.Lerp_Assign).source
+	alpha  := op.variant.(ml.Lerp_Assign).alpha
+
+	if _lerp_assign_pipeline == nil {
+		_lerp_assign_pipeline = _make_pipeline(LERP_ASSIGN_SPIRV, 2, size_of(Lerp_Assign_Params))
+	}
+	params := Lerp_Assign_Params{n = u32(ml.len(dst)), alpha = alpha}
+	bufs   := [2]vk.Buffer{data(dst).buffer, data(source).buffer}
+	_dispatch(_lerp_assign_pipeline, bufs[:], &params, _div_up(ml.len(dst), 256))
+}
+
+accumulate_mean_forward :: proc(op: ml.Operation) {
+	dst    := op.output
+	source := op.input
+
+	if _accumulate_mean_pipeline == nil {
+		_accumulate_mean_pipeline = _make_pipeline(ACCUMULATE_MEAN_SPIRV, 2, size_of(Accumulate_Mean_Params))
+	}
+	params := Accumulate_Mean_Params{n = u32(ml.len(source))}
+	bufs   := [2]vk.Buffer{data(dst).buffer, data(source).buffer}
+	_dispatch(_accumulate_mean_pipeline, bufs[:], &params, 1)
+}
+
 _forward_op_count: int
 _forward_op_ns:    i64
 
@@ -333,6 +358,8 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Attention:          attention_forward          (op)
 	case ml.Attention_Cache:    attention_cache_forward    (op)
 	case ml.Cast:               cast_forward               (op)
+	case ml.Lerp_Assign:        lerp_assign_forward        (op)
+	case ml.Accumulate_Mean:    accumulate_mean_forward    (op)
 	}
 }
 
@@ -380,6 +407,8 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Attention:          attention_backward         (op)
 	case ml.Attention_Cache:    attention_cache_backward   (op)
 	case ml.Cast:               cast_backward              (op)
+	case ml.Lerp_Assign:        fmt.panicf("GPU lerp_assign_backward: lerp_assign is a forward-only utility op")
+	case ml.Accumulate_Mean:    fmt.panicf("GPU accumulate_mean_backward: accumulate_mean is a forward-only utility op")
 	}
 }
 

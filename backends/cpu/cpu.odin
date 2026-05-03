@@ -463,6 +463,8 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Attention:          attention_forward          (op)
 	case ml.Attention_Cache:    attention_cache_forward    (op)
 	case ml.Cast:               cast_forward               (op)
+	case ml.Lerp_Assign:        lerp_assign_forward        (op)
+	case ml.Accumulate_Mean:    accumulate_mean_forward    (op)
 	}
 }
 
@@ -507,7 +509,29 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Attention:          attention_backward         (op)
 	case ml.Attention_Cache:    attention_cache_backward   (op)
 	case ml.Cast:               cast_backward              (op)
+	case ml.Lerp_Assign:        panic("CPU lerp_assign_backward: lerp_assign is a forward-only utility op")
+	case ml.Accumulate_Mean:    panic("CPU accumulate_mean_backward: accumulate_mean is a forward-only utility op")
 	}
+}
+
+lerp_assign_forward :: proc(op: ml.Operation) {
+	dst    := data(op.output)
+	source := data(op.variant.(ml.Lerp_Assign).source)
+	alpha  := op.variant.(ml.Lerp_Assign).alpha
+	one_minus := 1 - alpha
+	for i in 0 ..< builtin.len(dst) {
+		dst[i] = one_minus * dst[i] + alpha * source[i]
+	}
+}
+
+accumulate_mean_forward :: proc(op: ml.Operation) {
+	dst    := data(op.output)
+	source := data(op.input)
+	sum: f32
+	for v in source {
+		sum += v
+	}
+	dst[0] += sum / f32(builtin.len(source))
 }
 
 cast_forward :: proc(op: ml.Operation) {

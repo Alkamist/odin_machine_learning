@@ -461,3 +461,11 @@ Adam_Params :: struct {
 	lr, beta1, beta2, eps, wd, bc1, bc2: f32,
 }
 _adam_step_pipeline: ^Pipeline
+
+LERP_ASSIGN_SPIRV :: #load("shaders/lerp_assign/lerp_assign.spv", []u8)
+Lerp_Assign_Params :: struct { n: u32, alpha: f32 }
+_lerp_assign_pipeline: ^Pipeline
+
+ACCUMULATE_MEAN_SPIRV :: #load("shaders/accumulate_mean/accumulate_mean.spv", []u8)
+Accumulate_Mean_Params :: struct { n: u32 }
+_accumulate_mean_pipeline: ^Pipeline
