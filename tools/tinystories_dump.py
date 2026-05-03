@@ -20,13 +20,13 @@ import numpy as np
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
-REPO_ID         = "roneneldan/TinyStories"
-TRAIN_FILE      = "TinyStories-train.txt"
-VALID_FILE      = "TinyStories-valid.txt"
-TOKENIZER_PATH  = Path("smollm_data/tokenizer.json")
-OUT_DIR         = Path("examples/data")
-OUT_TRAIN       = OUT_DIR / "tinystories_train.bin"
-OUT_VALID       = OUT_DIR / "tinystories_valid.bin"
+REPO_ID        = "roneneldan/TinyStories"
+TRAIN_FILE     = "TinyStories-train.txt"
+VALID_FILE     = "TinyStories-valid.txt"
+TOKENIZER_PATH = Path("smollm_data/tokenizer.json")
+OUT_DIR        = Path("examples/data")
+OUT_TRAIN      = OUT_DIR / "tinystories_train.bin"
+OUT_VALID      = OUT_DIR / "tinystories_valid.bin"
 
 
 CHUNK_LINES = 4096
