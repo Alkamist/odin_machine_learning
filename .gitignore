@@ -13,11 +13,17 @@ ggml/
 llama.cpp/
 ollama/
 
+models/
+audio_sources/
+
 .claude/
 
 __pycache__
 
 tests/pytorch_parity/artifacts
+
+examples/data/audio_samples
+examples/data/audio_lm.ckpt
 
 *.safetensors
 
