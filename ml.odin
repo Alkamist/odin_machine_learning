@@ -72,6 +72,11 @@ Buffer_Kind :: enum u8 {
 }
 Buffer_Set :: bit_set[Buffer_Kind; u8]
 
+Clear_Flag :: enum u8 {
+	No_Gradients,
+}
+Clear_Flags :: bit_set[Clear_Flag; u8]
+
 Backend_Buffer :: [BACKEND_BUFFER_MAX_SIZE]byte
 
 Tensor :: struct {
@@ -105,7 +110,7 @@ Context :: struct {
 	operation_count: int,
 	operations:      [MAX_OPERATIONS]Operation,
 
-	inference_only: bool,
+	clear_flags: Clear_Flags,
 
 	previous_ctx: ^Context,
 }
@@ -148,9 +153,10 @@ current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
 	return _current_ctx
 }
 
-clear :: proc(loc := #caller_location) {
+clear :: proc(flags: Clear_Flags = {}, loc := #caller_location) {
 	assert(_current_ctx != nil, "Did you forget to call context_create or context_scope?", loc=loc)
 
+	_current_ctx.clear_flags = flags
 	_current_ctx.backend.clear(loc)
 
 	mem.arena_free_all(&_current_ctx.op_arena)
@@ -212,15 +218,10 @@ alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_S
 @(require_results)
 zeros :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> (t: Tensor) {
 	buffers := DEFAULT_ACTIVATION_BUFFERS
-	if _current_ctx != nil && _current_ctx.inference_only {
+	if _current_ctx != nil && .No_Gradients in _current_ctx.clear_flags {
 		buffers = Buffer_Set{.Data}
 	}
 	return alloc(type, shape, persistent=false, buffers=buffers, loc=loc)
-}
-
-set_inference_only :: proc(enabled: bool, loc := #caller_location) {
-	assert(_current_ctx != nil, "set_inference_only called with no active context", loc=loc)
-	_current_ctx.inference_only = enabled
 }
 
 @(require_results)
@@ -709,7 +710,7 @@ add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Add{b = b},
+		variant = Add{b=b},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -731,7 +732,7 @@ sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Sub{b = b},
+		variant = Sub{b=b},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -753,7 +754,7 @@ mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Mul{b = b},
+		variant = Mul{b=b},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -775,7 +776,7 @@ gelu_mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Gelu_Mul{b = b},
+		variant = Gelu_Mul{b=b},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -797,7 +798,7 @@ div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	op := Operation{
 		input   = a,
 		output  = output,
-		variant = Div{b = b},
+		variant = Div{b=b},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -1103,7 +1104,7 @@ linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Linear_Q4_K{weight = weight},
+		variant = Linear_Q4_K{weight=weight},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -1132,7 +1133,7 @@ linear_q6_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Linear_Q6_K{weight = weight},
+		variant = Linear_Q6_K{weight=weight},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
@@ -1561,7 +1562,7 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 		input   = a,
 		output  = output,
 		variant = Batched_Matmul{
-			b = b,
+			b=b,
 		},
 	}
 	_current_ctx.backend.forward(op, loc)
@@ -1594,7 +1595,7 @@ permute :: proc(input: Tensor, axes: [3]int, loc := #caller_location) -> (output
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Permute{axes = axes},
+		variant = Permute{axes=axes},
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)

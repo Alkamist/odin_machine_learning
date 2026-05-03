@@ -1,6 +1,6 @@
 package smollm_chat_repl
 
-// odin run examples/smollm_chat_repl --model smollm_data/model_instruct.safetensors --cpu --threads 24 --max-tokens 200
+// odin run examples/smollm_chat_repl -o:speed -- --model smollm_data/model_instruct.safetensors --cpu --threads 24 --max-tokens 200
 
 import "base:builtin"
 import "base:runtime"
@@ -62,7 +62,6 @@ main :: proc() {
 	}
 
 	ml.context_scope(ctx)
-	ml.set_inference_only(true)
 
 	fmt.println("Loading tokenizer ...")
 	tokenizer, tokenizer_ok := gpt2.load(TOKENIZER_PATH)
@@ -165,7 +164,7 @@ main :: proc() {
 
 		t_prefill := time.tick_now()
 		{
-			ml.clear()
+			ml.clear({.No_Gradients})
 			logits := llama.forward_cached(model, &cache, new_tokens[:])
 			buf := make([]f32, ml.len(logits), context.temp_allocator)
 			ml.get_data(logits, buf)
@@ -204,7 +203,7 @@ main :: proc() {
 
 			if step == max_new_tokens - 1 do break
 
-			ml.clear()
+			ml.clear({.No_Gradients})
 			single := [1]int{next_id}
 			logits := llama.forward_cached(model, &cache, single[:])
 			ml.get_data(logits, last_row)

@@ -1632,7 +1632,7 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 	// The forward shader recomputes rstd internally — the stats dispatch
 	// only writes `variant.rstd` for the backward pass to consume. Skip
 	// it during inference.
-	if !ml.current_context().inference_only {
+	if .No_Gradients not_in ml.current_context().clear_flags {
 		stats_params := Rmsnorm_Stats_Params{count = u32(count), size = u32(size), eps = variant.eps}
 		stats_bufs   := [2]vk.Buffer{data(input).buffer, data(variant.rstd).buffer}
 		_dispatch(stats_pipe, stats_bufs[:], &stats_params, u32(count))
@@ -2604,7 +2604,7 @@ attention_cache_forward :: proc(op: ml.Operation) {
 }
 
 attention_cache_backward :: proc(op: ml.Operation) {
-	fmt.panicf("attention_with_cache is forward-only (inference path); backward is not implemented")
+	fmt.panicf("attention_with_cache is forward-only; backward is not implemented")
 }
 
 enable_timing :: proc(capacity: u32 = 4096, loc := #caller_location) {

@@ -191,9 +191,6 @@ read_mean_loss :: proc(loss_tensor: ml.Tensor) -> f32 {
 }
 
 evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
-	ml.set_inference_only(true)
-	defer ml.set_inference_only(false)
-
 	inputs:  [SEQ_LEN]int
 	targets: [SEQ_LEN]int
 
@@ -203,7 +200,7 @@ evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
 
 		sample_window(corpus, inputs[:], targets[:])
 
-		ml.clear()
+		ml.clear({.No_Gradients})
 		logits     := llama.forward(model, inputs[:])
 		token_loss := ml.cross_entropy(logits, targets[:])
 		total += read_mean_loss(token_loss)
@@ -212,9 +209,6 @@ evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
 }
 
 sample :: proc(model: llama.Llama, prompt: string, gen_count: int, valid_bytes: []bool) {
-	ml.set_inference_only(true)
-	defer ml.set_inference_only(false)
-
 	t_max := builtin.len(prompt) + gen_count + 4
 	cache := llama.cache_make(model, t_max)
 	defer llama.cache_destroy(cache)
@@ -224,7 +218,7 @@ sample :: proc(model: llama.Llama, prompt: string, gen_count: int, valid_bytes: 
 		prompt_tokens[i] = int(prompt[i])
 	}
 
-	ml.clear()
+	ml.clear({.No_Gradients})
 	logits := llama.forward_cached(model, &cache, prompt_tokens)
 
 	last_logits := make([]f32, VOCAB_SIZE)
@@ -243,7 +237,7 @@ sample :: proc(model: llama.Llama, prompt: string, gen_count: int, valid_bytes: 
 	for _ in 0 ..< gen_count - 1 {
 		defer free_all(context.temp_allocator)
 
-		ml.clear()
+		ml.clear({.No_Gradients})
 		step_logits := llama.forward_cached(model, &cache, {next_token})
 		ml.get_data(step_logits, last_logits)
 

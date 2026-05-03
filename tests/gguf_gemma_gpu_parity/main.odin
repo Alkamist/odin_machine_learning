@@ -49,7 +49,7 @@ main :: proc() {
 	ctx := gpu.context_create()
 	defer gpu.context_destroy(ctx)
 	ml.context_scope(ctx)
-	ml.set_inference_only(true)
+	ml.clear({.No_Gradients})
 
 	cfg := gemma.make_e4b_config()
 	defer gemma.config_destroy(cfg)

@@ -58,7 +58,6 @@ main :: proc() {
 	}
 
 	ml.context_scope(ctx)
-	ml.set_inference_only(true)
 
 	fmt.println("Loading tokenizer ...")
 	tokenizer, tokenizer_ok := tok.load(TOKENIZER_PATH)
@@ -169,7 +168,7 @@ main :: proc() {
 			pos := 0
 			n := builtin.len(new_tokens)
 			for pos < n {
-				ml.clear()
+				ml.clear({.No_Gradients})
 				take := PREFILL_CHUNK
 				if pos + take > n do take = n - pos
 				if take != PREFILL_CHUNK do take = 1
@@ -215,7 +214,7 @@ main :: proc() {
 
 			if step == max_new_tokens - 1 do break
 
-			ml.clear()
+			ml.clear({.No_Gradients})
 			single := [1]int{next_id}
 			logits := gemma.forward_cached(model, &cache, single[:])
 			ml.get_data(logits, last_row)

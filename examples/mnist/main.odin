@@ -50,7 +50,7 @@ main :: proc() {
 		order[i] = i
 	}
 
-	for epoch in 0 ..< 10 {
+	for epoch in 0 ..< 50 {
 		defer free_all(context.temp_allocator)
 
 		rand.shuffle(order)
@@ -98,7 +98,7 @@ model_forward :: proc(model: Model, input: []f32, batch_size: int) -> ml.Tensor 
 model_predict :: proc(model: Model, input: []f32, predictions: []int) {
 	count := len(predictions)
 
-	ml.clear()
+	ml.clear({.No_Gradients})
 
 	logits             := model_forward(model, input, count)
 	probabilities      := ml.softmax(logits)

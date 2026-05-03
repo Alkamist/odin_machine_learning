@@ -18,45 +18,43 @@ main :: proc() {
 	fmt.println("=== GPU activation alloc cost (zeros + clear cycle, no compute) ===")
 	fmt.println()
 
-	bench("zeros [1, 2048]   (Bf16, .Data + .Gradient)", proc() {
+	bench("zeros [1, 2048]   (Bf16, .Data + .Gradient)", {}, proc() {
 		_ = ml.zeros(.Bf16, {1, 2048})
 	})
 
-	ml.set_inference_only(true)
-	defer ml.set_inference_only(false)
-	bench("zeros [1, 2048]   inference mode (.Data only)", proc() {
+	bench("zeros [1, 2048]   inference mode (.Data only)", {.No_Gradients}, proc() {
 		_ = ml.zeros(.Bf16, {1, 2048})
 	})
-	bench("zeros [1, 10240]  inference mode (.Data only)", proc() {
+	bench("zeros [1, 10240]  inference mode (.Data only)", {.No_Gradients}, proc() {
 		_ = ml.zeros(.Bf16, {1, 10240})
 	})
 
-	bench("zeros [1, 2560]   (Bf16, .Data + .Gradient)", proc() {
+	bench("zeros [1, 2560]   (Bf16, .Data + .Gradient)", {}, proc() {
 		_ = ml.zeros(.Bf16, {1, 2560})
 	})
 
-	bench("zeros [1, 10240]  (Bf16, .Data + .Gradient)", proc() {
+	bench("zeros [1, 10240]  (Bf16, .Data + .Gradient)", {}, proc() {
 		_ = ml.zeros(.Bf16, {1, 10240})
 	})
 
-	bench("alloc data-only [1, 2048] (Bf16, .Data)", proc() {
+	bench("alloc data-only [1, 2048] (Bf16, .Data)", {}, proc() {
 		_ = ml.alloc(.Bf16, {1, 2048}, persistent=false, buffers=ml.Buffer_Set{.Data})
 	})
 
-	bench("alloc data-only [1, 2560] (Bf16, .Data)", proc() {
+	bench("alloc data-only [1, 2560] (Bf16, .Data)", {}, proc() {
 		_ = ml.alloc(.Bf16, {1, 2560}, persistent=false, buffers=ml.Buffer_Set{.Data})
 	})
 }
 
-bench :: proc(label: string, fn: proc()) {
+bench :: proc(label: string, flags: ml.Clear_Flags, fn: proc()) {
 	for _ in 0 ..< 50 {
-		ml.clear()
+		ml.clear(flags)
 		fn()
 	}
 
 	t0 := time.tick_now()
 	for _ in 0 ..< ITERS {
-		ml.clear()
+		ml.clear(flags)
 		fn()
 	}
 	per_op_ns := i64(time.tick_since(t0)) / ITERS

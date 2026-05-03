@@ -78,6 +78,7 @@ main :: proc() {
 
 	ctx := gpu.context_create()
 	defer gpu.context_destroy(ctx)
+
 	ml.context_scope(ctx)
 
 	model := llama.make(CONFIG)
@@ -192,9 +193,6 @@ read_mean_loss :: proc(loss_tensor: ml.Tensor) -> f32 {
 }
 
 evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
-	ml.set_inference_only(true)
-	defer ml.set_inference_only(false)
-
 	inputs:  [SEQ_LEN]int
 	targets: [SEQ_LEN]int
 
@@ -204,7 +202,7 @@ evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
 
 		sample_window(corpus, inputs[:], targets[:])
 
-		ml.clear()
+		ml.clear({.No_Gradients})
 		logits     := llama.forward(model, inputs[:])
 		token_loss := ml.cross_entropy(logits, targets[:])
 		total += read_mean_loss(token_loss)
@@ -213,9 +211,6 @@ evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
 }
 
 sample :: proc(model: llama.Llama, tokenizer: ^gpt2.Tokenizer, prompt: string, gen_count: int) {
-	ml.set_inference_only(true)
-	defer ml.set_inference_only(false)
-
 	prompt_tokens := gpt2.encode(tokenizer, prompt, context.temp_allocator)
 	if builtin.len(prompt_tokens) == 0 {
 		fmt.println("(empty prompt tokenization)")
@@ -229,7 +224,7 @@ sample :: proc(model: llama.Llama, tokenizer: ^gpt2.Tokenizer, prompt: string, g
 	last_logits := make([]f32, VOCAB_SIZE)
 	defer delete(last_logits)
 
-	ml.clear()
+	ml.clear({.No_Gradients})
 	logits := llama.forward_cached(model, &cache, prompt_tokens)
 	logits_buf := make([]f32, ml.len(logits), context.temp_allocator)
 	ml.get_data(logits, logits_buf)
@@ -256,7 +251,7 @@ sample :: proc(model: llama.Llama, tokenizer: ^gpt2.Tokenizer, prompt: string, g
 			previous_decoded_length = builtin.len(decoded)
 		}
 
-		ml.clear()
+		ml.clear({.No_Gradients})
 		single := [1]int{next_token}
 		step_logits := llama.forward_cached(model, &cache, single[:])
 		ml.get_data(step_logits, last_logits)

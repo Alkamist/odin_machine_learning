@@ -65,7 +65,6 @@ main :: proc() {
 	ctx := cpu.context_create(cpu_arena) if use_cpu else gpu.context_create()
 	defer if use_cpu { cpu.context_destroy(ctx) } else { gpu.context_destroy(ctx) }
 	ml.context_scope(ctx)
-	ml.set_inference_only(true)
 
 	tokenizer, tokenizer_ok := tok.load(TOKENIZER_PATH)
 	if !tokenizer_ok {
@@ -142,7 +141,7 @@ main :: proc() {
 		}
 
 		gemma.cache_reset(&cache)
-		ml.clear()
+		ml.clear({.No_Gradients})
 
 		t_prefill := time.tick_now()
 		{
@@ -166,7 +165,7 @@ main :: proc() {
 			generated += 1
 			if next_id == EOS_TOKEN_ID do break
 
-			ml.clear()
+			ml.clear({.No_Gradients})
 			single := [1]int{next_id}
 			t_rec := time.tick_now()
 			logits := gemma.forward_cached(model, &cache, single[:])
