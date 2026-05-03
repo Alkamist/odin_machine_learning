@@ -41,11 +41,10 @@ def encode_file_streaming(tokenizer: Tokenizer, src_path: Path, dst_path: Path) 
     print(f"  text: {src_bytes:,} bytes")
 
     with open(dst_path, "wb") as out:
-        out.write(struct.pack("<I", 0))  # length placeholder
+        out.write(struct.pack("<I", 0)) # length placeholder
 
         with open(src_path, "r", encoding="utf-8") as f:
             buffer: list[str] = []
-            line_count = 0
             last_report = 0
             consumed_bytes = 0
             for line in f:

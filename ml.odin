@@ -525,9 +525,6 @@ Lerp_Assign :: struct {
 	alpha:  f32,
 }
 
-// In-place dst <- (1 - alpha) * dst + alpha * source. Bypasses the autograd
-// graph; used to maintain an EMA of model parameters without round-tripping
-// through host memory each step.
 lerp_assign :: proc(dst, source: Tensor, alpha: f32, loc := #caller_location) {
 	assert(len(dst) == len(source), "lerp_assign: dst and source must have the same length", loc=loc)
 	assert(dst.type == .F32 && source.type == .F32, "lerp_assign requires F32 tensors", loc=loc)
@@ -542,9 +539,6 @@ lerp_assign :: proc(dst, source: Tensor, alpha: f32, loc := #caller_location) {
 
 Accumulate_Mean :: struct {}
 
-// In-place dst[0] += mean(source). Bypasses the autograd graph; used to
-// keep a running loss average on-device so training does not need to sync
-// the loss to host each step.
 accumulate_mean :: proc(dst, source: Tensor, loc := #caller_location) {
 	assert(len(dst) == 1, "accumulate_mean: dst must be a length-1 scalar", loc=loc)
 	assert(dst.type == .F32 && source.type == .F32, "accumulate_mean requires F32 tensors", loc=loc)
