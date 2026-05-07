@@ -14,10 +14,10 @@ import "core:time"
 
 import ml    "../../"
 import gpu   "../../backends/gpu"
-// import cpu   "../../backends/cpu"
+import cpu   "../../backends/cpu"
 import llama "../../networks/llama"
 
-DATA_PATH :: "../data/shakespeare.txt"
+DATA_PATH :: "examples/data/shakespeare.txt"
 
 VOCAB_SIZE   :: 256
 SEQ_LEN      :: 128
@@ -30,10 +30,10 @@ SAMPLE_TEMP  :: 0.8
 SAMPLE_TOP_K :: 40
 
 LEARNING_RATE :: 6e-4
-MIN_LR_FRAC   :: f32(0.1)
+MIN_LR_FRAC   :: 0.1
 WARMUP_STEPS  :: 100
 WEIGHT_DECAY  :: 0.1
-SEED          :: u64(0xC0FFEE)
+SEED          :: 0xC0FFEE
 
 base_config :: proc(use_qk_norm: bool) -> llama.Config {
 	return llama.Config{
@@ -72,17 +72,17 @@ main :: proc() {
 		valid_bytes[b] = true
 	}
 
-	split    := (builtin.len(corpus) * 9) / 10
+	split     := (builtin.len(corpus) * 9) / 10
 	train_set := corpus[:split]
 	val_set   := corpus[split:]
 
-	// cpu.set_thread_count(24)
+	cpu.set_thread_count(24)
 
-	// ctx := cpu.context_create(1024 * 1024 * 1024)
-	// defer cpu.context_destroy(ctx)
+	ctx := cpu.context_create(1024 * 1024 * 1024)
+	defer cpu.context_destroy(ctx)
 
-	ctx := gpu.context_create()
-	defer gpu.context_destroy(ctx)
+	// ctx := gpu.context_create()
+	// defer gpu.context_destroy(ctx)
 
 	ml.context_scope(ctx)
 

@@ -9,14 +9,14 @@ import "core:os"
 import ml    "../../"
 import llama "../../networks/llama"
 
-CHECKPOINT_MAGIC   :: u32le(0xA0D10AC0)
-CHECKPOINT_VERSION :: u32le(1)
+CHECKPOINT_MAGIC   :: 0xA0D10AC0
+CHECKPOINT_VERSION :: 1
 
 save_checkpoint :: proc(path: string, model: llama.Llama) -> bool {
 	cfg := model.config
 
-	tied_flag    := u32le(1) if cfg.tied_embeddings else u32le(0)
-	qk_norm_flag := u32le(1) if cfg.use_qk_norm     else u32le(0)
+	tied_flag    := u32le(1) if cfg.tied_embeddings else 0
+	qk_norm_flag := u32le(1) if cfg.use_qk_norm     else 0
 	rope_bits    := transmute(u32)cfg.rope_base
 
 	header := [12]u32le{
@@ -123,11 +123,11 @@ Pack_Ctx :: struct {
 for_each_tensor :: proc(model: llama.Llama, fn: proc(t: ml.Tensor, user: rawptr), user: rawptr) {
 	fn(model.token_embeddings, user)
 	for layer in model.layers {
-		fn(layer.input_norm_weight,     user)
-		fn(layer.q_proj_weight,         user)
-		fn(layer.k_proj_weight,         user)
-		fn(layer.v_proj_weight,         user)
-		fn(layer.o_proj_weight,         user)
+		fn(layer.input_norm_weight, user)
+		fn(layer.q_proj_weight,     user)
+		fn(layer.k_proj_weight,     user)
+		fn(layer.v_proj_weight,     user)
+		fn(layer.o_proj_weight,     user)
 		if model.config.use_qk_norm {
 			fn(layer.q_norm_weight, user)
 			fn(layer.k_norm_weight, user)
