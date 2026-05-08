@@ -347,6 +347,19 @@ _linear :: proc(input, weight: ml.Tensor) -> ml.Tensor {
 	return ml.linear(input, weight)
 }
 
+// FFN front-half: produces `gelu(input @ w_gate.T) * (input @ w_up.T)`.
+// Routes through ml.linear_q4_k_gate_up_geglu (single mmvq dispatch on
+// CUDA decode) when both weights are Q4_K; otherwise emits the unfused
+// gate / up / gelu_mul sequence.
+_gate_up_geglu :: proc(input, w_gate, w_up: ml.Tensor) -> ml.Tensor {
+	if w_gate.type == .Q4_K && w_up.type == .Q4_K {
+		return ml.linear_q4_k_gate_up_geglu(input, w_gate, w_up)
+	}
+	gate := _linear(input, w_gate)
+	up   := _linear(input, w_up)
+	return ml.gelu_mul(gate, up)
+}
+
 // Compute the per-layer-input table once per forward, mirroring
 // `Gemma4TextModel.get_per_layer_inputs` + `project_per_layer_inputs`.
 // Output is `[token_count, num_hidden_layers * ple_dim]` packed; layer `l`'s
@@ -525,9 +538,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
 		mlp_in: ml.Tensor
 		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
-		gate   := _linear(mlp_in, layer.gate_proj_weight)
-		up     := _linear(mlp_in, layer.up_proj_weight)
-		mlp    := _linear(ml.gelu_mul(gate, up), layer.down_proj_weight)
+		mlp    := _linear(_gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight), layer.down_proj_weight)
 		mlp     = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
 		residual = ml.add(residual, mlp)
 
@@ -618,9 +629,7 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		// Feedforward.
 		mlp_in: ml.Tensor
 		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
-		gate    := _linear(mlp_in, layer.gate_proj_weight)
-		up      := _linear(mlp_in, layer.up_proj_weight)
-		mlp     := _linear(ml.gelu_mul(gate, up), layer.down_proj_weight)
+		mlp     := _linear(_gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight), layer.down_proj_weight)
 		mlp      = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
 		residual = ml.add(residual, mlp)
 

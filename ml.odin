@@ -88,6 +88,11 @@ Tensor :: struct {
 	count:   int,
 }
 
+Backend_Capability :: enum {
+	Linear_Q4_K_Gate_Up_Geglu,
+}
+Backend_Capabilities :: bit_set[Backend_Capability]
+
 Backend :: struct #all_or_none {
 	clear:    proc(loc: runtime.Source_Code_Location),
 	forward:  proc(op: Operation, loc: runtime.Source_Code_Location),
@@ -99,6 +104,8 @@ Backend :: struct #all_or_none {
 	buffer_get:   proc(buffer: Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location),
 	buffer_set:   proc(buffer: Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location),
 	buffer_copy:  proc(dst, src: Backend_Buffer, loc: runtime.Source_Code_Location),
+
+	capabilities: Backend_Capabilities,
 }
 
 Context :: struct {
@@ -455,6 +462,7 @@ Operation_Variant :: union {
 	Concat,
 	Linear,
 	Linear_Q4_K,
+	Linear_Q4_K_Gate_Up_Geglu,
 	Linear_Q6_K,
 	Rope,
 	Layernorm,
@@ -1141,6 +1149,45 @@ linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 	}
 	_current_ctx.backend.forward(op, loc)
 	append_operation(op, loc=loc)
+
+	return
+}
+
+Linear_Q4_K_Gate_Up_Geglu :: struct {
+	w_gate: Tensor,
+	w_up:   Tensor,
+}
+
+@(require_results)
+linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank >= 1, "linear_q4_k_gate_up_geglu input must have rank >= 1", loc=loc)
+	assert(w_gate.rank == 2, "linear_q4_k_gate_up_geglu w_gate must be 2-D", loc=loc)
+	assert(w_up.rank == 2, "linear_q4_k_gate_up_geglu w_up must be 2-D", loc=loc)
+	assert(w_gate.type == .Q4_K && w_up.type == .Q4_K, "linear_q4_k_gate_up_geglu weights must be Q4_K", loc=loc)
+	assert(input.type == .Bf16, "linear_q4_k_gate_up_geglu input must be Bf16", loc=loc)
+	assert(w_gate.shape[0] == w_up.shape[0], "gate/up output dims must match", loc=loc)
+	assert(w_gate.shape[1] == w_up.shape[1], "gate/up input dims must match", loc=loc)
+
+	output_size := w_gate.shape[0]
+	input_size  := w_gate.shape[1]
+	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "input dim must be a multiple of 256", loc=loc)
+	assert(input.shape[input.rank - 1] == input_size, "input trailing dim must equal weight's input dim", loc=loc)
+
+	if _leading_count(input) == 1 && .Linear_Q4_K_Gate_Up_Geglu in _current_ctx.backend.capabilities {
+		output = _zeros_replace_trailing(input, output_size, loc=loc)
+		op := Operation{
+			input   = input,
+			output  = output,
+			variant = Linear_Q4_K_Gate_Up_Geglu{w_gate=w_gate, w_up=w_up},
+		}
+		_current_ctx.backend.forward(op, loc)
+		append_operation(op, loc=loc)
+		return
+	}
+
+	gate  := linear_q4_k(input, w_gate, loc=loc)
+	up    := linear_q4_k(input, w_up,   loc=loc)
+	output = gelu_mul(gate, up, loc=loc)
 
 	return
 }

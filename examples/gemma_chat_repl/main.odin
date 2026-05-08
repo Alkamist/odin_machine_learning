@@ -43,8 +43,9 @@ main :: proc() {
 	cpu_arena      := DEFAULT_CPU_ARENA
 	threads        := DEFAULT_THREADS
 	gguf_path      := ""
+	timing         := false
 
-	parse_args(&max_new_tokens, &temperature, &top_k, &top_p, &t_max, &use_cpu, &cpu_arena, &threads, &gguf_path)
+	parse_args(&max_new_tokens, &temperature, &top_k, &top_p, &t_max, &use_cpu, &cpu_arena, &threads, &gguf_path, &timing)
 
 	cpu.set_thread_count(threads)
 
@@ -58,6 +59,12 @@ main :: proc() {
 	}
 
 	ml.context_scope(ctx)
+
+	if timing && !use_cpu {
+		gpu.enable_timing(true)
+	} else if !use_cpu {
+		gpu.enable_decode_graph(true)
+	}
 
 	fmt.println("Loading tokenizer ...")
 	tokenizer, tokenizer_ok := tok.load(TOKENIZER_PATH)
@@ -187,6 +194,9 @@ main :: proc() {
 		reply_start := builtin.len(all_tokens)
 		previous_decoded_length := 0
 		generated := 0
+		if timing && !use_cpu {
+			gpu.reset_timing()
+		}
 		t_generate := time.tick_now()
 
 		for step in 0 ..< max_new_tokens {
@@ -227,6 +237,28 @@ main :: proc() {
 		fmt.printfln("  [prefill %v tok / %.2f s = %.1f tok/s   decode %v tok / %.2f s = %.1f tok/s]",
 			builtin.len(new_tokens), prefill_elapsed, prompt_rate,
 			generated, elapsed, decode_rate)
+
+		if timing && !use_cpu && generated > 0 {
+			entries := gpu.timing_snapshot()
+			defer delete(entries)
+			gpu_total_ns: i64
+			for e in entries do gpu_total_ns += e.total_ns
+			wall_ns := i64(time.duration_nanoseconds(time.tick_since(t_generate)))
+			gpu_ms_per_tok   := f64(gpu_total_ns) / f64(generated) / 1e6
+			wall_ms_per_tok  := f64(wall_ns)      / f64(generated) / 1e6
+			gpu_pct          := 100.0 * f64(gpu_total_ns) / f64(wall_ns) if wall_ns > 0 else 0
+			fmt.printfln("  [decode timing: gpu=%.2f ms/tok  wall=%.2f ms/tok  gpu/wall=%.1f%%]",
+				gpu_ms_per_tok, wall_ms_per_tok, gpu_pct)
+			shown := 0
+			for e in entries {
+				if shown >= 12 do break
+				avg_us := f64(e.total_ns) / f64(e.count) / 1e3
+				share  := 100.0 * f64(e.total_ns) / f64(gpu_total_ns) if gpu_total_ns > 0 else 0
+				fmt.printfln("    % 5.1f%%  % 7.1f us avg  x% -7d %s", share, avg_us, e.count, e.name)
+				shown += 1
+			}
+		}
+
 		fmt.println()
 	}
 }
@@ -304,7 +336,7 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 	return indices[keep - 1]
 }
 
-parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, threads: ^int, gguf_path: ^string) {
+parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, threads: ^int, gguf_path: ^string, timing: ^bool) {
 	args := os.args[1:]
 	i := 0
 	for i < builtin.len(args) {
@@ -345,6 +377,9 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 			if i + 1 >= builtin.len(args) do _usage_exit()
 			gguf_path^ = args[i + 1]
 			i += 2
+		case "--timing":
+			timing^ = true
+			i += 1
 		case "--help", "-h":
 			_usage_exit()
 		case:
@@ -355,7 +390,7 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 }
 
 _usage_exit :: proc() {
-	fmt.eprintln("usage: gemma_chat_repl [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N] [--gguf PATH]")
+	fmt.eprintln("usage: gemma_chat_repl [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N] [--gguf PATH] [--timing]")
 	os.exit(1)
 }
 

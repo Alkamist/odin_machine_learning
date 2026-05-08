@@ -22,6 +22,9 @@ Module   :: distinct rawptr
 Function :: distinct rawptr
 Stream   :: distinct rawptr
 Event    :: distinct rawptr
+Graph    :: distinct rawptr
+GraphExec :: distinct rawptr
+GraphNode :: distinct rawptr
 
 Device     :: distinct i32
 DevicePtr  :: distinct u64
@@ -130,6 +133,40 @@ CTX_LMEM_RESIZE_TO_MAX  :: 0x10
 STREAM_DEFAULT      :: 0x00
 STREAM_NON_BLOCKING :: 0x01
 
+// Stream capture mode (`CUstreamCaptureMode`). `Relaxed` is what graph
+// recording usually wants â€” `Global` enforces strict cross-thread isolation.
+StreamCaptureMode :: enum i32 {
+	Global       = 0,
+	Thread_Local = 1,
+	Relaxed      = 2,
+}
+
+// `cuGraphInstantiate` / `cuGraphInstantiateWithFlags` flags.
+GRAPH_INSTANTIATE_DEFAULT                    :: 0x00
+GRAPH_INSTANTIATE_AUTO_FREE_ON_LAUNCH        :: 0x01
+GRAPH_INSTANTIATE_UPLOAD                     :: 0x02
+GRAPH_INSTANTIATE_DEVICE_LAUNCH              :: 0x04
+GRAPH_INSTANTIATE_USE_NODE_PRIORITY          :: 0x08
+
+// `cuGraphExecUpdate` outcome codes (`CUgraphExecUpdateResult`).
+GraphExecUpdateResult :: enum i32 {
+	SUCCESS                           = 0,
+	ERROR                             = 1,
+	ERROR_TOPOLOGY_CHANGED            = 2,
+	ERROR_NODE_TYPE_CHANGED           = 3,
+	ERROR_FUNCTION_CHANGED            = 4,
+	ERROR_PARAMETERS_CHANGED          = 5,
+	ERROR_NOT_SUPPORTED               = 6,
+	ERROR_UNSUPPORTED_FUNCTION_CHANGE = 7,
+	ERROR_ATTRIBUTES_CHANGED          = 8,
+}
+
+GraphExecUpdateResultInfo :: struct {
+	result:          GraphExecUpdateResult,
+	error_node:      GraphNode,
+	error_from_node: GraphNode,
+}
+
 // Event creation flags (`CU_EVENT_*`).
 EVENT_DEFAULT        :: 0x00
 EVENT_BLOCKING_SYNC  :: 0x01
@@ -175,6 +212,19 @@ foreign lib {
 	StreamDestroy     :: proc(stream: Stream) -> Result ---
 	StreamSynchronize :: proc(stream: Stream) -> Result ---
 	StreamWaitEvent   :: proc(stream: Stream, event: Event, flags: u32) -> Result ---
+
+	// Stream capture (CUDA graphs).
+	StreamBeginCapture_v2  :: proc(stream: Stream, mode: StreamCaptureMode) -> Result ---
+	StreamEndCapture       :: proc(stream: Stream, graph: ^Graph) -> Result ---
+	StreamIsCapturing      :: proc(stream: Stream, capture_status: ^i32) -> Result ---
+
+	// Graphs.
+	GraphInstantiateWithFlags :: proc(exec: ^GraphExec, graph: Graph, flags: u64) -> Result ---
+	GraphLaunch               :: proc(exec: GraphExec, stream: Stream) -> Result ---
+	GraphExecDestroy          :: proc(exec: GraphExec) -> Result ---
+	GraphDestroy              :: proc(graph: Graph) -> Result ---
+	@(link_name="cuGraphExecUpdate_v2")
+	GraphExecUpdate           :: proc(exec: GraphExec, graph: Graph, info: ^GraphExecUpdateResultInfo) -> Result ---
 
 	// Events (used for timing benchmarks).
 	EventCreate       :: proc(event: ^Event, flags: u32) -> Result ---

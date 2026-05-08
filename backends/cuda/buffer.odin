@@ -123,6 +123,14 @@ buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_C
 		"buffer_get: dst (%d) larger than buffer (%d)", builtin.len(dst), gb.size, loc=loc)
 
 	gctx := _gctx(loc)
+
+	// Auto-graph mode: this is our end-of-forward signal. End capture, update
+	// or re-instantiate the exec, then launch — so the DtoH copy below sees
+	// the freshly-produced data after StreamSynchronize.
+	if gctx.auto_capturing {
+		_auto_graph_finish(gctx, loc)
+	}
+
 	cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)
 	cuda.check(cuda.MemcpyDtoH(raw_data(dst), gb.ptr, uint(builtin.len(dst))), loc=loc)
 }
@@ -146,7 +154,14 @@ buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_C
 	// Synchronous semantics for the public API: caller's `src` must not be
 	// reused before the copy completes. Pinning the staging would let us
 	// overlap, but that's a Phase 7 perf concern.
-	cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)
+	//
+	// During auto-graph capture we can't `StreamSynchronize` (the stream is
+	// in capture state). Callers inside a captured forward are responsible
+	// for keeping `src` alive until the graph is launched; in practice every
+	// in-tree call site uses temp_allocator buffers that outlive the forward.
+	if !gctx.auto_capturing {
+		cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)
+	}
 }
 
 buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {

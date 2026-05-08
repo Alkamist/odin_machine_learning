@@ -72,7 +72,25 @@ void attention_cache_bf16(const unsigned int* __restrict__ q_buf,
 		if (tid < BC && t_k < t_k_max && t_k >= t_k_min) {
 			int k_base = (t_k % t_capacity) * kv_size + kv_h * D;
 			float dot = 0.0f;
-			for (int d = 0; d < D; ++d) {
+			// Vectorize K reads: one uint4 load = 8 bf16 elements vs 4 separate
+			// loads in the scalar version. K_base is a multiple of 8 elements
+			// in this codebase (kv_size and kv_h*D are multiples of 8 head-dim
+			// units), so the uint4 cast is well-aligned.
+			int d = 0;
+			int d_vec_end = D & ~7;
+			const uint4* k_vec = reinterpret_cast<const uint4*>(&k_buf[(k_base) >> 1]);
+			for (; d < d_vec_end; d += 8) {
+				uint4 k4 = __ldg(&k_vec[d >> 3]);
+				#pragma unroll
+				for (int i = 0; i < 4; ++i) {
+					unsigned int u = (i == 0) ? k4.x : (i == 1) ? k4.y : (i == 2) ? k4.z : k4.w;
+					float v0 = __int_as_float((int)((u & 0xffffu) << 16));
+					float v1 = __int_as_float((int)(((u >> 16) & 0xffffu) << 16));
+					dot += q_shared[d + 2*i + 0] * v0;
+					dot += q_shared[d + 2*i + 1] * v1;
+				}
+			}
+			for (; d < D; ++d) {
 				dot += q_shared[d] * load_bf16(k_buf, k_base + d);
 			}
 			score = dot * inv_sqrt_d;

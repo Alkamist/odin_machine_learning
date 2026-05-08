@@ -332,6 +332,7 @@ context_create :: proc(size: int, allocator := context.allocator, loc := #caller
 		buffer_get   = buffer_get,
 		buffer_set   = buffer_set,
 		buffer_copy  = buffer_copy,
+		capabilities = {},
 	}, allocator, loc)
 
 	return ctx
@@ -447,6 +448,7 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
 	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
+	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("cpu backend: Linear_Q4_K_Gate_Up_Geglu unreachable (proc decomposes when capability is absent)")
 	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
@@ -493,6 +495,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
 	case ml.Linear_Q4_K:        panic("CPU linear_q4_k_backward: linear_q4_k is forward-only")
+	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("CPU linear_q4_k_gate_up_geglu_backward: forward-only")
 	case ml.Linear_Q6_K:        panic("CPU linear_q6_k_backward: linear_q6_k is forward-only")
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)

@@ -19,6 +19,7 @@ _add_back_a_bf16_pipeline: ^Pipeline
 _add_back_b_bf16_pipeline: ^Pipeline
 _quantize_q8_1_pipeline:   ^Pipeline
 _linear_q4_k_mmvq_pipeline: ^Pipeline
+_linear_q4_k_gate_up_geglu_bf16_pipeline: ^Pipeline
 _linear_q6_k_gemv_pipeline: ^Pipeline
 
 _mul_pipeline:           ^Pipeline
@@ -64,8 +65,9 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Tanh:         _tanh_forward(op, loc)
 	case ml.Cast:         _cast_forward(op, loc)
 	case ml.Linear:       _linear_forward(op, loc)
-	case ml.Linear_Q4_K:  _linear_q4_k_forward(op, loc)
-	case ml.Linear_Q6_K:  _linear_q6_k_forward(op, loc)
+	case ml.Linear_Q4_K:               _linear_q4_k_forward(op, loc)
+	case ml.Linear_Q4_K_Gate_Up_Geglu: _linear_q4_k_gate_up_geglu_forward(op, loc)
+	case ml.Linear_Q6_K:               _linear_q6_k_forward(op, loc)
 	case ml.Rmsnorm:      _rmsnorm_forward(op, loc)
 	case ml.Add_Rmsnorm:  _add_rmsnorm_forward(op, loc)
 	case ml.Rmsnorm_Rope:    _rmsnorm_rope_forward(op, loc)
@@ -221,17 +223,26 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	// way the vulkan backend's `_create_pooled_activation_buffer` does.
 	q8_block_count := input_size / Q8_1_BLOCK_ELEMS
 	q8_byte_count  := q8_block_count * Q8_1_BLOCK_BYTES
-	q8_ptr := _activation_alloc(gctx, u64(q8_byte_count), loc)
 
-	// Stage 1: bf16 input -> q8_1 blocks.
 	xp := data(input).ptr
-	q8 := q8_ptr
 	K  := i32(input_size)
-	q1_args := [?]rawptr{ &xp, &q8, &K }
-	_dispatch(_quantize_q8_1_pipeline,
-		u32(q8_block_count), 1, 1,
-		32, 1, 1,
-		0, q1_args[:], loc)
+
+	// If a previous Q4_K matmul already quantized this exact input within the
+	// current forward (q/k/v sharing input_norm output, gate/up sharing
+	// pre_ff_norm output), reuse its q8_1 buffer. Saves ~half the
+	// quantize_q8_1 dispatches per token on Gemma-shaped models.
+	q8: cuda.DevicePtr
+	if cached, ok := gctx.q8_1_cache[xp]; ok {
+		q8 = cached
+	} else {
+		q8 = _activation_alloc(gctx, u64(q8_byte_count), loc)
+		q1_args := [?]rawptr{ &xp, &q8, &K }
+		_dispatch(_quantize_q8_1_pipeline,
+			u32(q8_block_count), 1, 1,
+			32, 1, 1,
+			0, q1_args[:], loc)
+		gctx.q8_1_cache[xp] = q8
+	}
 
 	// Stage 2: q4_k weight x q8_1 activation -> bf16 output row.
 	wp := data(weight).ptr
@@ -241,8 +252,62 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	mmvq_args := [?]rawptr{ &q8, &wp, &yp, &M, &K, &N }
 	_dispatch(_linear_q4_k_mmvq_pipeline,
 		u32(output_size / Q4_K_MMVQ_ROWS_PER_WG), 1, 1,
-		32, 1, 1,
+		32, 4, 1,
 		0, mmvq_args[:], loc)
+}
+
+// Fused FFN front-half (gate + up + GEGLU) over Q4_K weights, decode (M=1).
+// Mirrors `_linear_q4_k_forward` but consumes two weight tensors and emits
+// `gelu(gate) * up` directly, eliminating one Q4_K dispatch and the
+// downstream `gelu_mul_bf16` per layer.
+_linear_q4_k_gate_up_geglu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	input       := op.input
+	v           := op.variant.(ml.Linear_Q4_K_Gate_Up_Geglu)
+	w_gate      := v.w_gate
+	w_up        := v.w_up
+	output      := op.output
+	output_size := w_gate.shape[0]
+	input_size  := w_gate.shape[1]
+	count       := ml.len(input) / input_size
+
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE  == 0, "linear_q4_k_gate_up_geglu: K must be a multiple of 256, got %v", input_size, loc=loc)
+	fmt.assertf(output_size % Q4_K_MMVQ_ROWS_PER_WG == 0, "linear_q4_k_gate_up_geglu: N must be a multiple of %v, got %v", Q4_K_MMVQ_ROWS_PER_WG, output_size, loc=loc)
+	fmt.assertf(count == 1, "cuda linear_q4_k_gate_up_geglu requires M=1 (decode); got M=%v", count, loc=loc)
+
+	if _quantize_q8_1_pipeline                      == nil { _quantize_q8_1_pipeline                      = _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC,             "quantize_q8_1_bf16.cu",             "quantize_q8_1_bf16") }
+	if _linear_q4_k_gate_up_geglu_bf16_pipeline     == nil { _linear_q4_k_gate_up_geglu_bf16_pipeline     = _compile_pipeline(LINEAR_Q4_K_GATE_UP_GEGLU_BF16_SRC, "linear_q4_k_gate_up_geglu_bf16.cu", "linear_q4_k_gate_up_geglu_bf16") }
+
+	gctx := _gctx(loc)
+
+	q8_block_count := input_size / Q8_1_BLOCK_ELEMS
+	q8_byte_count  := q8_block_count * Q8_1_BLOCK_BYTES
+
+	xp := data(input).ptr
+	K  := i32(input_size)
+
+	q8: cuda.DevicePtr
+	if cached, ok := gctx.q8_1_cache[xp]; ok {
+		q8 = cached
+	} else {
+		q8 = _activation_alloc(gctx, u64(q8_byte_count), loc)
+		q1_args := [?]rawptr{ &xp, &q8, &K }
+		_dispatch(_quantize_q8_1_pipeline,
+			u32(q8_block_count), 1, 1,
+			32, 1, 1,
+			0, q1_args[:], loc)
+		gctx.q8_1_cache[xp] = q8
+	}
+
+	wgp := data(w_gate).ptr
+	wup := data(w_up).ptr
+	yp  := data(output).ptr
+	M   := i32(count)
+	N   := i32(output_size)
+	args := [?]rawptr{ &q8, &wgp, &wup, &yp, &M, &K, &N }
+	_dispatch(_linear_q4_k_gate_up_geglu_bf16_pipeline,
+		u32(output_size / Q4_K_MMVQ_ROWS_PER_WG), 1, 1,
+		32, 4, 1,
+		0, args[:], loc)
 }
 
 _add_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -577,7 +642,7 @@ _linear_q6_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	args := [?]rawptr{ &xp, &wp, &yp, &M, &K, &N }
 	_dispatch(_linear_q6_k_gemv_pipeline,
 		u32(output_size / Q4_K_MMVQ_ROWS_PER_WG), 1, 1,
-		32, 1, 1,
+		32, 4, 1,
 		0, args[:], loc)
 }
 

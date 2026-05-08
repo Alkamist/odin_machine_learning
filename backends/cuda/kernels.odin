@@ -46,6 +46,7 @@ ROPE_BF16_SRC        :: #load("kernels/rope/rope_bf16.cu",         []u8)
 
 QUANTIZE_Q8_1_BF16_SRC :: #load("kernels/linear/quantize_q8_1_bf16.cu", []u8)
 LINEAR_Q4_K_MMVQ_SRC   :: #load("kernels/linear/linear_q4_k_mmvq.cu",   []u8)
+LINEAR_Q4_K_GATE_UP_GEGLU_BF16_SRC :: #load("kernels/linear/linear_q4_k_gate_up_geglu_bf16.cu", []u8)
 LINEAR_Q6_K_GEMV_SRC   :: #load("kernels/linear/linear_q6_k_gemv.cu",   []u8)
 
 ATTENTION_BF16_SRC       :: #load("kernels/attention/attention_bf16.cu",       []u8)
