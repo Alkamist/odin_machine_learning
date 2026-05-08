@@ -26,7 +26,7 @@ main :: proc() {
 		action = game.human_action(action)
 
 		for utility.fixed_timestep(&timestep, game.FIXED_DELTA) {
-			_, done := game.step(&game_state, action, game.FIXED_DELTA)
+			_, done, _ := game.step(&game_state, action, game.FIXED_DELTA)
 			if done {
 				game.reset(&game_state)
 			}

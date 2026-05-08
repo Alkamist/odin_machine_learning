@@ -36,10 +36,10 @@ main :: proc() {
 	model := model_make()
 	defer model_destroy(model)
 
-	training_set := mnist_load("../data/mnist_train.csv", 60000)
+	training_set := mnist_load("examples/data/mnist_train.csv", 60000)
 	defer mnist_destroy(training_set)
 
-	validation_set := mnist_load("../data/mnist_test.csv", 10000)
+	validation_set := mnist_load("examples/data/mnist_test.csv", 10000)
 	defer mnist_destroy(validation_set)
 
 	// Create an order to shuffle so that we can train on

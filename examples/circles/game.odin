@@ -91,7 +91,7 @@ reset :: proc(state: ^State) {
 	state.goal     = state.position + utility.rotate([2]f32{0, 200}, rand.float32_range(0, math.PI * 2))
 }
 
-step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done: bool) {
+step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done: bool, truncated: bool) {
 	state.time += delta
 
 	switch action {
@@ -114,7 +114,8 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done: b
         if state.score > state.high_score {
             state.high_score = state.score
         }
-        done = true
+        done      = true
+        truncated = true
     }
 
 	return

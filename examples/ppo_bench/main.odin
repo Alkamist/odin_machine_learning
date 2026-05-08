@@ -1,10 +1,12 @@
-// In this example, Proximal Policy Optimization is used to
-// train a Multilayer Perceptron to play either CartPole or
-// Circles, based on the import.
+// Benchmark harness for PPO on CartPole.
 //
-// Comment or uncomment train or play to train a model and
-// save it to a file, or load a model from a file and play
-// with it.
+// Mirrors examples/ppo/main.odin but:
+//   - Seeds rand for reproducibility.
+//   - Selects a variant at runtime so we can compare correctness fixes.
+//   - Emits CSV: seed,variant,step,wall_seconds,score
+//
+// Usage:
+//   ppo_bench --seed N --variant {baseline,no_vclip,epochs4,both} --steps S [--solve-stop]
 
 package main
 
@@ -13,7 +15,8 @@ import "core:fmt"
 import "core:math"
 import "core:math/rand"
 import "core:slice"
-import "core:encoding/json"
+import "core:time"
+import "core:strconv"
 import "../utility"
 import ml "../../"
 import cpu "../../backends/cpu"
@@ -21,94 +24,116 @@ import "../../networks/mlp"
 
 import game "../cartpole"
 
-MODEL_FILE :: "model.json"
+Variant :: enum {
+	Baseline,
+	No_Vclip,
+	Epochs4,
+	Both,
+}
 
-STEPS         :: 5000  // How many steps until training is done, also decays learning rate.
-EPOCHS        :: 4     // Pass over the frames of each step this many times. Typically 1-10.
-TRAJECTORIES  :: 32    // Learn from this many games each PPO step.
-LEARNING_RATE :: 0.001 // How fast the model should learn.
-PERIOD        :: 128   // How many frames to accumulate gradients for.
+DEFAULT_STEPS :: 5000
 
-HIDDEN_SIZE :: 128 // How powerful the multilayer perceptron is.
+TRAJECTORIES  :: 32
+LEARNING_RATE :: 0.001
+PERIOD        :: 128
 
-EVALUATION_GAMES    :: 1  // How many games to evaluate the model on.
-EVALUATION_INTERVAL :: 5 // How often to evaluate the model.
+HIDDEN_SIZE :: 128
 
-GAMMA              :: 0.99 // How much future rewards are worth relative to immediate ones.
-LAMBDA             :: 0.95 // How much future rewards contribute to advantage estimates.
-CLIP_EPSILON       :: 0.2  // How much the policy is allowed to change each update.
-VALUE_CLIP_EPSILON :: 0.5  // How much the value function is allowed to change each update.
-ENTROPY            :: 0.01 // How much is exploration encouraged.
+EVALUATION_GAMES    :: 1
+EVALUATION_INTERVAL :: 25
+
+GAMMA              :: 0.99
+LAMBDA             :: 0.95
+CLIP_EPSILON       :: 0.2
+VALUE_CLIP_EPSILON :: 0.5
+ENTROPY            :: 0.01
+
+g_seed:       u64
+g_variant:    Variant = .Baseline
+g_steps:      int     = DEFAULT_STEPS
+g_solve_stop: bool
 
 main :: proc() {
-	defer fmt.println("Finished")
+	parse_args()
 
-	cpu.set_thread_count(1)
+	rand.reset(g_seed)
 
 	ctx := cpu.context_create(1024 * 1024)
 	defer cpu.context_destroy(ctx)
-
 	ml.context_scope(ctx)
 
 	train()
-	// play()
+}
+
+parse_args :: proc() {
+	args := os.args
+	i := 1
+	for i < len(args) {
+		arg := args[i]
+		switch arg {
+		case "--seed":
+			i += 1
+			val, ok := strconv.parse_u64(args[i])
+			if !ok do panic("bad --seed")
+			g_seed = val
+		case "--variant":
+			i += 1
+			switch args[i] {
+			case "baseline": g_variant = .Baseline
+			case "no_vclip": g_variant = .No_Vclip
+			case "epochs4":  g_variant = .Epochs4
+			case "both":     g_variant = .Both
+			case: panic("bad --variant")
+			}
+		case "--steps":
+			i += 1
+			val, ok := strconv.parse_int(args[i])
+			if !ok do panic("bad --steps")
+			g_steps = val
+		case "--solve-stop":
+			g_solve_stop = true
+		case:
+			fmt.eprintfln("unknown arg: %s", arg)
+			os.exit(1)
+		}
+		i += 1
+	}
+}
+
+variant_name :: proc(v: Variant) -> string {
+	switch v {
+	case .Baseline: return "baseline"
+	case .No_Vclip: return "no_vclip"
+	case .Epochs4:  return "epochs4"
+	case .Both:     return "both"
+	}
+	return "?"
 }
 
 train :: proc() {
 	model := model_make()
 	defer model_destroy(&model)
 
+	start := time.tick_now()
+
 	for {
 		defer free_all(context.temp_allocator)
 
-		if model.step >= STEPS {
-			evaluate(&model, MODEL_FILE)
+		if model.step >= g_steps {
 			break
 		}
 
 		improve(&model)
 
 		if model.step % EVALUATION_INTERVAL == 0 {
-			score := evaluate(&model, MODEL_FILE)
-			fmt.printfln("%v Score: %.2f", model.step, score)
+			score    := evaluate(&model)
+			elapsed  := time.duration_seconds(time.tick_diff(start, time.tick_now()))
+			fmt.printfln("%d,%s,%d,%.3f,%.4f", g_seed, variant_name(g_variant), model.step, elapsed, score)
 
-			if score >= game.SOLVE_SCORE {
+			if g_solve_stop && score >= game.SOLVE_SCORE {
 				break
 			}
 		}
-	}
-}
-
-play :: proc() {
-	model := model_load(MODEL_FILE)
-	defer model_destroy(&model)
-
-	timestep: utility.Fixed_Timestep
-
-	game_state := &model.game_state
-
-	game_state.high_score = 0
-	game.reset(game_state)
-
-	game.open_window()
-	defer game.close_window()
-
-	for !game.window_should_close() {
-		defer free_all(context.temp_allocator)
-
-		game.begin_frame()
-
-		for utility.fixed_timestep(&timestep, game.FIXED_DELTA) {
-			action, _  := choose_action(model.actor, game.embedding(game_state^))
-			_, done, _ := game.step(game_state, action, game.FIXED_DELTA)
-			if done {
-				game.reset(game_state)
-			}
-		}
-
-		game.draw(game_state^, timestep.interpolation, is_human=true)
-
-		game.end_frame()
 	}
 }
 
@@ -143,24 +168,13 @@ network_update :: proc(opt: ml.Optimizer, network: Network) {
 	mlp.update(opt, network.mlp)
 }
 
-Checkpoint :: struct {
-	actor:  Network,
-	critic: Network,
-
-	opt: ml.Optimizer,
-
-	step:       int,
-	best_score: f32,
-}
-
 Model :: struct {
 	actor:  Network,
 	critic: Network,
 
 	opt: ml.Optimizer,
 
-	step:       int,
-	best_score: f32,
+	step: int,
 
 	game_state: game.State,
 	frames:     [dynamic]Frame,
@@ -177,33 +191,6 @@ model_make :: proc(allocator := context.allocator) -> (model: Model) {
 	return
 }
 
-model_load :: proc(file_name: string, allocator := context.allocator) -> (model: Model) {
-	data, file_err := os.read_entire_file(file_name, allocator=context.temp_allocator)
-	if file_err != nil {
-		fmt.println("Failed to load model file")
-		return model_make()
-	}
-
-	checkpoint: Checkpoint
-	json_err := json.unmarshal(data, &checkpoint, allocator=allocator)
-	if json_err != nil {
-		fmt.println("Failed to unmarshal model from JSON")
-		return model_make()
-	}
-
-	model.actor      = checkpoint.actor
-	model.critic     = checkpoint.critic
-	model.opt        = checkpoint.opt
-	model.step       = checkpoint.step
-	model.best_score = checkpoint.best_score
-
-	model.frames = make([dynamic]Frame, 0, 60 * 60 * TRAJECTORIES, allocator=allocator)
-
-	game.init(&model.game_state)
-
-	return
-}
-
 model_destroy :: proc(model: ^Model) {
 	network_destroy(model.actor)
 	network_destroy(model.critic)
@@ -211,23 +198,6 @@ model_destroy :: proc(model: ^Model) {
 	delete(model.frames)
 
 	game.destroy(&model.game_state)
-}
-
-model_save :: proc(model: Model, file_name: string) {
-	checkpoint := Checkpoint{
-		actor      = model.actor,
-		critic     = model.critic,
-		opt        = model.opt,
-		step       = model.step,
-		best_score = model.best_score,
-	}
-
-	data, json_err := json.marshal(checkpoint)
-	if json_err != nil {
-		return
-	}
-
-	_ = os.write_entire_file(file_name, data)
 }
 
 choose_action :: proc(network: Network, embedding: game.Embedding, sample := false) -> (action: game.Action, log_probability: f32) {
@@ -268,8 +238,8 @@ record_trajectory :: proc(model: ^Model) {
 
 	start_index := len(model.frames)
 
-	bootstrap:      f32
-	truncated_end:  bool
+	bootstrap:     f32
+	truncated_end: bool
 
 	for {
 		frame: Frame
@@ -287,9 +257,6 @@ record_trajectory :: proc(model: ^Model) {
 		append(&model.frames, frame)
 
 		if done {
-			// On truncation the episode was cut short rather than ended,
-			// so bootstrap the final return with the critic's estimate of
-			// the state we landed in.
 			if truncated {
 				ml.clear()
 				bootstrap     = predict_value(model.critic, game.embedding(model.game_state))
@@ -334,7 +301,6 @@ normalize_advantages :: proc(model: Model) {
 	}
 	std := math.sqrt(sum / f32(count))
 
-	// Small epsilon to prevent division by zero.
 	if std > 1e-8 {
 		for &frame in model.frames {
 			frame.advantage = (frame.advantage - mean) / std
@@ -357,17 +323,11 @@ play_game :: proc(model: ^Model) -> (score: f32) {
 	return
 }
 
-evaluate :: proc(model: ^Model, save_file: string) -> (score: f32) {
+evaluate :: proc(model: ^Model) -> (score: f32) {
 	for _ in 0 ..< EVALUATION_GAMES {
 		score += play_game(model)
 	}
 	score /= f32(EVALUATION_GAMES)
-
-	if score > model.best_score {
-		model.best_score = score
-		model_save(model^, save_file)
-	}
-
 	return
 }
 
@@ -380,13 +340,20 @@ improve :: proc(model: ^Model) {
 
 	normalize_advantages(model^)
 
-	lr := utility.linear_learning_rate(LEARNING_RATE, 0, model.step, STEPS)
+	lr := utility.linear_learning_rate(LEARNING_RATE, 0, model.step, g_steps)
 
-	for _ in 0 ..< EPOCHS {
+	epochs := 1
+	if g_variant == .Epochs4 || g_variant == .Both {
+		epochs = 4
+	}
+
+	use_value_clip := g_variant == .Baseline || g_variant == .Epochs4
+
+	for _ in 0 ..< epochs {
 		rand.shuffle(model.frames[:])
 
 		for &frame in model.frames {
-			// Calculate actor gradients.
+			// Actor.
 			ml.clear()
 
 			logits            := network_forward(model.actor, frame.embedding[:])
@@ -411,18 +378,24 @@ improve :: proc(model: ^Model) {
 
 			ml.backward()
 
-			// Calculate critic gradients.
+			// Critic.
 			ml.clear()
 
-			value         := network_forward(model.critic, frame.embedding[:])
-			clipped_value := ml.clamp(value, frame.value - VALUE_CLIP_EPSILON, frame.value + VALUE_CLIP_EPSILON)
-
+			value  := network_forward(model.critic, frame.embedding[:])
 			target := ml.scalar(.F32, frame.discounted_return)
 
-			unclipped_loss := ml.mean_squared_error(value,         target)
-			clipped_loss   := ml.mean_squared_error(clipped_value, target)
+			critic_loss: ml.Tensor
+			if use_value_clip {
+				clipped_value := ml.clamp(value, frame.value - VALUE_CLIP_EPSILON, frame.value + VALUE_CLIP_EPSILON)
 
-			critic_loss := ml.max(unclipped_loss, clipped_loss)
+				unclipped_loss := ml.mean_squared_error(value,         target)
+				clipped_loss   := ml.mean_squared_error(clipped_value, target)
+
+				critic_loss = ml.max(unclipped_loss, clipped_loss)
+			} else {
+				critic_loss = ml.mean_squared_error(value, target)
+			}
+			_ = critic_loss
 
 			ml.backward()
 

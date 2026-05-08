@@ -1,10 +1,8 @@
-// In this example, Proximal Policy Optimization is used to
-// train a Multilayer Perceptron to play either CartPole or
-// Circles, based on the import.
-//
-// Comment or uncomment train or play to train a model and
-// save it to a file, or load a model from a file and play
-// with it.
+// Parallel variant of the PPO example. Trajectory collection is the
+// only phase that runs across multiple host threads: each worker owns
+// its own ml.Context, game state, and frame buffer, and reads the
+// shared actor/critic weights for inference. The learning phase stays
+// single-threaded so the optimizer state remains coherent.
 
 package main
 
@@ -13,10 +11,13 @@ import "core:fmt"
 import "core:math"
 import "core:math/rand"
 import "core:slice"
+import "core:sync"
+import "core:thread"
 import "core:encoding/json"
 import "../utility"
 import ml "../../"
 import cpu "../../backends/cpu"
+import gpu "../../backends/gpu"
 import "../../networks/mlp"
 
 import game "../cartpole"
@@ -29,10 +30,13 @@ TRAJECTORIES  :: 32    // Learn from this many games each PPO step.
 LEARNING_RATE :: 0.001 // How fast the model should learn.
 PERIOD        :: 128   // How many frames to accumulate gradients for.
 
+PARALLEL_INSTANCES :: 8
+WORKER_ARENA_SIZE  :: 1 * 1024 * 1024
+
 HIDDEN_SIZE :: 128 // How powerful the multilayer perceptron is.
 
-EVALUATION_GAMES    :: 1  // How many games to evaluate the model on.
-EVALUATION_INTERVAL :: 5 // How often to evaluate the model.
+EVALUATION_GAMES    :: 1 // How many games to evaluate the model on.
+EVALUATION_INTERVAL :: 1 // How often to evaluate the model.
 
 GAMMA              :: 0.99 // How much future rewards are worth relative to immediate ones.
 LAMBDA             :: 0.95 // How much future rewards contribute to advantage estimates.
@@ -43,10 +47,13 @@ ENTROPY            :: 0.01 // How much is exploration encouraged.
 main :: proc() {
 	defer fmt.println("Finished")
 
-	cpu.set_thread_count(1)
+	// cpu.set_thread_count(24)
 
 	ctx := cpu.context_create(1024 * 1024)
 	defer cpu.context_destroy(ctx)
+
+	// ctx := gpu.context_create()
+	// defer gpu.context_destroy(ctx)
 
 	ml.context_scope(ctx)
 
@@ -58,6 +65,9 @@ train :: proc() {
 	model := model_make()
 	defer model_destroy(&model)
 
+	pool := pool_make(&model)
+	defer pool_destroy(pool)
+
 	for {
 		defer free_all(context.temp_allocator)
 
@@ -66,7 +76,7 @@ train :: proc() {
 			break
 		}
 
-		improve(&model)
+		improve(&model, pool)
 
 		if model.step % EVALUATION_INTERVAL == 0 {
 			score := evaluate(&model, MODEL_FILE)
@@ -224,10 +234,15 @@ model_save :: proc(model: Model, file_name: string) {
 
 	data, json_err := json.marshal(checkpoint)
 	if json_err != nil {
+		fmt.eprintfln("Failed to marshal json: %v",json_err)
 		return
 	}
 
-	_ = os.write_entire_file(file_name, data)
+	file_err := os.write_entire_file(file_name, data)
+	if file_err != nil {
+		fmt.eprintfln("Failed to save model file: %v", file_err)
+		return
+	}
 }
 
 choose_action :: proc(network: Network, embedding: game.Embedding, sample := false) -> (action: game.Action, log_probability: f32) {
@@ -263,36 +278,119 @@ predict_value :: proc(network: Network, embedding: game.Embedding) -> f32 {
 	return value[0]
 }
 
-record_trajectory :: proc(model: ^Model) {
-	game.reset(&model.game_state)
+Pool :: struct {
+	workers:  []^Worker,
+	done_wg:  sync.Wait_Group,
+	shutdown: bool,
+}
 
-	start_index := len(model.frames)
+Worker :: struct {
+	pool:       ^Pool,
+	thread:     ^thread.Thread,
+	start_sem:  sync.Sema,
 
-	bootstrap:      f32
-	truncated_end:  bool
+	ctx:        ^ml.Context,
+	game_state: game.State,
+	frames:     [dynamic]Frame,
+
+	actor:  Network,
+	critic: Network,
+
+	start, end: int,
+}
+
+pool_make :: proc(model: ^Model) -> ^Pool {
+	pool         := new(Pool)
+	pool.workers  = make([]^Worker, PARALLEL_INSTANCES)
+	for i in 0 ..< PARALLEL_INSTANCES {
+		w     := new(Worker)
+		w.pool = pool
+		w.ctx  = cpu.context_create(WORKER_ARENA_SIZE)
+		w.actor  = model.actor
+		w.critic = model.critic
+		w.frames = make([dynamic]Frame, 0, 60 * 60 * TRAJECTORIES / PARALLEL_INSTANCES + 60 * 60)
+		game.init(&w.game_state)
+		pool.workers[i] = w
+	}
+
+	when PARALLEL_INSTANCES > 1 {
+		for w in pool.workers {
+			w.thread      = thread.create(worker_loop)
+			w.thread.data = w
+			thread.start(w.thread)
+		}
+	}
+
+	return pool
+}
+
+pool_destroy :: proc(pool: ^Pool) {
+	when PARALLEL_INSTANCES > 1 {
+		pool.shutdown = true
+		for w in pool.workers {
+			sync.sema_post(&w.start_sem)
+		}
+		for w in pool.workers {
+			thread.join(w.thread)
+			thread.destroy(w.thread)
+		}
+	}
+
+	for w in pool.workers {
+		game.destroy(&w.game_state)
+		delete(w.frames)
+		cpu.context_destroy(w.ctx)
+		free(w)
+	}
+	delete(pool.workers)
+	free(pool)
+}
+
+worker_loop :: proc(t: ^thread.Thread) {
+	w := cast(^Worker)t.data
+
+	ml.context_scope(w.ctx)
+
+	for {
+		sync.sema_wait(&w.start_sem)
+		if w.pool.shutdown do return
+
+		for _ in w.start ..< w.end {
+			record_trajectory_into(w)
+			free_all(context.temp_allocator)
+		}
+
+		sync.wait_group_done(&w.pool.done_wg)
+	}
+}
+
+record_trajectory_into :: proc(w: ^Worker) {
+	game.reset(&w.game_state)
+
+	start_index := len(w.frames)
+
+	bootstrap:     f32
+	truncated_end: bool
 
 	for {
 		frame: Frame
 
-		frame.embedding = game.embedding(model.game_state)
+		frame.embedding = game.embedding(w.game_state)
 
 		ml.clear()
-		frame.value = predict_value(model.critic, frame.embedding)
+		frame.value = predict_value(w.critic, frame.embedding)
 
-		frame.action, frame.log_probability = choose_action(model.actor, frame.embedding, sample=true)
+		frame.action, frame.log_probability = choose_action(w.actor, frame.embedding, sample=true)
 
 		done, truncated: bool
-		frame.reward, done, truncated = game.step(&model.game_state, frame.action, game.FIXED_DELTA)
+		frame.reward, done, truncated = game.step(&w.game_state, frame.action, game.FIXED_DELTA)
 
-		append(&model.frames, frame)
+		append(&w.frames, frame)
 
 		if done {
-			// On truncation the episode was cut short rather than ended,
-			// so bootstrap the final return with the critic's estimate of
-			// the state we landed in.
 			if truncated {
 				ml.clear()
-				bootstrap     = predict_value(model.critic, game.embedding(model.game_state))
+				bootstrap     = predict_value(w.critic, game.embedding(w.game_state))
 				truncated_end = true
 			}
 			break
@@ -300,21 +398,21 @@ record_trajectory :: proc(model: ^Model) {
 	}
 
 	gae: f32
-	for i := len(model.frames) - 1; i >= start_index; i -= 1 {
-		value: f32 = model.frames[i].value
+	for i := len(w.frames) - 1; i >= start_index; i -= 1 {
+		value: f32 = w.frames[i].value
 
 		next_value: f32
-		if i + 1 < len(model.frames) {
-			next_value = model.frames[i + 1].value
+		if i + 1 < len(w.frames) {
+			next_value = w.frames[i + 1].value
 		} else if truncated_end {
 			next_value = bootstrap
 		}
 
-		delta := model.frames[i].reward + GAMMA * next_value - value
+		delta := w.frames[i].reward + GAMMA * next_value - value
 		gae    = delta + GAMMA * LAMBDA * gae
 
-		model.frames[i].advantage         = gae
-		model.frames[i].discounted_return = value + gae
+		w.frames[i].advantage         = gae
+		w.frames[i].discounted_return = value + gae
 	}
 }
 
@@ -365,18 +463,53 @@ evaluate :: proc(model: ^Model, save_file: string) -> (score: f32) {
 
 	if score > model.best_score {
 		model.best_score = score
-		model_save(model^, save_file)
+		// model_save(model^, save_file)
 	}
 
 	return
 }
 
-improve :: proc(model: ^Model) {
+collect_trajectories :: proc(model: ^Model, pool: ^Pool) {
 	clear(&model.frames)
 
-	for _ in 0 ..< TRAJECTORIES {
-		record_trajectory(model)
+	for w, i in pool.workers {
+		clear(&w.frames)
+		// Even split with the remainder spread across the first few workers.
+		base      := TRAJECTORIES / PARALLEL_INSTANCES
+		remainder := TRAJECTORIES % PARALLEL_INSTANCES
+		w.start = i * base + min(i, remainder)
+		w.end   = w.start + base + (1 if i < remainder else 0)
 	}
+
+	when PARALLEL_INSTANCES <= 1 {
+		// Single-instance path runs inline on the main thread to avoid
+		// any synchronization cost.
+		ml.context_scope(pool.workers[0].ctx)
+		for _ in pool.workers[0].start ..< pool.workers[0].end {
+			record_trajectory_into(pool.workers[0])
+			free_all(context.temp_allocator)
+		}
+	} else {
+		active := 0
+		for w in pool.workers do if w.start < w.end do active += 1
+		sync.wait_group_add(&pool.done_wg, active)
+		for w in pool.workers {
+			if w.start < w.end {
+				sync.sema_post(&w.start_sem)
+			}
+		}
+		sync.wait_group_wait(&pool.done_wg)
+	}
+
+	for w in pool.workers {
+		for frame in w.frames {
+			append(&model.frames, frame)
+		}
+	}
+}
+
+improve :: proc(model: ^Model, pool: ^Pool) {
+	collect_trajectories(model, pool)
 
 	normalize_advantages(model^)
 

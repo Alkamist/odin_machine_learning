@@ -152,6 +152,13 @@ when thread.IS_SUPPORTED {
 			return
 		}
 
+		if _thread_count <= 1 || task_count <= 1 {
+			for i in 0 ..< job_count {
+				job(i, data)
+			}
+			return
+		}
+
 		sync.mutex_lock(&_pool_mutex)
 		defer sync.mutex_unlock(&_pool_mutex)
 

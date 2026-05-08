@@ -226,7 +226,7 @@ reset :: proc(state: ^State) {
 	state.revolute_joint      = b2.CreateRevoluteJoint(state.world, revolute_def)
 }
 
-step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done: bool) {
+step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done: bool, truncated: bool) {
 	state.time += delta
 
 	// Apply a force to the cart based on action.
@@ -274,12 +274,14 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done: b
 		}
 	}
 
-	// Game-ending conditions.
+	// Game-ending conditions. Wall hits are real terminations; the time
+	// limit is a truncation, so callers can bootstrap value estimates.
 	if wall_hit || state.time > TIME_LIMIT {
 		if state.score > state.high_score {
 			state.high_score = state.score
 		}
-		done = true
+		done      = true
+		truncated = !wall_hit
 	}
 
 	return

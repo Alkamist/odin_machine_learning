@@ -17,6 +17,7 @@
 
 - Odin is C alternative language with manual memory management. 
 - Odin is NOT Go.
+- Use `odin check` to quickly check for errors.
 
 ### Packages
 

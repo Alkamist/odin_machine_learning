@@ -63,11 +63,11 @@ main :: proc() {
 			// Poll the human's action, add the human's game state and action
 			// to the replay buffer, and then step the human's game state.
 			add_frame(replay_buffer, Frame{game.embedding(human_game_state), human_action})
-			_, human_done := game.step(&human_game_state, human_action, game.FIXED_DELTA)
+			_, human_done, _ := game.step(&human_game_state, human_action, game.FIXED_DELTA)
 
 			// Sample the agent's action and step the agent's game state.
 			agent_action  := model_choose_action(model, game.embedding(agent_game_state))
-			_, agent_done := game.step(&agent_game_state, agent_action, game.FIXED_DELTA)
+			_, agent_done, _ := game.step(&agent_game_state, agent_action, game.FIXED_DELTA)
 
 			if human_done {
 				game.reset(&human_game_state)
