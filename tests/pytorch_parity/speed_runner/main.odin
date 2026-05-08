@@ -1,4 +1,4 @@
-package pytorch_parity_speed_runner
+﻿package pytorch_parity_speed_runner
 
 import "base:builtin"
 
@@ -10,7 +10,7 @@ import "core:math/rand"
 
 import ml  "../../.."
 import cpu "../../../backends/cpu"
-import gpu "../../../backends/gpu"
+import gpu "../../../backends/vulkan"
 import mlp "../../../networks/mlp"
 
 SEED       :: 0xC0FFEE

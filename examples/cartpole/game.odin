@@ -90,7 +90,7 @@ Box :: struct {
 	rotation_: f32,    // Previous rotation for visual interpolation
 }
 
-make_box :: proc(state: State, type: b2.BodyType, position, size: [2]f32, density: f32, category: Category_Set = {.Normal}, mask: Category_Set = {.Normal}) -> (box: Box) {
+box_make :: proc(state: State, type: b2.BodyType, position, size: [2]f32, density: f32, category: Category_Set = {.Normal}, mask: Category_Set = {.Normal}) -> (box: Box) {
 	box.size      = size
 	box.position_ = position
 
@@ -112,17 +112,17 @@ make_box :: proc(state: State, type: b2.BodyType, position, size: [2]f32, densit
 	return
 }
 
-destroy_box :: proc(box: Box) {
+box_destroy :: proc(box: Box) {
 	if box.shape != {} do b2.DestroyShape(box.shape, true)
 	if box.body  != {} do b2.DestroyBody(box.body)
 }
 
-update_box :: proc(box: ^Box) {
+box_update :: proc(box: ^Box) {
 	box.position_ = b2.Body_GetPosition(box.body)
 	box.rotation_ = -rl.RAD2DEG * b2.Rot_GetAngle(b2.Body_GetRotation(box.body))
 }
 
-draw_box :: proc(box: Box, color: rl.Color, interpolation: f32) {
+box_draw :: proc(box: Box, color: rl.Color, interpolation: f32) {
 	position := math.lerp(box.position_, b2.Body_GetPosition(box.body), interpolation)
 	rotation := utility.lerp_angle(box.rotation_, -rl.RAD2DEG * b2.Rot_GetAngle(b2.Body_GetRotation(box.body)), interpolation)
 	rl.DrawRectanglePro(
@@ -176,10 +176,10 @@ destroy :: proc(state: ^State) {
 	if state.revolute_joint  != {} do b2.DestroyJoint(state.revolute_joint)
 	if state.prismatic_joint != {} do b2.DestroyJoint(state.prismatic_joint)
 	if state.anchor_body     != {} do b2.DestroyBody(state.anchor_body)
-	destroy_box(state.pole)
-	destroy_box(state.cart)
-	destroy_box(state.left_wall)
-	destroy_box(state.right_wall)
+	box_destroy(state.pole)
+	box_destroy(state.cart)
+	box_destroy(state.left_wall)
+	box_destroy(state.right_wall)
 	b2.DestroyWorld(state.world)
 }
 
@@ -187,10 +187,10 @@ reset :: proc(state: ^State) {
 	if state.revolute_joint  != {} do b2.DestroyJoint(state.revolute_joint)
 	if state.prismatic_joint != {} do b2.DestroyJoint(state.prismatic_joint)
 	if state.anchor_body     != {} do b2.DestroyBody(state.anchor_body)
-	destroy_box(state.cart)
-	destroy_box(state.pole)
-	destroy_box(state.left_wall)
-	destroy_box(state.right_wall)
+	box_destroy(state.cart)
+	box_destroy(state.pole)
+	box_destroy(state.left_wall)
+	box_destroy(state.right_wall)
 
 	state.time     = 0
 	state.score    = 0
@@ -201,12 +201,12 @@ reset :: proc(state: ^State) {
 	anchor_def.position = {0, 0}
 	state.anchor_body   = b2.CreateBody(state.world, anchor_def)
 
-	state.cart = make_box(state^, .dynamicBody, {0, 0}, CART_SIZE, 5)
-	state.pole = make_box(state^, .dynamicBody, {0, -POLE_SIZE.y * 0.5}, POLE_SIZE, 2, category={.Pole}, mask={})
+	state.cart = box_make(state^, .dynamicBody, {0, 0}, CART_SIZE, 5)
+	state.pole = box_make(state^, .dynamicBody, {0, -POLE_SIZE.y * 0.5}, POLE_SIZE, 2, category={.Pole}, mask={})
 
 	// Create walls.
-	state.left_wall  = make_box(state^, .staticBody, {-CART_LIMIT, 0}, WALL_SIZE, 0)
-	state.right_wall = make_box(state^, .staticBody, { CART_LIMIT, 0}, WALL_SIZE, 0)
+	state.left_wall  = box_make(state^, .staticBody, {-CART_LIMIT, 0}, WALL_SIZE, 0)
+	state.right_wall = box_make(state^, .staticBody, { CART_LIMIT, 0}, WALL_SIZE, 0)
 
 	// Create prismatic joint to constrain cart movement.
 	prismatic_def                 := b2.DefaultPrismaticJointDef()
@@ -226,7 +226,7 @@ reset :: proc(state: ^State) {
 	state.revolute_joint      = b2.CreateRevoluteJoint(state.world, revolute_def)
 }
 
-step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done: bool, truncated: bool) {
+step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done, truncated: bool) {
 	state.time += delta
 
 	// Apply a force to the cart based on action.
@@ -243,11 +243,11 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (reward: f32, done: b
 	b2.Body_ApplyForceToCenter(state.cart.body, {force, 0}, true)
 
 	// Update interpolation values.
-	update_box(&state.left_wall)
-	update_box(&state.right_wall)
+	box_update(&state.left_wall)
+	box_update(&state.right_wall)
 
-	update_box(&state.cart)
-	update_box(&state.pole)
+	box_update(&state.cart)
+	box_update(&state.pole)
 
 	// Step physics.
 	b2.World_Step(state.world, delta, 4)
@@ -299,8 +299,8 @@ draw :: proc(state: State, interpolation: f32, is_human := true) {
 
 	screen_top := f32(rl.GetScreenHeight()) / 2.0
 
-	draw_box(state.left_wall,  rl.RED, interpolation)
-	draw_box(state.right_wall, rl.RED, interpolation)
+	box_draw(state.left_wall,  rl.RED, interpolation)
+	box_draw(state.right_wall, rl.RED, interpolation)
 
 	cart_color  := rl.DARKBLUE
 	pole_color  := rl.GREEN
@@ -310,8 +310,8 @@ draw :: proc(state: State, interpolation: f32, is_human := true) {
 		pole_color.a  = 32
 		score_color.a = 32
 	}
-	draw_box(state.cart, cart_color, interpolation)
-	draw_box(state.pole, pole_color, interpolation)
+	box_draw(state.cart, cart_color, interpolation)
+	box_draw(state.pole, pole_color, interpolation)
 
 	position := math.lerp(state.cart.position_, b2.Body_GetPosition(state.cart.body), interpolation)
 	draw_text_centered(rl.TextFormat("%.2f", state.score), 10, position.x, position.y + 50, score_color)

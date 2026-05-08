@@ -1,4 +1,4 @@
-package machine_learning_backend_gpu
+﻿package machine_learning_backend_vulkan
 
 import "base:builtin"
 
@@ -255,7 +255,7 @@ _dispatch :: proc(
 
 	// Insert a memory barrier before every dispatch so prior shader writes
 	// and CmdFillBuffer zero-fills are visible. Per-buffer dependencies
-	// aren't tracked, so a global SHADER+TRANSFER → SHADER barrier covers
+	// aren't tracked, so a global SHADER+TRANSFER â†’ SHADER barrier covers
 	// both pipelined dispatches and alloc-time fills in the same CB.
 	cmd := gctx.batch.cmd
 	barrier := vk.MemoryBarrier{

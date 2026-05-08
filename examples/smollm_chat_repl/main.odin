@@ -1,4 +1,4 @@
-package smollm_chat_repl
+﻿package smollm_chat_repl
 
 // odin run examples/smollm_chat_repl -o:speed -- --model smollm_data/model_instruct.safetensors --cpu --threads 24 --max-tokens 200
 
@@ -14,7 +14,7 @@ import "core:time"
 
 import ml    "../.."
 import cpu   "../../backends/cpu"
-import gpu   "../../backends/gpu"
+import gpu   "../../backends/vulkan"
 import llama "../../networks/llama"
 import gpt2  "../../tokenizers/gpt2"
 

@@ -1,4 +1,4 @@
-package machine_learning_backend_gpu
+﻿package machine_learning_backend_vulkan
 
 import "core:fmt"
 import "core:mem"
@@ -83,7 +83,7 @@ _create_pooled_activation_buffer :: proc(
 		}
 		// Either size differs or arena.used has drifted (an earlier slot was
 		// rebuilt at a different size). Every slot from here on has stale
-		// offsets — destroy them all and rebuild the tail.
+		// offsets â€” destroy them all and rebuild the tail.
 		for i in gctx.activation_cursor ..< len(gctx.activation_pool) {
 			doomed := gctx.activation_pool[i]
 			vk.DestroyBuffer(_gpu.device, doomed.buf, nil)
@@ -268,7 +268,7 @@ _ensure_staging :: proc(min_size: vk.DeviceSize, loc := #caller_location) {
 }
 
 // Fill `buf` with `value` (u32 stamp). When a batch is active, ALL fills
-// must record into the batch CB — a one-shot during recording would execute
+// must record into the batch CB â€” a one-shot during recording would execute
 // on the queue before later-recorded work in the batch, clobbering writes.
 _record_fill :: proc(buf: vk.Buffer, size: vk.DeviceSize, value: u32, loc := #caller_location) {
 	gctx := _gctx(loc)
@@ -332,7 +332,7 @@ _end_one_shot :: proc(cmd: vk.CommandBuffer, loc := #caller_location) {
 	vk.FreeCommandBuffers(_gpu.device, _gctx(loc).command_pool, 1, &cmd)
 }
 
-// Copy host data → device buffer via the staging buffer. Synchronous on
+// Copy host data â†’ device buffer via the staging buffer. Synchronous on
 // purpose; uploads are not on the hot path. Flushes any active batch first
 // so prior queued writes to the buffer don't clobber the upload.
 _upload :: proc(dst: vk.Buffer, src: []byte, loc := #caller_location) {
@@ -354,8 +354,8 @@ _upload :: proc(dst: vk.Buffer, src: []byte, loc := #caller_location) {
 	_end_one_shot(cmd, loc)
 }
 
-// Copy device buffer → host data. Synchronous — when this returns, dst
-// holds the GPU's contents. If a batch is active, fold the device →
+// Copy device buffer â†’ host data. Synchronous â€” when this returns, dst
+// holds the GPU's contents. If a batch is active, fold the device â†’
 // staging copy into it and end the batch so the deferred host memcpy
 // runs (one submit total instead of two).
 _download :: proc(src: vk.Buffer, dst: []byte, loc := #caller_location) {

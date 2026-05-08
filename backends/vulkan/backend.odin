@@ -1,4 +1,4 @@
-package machine_learning_backend_gpu
+﻿package machine_learning_backend_vulkan
 
 import "base:builtin"
 import "base:runtime"
@@ -158,7 +158,7 @@ buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Lo
 	}
 
 	// Backward kernels accumulate into gradient buffers (`+=`), so any pooled
-	// slot — fresh or reused — must start at zero each forward pass.
+	// slot â€” fresh or reused â€” must start at zero each forward pass.
 	_record_fill_zero(gpu_buffer.buffer, size, loc)
 
 	return transmute(ml.Backend_Buffer)gpu_buffer
@@ -449,7 +449,7 @@ cast_backward :: proc(op: ml.Operation) {
 	if input.type == output.type {
 		// Same-type cast forward is a memcpy; backward accumulates dy into dx.
 		// No element-wise op currently does plain accumulate, but a fused
-		// path is overkill for a degenerate case — fall through to a small
+		// path is overkill for a degenerate case â€” fall through to a small
 		// add. For now: assume same-type cast is rare and just panic if it
 		// shows up in a backward pass so we notice.
 		fmt.panicf("GPU cast_backward: same-type cast not implemented")
@@ -1179,7 +1179,7 @@ linear_forward :: proc(op: ml.Operation) {
 	case .Bf16:
 		// Decode (M=1) shape: use the GEMV-shape shader. The tiled bf16 path
 		// (TILE_M=32) wastes 31/32 of M-dim compute, which is the dominant
-		// cost on Gemma 4 GGUF — lm_head reads 1.34 GB of bf16 weight per
+		// cost on Gemma 4 GGUF â€” lm_head reads 1.34 GB of bf16 weight per
 		// token, plus q_proj/k_proj. One workgroup per pair of output rows
 		// so adjacent bf16-packed writes don't collide.
 		if count == 1 && input_size % 2 == 0 && output_size % LINEAR_BF16_GEMV_ROWS_PER == 0 {
@@ -1300,7 +1300,7 @@ linear_q4_k_forward :: proc(op: ml.Operation) {
 		output_size = u32(output_size),
 	}
 
-	// Prefill (M>1): coopmat tile path. Mirrors linear_bf16_coopmat — reads X
+	// Prefill (M>1): coopmat tile path. Mirrors linear_bf16_coopmat â€” reads X
 	// as bf16 and dequantizes Q4_K -> bf16 into shared memory each K-step.
 	if count > 1 && _gpu.coopmat_bf16 &&
 	   count       % LINEAR_Q4_K_COOPMAT_BM == 0 &&
@@ -1658,7 +1658,7 @@ rmsnorm_forward :: proc(op: ml.Operation) {
 		fwd_pipe   = _rmsnorm_pipeline
 	}
 
-	// The forward shader recomputes rstd internally — the stats dispatch
+	// The forward shader recomputes rstd internally â€” the stats dispatch
 	// only writes `variant.rstd` for the backward pass to consume. Skip
 	// it during inference.
 	if .No_Gradients not_in ml.current_context().clear_flags {
@@ -2678,7 +2678,7 @@ dump_timing :: proc(loc := #caller_location) {
 	for p, stat in gctx.timing_totals {
 		append(&entries, Timing_Entry{pipeline = p, total_ns = stat.total_ns, count = stat.count})
 	}
-	// Insertion sort by total_ns desc — small N (≤ ~50 unique pipelines).
+	// Insertion sort by total_ns desc â€” small N (â‰¤ ~50 unique pipelines).
 	for i in 1 ..< builtin.len(entries) {
 		j := i
 		for j > 0 && entries[j].total_ns > entries[j - 1].total_ns {

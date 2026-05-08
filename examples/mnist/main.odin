@@ -1,4 +1,4 @@
-// In this example, a Multilayer Perceptron will learn how
+﻿// In this example, a Multilayer Perceptron will learn how
 // to look at the raw data of hand-drawn digits from the
 // MNIST dataset and predict which digits they are.
 //
@@ -15,7 +15,7 @@ import "core:encoding/csv"
 
 import ml "../../"
 import cpu "../../backends/cpu"
-import gpu "../../backends/gpu"
+import gpu "../../backends/vulkan"
 import "../../networks/mlp"
 
 BATCH_SIZE :: 1000

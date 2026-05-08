@@ -1,4 +1,4 @@
-package machine_learning_backend_gpu
+﻿package machine_learning_backend_vulkan
 
 ADD_SPIRV             :: #load("shaders/add/add.spv",             []u8)
 ADD_BACK_A_SPIRV      :: #load("shaders/add/add_back_a.spv",      []u8)

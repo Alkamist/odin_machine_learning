@@ -1,4 +1,4 @@
-// Train a ~50M-param Llama+QK-norm decoder on TinyStories with the
+﻿// Train a ~50M-param Llama+QK-norm decoder on TinyStories with the
 // SmolLM2 GPT-2 BPE tokenizer (vocab=49152). Tokens are pre-encoded
 // by `tools/tinystories_dump.py` into flat int32 binaries.
 //
@@ -15,7 +15,7 @@ import "core:os"
 import "core:time"
 
 import ml    "../../"
-import gpu   "../../backends/gpu"
+import gpu   "../../backends/vulkan"
 import llama "../../networks/llama"
 import gpt2  "../../tokenizers/gpt2"
 

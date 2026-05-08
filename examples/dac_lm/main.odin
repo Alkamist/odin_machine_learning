@@ -1,4 +1,4 @@
-// Train a small Llama+QK-norm decoder on a flat DAC token stream produced
+﻿// Train a small Llama+QK-norm decoder on a flat DAC token stream produced
 // by `tools/dac_lm_dump.py`. Vocab is 18432 (9 codebooks * 2 channels of
 // 1024, frame-interleaved with a per-slot offset). No text conditioning.
 // Periodically writes a sample of generated tokens that can be decoded
@@ -24,7 +24,7 @@ import "core:os"
 import "core:time"
 
 import ml    "../../"
-import gpu   "../../backends/gpu"
+import gpu   "../../backends/vulkan"
 import llama "../../networks/llama"
 
 DATA_DIR        :: "examples/data"

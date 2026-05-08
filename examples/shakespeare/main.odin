@@ -1,4 +1,4 @@
-// Train a small Llama-style decoder from scratch on the
+﻿// Train a small Llama-style decoder from scratch on the
 // Tiny Shakespeare corpus, byte-level. Proof of concept for
 // the training path through the GPU backend.
 
@@ -13,7 +13,7 @@ import "core:os"
 import "core:time"
 
 import ml    "../../"
-import gpu   "../../backends/gpu"
+import gpu   "../../backends/vulkan"
 import cpu   "../../backends/cpu"
 import llama "../../networks/llama"
 

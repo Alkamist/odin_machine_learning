@@ -1,4 +1,4 @@
-package gpu_unified_check
+﻿package gpu_unified_check
 
 import "core:fmt"
 import "core:os"
@@ -6,7 +6,7 @@ import "core:math"
 
 import ml  "../.."
 import cpu "../../backends/cpu"
-import gpu "../../backends/gpu"
+import gpu "../../backends/vulkan"
 
 main :: proc() {
 	any_failed := false
@@ -783,7 +783,7 @@ main :: proc() {
 			gpu.download_tensor_gradient (b, gpu_db[:])
 		}
 
-		// Reductions over k / j / i — fp32 reduction-order drift. Same bar
+		// Reductions over k / j / i â€” fp32 reduction-order drift. Same bar
 		// as `linear`.
 		TOL :: f32(1e-4)
 		max_y, max_da, max_db: f32
@@ -797,9 +797,9 @@ main :: proc() {
 	}
 
 	// --- Phase 14: end-to-end ml.attention ---
-	// Decomposes into slice_trailing → reshape → permute → batched_matmul →
-	// mul (broadcast scalar) → causal_mask → softmax → batched_matmul →
-	// permute → reshape. Exercises every op that's been ported plus the
+	// Decomposes into slice_trailing â†’ reshape â†’ permute â†’ batched_matmul â†’
+	// mul (broadcast scalar) â†’ causal_mask â†’ softmax â†’ batched_matmul â†’
+	// permute â†’ reshape. Exercises every op that's been ported plus the
 	// set_data hook (used by `scalar(1/sqrt(D))`).
 	{
 		TOKENS    :: 16
@@ -916,7 +916,7 @@ main :: proc() {
 		}
 
 		// Mean / variance / dnorm reductions per row plus the dW reduction
-		// across rows — fp32 reduction-order drift.
+		// across rows â€” fp32 reduction-order drift.
 		TOL :: f32(1e-4)
 		max_y, max_dx, max_dw: f32
 		for i in 0 ..< len(cpu_y)  do max_y  = math.max(max_y,  math.abs(cpu_y[i]  - gpu_y[i]))

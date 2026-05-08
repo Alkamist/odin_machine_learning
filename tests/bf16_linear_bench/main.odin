@@ -1,10 +1,10 @@
-package bf16_linear_bench
+﻿package bf16_linear_bench
 
 import "core:fmt"
 import "core:time"
 
 import ml  "../.."
-import gpu "../../backends/gpu"
+import gpu "../../backends/vulkan"
 
 WARMUP_DISPATCHES :: 10
 TIMED_DISPATCHES  :: 50

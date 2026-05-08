@@ -1,4 +1,4 @@
-package gguf_linear_parity
+﻿package gguf_linear_parity
 
 import "core:fmt"
 import "core:mem"
@@ -8,14 +8,14 @@ import "core:math"
 
 import ml  "../.."
 import cpu "../../backends/cpu"
-import gpu "../../backends/gpu"
+import gpu "../../backends/vulkan"
 import "../../loaders/gguf"
 
 // Parity test for the new ml.linear_q4_k / linear_q6_k ops. Both the CPU
 // op and the reference here dequantize via gguf.dequantize_q* and accumulate
 // in f32, so a correct wiring should match bit-exactly. Tolerance is 0.
 
-K   :: 256 // input_size — one Q4_K / Q6_K block per row
+K   :: 256 // input_size â€” one Q4_K / Q6_K block per row
 N   ::  64 // output_size
 M   ::   2 // batch (number of activation rows)
 
@@ -133,7 +133,7 @@ _make_synthetic_q4_k_bytes :: proc(rows: int) -> []byte {
 		mem.copy(raw_data(out[base + 0:]), &d_h,    2)
 		mem.copy(raw_data(out[base + 2:]), &dmin_h, 2)
 
-		// scales[12] — fill with mixed but in-range bytes. Each 6-bit scale
+		// scales[12] â€” fill with mixed but in-range bytes. Each 6-bit scale
 		// and 6-bit min is masked from 8-bit storage in
 		// _unpack_scale_min_k4 so any bit pattern produces a valid block.
 		for i in 0 ..< 12 {
@@ -158,7 +158,7 @@ _make_synthetic_q6_k_bytes :: proc(rows: int) -> []byte {
 		for i in 0 ..<  64 do out[base + 128 + i] = u8(_lcg(&state) & 0xFF)
 		// scales[16] (i8). Modest magnitudes to keep dequant bounded.
 		for i in 0 ..<  16 {
-			s := i8(_lcg(&state) & 0xFF) >> 5 // ±3-ish
+			s := i8(_lcg(&state) & 0xFF) >> 5 // Â±3-ish
 			out[base + 192 + i] = u8(s)
 		}
 		// d (fp16)
@@ -219,7 +219,7 @@ _run_q6_k_parity :: proc(w_bytes: []byte, any_failed: ^bool, label: string) {
 
 // Reference: dequantize each weight row to f32, dot with bf16 activation
 // (converting each element to f32), bf16 the result. This matches what
-// linear_q4_k_forward does internally — equality means the op wiring is
+// linear_q4_k_forward does internally â€” equality means the op wiring is
 // correct (variant unpack, output indexing, parallelization).
 _reference_q4_k_matmul :: proc(w_bytes: []byte, x: []ml.Bf16) -> [M * N]ml.Bf16 {
 	out: [M * N]ml.Bf16
@@ -306,7 +306,7 @@ _run_real_for_type :: proc(loader: gguf.Loader, ty: gguf.Tensor_Type, any_failed
 		if info.type != ty do continue
 		if len(info.shape) != 2 do continue
 		if info.shape[1] % ml.K_QUANT_BLOCK_SIZE != 0 do continue
-		// Pick the tensor with the smallest output_size × input_size product
+		// Pick the tensor with the smallest output_size Ã— input_size product
 		// to keep the test fast. Real Gemma 4 E4B Q6_K tensors all have
 		// output_size = 2560 (vocab/hidden dim), so capping output_size alone
 		// would skip them entirely.
@@ -391,7 +391,7 @@ _ml_dtype :: proc(ty: gguf.Tensor_Type) -> ml.Data_Type {
 	}
 }
 
-// --- GPU parity (Q4_K only — Q6_K shader not implemented yet) ----------
+// --- GPU parity (Q4_K only â€” Q6_K shader not implemented yet) ----------
 
 // The GPU GEMV shader supports M=1 only. Reductions are parallel (subgroupAdd
 // across 32 lanes), so summation order differs from the sequential CPU

@@ -1,4 +1,4 @@
-package dtype_roundtrip
+﻿package dtype_roundtrip
 
 import "core:fmt"
 import "core:math"
@@ -7,7 +7,7 @@ import "core:os"
 
 import ml  "../.."
 import cpu "../../backends/cpu"
-import gpu "../../backends/gpu"
+import gpu "../../backends/vulkan"
 
 main :: proc() {
 	any_failed := false
@@ -23,7 +23,7 @@ main :: proc() {
 	run_backend :: proc(label: string, ctx: ^ml.Context, any_failed: ^bool) {
 		ml.context_scope(ctx)
 
-		// F32 round-trip — sanity, since the slice header semantics changed.
+		// F32 round-trip â€” sanity, since the slice header semantics changed.
 		{
 			t := ml.zeros(.F32, {4})
 			src := [4]f32{1.5, -2.25, 3.75, 0.125}
@@ -34,7 +34,7 @@ main :: proc() {
 			check(ok, fmt.tprintf("%v: F32 round-trip", label), any_failed)
 		}
 
-		// Bf16 round-trip — bit-exact under the truncate-with-RNE conversion
+		// Bf16 round-trip â€” bit-exact under the truncate-with-RNE conversion
 		// for values whose mantissa fits in 7 bits (clean halves work).
 		{
 			t := ml.zeros(.Bf16, {4})
@@ -72,7 +72,7 @@ main :: proc() {
 			check(ok, fmt.tprintf("%v: cast_to F32->Bf16->F32 exact for clean values", label), any_failed)
 		}
 
-		// cast_to backward — F32 -> Bf16 cast. backward() seeds the final
+		// cast_to backward â€” F32 -> Bf16 cast. backward() seeds the final
 		// output's gradient with ones; cast backward should expand those
 		// bf16 ones into f32 ones and accumulate into x.grad. Loss tensor
 		// must currently be F32, so cast back at the end.
@@ -94,7 +94,7 @@ main :: proc() {
 			check(ok, fmt.tprintf("%v: cast_to backward propagates ones through bf16", label), any_failed)
 		}
 
-		// Bf16 add forward + backward — broadcast add of clean values that
+		// Bf16 add forward + backward â€” broadcast add of clean values that
 		// round-trip exactly through bf16. cast_to .F32 at the end so backward
 		// can seed an F32 gradient.
 		{
@@ -138,7 +138,7 @@ main :: proc() {
 			check(db_ok, fmt.tprintf("%v: Bf16 add backward db == stride", label), any_failed)
 		}
 
-		// Bf16 linear forward — clean values that round-trip through bf16
+		// Bf16 linear forward â€” clean values that round-trip through bf16
 		// exactly so the result is bit-identical to the f32 reference (and
 		// thus identical across the cpu and gpu paths).
 		{
@@ -231,11 +231,11 @@ main :: proc() {
 			check(ok, fmt.tprintf("%v: Bf16 linear forward (multi-tile) matches f32 reference", label), any_failed)
 		}
 
-		// Bf16 linear backward — same {-1, 0, 1} value trick so the f32 reference
+		// Bf16 linear backward â€” same {-1, 0, 1} value trick so the f32 reference
 		// gradients are bit-exact in bf16. backward() seeds dy = ones, so:
 		//   dx[c, k] = sum_o w[o, k]
 		//   dw[o, k] = sum_c x[c, k]
-		// Both sums are bounded by ±count or ±output_size respectively; with
+		// Both sums are bounded by Â±count or Â±output_size respectively; with
 		// count=N=output_size=16 they fit in [-16, 16], representable exactly.
 		{
 			M :: 16
@@ -619,7 +619,7 @@ main :: proc() {
 			check(db_ok, fmt.tprintf("%v: Bf16 div backward db matches f32 reference", label), any_failed)
 		}
 
-		// Bf16 unary activations — relu/sigmoid/silu/tanh/gelu/exp. Compare
+		// Bf16 unary activations â€” relu/sigmoid/silu/tanh/gelu/exp. Compare
 		// against the F32 reference run on the same (clean-bf16) input. exp/tanh/
 		// sigmoid/silu/gelu are nonlinear so we tolerate small relative error;
 		// relu's output and gradient are bf16-clean for these inputs.
@@ -680,7 +680,7 @@ main :: proc() {
 			run_unary("exp",     label, 0.2,  proc(x: ml.Tensor) -> ml.Tensor { return ml.exp(x) },     x_src[:], any_failed)
 		}
 
-		// Bf16 softmax / log_softmax / layernorm / entropy — compared against
+		// Bf16 softmax / log_softmax / layernorm / entropy â€” compared against
 		// f32 reference on the same input. Tolerance covers the bf16 round-off
 		// in the reductions and stored outputs.
 		{
@@ -893,7 +893,7 @@ main :: proc() {
 			}
 		}
 
-		// Bf16 attention forward + backward — compared against an F32 attention
+		// Bf16 attention forward + backward â€” compared against an F32 attention
 		// run on the same (clean-bf16) input. softmax/exp make exact bit-match
 		// impossible, so we tolerate small relative error.
 		{
@@ -1473,7 +1473,7 @@ main :: proc() {
 			ml.backward()
 			got_dx: [N]f32
 			ml.get_gradient(x_f32, got_dx[:])
-			// dy = ones; the bwd rotation maps (1,1) → (cos+sin, -sin+cos).
+			// dy = ones; the bwd rotation maps (1,1) â†’ (cos+sin, -sin+cos).
 			ref_dx: [N]f32
 			for t in 0 ..< TC {
 				for h in 0 ..< HC {

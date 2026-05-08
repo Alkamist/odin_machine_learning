@@ -1,4 +1,4 @@
-package gguf_gemma_gpu_parity
+﻿package gguf_gemma_gpu_parity
 
 import "base:builtin"
 
@@ -9,11 +9,11 @@ import "core:slice"
 import "core:time"
 
 import ml    "../.."
-import gpu   "../../backends/gpu"
+import gpu   "../../backends/vulkan"
 import gemma "../../networks/gemma"
 
 // GPU parity for the GGUF Gemma 4 E4B model. Our Q4_K/Q6_K GPU shaders are
-// M=1 only, so we drive `forward_cached` one token at a time — same shape
+// M=1 only, so we drive `forward_cached` one token at a time â€” same shape
 // the chat repl will hit during decode. Also reports decode tok/s once the
 // cache is warm.
 
@@ -82,7 +82,7 @@ main :: proc() {
 		t_step := time.tick_now()
 		logits := gemma.forward_cached(model, &cache, []int{token})
 		t_record := time.tick_since(t_step)
-		// Read this position's logits — this is what triggers submit + wait.
+		// Read this position's logits â€” this is what triggers submit + wait.
 		row := all_logits[pos * vocab_size : (pos + 1) * vocab_size]
 		if logits.type == .F32 {
 			ml.get_data(logits, row)

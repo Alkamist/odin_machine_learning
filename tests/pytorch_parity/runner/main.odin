@@ -1,4 +1,4 @@
-package pytorch_parity_runner
+﻿package pytorch_parity_runner
 
 import "base:builtin"
 
@@ -10,7 +10,7 @@ import "core:path/filepath"
 
 import ml  "../../.."
 import cpu "../../../backends/cpu"
-import gpu "../../../backends/gpu"
+import gpu "../../../backends/vulkan"
 import mlp   "../../../networks/mlp"
 import llama "../../../networks/llama"
 

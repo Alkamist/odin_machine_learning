@@ -1,4 +1,4 @@
-package gemma_chat_repl
+﻿package gemma_chat_repl
 
 import "base:builtin"
 import "base:runtime"
@@ -12,7 +12,7 @@ import "core:time"
 
 import ml    "../.."
 import cpu   "../../backends/cpu"
-import gpu   "../../backends/gpu"
+import gpu   "../../backends/cuda"
 import gemma "../../networks/gemma"
 import tok   "../../tokenizers/gemma"
 
@@ -162,7 +162,7 @@ main :: proc() {
 		{
 			// Q4_K/Q6_K coopmat prefill requires M % 64 == 0, so feed prefill
 			// in 64-token aligned chunks plus a single-token-per-step tail.
-			// (bf16 prefill works for any M but uses the same chunking — the
+			// (bf16 prefill works for any M but uses the same chunking â€” the
 			//  branching adds no real cost.)
 			PREFILL_CHUNK :: 64
 			pos := 0

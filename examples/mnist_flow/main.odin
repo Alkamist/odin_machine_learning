@@ -1,4 +1,4 @@
-// Train a small MLP as a conditional-OT flow-matching model on MNIST.
+﻿// Train a small MLP as a conditional-OT flow-matching model on MNIST.
 // The model learns a velocity field v_theta(x_t, t) such that integrating
 // dx/dt = v(x, t) from t=0 (Gaussian noise) to t=1 (data) produces a digit.
 //
@@ -21,7 +21,7 @@ import "core:strconv"
 import "core:encoding/csv"
 
 import ml  "../../"
-import gpu "../../backends/gpu"
+import gpu "../../backends/vulkan"
 
 DATA_DIR    :: "examples/data"
 TRAIN_CSV   :: DATA_DIR + "/mnist_train.csv"

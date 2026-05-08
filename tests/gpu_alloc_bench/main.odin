@@ -1,4 +1,4 @@
-package gpu_alloc_bench
+﻿package gpu_alloc_bench
 
 import "base:builtin"
 
@@ -6,7 +6,7 @@ import "core:fmt"
 import "core:time"
 
 import ml  "../.."
-import gpu "../../backends/gpu"
+import gpu "../../backends/vulkan"
 
 ITERS :: 1000
 
