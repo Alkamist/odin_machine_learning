@@ -253,16 +253,21 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 		layer.per_layer_input_gate_weight      = make_w(dtype, {config.hidden_size_per_layer_input, config.hidden_size}, buffers)
 		layer.per_layer_projection_weight      = make_w(dtype, {config.hidden_size, config.hidden_size_per_layer_input}, buffers)
 		layer.post_per_layer_input_norm_weight = make_w(dtype, {config.hidden_size}, buffers)
-		layer.layer_scalar                     = make_w(dtype, {1}, buffers)
+		// layer_scalar gets multiplied with the residual (FP32 in the
+		// post-ggml-shape pipeline); store as F32 so `ml.mul` doesn't need a
+		// per-call cast.
+		layer.layer_scalar                     = make_w(.F32, {1}, buffers)
 	}
 
-	model.embed_scale       = _make_const_scalar(dtype, math.sqrt(f32(config.hidden_size)))
-	model.ple_token_scale   = _make_const_scalar(dtype, math.sqrt(f32(config.hidden_size_per_layer_input)))
-	model.ple_ctx_scale     = _make_const_scalar(dtype, 1.0 / math.sqrt(f32(config.hidden_size)))
-	model.ple_combine_scale = _make_const_scalar(dtype, 1.0 / math.sqrt(f32(2)))
+	// Scalars/scales live as F32 so they compose with the FP32 activation path
+	// without per-mul dtype conversions.
+	model.embed_scale       = _make_const_scalar(.F32, math.sqrt(f32(config.hidden_size)))
+	model.ple_token_scale   = _make_const_scalar(.F32, math.sqrt(f32(config.hidden_size_per_layer_input)))
+	model.ple_ctx_scale     = _make_const_scalar(.F32, 1.0 / math.sqrt(f32(config.hidden_size)))
+	model.ple_combine_scale = _make_const_scalar(.F32, 1.0 / math.sqrt(f32(2)))
 	if config.final_logit_softcapping > 0 {
-		model.softcap_inv = _make_const_scalar(dtype, 1.0 / config.final_logit_softcapping)
-		model.softcap     = _make_const_scalar(dtype, config.final_logit_softcapping)
+		model.softcap_inv = _make_const_scalar(.F32, 1.0 / config.final_logit_softcapping)
+		model.softcap     = _make_const_scalar(.F32, config.final_logit_softcapping)
 	}
 
 	return
@@ -381,6 +386,7 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	}
 	token_identity := ml.alloc(model.dtype, {token_count, ple_total}, persistent=false, buffers={.Data})
 	ml.set_data_bytes(token_identity, lookup_buf)
+	if token_identity.type != .F32 do token_identity = ml.cast_to(token_identity, .F32)
 	token_identity = ml.mul(token_identity, model.ple_token_scale)
 
 	// Context-aware component: project inputs_embeds, scale by 1/sqrt(hidden), reshape, RMSNorm.
@@ -485,6 +491,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 	cache_position := cache.length
 
 	embeds := ml.select(model.embed_tokens_weight, new_tokens)
+	if embeds.type != .F32 do embeds = ml.cast_to(embeds, .F32)
 	embeds  = ml.mul(embeds, model.embed_scale)
 	inputs_embeds := embeds
 
@@ -526,7 +533,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 			v = step_kvs[source].v
 		} else {
 			k = _linear(hidden, layer.k_proj_weight)
-			k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
+			k = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction, k_cache, k_cache.shape[0])
 
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
 			v = _linear(hidden, layer.v_proj_weight)
@@ -555,13 +562,17 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 	}
 
 	final_hidden := ml.rmsnorm(residual, model.output_norm_weight, cfg.rms_norm_eps)
-	logits = _linear(final_hidden, model.lm_head_weight)
+	// lm_head_weight is bf16 (tied to embed_tokens_weight). cuBLAS GemmEx
+	// doesn't support fp32-input × bf16-weight directly, so cast the hidden
+	// state to bf16 for the matmul, then back to fp32 for softcap/logits.
+	lm_input := final_hidden.type == .Bf16 ? final_hidden : ml.cast_to(final_hidden, .Bf16)
+	logits = _linear(lm_input, model.lm_head_weight)
+	if logits.type != .F32 do logits = ml.cast_to(logits, .F32)
 	if cfg.final_logit_softcapping > 0 {
 		logits = ml.mul(logits, model.softcap_inv)
 		logits = ml.tanh(logits)
 		logits = ml.mul(logits, model.softcap)
 	}
-	if model.dtype != .F32 do logits = ml.cast_to(logits, .F32)
 
 	cache.length += token_count
 	return
@@ -575,6 +586,7 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 
 	// Scaled token embedding.
 	embeds := ml.select(model.embed_tokens_weight, tokens)
+	if embeds.type != .F32 do embeds = ml.cast_to(embeds, .F32)
 	embeds  = ml.mul(embeds, model.embed_scale)
 	inputs_embeds := embeds
 
@@ -648,7 +660,9 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 	}
 
 	final_hidden = ml.rmsnorm(residual, model.output_norm_weight, cfg.rms_norm_eps)
-	logits        = _linear(final_hidden, model.lm_head_weight)
+	lm_input := final_hidden.type == .Bf16 ? final_hidden : ml.cast_to(final_hidden, .Bf16)
+	logits = _linear(lm_input, model.lm_head_weight)
+	if logits.type != .F32 do logits = ml.cast_to(logits, .F32)
 	if cfg.final_logit_softcapping > 0 {
 		logits = ml.mul(logits, model.softcap_inv)
 		logits = ml.tanh(logits)

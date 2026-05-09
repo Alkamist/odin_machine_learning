@@ -79,15 +79,14 @@ Context :: struct {
 	// quantize_q8_1 dispatch. Cleared on every `clear()`.
 	q8_1_cache: map[cuda.DevicePtr]cuda.DevicePtr,
 
-	// Per-forward set of K/V caches whose `cache_write` (and shift, for
-	// sliding) has already been emitted this forward. Gemma's KV-shared
-	// layers point at the source layer's k_cache/v_cache; the source runs
-	// first and produces the new K/V, then shared layers re-pass the same
-	// k_cache/v_cache to attention_with_cache. Without dedup, each shared
-	// layer would re-shift the cache and corrupt history. Cleared every
-	// `clear()`. Storing one of {k_cache, v_cache}; in our model they
-	// always come paired.
-	cache_written_this_forward: map[cuda.DevicePtr]bool,
+	// Per-forward sets of K and V caches whose `cache_write` (and shift, for
+	// sliding) has already been emitted this forward. Gemma's KV-shared layers
+	// point at the source layer's k_cache/v_cache; without dedup, each shared
+	// layer would re-shift and re-write the cache. Split into K and V so the
+	// fused `rmsnorm_rope_write_cache` op (which writes only K) can mark the K
+	// side as done without affecting V. Both cleared every `clear()`.
+	k_cache_written_this_forward: map[cuda.DevicePtr]bool,
+	v_cache_written_this_forward: map[cuda.DevicePtr]bool,
 
 	// Decode-position upload state. Position-bearing kernels (rmsnorm_rope,
 	// rope, attention_cache) read `cache_position` from `position_dev` instead
@@ -111,6 +110,29 @@ Context :: struct {
 	// dst/src. Sized lazily to the max (cap-1)*kv_size bytes seen.
 	shift_scratch_dev:  cuda.DevicePtr,
 	shift_scratch_size: u64,
+
+	// ggml MMA F16 attention infrastructure. ggml's kernel takes fp16 K/V
+	// (their `launch_fattn` converts bf16→fp16 before each call). For each
+	// non-shared sliding layer this forward, we allocate fp16 K and V scratch
+	// from the activation pool and run a bf16→fp16 conversion. Shared layers
+	// reuse the source layer's fp16 buffers via this map.
+	fp16_kv_cache:      map[cuda.DevicePtr]Fp16_Kv_Pair,
+
+	// Static all-zero mask for the MMA kernel. ncols2>1 requires non-null
+	// mask; the kernel reads it as `half[ne01.z, ne11]` and adds slope*mask
+	// to KQ scores. With max_bias=0 (no ALiBi) and a valid range covering
+	// all cache slots (sliding window fully filled), an all-zero mask is
+	// correct. Allocated lazily once it's first needed; sized to fit the
+	// largest sw seen.
+	fa_mask_dev:        cuda.DevicePtr,
+	fa_mask_bytes:      u64,
+}
+
+// Pair of fp16 K and V device buffers shadowing a bf16 K/V cache for the
+// MMA F16 attention kernel.
+Fp16_Kv_Pair :: struct {
+	k_fp16: cuda.DevicePtr,
+	v_fp16: cuda.DevicePtr,
 }
 
 Activation_Slot :: struct {
@@ -231,7 +253,7 @@ context_create :: proc(allocator := context.allocator, loc := #caller_location) 
 		buffer_get   = buffer_get,
 		buffer_set   = buffer_set,
 		buffer_copy  = buffer_copy,
-		capabilities = { .Linear_Q4_K_Gate_Up_Geglu },
+		capabilities = { .Linear_Q4_K_Gate_Up_Geglu, .Rmsnorm_Rope_Write_Cache },
 	}, allocator, loc)
 
 	return gctx
@@ -278,7 +300,9 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 		gctx.auto_exec = nil
 	}
 	delete(gctx.q8_1_cache)
-	delete(gctx.cache_written_this_forward)
+	delete(gctx.k_cache_written_this_forward)
+	delete(gctx.v_cache_written_this_forward)
+	delete(gctx.fp16_kv_cache)
 
 	if gctx.position_dev != 0 {
 		cuda.MemFree(gctx.position_dev)
@@ -292,6 +316,11 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 		cuda.MemFree(gctx.shift_scratch_dev)
 		gctx.shift_scratch_dev = 0
 		gctx.shift_scratch_size = 0
+	}
+	if gctx.fa_mask_dev != 0 {
+		cuda.MemFree(gctx.fa_mask_dev)
+		gctx.fa_mask_dev = 0
+		gctx.fa_mask_bytes = 0
 	}
 
 	if gctx.cublas_handle != nil {
@@ -349,7 +378,13 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 	builtin.clear(&gctx.q8_1_cache)
 
 	// Reset KV-cache shift/write dedup set. New forward = new shift cycle.
-	builtin.clear(&gctx.cache_written_this_forward)
+	builtin.clear(&gctx.k_cache_written_this_forward)
+	builtin.clear(&gctx.v_cache_written_this_forward)
+
+	// Reset fp16 K/V dedup map. The fp16 buffers themselves come from the
+	// activation pool which clears separately; map entries point at slots
+	// from the *previous* forward, so they're stale.
+	builtin.clear(&gctx.fp16_kv_cache)
 
 	// Position upload happens lazily on the first position-bearing dispatch
 	// of the new forward (see `_emit_position_upload` in ops.odin).

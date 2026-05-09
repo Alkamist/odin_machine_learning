@@ -90,6 +90,7 @@ Tensor :: struct {
 
 Backend_Capability :: enum {
 	Linear_Q4_K_Gate_Up_Geglu,
+	Rmsnorm_Rope_Write_Cache,
 }
 Backend_Capabilities :: bit_set[Backend_Capability]
 
@@ -468,6 +469,7 @@ Operation_Variant :: union {
 	Layernorm,
 	Rmsnorm,
 	Rmsnorm_Rope,
+	Rmsnorm_Rope_Write_Cache,
 	Add_Rmsnorm,
 	Softmax,
 	Entropy,
@@ -701,9 +703,9 @@ attention_with_cache :: proc(
 	assert(kv_size / kv_heads == head_size, "head_size must match between query and key/value", loc=loc)
 	assert(n_q_heads % kv_heads == 0, "n_q_heads must be a multiple of n_kv_heads", loc=loc)
 
-	assert(query.type == key.type && key.type == value.type, "attention_with_cache Q/K/V must share dtype", loc=loc)
-	assert(query.type == k_cache.type && query.type == v_cache.type, "attention_with_cache cache dtype must match Q", loc=loc)
-	assert(query.type == .F32 || query.type == .Bf16, "attention_with_cache requires F32 or Bf16", loc=loc)
+	assert(query.type == value.type, "attention_with_cache Q/V must share dtype", loc=loc)
+	assert(k_cache.type == v_cache.type, "attention_with_cache k_cache/v_cache must share dtype", loc=loc)
+	assert(query.type == .F32 || query.type == .Bf16, "attention_with_cache requires F32 or Bf16 activations", loc=loc)
 
 	t_capacity := k_cache.shape[0]
 	assert(cache_position >= 0, "cache_position must be non-negative", loc=loc)
@@ -1101,15 +1103,16 @@ Linear :: struct {
 
 @(require_results)
 linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank  >= 1, "Linear input must have rank >= 1",  loc=loc)
+	assert(input.rank >= 1, "Linear input must have rank >= 1",  loc=loc)
 	assert(weight.rank == 2, "Linear weight must be a 2-D tensor [output_size, input_size]", loc=loc)
-	assert(input.type == weight.type, "linear input and weight must have the same dtype", loc=loc)
 
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
 	assert(input.shape[input.rank - 1] == input_size, "Input trailing dim must equal weight's input dim", loc=loc)
 
-	output = _zeros_replace_trailing(input, output_size, loc=loc)
+	new_shape                := input.shape
+	new_shape[input.rank - 1] = output_size
+	output = zeros(input.type, new_shape[:input.rank], loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -1130,17 +1133,19 @@ Linear_Q4_K :: struct {
 
 @(require_results)
 linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank  >= 1, "linear_q4_k input must have rank >= 1", loc=loc)
+	assert(input.rank >= 1, "linear_q4_k input must have rank >= 1", loc=loc)
 	assert(weight.rank == 2, "linear_q4_k weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 	assert(weight.type == .Q4_K, "linear_q4_k weight must be Q4_K", loc=loc)
-	assert(input.type  == .Bf16, "linear_q4_k input must be Bf16", loc=loc)
+	assert(input.type == .Bf16 || input.type == .F32, "linear_q4_k input must be Bf16 or F32", loc=loc)
 
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
 	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "linear_q4_k input dim must be a multiple of 256", loc=loc)
 	assert(input.shape[input.rank - 1] == input_size, "linear_q4_k input trailing dim must equal weight's input dim", loc=loc)
 
-	output = _zeros_replace_trailing(input, output_size, loc=loc)
+	new_shape: [MAX_TENSOR_RANK]int = input.shape
+	new_shape[input.rank - 1] = output_size
+	output = zeros(.F32, new_shape[:input.rank], loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -1164,7 +1169,7 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 	assert(w_gate.rank == 2, "linear_q4_k_gate_up_geglu w_gate must be 2-D", loc=loc)
 	assert(w_up.rank == 2, "linear_q4_k_gate_up_geglu w_up must be 2-D", loc=loc)
 	assert(w_gate.type == .Q4_K && w_up.type == .Q4_K, "linear_q4_k_gate_up_geglu weights must be Q4_K", loc=loc)
-	assert(input.type == .Bf16, "linear_q4_k_gate_up_geglu input must be Bf16", loc=loc)
+	assert(input.type == .Bf16 || input.type == .F32, "linear_q4_k_gate_up_geglu input must be Bf16 or F32", loc=loc)
 	assert(w_gate.shape[0] == w_up.shape[0], "gate/up output dims must match", loc=loc)
 	assert(w_gate.shape[1] == w_up.shape[1], "gate/up input dims must match", loc=loc)
 
@@ -1174,7 +1179,9 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 	assert(input.shape[input.rank - 1] == input_size, "input trailing dim must equal weight's input dim", loc=loc)
 
 	if _leading_count(input) == 1 && .Linear_Q4_K_Gate_Up_Geglu in _current_ctx.backend.capabilities {
-		output = _zeros_replace_trailing(input, output_size, loc=loc)
+		new_shape: [MAX_TENSOR_RANK]int = input.shape
+		new_shape[input.rank - 1] = output_size
+		output = zeros(.F32, new_shape[:input.rank], loc=loc)
 		op := Operation{
 			input   = input,
 			output  = output,
@@ -1201,14 +1208,16 @@ linear_q6_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 	assert(input.rank  >= 1, "linear_q6_k input must have rank >= 1", loc=loc)
 	assert(weight.rank == 2, "linear_q6_k weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 	assert(weight.type == .Q6_K, "linear_q6_k weight must be Q6_K", loc=loc)
-	assert(input.type  == .Bf16, "linear_q6_k input must be Bf16", loc=loc)
+	assert(input.type == .Bf16 || input.type == .F32, "linear_q6_k input must be Bf16 or F32", loc=loc)
 
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
 	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "linear_q6_k input dim must be a multiple of 256", loc=loc)
 	assert(input.shape[input.rank - 1] == input_size, "linear_q6_k input trailing dim must equal weight's input dim", loc=loc)
 
-	output = _zeros_replace_trailing(input, output_size, loc=loc)
+	new_shape                := input.shape
+	new_shape[input.rank - 1] = output_size
+	output = zeros(.F32, new_shape[:input.rank], loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -1347,11 +1356,21 @@ Rmsnorm_Rope :: struct {
 	rotate_pair_count: int,
 }
 
+Rmsnorm_Rope_Write_Cache :: struct {
+	weight:            Tensor,
+	eps:               f32,
+	head_count:        int,
+	base:              f32,
+	position_offset:   int,
+	rotate_pair_count: int,
+	cache:             Tensor,
+	cache_capacity:    int,
+}
+
 @(require_results)
 rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32, position_offset: int, rope_fraction: f32, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank == 2, "rmsnorm_rope requires rank-2 input [tokens, head_count*head_size]", loc=loc)
 	assert(weight.rank == 1, "rmsnorm_rope weight must be 1-D", loc=loc)
-	assert(input.type == weight.type, "rmsnorm_rope input and weight dtype must match", loc=loc)
 	assert(eps > 0, "rmsnorm_rope eps must be positive", loc=loc)
 	assert(rope_fraction > 0 && rope_fraction <= 1, "rope_fraction must be in (0, 1]", loc=loc)
 
@@ -1385,6 +1404,57 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 	return
 }
 
+@(require_results)
+rmsnorm_rope_write_cache :: proc(
+	input, weight: Tensor,
+	head_count: int, eps, base: f32,
+	position_offset: int, rope_fraction: f32,
+	cache: Tensor, cache_capacity: int,
+	loc := #caller_location,
+) -> (output: Tensor) {
+	assert(input.rank == 2, "rmsnorm_rope_write_cache requires rank-2 input", loc=loc)
+	assert(weight.rank == 1, "rmsnorm_rope_write_cache weight must be 1-D", loc=loc)
+	assert(cache.rank == 2, "rmsnorm_rope_write_cache cache must be 2-D [capacity, head_count*head_size]", loc=loc)
+	assert(cache.shape[1] == input.shape[1], "rmsnorm_rope_write_cache cache trailing dim must equal input trailing dim", loc=loc)
+	assert(cache_capacity == cache.shape[0], "rmsnorm_rope_write_cache cache_capacity must equal cache.shape[0]", loc=loc)
+	assert(eps > 0, "rmsnorm_rope_write_cache eps must be positive", loc=loc)
+	assert(rope_fraction > 0 && rope_fraction <= 1, "rope_fraction must be in (0, 1]", loc=loc)
+
+	input_size := input.shape[1]
+	assert(input_size % head_count == 0, "Trailing dim must be divisible by head count", loc=loc)
+	head_size := input_size / head_count
+	assert(head_size % 2 == 0, "Head size must be even", loc=loc)
+	assert(weight.shape[0] == head_size, "rmsnorm_rope_write_cache weight length must equal head_size", loc=loc)
+
+	half_head         := head_size / 2
+	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
+	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
+
+	if .Rmsnorm_Rope_Write_Cache in _current_ctx.backend.capabilities {
+		output = zeros_like(input, loc=loc)
+		op := Operation{
+			input   = input,
+			output  = output,
+			variant = Rmsnorm_Rope_Write_Cache{
+				weight            = weight,
+				eps               = eps,
+				head_count        = head_count,
+				base              = base,
+				position_offset   = position_offset,
+				rotate_pair_count = rotate_pair_count,
+				cache             = cache,
+				cache_capacity    = cache_capacity,
+			},
+		}
+		_current_ctx.backend.forward(op, loc)
+		append_operation(op, loc=loc)
+		return
+	}
+
+	output = rmsnorm_rope(input, weight, head_count, eps, base, position_offset, rope_fraction, loc=loc)
+	return
+}
+
 Add_Rmsnorm :: struct {
 	b:            Tensor,
 	weight:       Tensor,
@@ -1395,7 +1465,7 @@ Add_Rmsnorm :: struct {
 @(require_results)
 add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #caller_location) -> (residual_new, normed: Tensor) {
 	assert(a.rank == b.rank, "add_rmsnorm a/b rank must match", loc=loc)
-	assert(a.type == b.type && a.type == weight.type, "add_rmsnorm a/b/weight dtypes must match", loc=loc)
+	assert(a.type == b.type, "add_rmsnorm a/b dtypes must match", loc=loc)
 	assert(weight.rank == 1, "add_rmsnorm weight must be 1-D", loc=loc)
 	assert(weight.shape[0] == a.shape[a.rank - 1], "add_rmsnorm weight length must equal trailing dim", loc=loc)
 	assert(eps > 0, "add_rmsnorm eps must be positive", loc=loc)

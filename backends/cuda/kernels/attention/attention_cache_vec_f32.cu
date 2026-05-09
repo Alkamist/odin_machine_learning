@@ -1,26 +1,11 @@
-// Port of ggml's `flash_attn_ext_vec` (fattn-vec.cuh) stripped to our case:
-//   - bf16 K, bf16 V (no quantized kv).
-//   - ncols = 1 (single Q token per block; loop in caller for multi-token prefill).
-//   - causal mask with optional sliding window (no ALiBi, no logit_softcap, no sinks).
-//   - GQA via kv_h = h * n_kv_heads / n_q_heads.
-//   - Output: bf16 packed pairs (one block writes its full D-vector at end).
+// Port of `attention_cache_vec_bf16.cu` with fp32 Q input and fp32 output.
+// K/V cache stays bf16 (the model's stored cache dtype). 16-byte LDG.E.128
+// for K/V reads. Output is written as fp32, eliminating the bf16-pack
+// round-trip on the attention's hot path.
 //
-// Cache layout is linear (= ggml's): slot 0 is oldest, slot cap-1 is newest.
-// For full layers and for sliding layers within their first `capacity`
-// tokens, slot j corresponds to seq_pos j. After a sliding layer's window
-// fills (at seq_pos >= cap), the host shifts the cache back by n_rows
-// before each write so the cache always holds the most recent `cap` rows
-// at slots [0..cap), with the newest at slot cap-1.
-//
-// Per-Q-token live K range, computed unified for both layer types:
-//   t_q_slot = min(cache_position + t_q, capacity - q_token_count + t_q)
-//   t_k_max  = t_q_slot + 1                              (causal)
-//   t_k_min  = max(0, t_q_slot + 1 - window) if window>0 (sliding mask)
-//            = 0                              if window=0 (no window)
-//
-// Q/K/V loads use 16-byte LDG.E.128 (= ggml's `ggml_cuda_memcpy_1<16>`),
-// reading 4 bf16 pairs (= 8 bf16 elements) per transaction. Cuts LDG
-// instruction count vs the 4-byte path by 4×.
+// Cache layout, per-Q-token live K range, and shared-memory layout are
+// identical to the bf16 version — only the Q load and the final dst writes
+// change type.
 #include <cuda_bf16.h>
 
 #ifndef D_HEAD
@@ -30,16 +15,16 @@
 #define D            D_HEAD
 #define WARP_SIZE    32
 #define NWARPS       4
-#define NTHREADS     (WARP_SIZE * NWARPS)            // = 128
+#define NTHREADS     (WARP_SIZE * NWARPS)
 #define NTHREADS_KQ  8
 #define NTHREADS_V   8
-#define V_COLS_PER_ITER (WARP_SIZE / NTHREADS_V)     // = 4
-#define BC           NTHREADS                          // = 128 K-rows per outer iter
-#define D_PER_THREAD_KQ (D / NTHREADS_KQ)             // = 32 (per-thread Q slice)
-#define D_PER_THREAD_V  (D / NTHREADS_V)              // = 32 (per-thread VKQ accumulators)
-#define HALF_D_PER_THREAD_V (D_PER_THREAD_V / 2)      // = 16 float2 pairs
-#define PAIRS_PER_LDG   4                             // 16-byte LDG = 4 packed-pair uints
-#define KQ_LDG_ITERS    (D_PER_THREAD_KQ / (2 * PAIRS_PER_LDG))  // bf16 pairs per thread / pairs per LDG
+#define V_COLS_PER_ITER (WARP_SIZE / NTHREADS_V)
+#define BC           NTHREADS
+#define D_PER_THREAD_KQ (D / NTHREADS_KQ)
+#define D_PER_THREAD_V  (D / NTHREADS_V)
+#define HALF_D_PER_THREAD_V (D_PER_THREAD_V / 2)
+#define PAIRS_PER_LDG   4
+#define KQ_LDG_ITERS    (D_PER_THREAD_KQ / (2 * PAIRS_PER_LDG))
 #define V_LDG_ITERS     (HALF_D_PER_THREAD_V / PAIRS_PER_LDG)
 
 __device__ __forceinline__ float bf16_uint16_to_float(unsigned short bits) {
@@ -47,20 +32,13 @@ __device__ __forceinline__ float bf16_uint16_to_float(unsigned short bits) {
 	return __int_as_float((int)as_u32);
 }
 
-__device__ __forceinline__ unsigned short bf16_round(float v) {
-	unsigned int bits = __float_as_uint(v);
-	if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
-	unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
-	return (unsigned short)((rounded >> 16) & 0xffffu);
-}
-
 extern "C" __global__
 __launch_bounds__(NTHREADS, 1)
-void attention_cache_vec_bf16(
-    const unsigned int* __restrict__ q_buf,
-    const unsigned int* __restrict__ k_buf,
-    const unsigned int* __restrict__ v_buf,
-    unsigned int*       __restrict__ o,
+void attention_cache_vec_f32(
+    const float*        __restrict__ q_buf,    // fp32 Q [tokens, n_q_heads * D]
+    const unsigned int* __restrict__ k_buf,    // bf16 packed pairs (cache)
+    const unsigned int* __restrict__ v_buf,    // bf16 packed pairs (cache)
+    float*              __restrict__ o,         // fp32 output [tokens, n_q_heads * D]
     int n_q_heads, int n_kv_heads, int head_size,
     int q_token_count, const int* __restrict__ cache_position_dev,
     int q_size, int kv_size,
@@ -73,10 +51,6 @@ void attention_cache_vec_bf16(
 	const int kv_h = h * n_kv_heads / n_q_heads;
 	const int cache_position = *cache_position_dev;
 
-	// Slot of Q[t_q]'s own K row (last row in its causal range, plus 1 = exclusive
-	// upper bound). Unified formula: pre-fill it's `cache_position + t_q`; once
-	// the cache is at capacity (sliding steady state), it pins to
-	// `capacity - q_token_count + t_q` after the host's shift.
 	const int linear_slot = cache_position + t_q;
 	const int pinned_slot = capacity - q_token_count + t_q;
 	const int t_q_slot    = linear_slot < pinned_slot ? linear_slot : pinned_slot;
@@ -91,21 +65,16 @@ void attention_cache_vec_bf16(
 	const int kq_group_in_warp = threadIdx.x / NTHREADS_KQ;
 	const int kq_lane_in_group = threadIdx.x & (NTHREADS_KQ - 1);
 
-	// Q load. 16-byte LDG of 4 packed-pair uints = 8 bf16 elements per load,
-	// pre-scaled by 1/sqrt(D) on the fp32 path.
+	// Q load: 16-byte LDG of 4 fp32 elements per LDG = float4 → 4 elements/thread/iter.
+	// Total per thread = D_PER_THREAD_KQ floats.
 	float2 Q_reg[D_PER_THREAD_KQ / 2];
 	{
-		const int q_uint_base = (q_base + kq_lane_in_group * D_PER_THREAD_KQ) >> 1;
+		const int q_elem_base = q_base + kq_lane_in_group * D_PER_THREAD_KQ;
 		#pragma unroll
-		for (int i = 0; i < KQ_LDG_ITERS; ++i) {
-			uint4 packed = __ldg(reinterpret_cast<const uint4*>(&q_buf[q_uint_base + i * PAIRS_PER_LDG]));
-			unsigned int p[PAIRS_PER_LDG] = { packed.x, packed.y, packed.z, packed.w };
-			#pragma unroll
-			for (int j = 0; j < PAIRS_PER_LDG; ++j) {
-				float a = bf16_uint16_to_float((unsigned short)(p[j] & 0xffffu)) * scale;
-				float b = bf16_uint16_to_float((unsigned short)((p[j] >> 16) & 0xffffu)) * scale;
-				Q_reg[i * PAIRS_PER_LDG + j] = make_float2(a, b);
-			}
+		for (int i = 0; i < D_PER_THREAD_KQ / 4; ++i) {
+			float4 v = __ldg(reinterpret_cast<const float4*>(&q_buf[q_elem_base + i * 4]));
+			Q_reg[i * 2 + 0] = make_float2(v.x * scale, v.y * scale);
+			Q_reg[i * 2 + 1] = make_float2(v.z * scale, v.w * scale);
 		}
 	}
 
@@ -253,26 +222,16 @@ void attention_cache_vec_bf16(
 	}
 	__syncthreads();
 
-	const int total_pairs = D / 2;
 	#pragma unroll
-	for (int p = tid; p < total_pairs; p += NTHREADS) {
-		const int d_lo = 2 * p;
-		const int d_hi = d_lo + 1;
-
-		float sum_lo = 0.0f, sum_hi = 0.0f;
+	for (int d = tid; d < D; d += NTHREADS) {
+		float s = 0.0f;
 		#pragma unroll
 		for (int w = 0; w < NWARPS; ++w) {
 			#pragma unroll
 			for (int g = 0; g < V_COLS_PER_ITER; ++g) {
-				sum_lo += VKQ_shared[w][g][d_lo];
-				sum_hi += VKQ_shared[w][g][d_hi];
+				s += VKQ_shared[w][g][d];
 			}
 		}
-		sum_lo *= inv_sum;
-		sum_hi *= inv_sum;
-
-		unsigned short lo = bf16_round(sum_lo);
-		unsigned short hi = bf16_round(sum_hi);
-		o[(o_base + d_lo) >> 1] = (unsigned int)lo | ((unsigned int)hi << 16);
+		o[o_base + d] = s * inv_sum;
 	}
 }

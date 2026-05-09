@@ -35,6 +35,7 @@ context_create :: proc(allocator := context.allocator, loc := #caller_location) 
 		buffer_get   = buffer_get,
 		buffer_set   = buffer_set,
 		buffer_copy  = buffer_copy,
+		capabilities = {},
 	}, allocator, loc)
 
 	return gctx
@@ -339,11 +340,13 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
 	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
+	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Vulkan Linear_Q4_K_Gate_Up_Geglu_forward: backend does not advertise the capability")
 	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
 	case ml.Rmsnorm_Rope:       rmsnorm_rope_forward       (op)
+	case ml.Rmsnorm_Rope_Write_Cache: panic("Vulkan Rmsnorm_Rope_Write_Cache_forward: backend does not advertise the capability")
 	case ml.Add_Rmsnorm:        add_rmsnorm_forward        (op)
 	case ml.Softmax:            softmax_forward            (op)
 	case ml.Entropy:            entropy_forward            (op)
@@ -388,11 +391,13 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
 	case ml.Linear_Q4_K:        fmt.panicf("GPU linear_q4_k_backward: linear_q4_k is forward-only (inference path)")
+	case ml.Linear_Q4_K_Gate_Up_Geglu: fmt.panicf("GPU linear_q4_k_gate_up_geglu_backward: forward-only fused op")
 	case ml.Linear_Q6_K:        fmt.panicf("GPU linear_q6_k_backward: linear_q6_k is forward-only (inference path)")
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
 	case ml.Rmsnorm_Rope:       fmt.panicf("GPU rmsnorm_rope_backward: fused rmsnorm+rope is forward-only (inference path)")
+	case ml.Rmsnorm_Rope_Write_Cache: fmt.panicf("GPU rmsnorm_rope_write_cache_backward: forward-only fused op")
 	case ml.Add_Rmsnorm:        fmt.panicf("GPU add_rmsnorm_backward: fused add+rmsnorm is forward-only (inference path)")
 	case ml.Softmax:            softmax_backward           (op)
 	case ml.Entropy:            entropy_backward           (op)

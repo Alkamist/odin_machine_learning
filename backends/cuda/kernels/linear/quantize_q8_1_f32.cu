@@ -1,5 +1,5 @@
-// Bf16 X[K] -> Q8_1 blocks. Port of ggml's `quantize_q8_1`
-// (ggml/src/ggml-cuda/quantize.cu) with bf16-packed-pair input.
+// fp32 X[K] -> Q8_1 blocks. Port of ggml's `quantize_q8_1`
+// (ggml/src/ggml-cuda/quantize.cu).
 //
 // Block layout: CUDA_QUANTIZE_BLOCK_SIZE = 256 threads, each thread handles one
 // element. With QK8_1 = 32 a warp of 32 threads exactly maps to one Q8_1
@@ -35,18 +35,14 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
 
 extern "C" __global__
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
-void quantize_q8_1_bf16(const unsigned int* __restrict__ x_packed,
-                        unsigned int*       __restrict__ y,
-                        int K) {
+void quantize_q8_1_f32(const float*  __restrict__ x,
+                       unsigned int* __restrict__ y,
+                       int K) {
 	const int i0 = blockDim.x * blockIdx.x + threadIdx.x;
 
 	if (i0 >= K) return;
 
-	unsigned int pkx = x_packed[i0 >> 1];
-	unsigned short half_bits = (i0 & 1) ? (unsigned short)(pkx >> 16)
-	                                    : (unsigned short)(pkx & 0xffffu);
-	unsigned int as_u32 = (unsigned int)half_bits << 16;
-	float xi = __int_as_float((int)as_u32);
+	float xi = x[i0];
 
 	float amax = fabsf(xi);
 	float sum  = xi;
@@ -60,8 +56,6 @@ void quantize_q8_1_bf16(const unsigned int* __restrict__ x_packed,
 	const int ib  = i0 / QK8_1;
 	const int iqs = i0 % QK8_1;
 
-	// y[ib].qs[iqs] = q. The output is uint*-aliased; bytes coalesce within
-	// each 32-byte segment of qs (4 lanes per uint, 8 uints per sub-block).
 	signed char* y_bytes = (signed char*)y;
 	y_bytes[ib * 36 + 4 + iqs] = q;
 
