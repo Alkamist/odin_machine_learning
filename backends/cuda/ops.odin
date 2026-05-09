@@ -623,6 +623,7 @@ _rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 		_dispatch(_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
+		fmt.assertf(size % 2 == 0, "rmsnorm f32 requires even size (got %v)", size, loc=loc)
 		if _rmsnorm_pipeline == nil {
 			_rmsnorm_pipeline = _compile_pipeline(RMSNORM_F32_SRC,       "rmsnorm.cu",       "rmsnorm_f32")
 		}
