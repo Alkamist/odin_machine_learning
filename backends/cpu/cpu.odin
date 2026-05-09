@@ -379,7 +379,8 @@ adam_v :: #force_inline proc(t: ml.Tensor) -> []f32 {
 	return ([^]f32)(raw_data(bytes))[:t.count]
 }
 
-buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+	_ = kind  // CPU backend uses `builtin.make` which always zero-fills; the kind hint is consumed by GPU backends.
 	ctx       := cast(^Context)ml.current_context(loc=loc)
 	allocator := persist ? context.allocator : mem.arena_allocator(&ctx.arena)
 

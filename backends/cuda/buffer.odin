@@ -29,7 +29,7 @@ Gpu_Buffer :: struct {
 // matching the vulkan backend's F32_ONE_BITS use.
 F32_ONE_BITS :: u32(0x3F800000)
 
-buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
 	t_start := time.tick_now()
 	defer {
 		_alloc_count += 1
@@ -54,10 +54,15 @@ buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Lo
 		gb.ptr = _activation_alloc(gctx, u64(byte_count), loc)
 	}
 
-	// Backward kernels accumulate into gradient buffers (`+=`), so the buffer
-	// must start zeroed every forward pass Ã¢â‚¬â€ mirrors the vulkan backend's
-	// _record_fill_zero.
-	cuda.check(cuda.MemsetD8Async(gb.ptr, 0, uint(byte_count), gctx.stream), loc=loc)
+	// Gradient/Adam buffers are zeroed every forward because backward kernels
+	// and optimizer updates accumulate (`+=`) into them. Activation Data
+	// buffers (persist=false) are not: forward kernels fully overwrite their
+	// output before any read, and skipping the memset drops one node per ml-op
+	// from the captured decode graph — `cuGraphExecUpdate` is host-bound and
+	// scales with node count. Persistent Data still zeroed at load time.
+	if kind != .Data || persist {
+		cuda.check(cuda.MemsetD8Async(gb.ptr, 0, uint(byte_count), gctx.stream), loc=loc)
+	}
 
 	return transmute(ml.Backend_Buffer)gb
 }

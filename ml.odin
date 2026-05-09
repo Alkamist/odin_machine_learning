@@ -99,7 +99,7 @@ Backend :: struct #all_or_none {
 	backward: proc(op: Operation, loc: runtime.Source_Code_Location),
 	update:   proc(opt: Optimizer, t: Tensor, loc: runtime.Source_Code_Location),
 
-	buffer_alloc: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> Backend_Buffer,
+	buffer_alloc: proc(byte_count: int, kind: Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> Backend_Buffer,
 	buffer_free:  proc(buffer: Backend_Buffer, loc: runtime.Source_Code_Location),
 	buffer_get:   proc(buffer: Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location),
 	buffer_set:   proc(buffer: Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location),
@@ -215,7 +215,7 @@ alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_S
 
 	for kind in Buffer_Kind {
 		if kind in buffers {
-			t.buffers[kind] = t.backend.buffer_alloc(byte_count, persistent, loc)
+			t.buffers[kind] = t.backend.buffer_alloc(byte_count, kind, persistent, loc)
 		}
 	}
 
@@ -497,6 +497,12 @@ Operation :: struct {
 }
 
 append_operation :: proc(op: Operation, loc := #caller_location) {
+	// The operations array exists solely to drive `backward`. Under
+	// No_Gradients (inference) the caller has declared that backward will not
+	// run, so skip the struct copy + count increment — the array is the size
+	// of `MAX_OPERATIONS × Operation` (hundreds of KB), and at decode we hit
+	// ~850 ml-ops per forward. Saves both CPU cycles and L1/L2 cache pressure.
+	if .No_Gradients in _current_ctx.clear_flags { return }
 	assert(_current_ctx.operation_count < MAX_OPERATIONS, "Maximum operations exceeded, did you forget to call clear?", loc=loc)
 	_current_ctx.operations[_current_ctx.operation_count] = op
 	_current_ctx.operation_count += 1

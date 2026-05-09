@@ -3,7 +3,8 @@
 // rotate_pair_count pairs within each head. One workgroup per (token, head).
 #include <cuda_bf16.h>
 
-#define RMSROPE_WG 128
+#define RMSROPE_WG     128
+#define RMSROPE_NWARPS (RMSROPE_WG / 32)
 
 extern "C" __global__
 void rmsnorm_rope_bf16(const unsigned int* __restrict__ x,
@@ -26,15 +27,22 @@ void rmsnorm_rope_bf16(const unsigned int* __restrict__ x,
 		float v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((xp >> 16) & 0xffffu)));
 		s2 += v0 * v0 + v1 * v1;
 	}
-	__shared__ float partial[RMSROPE_WG];
-	partial[tid] = s2;
-	__syncthreads();
+
+	// Intra-warp reduction.
 	#pragma unroll
-	for (int stride = RMSROPE_WG / 2; stride > 0; stride >>= 1) {
-		if (tid < stride) partial[tid] += partial[tid + stride];
-		__syncthreads();
+	for (int off = 16; off > 0; off >>= 1) {
+		s2 += __shfl_xor_sync(0xffffffffu, s2, off);
 	}
-	float rstd = rsqrtf(partial[0] / (float)head_size + eps);
+
+	__shared__ float warp_sums[RMSROPE_NWARPS];
+	if ((tid & 31) == 0) warp_sums[tid >> 5] = s2;
+	__syncthreads();
+
+	float total = 0.0f;
+	#pragma unroll
+	for (int i = 0; i < RMSROPE_NWARPS; ++i) total += warp_sums[i];
+
+	float rstd = rsqrtf(total / (float)head_size + eps);
 
 	float pos_f       = (float)(pos + position_offset);
 	float head_size_f = (float)head_size;

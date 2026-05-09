@@ -1,7 +1,8 @@
 // Bf16 rmsnorm forward. One block per row; size must be even.
 #include <cuda_bf16.h>
 
-#define RMS_WG 256
+#define RMS_WG    256
+#define RMS_NWARPS (RMS_WG / 32)
 
 extern "C" __global__
 void rmsnorm_bf16(const unsigned int* __restrict__ x,
@@ -23,15 +24,24 @@ void rmsnorm_bf16(const unsigned int* __restrict__ x,
 		s2 += v0 * v0 + v1 * v1;
 	}
 
-	__shared__ float partial[RMS_WG];
-	partial[tid] = s2;
-	__syncthreads();
+	// Intra-warp reduction: collapse 32 lanes into lane 0 via butterfly shuffles.
 	#pragma unroll
-	for (int stride = RMS_WG / 2; stride > 0; stride >>= 1) {
-		if (tid < stride) partial[tid] += partial[tid + stride];
-		__syncthreads();
+	for (int off = 16; off > 0; off >>= 1) {
+		s2 += __shfl_xor_sync(0xffffffffu, s2, off);
 	}
-	float rstd = rsqrtf(partial[0] / (float)size + eps);
+
+	// Inter-warp: lane 0 of each warp publishes; one syncthreads; then every
+	// thread sums the NWARPS-element table locally so the broadcast falls out
+	// of HW shared-mem fanout (no second sync needed for the result read).
+	__shared__ float warp_sums[RMS_NWARPS];
+	if ((tid & 31) == 0) warp_sums[tid >> 5] = s2;
+	__syncthreads();
+
+	float total = 0.0f;
+	#pragma unroll
+	for (int i = 0; i < RMS_NWARPS; ++i) total += warp_sums[i];
+
+	float rstd = rsqrtf(total / (float)size + eps);
 
 	for (int pi = tid; pi < pair_count; pi += RMS_WG) {
 		unsigned int xp = x[pair_base + pi];

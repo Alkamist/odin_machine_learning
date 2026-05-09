@@ -132,7 +132,7 @@ upload_stats :: proc() -> (count: int, ns: i64) {
 	return _upload_count, _upload_ns
 }
 
-buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
 	t_start := time.tick_now()
 	defer {
 		_alloc_count += 1
@@ -157,9 +157,13 @@ buffer_alloc :: proc(byte_count: int, persist: bool, loc: runtime.Source_Code_Lo
 		}
 	}
 
-	// Backward kernels accumulate into gradient buffers (`+=`), so any pooled
-	// slot â€” fresh or reused â€” must start at zero each forward pass.
-	_record_fill_zero(gpu_buffer.buffer, size, loc)
+	// Gradient/Adam buffers are zeroed every forward because backward kernels
+	// and optimizer updates accumulate (`+=`) into them. Activation Data
+	// buffers (persist=false) are not: forward kernels fully overwrite their
+	// output. Persistent Data still zeroed at load time.
+	if kind != .Data || persist {
+		_record_fill_zero(gpu_buffer.buffer, size, loc)
+	}
 
 	return transmute(ml.Backend_Buffer)gpu_buffer
 }
