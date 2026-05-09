@@ -8,6 +8,9 @@ import "core:math"
 import "core:math/rand"
 import "core:os"
 import "core:strings"
+import "core:sync"
+import "core:sync/chan"
+import "core:thread"
 import "core:time"
 
 import ml    "../.."
@@ -124,6 +127,10 @@ main :: proc() {
 	fmt.println("Type your message and press Enter. Commands: :quit, :reset")
 	fmt.println()
 
+	printer: Printer
+	_printer_start(&printer)
+	defer _printer_stop(&printer)
+
 	input_buffer: [4096]byte
 	for {
 		fmt.print("> ")
@@ -201,6 +208,7 @@ main :: proc() {
 
 		for step in 0 ..< max_new_tokens {
 			if cache.length + 1 > t_max {
+				_printer_drain(&printer)
 				fmt.println()
 				fmt.println("(stopped: reached t_max)")
 				break
@@ -217,8 +225,7 @@ main :: proc() {
 			reply_so_far := tok.decode(&tokenizer, all_tokens[reply_start:])
 			defer delete(reply_so_far)
 			if builtin.len(reply_so_far) > previous_decoded_length {
-				fmt.print(reply_so_far[previous_decoded_length:])
-				os.flush(os.stdout)
+				_printer_emit(&printer, reply_so_far[previous_decoded_length:])
 				previous_decoded_length = builtin.len(reply_so_far)
 			}
 
@@ -230,6 +237,7 @@ main :: proc() {
 			ml.get_data(logits, last_row)
 		}
 
+		_printer_drain(&printer)
 		fmt.println()
 		elapsed := f64(time.duration_seconds(time.tick_since(t_generate)))
 		prompt_rate := f64(builtin.len(new_tokens)) / prefill_elapsed if prefill_elapsed > 0 else 0
@@ -282,23 +290,35 @@ read_line :: proc(buffer: []byte) -> (line: string, ok: bool) {
 }
 
 sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> int {
+	n := builtin.len(logits)
 	if temperature <= 0 || top_k == 1 {
 		best := 0
-		for i in 1 ..< builtin.len(logits) do if logits[i] > logits[best] do best = i
+		for i in 1 ..< n do if logits[i] > logits[best] do best = i
 		return best
 	}
 
-	candidate_count := top_k > 0 ? min(top_k, builtin.len(logits)) : builtin.len(logits)
+	candidate_count := top_k > 0 ? min(top_k, n) : n
+	indices := make([]int, candidate_count, context.temp_allocator)
 
-	indices := make([]int, builtin.len(logits), context.temp_allocator)
-	for i in 0 ..< builtin.len(logits) do indices[i] = i
-
-	for slot in 0 ..< candidate_count {
-		best := slot
-		for i in slot + 1 ..< builtin.len(indices) {
-			if logits[indices[i]] > logits[indices[best]] do best = i
+	// Min-heap of size candidate_count tracking the largest logits seen so
+	// far. Streaming the remaining vocab and replacing the heap min on each
+	// larger logit gives O(n log k) instead of the O(n*k) selection sort
+	// that was dominating decode wall time.
+	for i in 0 ..< candidate_count do indices[i] = i
+	for i := candidate_count / 2 - 1; i >= 0; i -= 1 {
+		_sift_down_min_logit(indices, logits, i, candidate_count)
+	}
+	for i in candidate_count ..< n {
+		if logits[i] > logits[indices[0]] {
+			indices[0] = i
+			_sift_down_min_logit(indices, logits, 0, candidate_count)
 		}
-		indices[slot], indices[best] = indices[best], indices[slot]
+	}
+	// Heap-sort the min-heap into descending order so indices[0] is the
+	// largest logit and indices[candidate_count-1] is the k-th largest.
+	for end := candidate_count - 1; end > 0; end -= 1 {
+		indices[0], indices[end] = indices[end], indices[0]
+		_sift_down_min_logit(indices, logits, 0, end)
 	}
 
 	max_logit := logits[indices[0]]
@@ -334,6 +354,20 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 		if r <= cumulative do return indices[slot]
 	}
 	return indices[keep - 1]
+}
+
+_sift_down_min_logit :: proc(indices: []int, logits: []f32, start, n: int) {
+	root := start
+	for {
+		child := 2 * root + 1
+		if child >= n do return
+		if child + 1 < n && logits[indices[child + 1]] < logits[indices[child]] {
+			child += 1
+		}
+		if logits[indices[root]] <= logits[indices[child]] do return
+		indices[root], indices[child] = indices[child], indices[root]
+		root = child
+	}
 }
 
 parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, threads: ^int, gguf_path: ^string, timing: ^bool) {
@@ -439,4 +473,57 @@ _parse_float :: proc(s: string) -> f64 {
 	}
 	out := value / scale
 	return -out if negative else out
+}
+
+// Drains stdout writes onto a worker thread so the decode loop never blocks
+// on os.flush. clear() at the start of each forward synchronises the CUDA
+// stream, so a per-token flush stall directly idles the GPU.
+PRINTER_QUEUE_CAPACITY :: 256
+
+Printer :: struct {
+	ch:      chan.Chan(string),
+	pending: sync.Wait_Group,
+	thread:  ^thread.Thread,
+}
+
+_printer_proc :: proc(t: ^thread.Thread) {
+	p := (^Printer)(t.data)
+	for {
+		msg, ok := chan.recv(p.ch)
+		if !ok do return
+		fmt.print(msg)
+		os.flush(os.stdout)
+		delete(msg)
+		sync.wait_group_done(&p.pending)
+	}
+}
+
+_printer_start :: proc(p: ^Printer) {
+	ch_err: runtime.Allocator_Error
+	p.ch, ch_err = chan.create(chan.Chan(string), PRINTER_QUEUE_CAPACITY, context.allocator)
+	if ch_err != .None {
+		fmt.eprintln("FAIL: could not create printer channel.")
+		os.exit(1)
+	}
+	p.thread = thread.create(_printer_proc)
+	p.thread.data = p
+	thread.start(p.thread)
+}
+
+_printer_stop :: proc(p: ^Printer) {
+	chan.close(p.ch)
+	thread.join(p.thread)
+	thread.destroy(p.thread)
+	chan.destroy(p.ch)
+}
+
+_printer_emit :: proc(p: ^Printer, s: string) {
+	if builtin.len(s) == 0 do return
+	cloned := strings.clone(s)
+	sync.wait_group_add(&p.pending, 1)
+	chan.send(p.ch, cloned)
+}
+
+_printer_drain :: proc(p: ^Printer) {
+	sync.wait_group_wait(&p.pending)
 }

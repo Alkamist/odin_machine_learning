@@ -3,57 +3,20 @@
 Status of Gemma 4 E4B Q4_K_M decode on `gemma_chat_repl`. Re-read this
 file before starting a new round of work.
 
-## ⚠️ Read first: the chat REPL flush bottleneck
+## TL;DR
 
-**The single biggest perf bug identified this session is in the chat
-REPL, not the backend.** `examples/gemma_chat_repl/main.odin:220-222`
-calls `os.flush(os.stdout)` after every generated token. When stdout is
-a TTY or a pipe, that flush is a real syscall that stalls the host
-thread. Because `clear()` synchronises on the stream at the start of
-each forward, the GPU sits idle while the host waits on the flush.
+We are at the 130 tok/s reference target for the standard
+"write me a short story about a cat" / 256-token decode test. The
+remaining work below is speculative — none of it is needed to close a
+known gap.
 
-Measured impact on `--max-tokens 256 --temperature 0`:
-
-| stdout destination     | tok/s | wall  |
-|------------------------|------:|------:|
-| `> /dev/null` / file   |    97 | 2.65s |
-| `\| cat`                |   64 | 4.00s |
-| `\| grep` / pipe        |   64 | 4.00s |
-| terminal (interactive) | ~67  | ~3.8s |
-
-Same binary, same kernels, same numerics — only the stdout target
-differs. Per-token flush stall ≈ 5 ms.
-
-This means most of the analysis below was written against a 64 tok/s
-"baseline" that was actually a flush-bound artefact. **The real
-GPU-bound rate is ~97 tok/s**, ~25–35% off the 130 tok/s reference. The
-gap is much smaller than the original note claimed.
-
-### How ollama and llama.cpp avoid this
-Both run the model in a server context (HTTP server in ollama, in-proc
-`server_context` in llama.cpp's `llama-cli`). The decode loop posts
-tokens to a buffered queue/channel and returns immediately to the next
-forward; a separate thread drains the queue and does the actual stdout
-write + flush. The GPU never blocks on terminal I/O.
-
-- ollama: `runner/ollamarunner/runner.go:200`
-  (`responses: make(chan response, 100)` — 100-token buffer between
-  decode goroutine and HTTP-flush goroutine).
-- llama.cpp: `tools/cli/cli.cpp:57` (`server_context` with task queue;
-  `server_response_reader` drains on a separate thread).
-
-### The fix (next session)
-Decouple the print from the decode loop in
-`examples/gemma_chat_repl/main.odin`. One Odin `core:thread` worker +
-a buffered ring/channel of detokenised string deltas. Decode loop
-writes a delta and continues; printer thread reads, writes to stdout,
-flushes. At end of decode wait for the queue to drain so the user sees
-all output. A simpler stop-gap (skip flush when `os.stdout` is not a
-TTY) helps benchmarking but does nothing for actual interactive use,
-which is the whole point.
-
-Until that is done, **always benchmark with `> /tmp/x.txt`**. The
-`| grep` / `| tail` pattern is unsafe and gives a false low number.
+The fix that closed it was the **printer-thread split in
+`examples/gemma_chat_repl/main.odin`** (session 2026-05-09). The
+per-token `os.flush(os.stdout)` was stalling the host thread, and
+because `clear()` synchronises on the CUDA stream at the start of each
+forward, the GPU was idling on every flush — even when stdout was a
+file. Decoupling the print into a `core:sync/chan` queue + worker
+thread eliminated the stall.
 
 ## Numbers
 
@@ -63,21 +26,42 @@ Test: `gemma_chat_repl --gguf gemma_data/model.gguf --max-tokens 256
 --temperature 0` with the prompt "write me a short story about a cat"
 (16-token prefill).
 
-Current steady-state, **stdout redirected to a file** (excludes flush
-stall): **~97 tok/s** decode. Three runs at 99.1, 95.6, 99.4 tok/s.
+| stdout destination     | before printer thread | after  |
+|------------------------|----------------------:|-------:|
+| `>` file               |                  ~97  | ~131   |
+| `\|` grep / pipe       |                   ~64 | ~129   |
 
-GPU compute (`--timing`, redirected output): ~14.9 ms/tok. Note that
-`--timing` adds ~9 ms/tok from `cuEventRecord` so the wall during a
-timing run is misleading; the per-kernel µs values it reports are still
-trustworthy.
+After the fix the destination no longer matters (within noise). Both
+runs produce ~130 tok/s (≈ 7.7 ms/tok wall).
 
-Reference target: ~130 tok/s (≈ 7.7 ms/tok wall), attributed to
-llama.cpp / ollama on the same model+hw. **Still not independently
-verified** — Gemma E4B has unusual architecture (PLE inputs,
-sliding+full attention split, 8/2 GQA, vocab=262144) that may make it
-slower in llama.cpp than typical Llama models. Worth running
-`llama-bench --model gemma_data/model.gguf` once to confirm the target
-before treating the remaining 25–35% gap as "stuck".
+The "before" file-redirect number was assumed in the prior PERF_NOTES
+to be the GPU-bound floor; it was not. Even file-mode `os.flush` was
+costing ~3 ms/tok of host-side stall on top of the captured graph
+launch.
+
+GPU compute (`--timing`, redirected output): ~14.9 ms/tok. `--timing`
+adds ~9 ms/tok from `cuEventRecord` so the wall during a timing run is
+misleading; the per-kernel µs values it reports are still trustworthy.
+
+Reference target: ~130 tok/s, attributed to llama.cpp / ollama on the
+same model+hw. **Still not independently verified** with `llama-bench`,
+but we are matching it now so the urgency is gone.
+
+### How ollama and llama.cpp avoid the flush stall (for reference)
+Both run the model in a server context (HTTP server in ollama, in-proc
+`server_context` in llama.cpp's `llama-cli`). The decode loop posts
+tokens to a buffered queue/channel and returns immediately to the next
+forward; a separate thread drains the queue and does the actual stdout
+write + flush. The GPU never blocks on terminal I/O.
+
+- ollama: `runner/ollamarunner/runner.go:200`
+  (`responses: make(chan response, 100)`).
+- llama.cpp: `tools/cli/cli.cpp:57` (`server_context` task queue;
+  `server_response_reader` drains on a separate thread).
+
+Our equivalent: `examples/gemma_chat_repl/main.odin` `Printer` struct +
+`core:sync/chan` (cap 256) + `core:thread` worker. See "What's in
+tree" below.
 
 ## Per-kernel breakdown (per token, --timing)
 
@@ -96,55 +80,45 @@ before treating the remaining 25–35% gap as "stuck".
 (`gate_up_geglu` at 73% of peak DRAM bw). Small kernels are launch- and
 overhead-bound — peak DRAM utilisation 5–30% is typical.
 
-## Root-cause analysis (current understanding)
+## Speculative wins beyond the reference target
 
-With the corrected ~97 tok/s (10.3 ms/tok wall) baseline, the gap to
-130 tok/s (7.7 ms/tok) is ~2.6 ms/tok. Skipping `cuGraphExecUpdate`
-buys back ~1 ms by itself. The rest has to come from per-kernel work
-or fewer kernels.
+We're at 130 tok/s. None of the items below are needed to close a known
+gap; they're notes for if/when we want to push past the reference.
+Listed in rough order of leverage. The leverage estimates are stale —
+they were sized against the prior 97 tok/s baseline. Rerun the math
+against the current ~7.7 ms/tok wall before treating any of them as
+worthwhile.
 
-In rough order of leverage:
-
-1. **`rmsnorm_f32` was not migrated to warp-shuffle when the pipeline went
-   f32.** The bf16 sibling and the other f32 rmsnorm variants
-   (`rmsnorm_rope_f32`, `add_rmsnorm_f32`, `rmsnorm_rope_cache_f32`) all
-   use `__shfl_xor_sync` butterfly reductions. Plain `rmsnorm_f32`
-   (`kernels/rmsnorm/rmsnorm.cu`) still does the 8×`__syncthreads`
-   shared-memory reduction tree. 191 calls × ~6 µs reclaimable ≈ **1.2
-   ms/tok**. Easy fix.
-
-2. **`attention_cache_vec_f32` only uses ~10% of the SMs on decode.**
+1. **`attention_cache_vec_f32` only uses ~10% of the SMs on decode.**
    `ops.odin:1184` launches with `gridDim = (n_q_heads, q_token_count, 1)
    = (8, 1, 1)` — 8 blocks on 84 SMs. ggml's `launch_fattn`
    (`fattn-common.cuh:1091-1118`) computes `parallel_blocks` across the K
    dimension based on `cudaOccupancyMaxActiveBlocksPerMultiprocessor` and
    `ntiles_KV`, then runs a `flash_attn_combine_results` fixup. Modest
-   win for 512-slot sliding (~0.3 ms), bigger on full-attention layers and
-   long context.
+   win for 512-slot sliding, bigger on full-attention layers and long
+   context.
 
-3. **NVRTC vs offline nvcc compilation.** Only the ggml MMA wrapper is
+2. **NVRTC vs offline nvcc compilation.** Only the ggml MMA wrapper is
    offline-compiled (`build_ptx.ps1`). Everything else goes through NVRTC
    at startup. NVRTC's optimizer passes are not identical to `nvcc -O3` —
    for register-heavy kernels at 5–10 µs you're paying every cycle.
    Worth trying offline cubin for `linear_q4_k_mmvq`, `linear_q6_k_mmvq`,
    `quantize_q8_1_f32`, the rmsnorm family, and comparing.
 
-4. **Gemma E4B has more dispatches than typical models.** The PLE
+3. **Gemma E4B has more dispatches than typical models.** The PLE
    machinery (`per_layer_input_gate`, `gelu_mul`, `per_layer_projection`,
    `post_per_layer_input_norm`, `add`, `mul`) is ~6 ops per layer × 42 =
    ~250 extra dispatches/token vs vanilla Llama. With 1000 small kernels
    per token, you eat overhead floors regardless of how good each kernel
-   is. This is intrinsic to the architecture; only fusion can reduce it.
+   is. Only fusion can reduce it.
 
-5. **Wall is host_record + gpu, not max(host, gpu).** `clear()` in
-   `cuda.odin:357` does `StreamSynchronize` at the start of each forward,
-   so consecutive forwards are serialised. With chat-flush stall added
-   on top, the chain is `gpu_N → host_print/flush → host_record_N+1 →
-   gpu_N+1` all serial on one thread. ggml in stable mode skips the
-   rebuild entirely (just `cudaGraphLaunch`), and their I/O happens on
-   another thread, so wall ≈ gpu for them. Closing this requires (i) the
-   chat-REPL thread split (top of file — fixes the chat side), and (ii)
-   the ggml-style stable-graph fast path (fixes the backend side).
+4. **ggml-style stable-graph fast path** (skip the whole forward
+   re-walk on stable steps and call `cudaGraphLaunch` directly). The
+   captured-graph path already records once and patches with
+   `cuGraphExecUpdate`; the host-side `forward_cached` re-walk is the
+   remaining cost. With wall now ≈ gpu (printer-thread fix removed the
+   serial host-print stall in front of the next forward), this is a
+   smaller win than it looked from the prior baseline.
 
 ## How ggml's stable-graph fast path actually works
 
@@ -174,6 +148,15 @@ backend dispatches inside `forward_cached` that need to be elided.
 
 All under `backends/cuda/` plus per-call sites in
 `networks/gemma/gemma.odin` and the fused-op machinery in `ml.odin`.
+
+### Chat REPL printer thread (closes the flush stall)
+`examples/gemma_chat_repl/main.odin` runs a `core:thread` worker that
+drains a `core:sync/chan.Chan(string)` (cap 256) of detokenised string
+deltas. The decode loop clones the delta, increments a
+`sync.Wait_Group`, and `chan.send`s; the worker `chan.recv`s, writes,
+flushes, deletes, and `wait_group_done`s. Decode loop drains via
+`wait_group_wait` before any direct `fmt.println` (timing line, etc.)
+so output stays ordered. Channel is closed + thread joined on exit.
 
 ### Auto CUDA-graph capture
 - `cuda.odin` / `graph.odin` / `buffer.odin` — `enable_decode_graph(true)`
@@ -314,48 +297,19 @@ hit the same wall. Real wins on this model need either:
 
 ## Fix list (current priority order)
 
-0. **PRE-REQ — Decouple chat REPL print from decode loop.** See the
-   "⚠️ Read first" section. Without this, all backend perf work is
-   measured against a flush-bound artefact and the wins look smaller
-   than they actually are. Implement with one Odin `core:thread`
-   worker + a buffered ring/channel between decode and stdout. Stop-gap
-   (skip flush when stdout isn't a TTY) is fine for benchmarking but
-   doesn't help interactive use. **Do this first in the next session.**
-1. ✅ DONE — `rmsnorm.cu` warp-shuffle port. Marginal; documented above.
-   Worth keeping as a small correctness improvement but not load-bearing.
-2. **Add `parallel_blocks` to `attention_cache_vec_*` + combine fixup.**
-   Mirror `ggml_cuda_op_flash_attn_vec`'s launch decision. Decode grid
-   is `(n_q_heads, q_token_count, 1) = (8, 1, 1)` today — 8 blocks on
-   84 SMs. Splitting the K dim by 4× would use ~32 SMs and parallelise
-   the K reduction. Bigger absolute win on full-attention layers
-   (capacity 4096) than sliding (capacity 512). ~150 lines (split
-   kernel + combine kernel + two-stage dispatcher). Lever (b) above.
-3. **Investigate ggml-style stable-graph fast path** (lever c). When
-   the captured graph is bit-stable across decode steps, skip the
-   entire `forward_cached` re-walk and just `cuGraphLaunch` the existing
-   exec. Saves the host-side recording overhead. Needs a
-   backend-capability flag so `gemma.forward_cached` can return early
-   on stable forwards. The op list in `_current_ctx.operations` is
-   already populated; only the per-op backend dispatches inside need
-   to be elided. Most architectural change, biggest single lever.
-4. **Try fusion: rmsnorm → next op's quantize_q8_1.** The 249 quantize
-   calls/tok at ~10 µs each are launch-bound just like rmsnorm. If
-   rmsnorm and quantize_q8_1 fuse (read x once, write y once, write
-   q8_1 blocks), we cut the dispatch count and the activation
-   round-trip. ggml does NOT fuse this — but they may not have to,
-   because their offline-compiled rmsnorm + quantize each take less
-   wall time. Worth testing.
-5. **Offline-compile the hot kernels via nvcc cubin.** Set up
-   `build_cubin.ps1` analogous to `build_ptx.ps1`. Compare per-call
-   timing for `linear_q4_k_mmvq`, `quantize_q8_1_f32`, the rmsnorm
-   family. Expected: small wins per kernel (1-2 µs?) but the per-call
-   floor is still launch overhead. Test before committing to it as a
-   strategy.
-6. **Verify the 130 tok/s reference.** Build llama.cpp + run
-   `llama-bench --model gemma_data/model.gguf` once. If ggml's actual
-   number on this exact model is much lower than 130, "parity" target
-   shifts and the gap may already be smaller than it looks. The
-   reference number is currently unverified.
+0. ✅ DONE — Printer-thread split in `examples/gemma_chat_repl/main.odin`
+   (session 2026-05-09). Closed the gap to the reference target on its
+   own. See "What's in tree".
+1. ✅ DONE — `rmsnorm.cu` warp-shuffle port. Marginal; not load-bearing.
+2. **Verify the 130 tok/s reference with `llama-bench`.** We're
+   currently matching it but the reference number itself is still
+   unverified. If llama.cpp on this model is actually faster than 130,
+   there's headroom; if slower, we may already be ahead. One-time
+   measurement.
+3. **Speculative wins** — see "Speculative wins beyond the reference
+   target" above. parallel_blocks for attention, offline-compiled
+   cubin for hot kernels, ggml-style stable-graph fast path. None
+   urgent.
 
 ## Things tried that didn't move the headline (don't redo)
 
@@ -391,18 +345,40 @@ hit the same wall. Real wins on this model need either:
 Keep this short — only entries that change a future session's
 priorities or correct a wrong assumption. Older context lives in git.
 
-### Session 2026-05-09
+### Session 2026-05-09 (later)
+- **Implemented the printer-thread split.** Added `Printer` struct +
+  `core:sync/chan.Chan(string)` (cap 256) + `core:thread` worker in
+  `examples/gemma_chat_repl/main.odin`. Decoder clones the delta,
+  `wait_group_add(1)`, `chan.send`. Worker recv/print/flush/delete/
+  `wait_group_done`. Decoder drains via `wait_group_wait` before any
+  direct `fmt.println`. Channel closed + thread joined on exit.
+- **Closed the gap to the reference target.** Three-run averages with
+  `--temperature 0`:
+  - File redirect: 97 → ~131 tok/s
+  - Pipe (`| grep`): 64 → ~129 tok/s
+  Destination no longer matters. Even file-mode `os.flush` was
+  costing ~3 ms/tok, not just terminal/pipe. The "97 tok/s GPU-bound
+  baseline" assumption from earlier in this session was wrong.
+- **Replaced selection-sort top-K in `sample_next` with a min-heap.**
+  After the printer fix, default-temperature decode (`--top-k 40` on
+  vocab=262144) was capped at 67 tok/s by the O(n*k) sampling sort —
+  10.5M comparisons + a 2 MB `indices` allocation per token. Min-heap
+  top-K + heap-sort to descending order is O(n log k) and only
+  allocates `k` ints. Default-temperature decode now matches
+  `--temperature 0` at ~131 tok/s. The PERF_NOTES test was hiding
+  this because it always used `--temperature 0`, which goes through a
+  fast O(n) argmax path.
+- **Demoted the rest of the fix list to speculative.** With us at the
+  reference target, parallel_blocks / offline cubin / stable-graph
+  fast path are no longer closing a known gap. Their leverage
+  estimates in the old "Root-cause analysis" section were sized
+  against the prior 97 tok/s baseline and are stale.
+
+### Session 2026-05-09 (earlier)
 - **Discovered the chat-REPL flush bottleneck.** Same binary giving 64
-  vs 97 tok/s depending only on stdout target. All "headline tok/s"
-  numbers in the prior PERF_NOTES (everything quoted as 45.8 → 63.2)
-  were measured against a `> /tmp/x.txt` redirect so they were already
-  measuring the GPU-bound rate, but session-time experiments using
-  `| grep` were the false-low artefact. The chat REPL fix is now
-  pre-req #0 on the fix list.
-- **Corrected baseline to ~97 tok/s** (was 64 in mid-session work).
-  Gap to 130 tok/s reference is ~25–35%, not ~100%. Some of the
-  bigger-effort fixes on the prior fix list (full stable-graph fast
-  path, fp32→bf16 activations revert) may not be needed to close it.
+  vs 97 tok/s depending only on stdout target. Per-token flush stall
+  through `os.flush(os.stdout)` while `clear()` synchronises the
+  stream at the start of each forward.
 - **Ported warp-shuffle to `kernels/rmsnorm/rmsnorm.cu`.** Verified
   the kernel is correct (deterministic across runs); fp32 reduction
   reorder shifts the greedy decode after ~10 tokens but kernel math
@@ -410,12 +386,8 @@ priorities or correct a wrong assumption. Older context lives in git.
   Lesson: small per-row kernels are launch-bound, not compute-bound.
   In-kernel optimisations are mostly noise; need fusion / bigger grids
   / skip-dispatch for real wins.
-- **Pruned ~50% of prior PERF_NOTES.** Removed: "wall = max(host,
-  gpu)" framing, "host work is the bottleneck" claim, the unverified
-  130 tok/s assertion presented as fact, and the misleading "Step A
-  was a no-op" rationale. See git history for the old text.
 - **Identified ggml's actual stable-graph fast path** in detail. ggml
   skips stream capture, cgraph evaluation, AND `cuGraphExecUpdate`
   when properties unchanged — they call `cudaGraphLaunch` directly.
   Our prior "Step A" only skipped the update; the recording itself was
-  what cost. Fix #3 is to do this properly.
+  what cost.
