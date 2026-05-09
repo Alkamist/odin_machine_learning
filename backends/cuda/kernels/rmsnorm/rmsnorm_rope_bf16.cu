@@ -11,11 +11,12 @@ void rmsnorm_rope_bf16(const unsigned int* __restrict__ x,
                        const unsigned int* __restrict__ w,
                        unsigned int*       __restrict__ y,
                        int token_count, int head_count, int head_size, float eps,
-                       float base, int position_offset, int rotate_pair_count) {
+                       float base, const int* __restrict__ position_offset_dev, int rotate_pair_count) {
 	int wg_id = blockIdx.x;
 	int tid   = threadIdx.x;
 	int head  = wg_id % head_count;
 	int pos   = wg_id / head_count;
+	int position_offset = *position_offset_dev;
 
 	int pair_count = head_size >> 1;
 	int base_pair  = (pos * head_count + head) * pair_count;

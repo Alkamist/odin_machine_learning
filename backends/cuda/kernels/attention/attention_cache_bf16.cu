@@ -30,12 +30,13 @@ void attention_cache_bf16(const unsigned int* __restrict__ q_buf,
                           const unsigned int* __restrict__ v_buf,
                           unsigned int*       __restrict__ o,
                           int n_q_heads, int n_kv_heads, int head_size,
-                          int q_token_count, int cache_position,
+                          int q_token_count, const int* __restrict__ cache_position_dev,
                           int q_size, int kv_size,
                           int window, int t_capacity) {
 	int h    = blockIdx.x;
 	int t_q  = blockIdx.y;
 	int tid  = threadIdx.x;
+	int cache_position = *cache_position_dev;
 
 	int   D    = head_size;
 	int   kv_h = h * n_kv_heads / n_q_heads;

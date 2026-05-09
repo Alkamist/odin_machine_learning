@@ -78,6 +78,20 @@ Context :: struct {
 	// the same rmsnorm; gate/up from the same pre_ff_norm) reuse a single
 	// quantize_q8_1 dispatch. Cleared on every `clear()`.
 	q8_1_cache: map[cuda.DevicePtr]cuda.DevicePtr,
+
+	// Decode-position upload state. Position-bearing kernels (rmsnorm_rope,
+	// rope, attention_cache) read `cache_position` from `position_dev` instead
+	// of taking it as a scalar kernel arg. The first position-bearing dispatch
+	// of each forward writes the value into the pinned host buffer and emits
+	// a single HtoDAsync into `position_dev`; the captured graph references
+	// stable pointers (pinned host → fixed device buffer) so re-captures of
+	// the same topology produce bit-identical kernel-arg buffers across
+	// decode steps. Without this, every step's captured graph differed by
+	// 4 bytes per position-bearing node, forcing `cuGraphExecUpdate` to
+	// patch each one. Mirrors how ggml keeps step-varying state in tensors.
+	position_pinned:                rawptr,         // pinned 4-byte host buffer
+	position_dev:                   cuda.DevicePtr, // 4-byte device buffer
+	position_written_this_forward:  bool,
 }
 
 Activation_Slot :: struct {
@@ -183,6 +197,11 @@ context_create :: proc(allocator := context.allocator, loc := #caller_location) 
 	cublas.check(cublas.Create_v2(&gctx.cublas_handle))
 	cublas.check(cublas.SetStream_v2(gctx.cublas_handle, gctx.stream))
 
+	cuda.check(cuda.MemAllocHost(&gctx.position_pinned, 4))
+	cuda.check(cuda.MemAlloc(&gctx.position_dev, 4))
+	cuda.check(cuda.MemsetD32(gctx.position_dev, 0, 1))
+	(^i32)(gctx.position_pinned)^ = 0
+
 	ml._context_init(gctx, {
 		clear        = clear,
 		forward      = forward,
@@ -241,6 +260,15 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	}
 	delete(gctx.q8_1_cache)
 
+	if gctx.position_dev != 0 {
+		cuda.MemFree(gctx.position_dev)
+		gctx.position_dev = 0
+	}
+	if gctx.position_pinned != nil {
+		cuda.MemFreeHost(gctx.position_pinned)
+		gctx.position_pinned = nil
+	}
+
 	if gctx.cublas_handle != nil {
 		cublas.Destroy_v2(gctx.cublas_handle)
 		gctx.cublas_handle = nil
@@ -294,6 +322,10 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 	// Drop q8_1 reuse cache: keyed by activation-pool pointers, which are
 	// stable across forwards but the *contents* are stale once we rewind.
 	builtin.clear(&gctx.q8_1_cache)
+
+	// Position upload happens lazily on the first position-bearing dispatch
+	// of the new forward (see `_emit_position_upload` in ops.odin).
+	gctx.position_written_this_forward = false
 
 	// Auto-graph mode: enter capture for the upcoming forward. The forward's
 	// kernel/memcpy launches will be recorded into a Graph instead of running.

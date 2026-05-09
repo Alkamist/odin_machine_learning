@@ -173,6 +173,7 @@ EVENT_BLOCKING_SYNC  :: 0x01
 EVENT_DISABLE_TIMING :: 0x02
 EVENT_INTERPROCESS   :: 0x04
 
+
 @(default_calling_convention="c", link_prefix="cu")
 foreign lib {
 	// Initialization & errors. `cuInit`, `cuDriverGetVersion`, etc.

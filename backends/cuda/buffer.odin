@@ -157,13 +157,11 @@ buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_C
 	gctx := _gctx(loc)
 	cuda.check(cuda.MemcpyHtoDAsync(gb.ptr, raw_data(src), uint(builtin.len(src)), gctx.stream), loc=loc)
 	// Synchronous semantics for the public API: caller's `src` must not be
-	// reused before the copy completes. Pinning the staging would let us
-	// overlap, but that's a Phase 7 perf concern.
-	//
-	// During auto-graph capture we can't `StreamSynchronize` (the stream is
-	// in capture state). Callers inside a captured forward are responsible
-	// for keeping `src` alive until the graph is launched; in practice every
-	// in-tree call site uses temp_allocator buffers that outlive the forward.
+	// reused before the copy completes. During auto-graph capture we can't
+	// `StreamSynchronize` (the stream is in capture state). Callers inside a
+	// captured forward are responsible for keeping `src` alive until the
+	// graph is launched; in practice every in-tree call site uses
+	// `temp_allocator` buffers that outlive the forward.
 	if !gctx.auto_capturing {
 		cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)
 	}

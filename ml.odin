@@ -497,12 +497,6 @@ Operation :: struct {
 }
 
 append_operation :: proc(op: Operation, loc := #caller_location) {
-	// The operations array exists solely to drive `backward`. Under
-	// No_Gradients (inference) the caller has declared that backward will not
-	// run, so skip the struct copy + count increment — the array is the size
-	// of `MAX_OPERATIONS × Operation` (hundreds of KB), and at decode we hit
-	// ~850 ml-ops per forward. Saves both CPU cycles and L1/L2 cache pressure.
-	if .No_Gradients in _current_ctx.clear_flags { return }
 	assert(_current_ctx.operation_count < MAX_OPERATIONS, "Maximum operations exceeded, did you forget to call clear?", loc=loc)
 	_current_ctx.operations[_current_ctx.operation_count] = op
 	_current_ctx.operation_count += 1

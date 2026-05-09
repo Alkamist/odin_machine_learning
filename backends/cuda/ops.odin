@@ -37,6 +37,7 @@ _rope_pipeline:          ^Pipeline
 _rope_bf16_pipeline:     ^Pipeline
 _attention_bf16_pipeline:       ^Pipeline
 _attention_cache_bf16_pipeline: ^Pipeline
+_cache_write_bf16_pipeline:     ^Pipeline
 _select_f32_pipeline:           ^Pipeline
 _select_bf16_pipeline:          ^Pipeline
 _slice_trailing_f32_pipeline:   ^Pipeline
@@ -54,6 +55,21 @@ gradient :: #force_inline proc(t: ml.Tensor) -> Gpu_Buffer {
 @(require_results)
 _div_up :: #force_inline proc(a, b: int) -> u32 {
 	return u32((a + b - 1) / b)
+}
+
+// Lazily upload `cache_position` for the current forward to the per-context
+// device buffer. Position-bearing kernels (rmsnorm_rope, rope, attention_cache)
+// take a `const int* pos_ptr` and read from this stable buffer instead of
+// receiving the value as a baked-in scalar arg. Net effect: the captured graph
+// references identical pointers across decode steps for these kernels, so
+// `cuGraphExecUpdate` finds nothing to patch on the kernel-arg side. Only the
+// K/V cache memcpy nodes still vary (their dst depends on cache_position %
+// t_capacity); fusing rope+set_rows would close that gap too.
+_emit_position_upload :: proc(gctx: ^Context, value: int, loc: runtime.Source_Code_Location) {
+	if gctx.position_written_this_forward { return }
+	(^i32)(gctx.position_pinned)^ = i32(value)
+	cuda.check(cuda.MemcpyHtoDAsync(gctx.position_dev, gctx.position_pinned, 4, gctx.stream), loc=loc)
+	gctx.position_written_this_forward = true
 }
 
 // Replace cuda.odin's stub. Routes by op variant.
@@ -577,11 +593,14 @@ _rmsnorm_rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locatio
 		_rmsnorm_rope_bf16_pipeline = _compile_pipeline(RMSNORM_ROPE_BF16_SRC, "rmsnorm_rope_bf16.cu", "rmsnorm_rope_bf16")
 	}
 
+	gctx := _gctx(loc)
+	_emit_position_upload(gctx, v.position_offset, loc)
+
 	xp := data(x).ptr; wp := data(v.weight).ptr; yp := data(y).ptr
 	tc := i32(token_count); hc := i32(v.head_count); hs := i32(head_size)
 	eps := v.eps; base := v.base
-	po := i32(v.position_offset); rpc := i32(v.rotate_pair_count)
-	args := [?]rawptr{ &xp, &wp, &yp, &tc, &hc, &hs, &eps, &base, &po, &rpc }
+	pos_dev := gctx.position_dev; rpc := i32(v.rotate_pair_count)
+	args := [?]rawptr{ &xp, &wp, &yp, &tc, &hc, &hs, &eps, &base, &pos_dev, &rpc }
 	_dispatch(_rmsnorm_rope_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 }
 
@@ -594,10 +613,13 @@ _rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	head_size   := x.shape[x.rank - 1] / v.head_count
 	total_pairs := token_count * v.head_count * (head_size / 2)
 
+	gctx := _gctx(loc)
+	_emit_position_upload(gctx, v.position_offset, loc)
+
 	xp := data(x).ptr; yp := data(y).ptr
 	tc := i32(token_count); hc := i32(v.head_count); hs := i32(head_size)
-	base := v.base; po := i32(v.position_offset); rpc := i32(v.rotate_pair_count)
-	args := [?]rawptr{ &xp, &yp, &tc, &hc, &hs, &base, &po, &rpc }
+	base := v.base; pos_dev := gctx.position_dev; rpc := i32(v.rotate_pair_count)
+	args := [?]rawptr{ &xp, &yp, &tc, &hc, &hs, &base, &pos_dev, &rpc }
 
 	#partial switch x.type {
 	case .F32:
@@ -710,54 +732,53 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 
 	gctx := _gctx(loc)
 
-	// Copy new K/V rows into the ring cache at `cache_position` (mod capacity).
-	// Up to two memcpys: a "first" segment up to the wrap point, then a "wrap"
-	// segment back at offset 0 if the new tokens straddle the end.
-	row_bytes  := uint(kv_size * ml.data_type_size(k.type))
 	t_capacity := k_cache.shape[0]
-	first_phys  := v.cache_position % t_capacity
-	first_count := token_count
-	if first_phys + first_count > t_capacity { first_count = t_capacity - first_phys }
-	first_size := uint(first_count) * row_bytes
-	first_dst  := uint(first_phys)  * row_bytes
 
-	cuda.check(cuda.MemcpyDtoDAsync(
-		cuda.DevicePtr(u64(data(k_cache).ptr) + u64(first_dst)),
-		data(k).ptr, first_size, gctx.stream,
-	), loc=loc)
-	cuda.check(cuda.MemcpyDtoDAsync(
-		cuda.DevicePtr(u64(data(v_cache).ptr) + u64(first_dst)),
-		data(val).ptr, first_size, gctx.stream,
-	), loc=loc)
+	// K/V cache writes go through `cache_write_bf16`, which computes the dst
+	// row index device-side as `(*pos_dev + row) % t_capacity`. This replaces
+	// two host-issued cuMemcpyDtoDAsync calls (one each for K and V) plus the
+	// optional wrap pair: every step's captured graph used to have a different
+	// dst pointer baked in, forcing `cuGraphExecUpdate` to patch on each step.
+	// With the kernel reading position from a stable device buffer, the args
+	// are bit-identical step-to-step.
+	if _cache_write_bf16_pipeline == nil {
+		_cache_write_bf16_pipeline = _compile_pipeline(CACHE_WRITE_BF16_SRC, "cache_write_bf16.cu", "cache_write_bf16")
+	}
+	{
+		k_src := data(k).ptr
+		k_dst := data(k_cache).ptr
+		v_src := data(val).ptr
+		v_dst := data(v_cache).ptr
+		pos_dev := gctx.position_dev
+		nr  := i32(token_count)
+		kvs := i32(kv_size)
+		tc  := i32(t_capacity)
 
-	if first_count < token_count {
-		wrap_src  := first_size
-		wrap_size := uint(token_count - first_count) * row_bytes
-		cuda.check(cuda.MemcpyDtoDAsync(
-			data(k_cache).ptr,
-			cuda.DevicePtr(u64(data(k).ptr) + u64(wrap_src)),
-			wrap_size, gctx.stream,
-		), loc=loc)
-		cuda.check(cuda.MemcpyDtoDAsync(
-			data(v_cache).ptr,
-			cuda.DevicePtr(u64(data(val).ptr) + u64(wrap_src)),
-			wrap_size, gctx.stream,
-		), loc=loc)
+		pairs_total := token_count * (kv_size / 2)
+		grid        := _div_up(pairs_total, 256)
+
+		k_args := [?]rawptr{ &k_src, &k_dst, &pos_dev, &nr, &kvs, &tc }
+		_dispatch(_cache_write_bf16_pipeline, grid, 1, 1, 256, 1, 1, 0, k_args[:], loc)
+
+		v_args := [?]rawptr{ &v_src, &v_dst, &pos_dev, &nr, &kvs, &tc }
+		_dispatch(_cache_write_bf16_pipeline, grid, 1, 1, 256, 1, 1, 0, v_args[:], loc)
 	}
 
 	if _attention_cache_bf16_pipeline == nil {
 		_attention_cache_bf16_pipeline = _compile_pipeline(ATTENTION_CACHE_BF16_SRC, "attention_cache_bf16.cu", "attention_cache_bf16")
 	}
 
+	_emit_position_upload(gctx, v.cache_position, loc)
+
 	qp := data(q).ptr; kcp := data(k_cache).ptr; vcp := data(v_cache).ptr; op_ptr := data(o).ptr
 	n_q_heads  := i32(v.n_q_heads)
 	n_kv_heads := i32(v.n_kv_heads)
-	hs := i32(head_size); qtc := i32(token_count); cp := i32(v.cache_position)
+	hs := i32(head_size); qtc := i32(token_count); pos_dev := gctx.position_dev
 	qs := i32(q_size); kvs := i32(kv_size); window := i32(v.window); tcap := i32(t_capacity)
 
 	args := [?]rawptr{
 		&qp, &kcp, &vcp, &op_ptr,
-		&n_q_heads, &n_kv_heads, &hs, &qtc, &cp, &qs, &kvs, &window, &tcap,
+		&n_q_heads, &n_kv_heads, &hs, &qtc, &pos_dev, &qs, &kvs, &window, &tcap,
 	}
 	_dispatch(_attention_cache_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
 }

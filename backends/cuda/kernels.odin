@@ -51,6 +51,7 @@ LINEAR_Q6_K_GEMV_SRC   :: #load("kernels/linear/linear_q6_k_gemv.cu",   []u8)
 
 ATTENTION_BF16_SRC       :: #load("kernels/attention/attention_bf16.cu",       []u8)
 ATTENTION_CACHE_BF16_SRC :: #load("kernels/attention/attention_cache_bf16.cu", []u8)
+CACHE_WRITE_BF16_SRC     :: #load("kernels/attention/cache_write_bf16.cu",     []u8)
 
 SELECT_F32_SRC           :: #load("kernels/select/select.cu",                  []u8)
 SELECT_BF16_SRC          :: #load("kernels/select/select_bf16.cu",             []u8)

@@ -1,22 +1,26 @@
-// Q4_K weight x Q8_1 activation GEMV (M=1 decode path). Mirrors ggml's mmvq.
+// Q4_K weight x Q8_1 activation GEMV (M=1 decode path). Mirrors the inner
+// per-thread work pattern of ggml's `mul_mat_vec_q` / `vec_dot_q4_K_q8_1`:
 //
 //   block_q4_K (144 bytes / 256 elements):
 //     half  d, dmin                     (4 bytes)
 //     u8    scales_mins[12]             (12 bytes packed 6-bit scales+mins)
-//     u8    qs[128]                     (128 bytes 4-bit nibbles)
+//     u8    qs[128]                     (32 ints, low+high nibbles per byte)
 //   block_q8_1 (36 bytes / 32 elements):
 //     half  d, s                        (s == d * sum(qs[i]))
-//     i8    qs[32]                      (packed 4-per-uint)
-//
-// Algorithm per Q4_K block:
-//   sum_e w(e)*x(e) = sum_{sub=0..7}   d * scale_s * d_q8 * dp4a(q4, q8)
-//                                    - dmin * min_s * s_q8
+//     i8    qs[32]                      (8 ints, packed 4-per-uint)
 //
 // Block layout: 4 warps x 32 lanes = 128 threads. Each block produces
-// ROWS_PER_WG=2 output rows; the 4 warps cooperate on K (each warp handles
-// 1/NWARPS of the K-blocks), then a tree reduction folds across warps.
-// Versus the previous 1-warp/2-row layout this 4xs SM warp count and lifts
-// the per-row K parallelism from 32 lanes to 128.
+// ROWS_PER_WG=2 output rows. The 128 threads are striped across K-blocks
+// at granularity `blocks_per_iter = 2 * NWARPS * WARP_SIZE / QI = 8`,
+// so 16 threads cover each K-block per outer iter (2 K-blocks per warp
+// per iter, vs the prior 1 K-block per warp). Each thread handles 16
+// weights via 4 dp4a calls — two q4 ints loaded once, expanded into
+// low+high nibble passes against four q8_1 ints. This matches ggml's
+// register-tiled mmvq body.
+//
+// q/k/v across the same `hidden` activation share the q8_1 buffer via
+// the q8_1 cache in ops.odin; downstream consumers read packed bf16
+// pairs (`y[n_lo >> 1] = (hi << 16) | lo`).
 #include <cuda_fp16.h>
 
 __device__ __forceinline__ void unpack_scale_min(int sub,
@@ -46,93 +50,105 @@ __device__ __forceinline__ unsigned int bf16_from_f32(float v) {
 	return (rounded >> 16) & 0xffffu;
 }
 
-#define ROWS_PER_WG 2
-#define NWARPS      4
-#define WARP_SIZE   32
-#define BLOCK_UINTS 36   // 144 / 4
+#define ROWS_PER_WG       2
+#define NWARPS            4
+#define WARP_SIZE         32
+#define VDR               2     // dp4a pairs per thread per K-block (== ggml's VDR_Q4_K_Q8_1_MMVQ)
+#define QI                32    // ints in a Q4_K block (qs section)
+#define BLOCK_UINTS       36    // total uints per Q4_K block (header + qs)
+#define THREADS_PER_BLOCK (NWARPS * WARP_SIZE)
+#define BLOCKS_PER_ITER   (VDR * NWARPS * WARP_SIZE / QI)  // = 8
 
 extern "C" __global__
-__launch_bounds__(NWARPS * WARP_SIZE, 1)
+__launch_bounds__(THREADS_PER_BLOCK, 1)
 void linear_q4_k_mmvq(const unsigned int* __restrict__ x,   // q8_1 stream
                       const unsigned int* __restrict__ w,   // q4_k stream
                       unsigned int*       __restrict__ y,   // bf16 packed pairs
                       int M, int K, int N) {
 	int n_base = blockIdx.x * ROWS_PER_WG;
-	int wid    = threadIdx.y;        // 0..NWARPS-1
-	int lane   = threadIdx.x;        // 0..31
+	int wid    = threadIdx.y;
+	int lane   = threadIdx.x;
+	int tid    = wid * WARP_SIZE + lane;
 
-	int num_blocks = K / 256;
+	int blocks_per_row = K / 256;
+
+	// Each thread covers 16 weights of one (K-block, sub-pair) combo. Threads
+	// are split into groups of QI/VDR=16: lanes within a group share the same
+	// kbx_start and walk the K dimension via blocks_per_iter strides.
+	int kqs               = VDR * (tid % (QI / VDR));    // 0,2,...,30
+	int bq8_offset        = 2 * ((kqs / 2) / 4);          // 0, 2, 4, or 6 — selects sub-block pair
+	int idx_in_subblock   = (kqs / 2) % 4;                 // 0..3 — which int inside the sub-block
 
 	float acc[ROWS_PER_WG];
 	#pragma unroll
 	for (int r = 0; r < ROWS_PER_WG; ++r) acc[r] = 0.0f;
 
-	int t_sub_0 = lane >> 3;
-	int t_inner = lane & 7;
-	int t_sub_1 = t_sub_0 + 4;
+	for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+		// Load q8_1 once for this K-block — shared across both output rows.
+		int q8_base = (kbx * 8 + bq8_offset) * 9;
+		unsigned int ds_0 = __ldg(&x[q8_base]);
+		unsigned int ds_1 = __ldg(&x[q8_base + 9]);
+		float d8_0  = __half2float(__ushort_as_half((unsigned short)(ds_0 & 0xffffu)));
+		float d8_1  = __half2float(__ushort_as_half((unsigned short)(ds_1 & 0xffffu)));
+		float q8s_0 = __half2float(__ushort_as_half((unsigned short)((ds_0 >> 16) & 0xffffu)));
+		float q8s_1 = __half2float(__ushort_as_half((unsigned short)((ds_1 >> 16) & 0xffffu)));
 
-	// Each warp strides through K with stride NWARPS, processing 1/NWARPS of
-	// the Q4_K blocks. Inside a warp the 32 lanes split the block's 8 sub-blocks
-	// x 8 inner ints exactly as in the 1-warp version.
-	for (int b = wid; b < num_blocks; b += NWARPS) {
-		int q8_block_base = b * 8;
-
-		int          q8_packed_0 = (int)__ldg(&x[(q8_block_base + t_sub_0) * 9 + 1 + t_inner]);
-		int          q8_packed_1 = (int)__ldg(&x[(q8_block_base + t_sub_1) * 9 + 1 + t_inner]);
-		unsigned int q8_ds_0 = __ldg(&x[(q8_block_base + t_sub_0) * 9]);
-		unsigned int q8_ds_1 = __ldg(&x[(q8_block_base + t_sub_1) * 9]);
-		float q8_d_0 = __half2float(__ushort_as_half((unsigned short)(q8_ds_0 & 0xffff)));
-		float q8_s_0 = __half2float(__ushort_as_half((unsigned short)((q8_ds_0 >> 16) & 0xffff)));
-		float q8_d_1 = __half2float(__ushort_as_half((unsigned short)(q8_ds_1 & 0xffff)));
-		float q8_s_1 = __half2float(__ushort_as_half((unsigned short)((q8_ds_1 >> 16) & 0xffff)));
+		int u[4];
+		u[0] = (int)__ldg(&x[q8_base + 1 + idx_in_subblock]);
+		u[1] = (int)__ldg(&x[q8_base + 1 + idx_in_subblock + 4]);
+		u[2] = (int)__ldg(&x[q8_base + 9 + 1 + idx_in_subblock]);
+		u[3] = (int)__ldg(&x[q8_base + 9 + 1 + idx_in_subblock + 4]);
 
 		#pragma unroll
 		for (int r = 0; r < ROWS_PER_WG; ++r) {
 			int n = n_base + r;
 			if (n >= N) continue;
 
-			int block_off = (n * num_blocks + b) * BLOCK_UINTS;
+			int block_off = (n * blocks_per_row + kbx) * BLOCK_UINTS;
 
 			uint4 hdr = __ldg(reinterpret_cast<const uint4*>(&w[block_off]));
 			unsigned int dm = hdr.x;
-			float d    = __half2float(__ushort_as_half((unsigned short)(dm & 0xffff)));
-			float dmin = __half2float(__ushort_as_half((unsigned short)((dm >> 16) & 0xffff)));
+			float d    = __half2float(__ushort_as_half((unsigned short)(dm & 0xffffu)));
+			float dmin = __half2float(__ushort_as_half((unsigned short)((dm >> 16) & 0xffffu)));
 			unsigned int sw0 = hdr.y;
 			unsigned int sw1 = hdr.z;
 			unsigned int sw2 = hdr.w;
 
-			float row_acc = 0.0f;
+			int sc0, m0, sc1, m1;
+			unpack_scale_min(bq8_offset,     sw0, sw1, sw2, sc0, m0);
+			unpack_scale_min(bq8_offset + 1, sw0, sw1, sw2, sc1, m1);
 
-			{
-				unsigned int nib_word = __ldg(&w[block_off + 4 + (t_sub_0 >> 1) * 8 + t_inner]);
-				int shift     = (t_sub_0 & 1) * 4;
-				int q4_packed = (int)((nib_word >> shift) & 0x0F0F0F0Fu);
-				int int_dot   = __dp4a(q4_packed, q8_packed_0, 0);
+			// Load v[0], v[1] — each holds 8 nibbles (= 8 weights) when expanded
+			// across the i={0,1} low/high nibble pass.
+			int v[2];
+			v[0] = (int)__ldg(&w[block_off + 4 + 4 * bq8_offset + idx_in_subblock]);
+			v[1] = (int)__ldg(&w[block_off + 4 + 4 * bq8_offset + idx_in_subblock + 4]);
 
-				int scale, min_v;
-				unpack_scale_min(t_sub_0, sw0, sw1, sw2, scale, min_v);
-
-				row_acc += d * (float)scale * q8_d_0 * (float)int_dot;
-				if (t_inner == 0) row_acc -= dmin * (float)min_v * q8_s_0;
-			}
-			{
-				unsigned int nib_word = __ldg(&w[block_off + 4 + (t_sub_1 >> 1) * 8 + t_inner]);
-				int shift     = (t_sub_1 & 1) * 4;
-				int q4_packed = (int)((nib_word >> shift) & 0x0F0F0F0Fu);
-				int int_dot   = __dp4a(q4_packed, q8_packed_1, 0);
-
-				int scale, min_v;
-				unpack_scale_min(t_sub_1, sw0, sw1, sw2, scale, min_v);
-
-				row_acc += d * (float)scale * q8_d_1 * (float)int_dot;
-				if (t_inner == 0) row_acc -= dmin * (float)min_v * q8_s_1;
+			// 4 dp4a calls per K-block per row, covering 16 weights.
+			float sumf_d = 0.0f;
+			#pragma unroll
+			for (int i = 0; i < 2; ++i) {
+				int v0i  = (v[0] >> (4 * i)) & 0x0F0F0F0Fu;
+				int v1i  = (v[1] >> (4 * i)) & 0x0F0F0F0Fu;
+				int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i + 0], 0));
+				int sc   = (i == 0) ? sc0 : sc1;
+				float d8 = (i == 0) ? d8_0 : d8_1;
+				sumf_d += d8 * (float)sc * (float)dot1;
 			}
 
-			acc[r] += row_acc;
+			// Min term uses precomputed q8_1 sums (q8s = d * sum(qs)). Only one
+			// thread per (sub-block-pair, K-block) credits the contribution to
+			// avoid quadruple-counting across the 4 threads sharing bq8_offset.
+			float min_contrib = 0.0f;
+			if (idx_in_subblock == 0) {
+				min_contrib = q8s_0 * (float)m0 + q8s_1 * (float)m1;
+			}
+
+			acc[r] += d * sumf_d - dmin * min_contrib;
 		}
 	}
 
-	// Warp-level reduction: each warp folds its 32 lanes into lane 0.
+	// Intra-warp reduction.
 	#pragma unroll
 	for (int r = 0; r < ROWS_PER_WG; ++r) {
 		#pragma unroll
@@ -141,8 +157,7 @@ void linear_q4_k_mmvq(const unsigned int* __restrict__ x,   // q8_1 stream
 		}
 	}
 
-	// Cross-warp reduction via shared memory: each warp's lane-0 contributes
-	// its sum, warp 0 finalizes.
+	// Cross-warp reduction via shared memory.
 	__shared__ float warp_sums[NWARPS][ROWS_PER_WG];
 	if (lane == 0) {
 		#pragma unroll
