@@ -249,27 +249,14 @@ without modification.
 ### fp32 activations end-to-end
 The CUDA Gemma path runs FP32 activations through the layer loop
 (matching ggml's shape). Quantized weights stay Q4_K/Q6_K, normaliser
-weights stay Bf16, KV cache stays Bf16. Removed `pack_f32_to_bf16_pairs`
-entirely — mmvq writes directly to its FP32 output tensor.
+weights stay Bf16, KV cache stays Bf16. mmvq writes directly to its
+FP32 output tensor.
 
 Reduced GPU/tok from 17.18 ms to 14.87 ms (-13%). Did NOT move headline
 tok/s because wall is GPU-bound and the smaller savings were close to
 host-overhead order. Worth periodically reconsidering reverting to bf16
-activations now that MMA F16 was abandoned (the only reason for fp32
-was MMA's fp16 K/V requirement) — would cut activation memory traffic in
-half on the post-norm boundaries.
-
-### MMA F16 attention (in-tree but disabled)
-- `kernels/attention/attention_cache_mma_bf16.cu` — hand-rolled WMMA;
-  46.2 tok/s on 600-token decode (regression vs vec).
-- `kernels/attention/ggml_mma/wrapper.cu` + offline-built PTX —
-  literal ggml `flash_attn_ext_f16<256, 256, 2, 4, false, false>`
-  instantiation; 55.3 tok/s on a sliding-crossing decode (wash vs vec
-  at 61.7). The bf16→fp16 K/V conversion ggml's kernel requires (~10 MB
-  per token) eats the per-call MMA gain.
-- Both gated off the live path. **Don't re-enable without solving the
-  bf16↔fp16 K/V cache conversion problem first** — the kernel works,
-  the surrounding glue is what kills it.
+activations — would cut activation memory traffic in half on the
+post-norm boundaries.
 
 ## Calibration: small per-row kernels are launch-bound, not reduction-bound
 
@@ -336,9 +323,9 @@ hit the same wall. Real wins on this model need either:
   `linear_q6_k_mmvq` call count is 33/tok which is more than expected
   for a standard Q4_K_M layout. If some Q6_K weights should be Q4_K,
   the fused gate+up+GEGLU path applies to more layers than today.
-- Do we still need fp32 activations now that MMA F16 is abandoned? The
-  whole pipeline could go back to bf16 activations and skip the
-  cast_bf16_to_f32 / quantize_q8_1_f32 dtype rotations.
+- Do we still need fp32 activations? The whole pipeline could go back
+  to bf16 activations and skip the cast_bf16_to_f32 /
+  quantize_q8_1_f32 dtype rotations.
 
 ## Session notes (chronological, latest first)
 

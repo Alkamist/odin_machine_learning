@@ -5,7 +5,6 @@ import "base:runtime"
 
 import "core:fmt"
 import "core:sync"
-import "core:time"
 
 import "bindings/cuda"
 
@@ -30,11 +29,6 @@ Gpu_Buffer :: struct {
 F32_ONE_BITS :: u32(0x3F800000)
 
 buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
-	t_start := time.tick_now()
-	defer {
-		_alloc_count += 1
-		_alloc_ns    += i64(time.tick_since(t_start))
-	}
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 
@@ -141,11 +135,6 @@ buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_C
 }
 
 buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location) {
-	t_start := time.tick_now()
-	defer {
-		_upload_count += 1
-		_upload_ns    += i64(time.tick_since(t_start))
-	}
 	sync.mutex_lock(&_gpu_mutex)
 	defer sync.mutex_unlock(&_gpu_mutex)
 

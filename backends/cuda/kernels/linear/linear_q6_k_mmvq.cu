@@ -12,8 +12,7 @@
 //     bytes 208..209   d (fp16 super-block scale)
 //   block_q8_1 (36 bytes / 32 weights / 9 uints): same as Q4_K mmvq.
 //
-// Output: float per row. The downstream `pack_f32_to_bf16_pairs` kernel
-// converts to the bf16-packed-pair layout the rest of the pipeline expects.
+// Output: float per row.
 #include <cuda_fp16.h>
 
 #define QK6_K            256

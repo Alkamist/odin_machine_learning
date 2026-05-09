@@ -5,7 +5,6 @@
 // (mmvq.cu) — same outer + inner structure as `linear_q4_k_mmvq.cu`, with
 // a parallel `tmp_gate` accumulator alongside the regular `tmp` accumulator,
 // and a final `gelu_tanh(gate) * up` combine before writing fp32 output.
-// The downstream `pack_f32_to_bf16_pairs` kernel converts to bf16.
 #include <cuda_fp16.h>
 
 #define QK4_K            256

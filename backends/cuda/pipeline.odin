@@ -150,32 +150,6 @@ _compile_pipeline :: proc(
 	return pipeline
 }
 
-// Load a precompiled PTX (or cubin) blob and resolve `entry` (mangled C++
-// name for templated kernels). Used for ggml's MMA F16 kernel which is
-// compiled offline via nvcc — see kernels/attention/ggml_mma/.
-_load_ptx_pipeline :: proc(
-	ptx:   []u8,
-	entry: cstring,
-	loc := #caller_location,
-) -> ^Pipeline {
-	// cuModuleLoadData wants NUL-terminated PTX text (it's just a buffer if
-	// it's cubin, but PTX is text and the driver scans for the trailing 0).
-	ptx_cstr := _bytes_to_cstring(ptx)
-	_ = ptx_cstr  // we pass raw_data below; the cache ensures the buffer is alive
-
-	pipeline, err := builtin.new(Pipeline, loc=loc)
-	fmt.assertf(err == nil, "Failed to allocate Pipeline: %v", err, loc=loc)
-
-	// _bytes_to_cstring gives us a NUL-terminated buffer; extract its raw
-	// data pointer the same way _compile_pipeline does for cubin.
-	cuda.check(cuda.ModuleLoadData(&pipeline.module, rawptr(ptx_cstr)), loc=loc)
-	cuda.check(cuda.ModuleGetFunction(&pipeline.function, pipeline.module, entry), loc=loc)
-	pipeline.name = builtin.string(entry)
-
-	builtin.append(&_gpu.pipelines, pipeline)
-	return pipeline
-}
-
 _destroy_pipeline :: proc(p: ^Pipeline) {
 	if p == nil { return }
 	if p.module != nil {

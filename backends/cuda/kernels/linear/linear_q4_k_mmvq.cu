@@ -13,11 +13,7 @@
 //     uint  0      : d (low 16) | s (high 16)               — half2 packed
 //     uints 1..8   : qs[32 bytes = 8 ints]
 //
-// Output: float per row. The downstream `pack_f32_to_bf16_pairs` kernel
-// converts to the bf16-packed-pair layout the rest of the pipeline expects.
-// We don't pack inline because doing so forced ROWS_PER_WG=2 in the previous
-// version, which deviates from ggml's empirically-chosen rows_per_cuda_block=1
-// for ncols_dst=1 on Ampere.
+// Output: float per row.
 #include <cuda_fp16.h>
 
 #define QK4_K            256

@@ -110,29 +110,6 @@ Context :: struct {
 	// dst/src. Sized lazily to the max (cap-1)*kv_size bytes seen.
 	shift_scratch_dev:  cuda.DevicePtr,
 	shift_scratch_size: u64,
-
-	// ggml MMA F16 attention infrastructure. ggml's kernel takes fp16 K/V
-	// (their `launch_fattn` converts bf16→fp16 before each call). For each
-	// non-shared sliding layer this forward, we allocate fp16 K and V scratch
-	// from the activation pool and run a bf16→fp16 conversion. Shared layers
-	// reuse the source layer's fp16 buffers via this map.
-	fp16_kv_cache:      map[cuda.DevicePtr]Fp16_Kv_Pair,
-
-	// Static all-zero mask for the MMA kernel. ncols2>1 requires non-null
-	// mask; the kernel reads it as `half[ne01.z, ne11]` and adds slope*mask
-	// to KQ scores. With max_bias=0 (no ALiBi) and a valid range covering
-	// all cache slots (sliding window fully filled), an all-zero mask is
-	// correct. Allocated lazily once it's first needed; sized to fit the
-	// largest sw seen.
-	fa_mask_dev:        cuda.DevicePtr,
-	fa_mask_bytes:      u64,
-}
-
-// Pair of fp16 K and V device buffers shadowing a bf16 K/V cache for the
-// MMA F16 attention kernel.
-Fp16_Kv_Pair :: struct {
-	k_fp16: cuda.DevicePtr,
-	v_fp16: cuda.DevicePtr,
 }
 
 Activation_Slot :: struct {
@@ -302,7 +279,6 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	delete(gctx.q8_1_cache)
 	delete(gctx.k_cache_written_this_forward)
 	delete(gctx.v_cache_written_this_forward)
-	delete(gctx.fp16_kv_cache)
 
 	if gctx.position_dev != 0 {
 		cuda.MemFree(gctx.position_dev)
@@ -316,11 +292,6 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 		cuda.MemFree(gctx.shift_scratch_dev)
 		gctx.shift_scratch_dev = 0
 		gctx.shift_scratch_size = 0
-	}
-	if gctx.fa_mask_dev != 0 {
-		cuda.MemFree(gctx.fa_mask_dev)
-		gctx.fa_mask_dev = 0
-		gctx.fa_mask_bytes = 0
 	}
 
 	if gctx.cublas_handle != nil {
@@ -381,11 +352,6 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 	builtin.clear(&gctx.k_cache_written_this_forward)
 	builtin.clear(&gctx.v_cache_written_this_forward)
 
-	// Reset fp16 K/V dedup map. The fp16 buffers themselves come from the
-	// activation pool which clears separately; map entries point at slots
-	// from the *previous* forward, so they're stale.
-	builtin.clear(&gctx.fp16_kv_cache)
-
 	// Position upload happens lazily on the first position-bearing dispatch
 	// of the new forward (see `_emit_position_upload` in ops.odin).
 	gctx.position_written_this_forward = false
@@ -422,22 +388,6 @@ enable_decode_graph :: proc(enabled: bool, loc := #caller_location) {
 	}
 	gctx.auto_graph_enabled = enabled
 }
-
-// Stats helpers, mirror the vulkan backend's API for parity in benchmarks.
-_alloc_count:  int
-_alloc_ns:     i64
-_upload_count: int
-_upload_ns:    i64
-
-reset_alloc_stats :: proc() {
-	_alloc_count  = 0
-	_alloc_ns     = 0
-	_upload_count = 0
-	_upload_ns    = 0
-}
-
-alloc_stats  :: proc() -> (count: int, ns: i64) { return _alloc_count,  _alloc_ns  }
-upload_stats :: proc() -> (count: int, ns: i64) { return _upload_count, _upload_ns }
 
 // Optional GPU timing. Once enabled, every _dispatch records start/end events
 // and `clear` folds the deltas into `timing_totals` keyed by Pipeline pointer.

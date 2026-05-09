@@ -4,7 +4,6 @@ import "base:builtin"
 import "base:runtime"
 
 import "core:fmt"
-import "core:math"
 
 import "bindings/cuda"
 import "bindings/cublas"
@@ -23,7 +22,6 @@ _quantize_q8_1_f32_pipeline: ^Pipeline
 _linear_q4_k_mmvq_pipeline: ^Pipeline
 _linear_q4_k_gate_up_geglu_bf16_pipeline: ^Pipeline
 _linear_q6_k_mmvq_pipeline: ^Pipeline
-_pack_f32_to_bf16_pairs_pipeline: ^Pipeline
 
 _mul_pipeline:           ^Pipeline
 _mul_bf16_pipeline:      ^Pipeline
@@ -49,9 +47,6 @@ _attention_cache_vec_bf16_d256_pipeline: ^Pipeline
 _attention_cache_vec_bf16_d512_pipeline: ^Pipeline
 _attention_cache_vec_f32_d256_pipeline:  ^Pipeline
 _attention_cache_vec_f32_d512_pipeline:  ^Pipeline
-_attention_cache_mma_bf16_d256_pipeline: ^Pipeline
-_ggml_mma_d256_ncols2_4_pipeline:        ^Pipeline
-_bf16_to_fp16_pairs_pipeline:            ^Pipeline
 _cache_write_bf16_pipeline:              ^Pipeline
 _cache_write_f32_pipeline:               ^Pipeline
 _select_f32_pipeline:           ^Pipeline
@@ -893,152 +888,6 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 	_dispatch(_attention_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
 }
 
-// Lazily allocate (or grow) the all-zero half-precision mask used by ggml's
-// MMA F16 attention kernel. The kernel requires non-null mask whenever
-// ncols2 > 1; with our case (max_bias = 0, sliding window fully filled →
-// every cache slot valid for the real Q, dummy Q's outputs discarded), an
-// all-zero mask is correct. Stable pointer across forwards.
-_ensure_fa_mask :: proc(gctx: ^Context, byte_count: u64, loc: runtime.Source_Code_Location) {
-	if gctx.fa_mask_bytes >= byte_count { return }
-	if gctx.fa_mask_dev != 0 {
-		cuda.check(cuda.MemFree(gctx.fa_mask_dev), loc=loc)
-	}
-	cuda.check(cuda.MemAlloc(&gctx.fa_mask_dev, uint(byte_count)), loc=loc)
-	cuda.check(cuda.MemsetD8(gctx.fa_mask_dev, 0, uint(byte_count)), loc=loc)
-	gctx.fa_mask_bytes = byte_count
-}
-
-// Run ggml's flash_attn_ext_f16<256, 256, 2, 4, false, false> for our case:
-// Gemma E4B sliding-window decode. This is the offline-nvcc-compiled kernel
-// (see kernels/attention/ggml_mma/wrapper.cu). Caller must verify the
-// preconditions (head_size==256, q_token_count==1, gqa_ratio==4,
-// cache_position >= sliding_window).
-_dispatch_mma_attention_d256 :: proc(
-	gctx: ^Context,
-	q, k_cache, v_cache, o: ml.Tensor,
-	cache_position: int,
-	capacity: int,
-	n_q_heads: int, n_kv_heads: int, head_size: int,
-	loc: runtime.Source_Code_Location,
-) {
-	if _ggml_mma_d256_ncols2_4_pipeline == nil {
-		_ggml_mma_d256_ncols2_4_pipeline = _load_ptx_pipeline(GGML_MMA_D256_NCOLS2_4_PTX, GGML_MMA_D256_NCOLS2_4_NAME, loc)
-		// cc 8.6 max dynamic shared mem per block = 100 KB. The kernel needs
-		// roughly 70-140 KB for K/V tiles depending on nstages. Grant 99 KB
-		// (driver caps at 99 KB on cc 8.6 per CUDA programming guide).
-		cuda.check(cuda.FuncSetAttribute(_ggml_mma_d256_ncols2_4_pipeline.function, .MAX_DYNAMIC_SHARED_SIZE_BYTES, 99 * 1024), loc=loc)
-	}
-	if _bf16_to_fp16_pairs_pipeline == nil {
-		_bf16_to_fp16_pairs_pipeline = _compile_pipeline(BF16_TO_FP16_PAIRS_SRC, "bf16_to_fp16.cu", "bf16_to_fp16_pairs")
-	}
-	fmt.assertf(q.type == .F32, "ggml MMA dispatch requires F32 Q (got %v)", q.type, loc=loc)
-	fmt.assertf(o.type == .F32, "ggml MMA dispatch requires F32 output (got %v)", o.type, loc=loc)
-
-	kv_size := n_kv_heads * head_size
-
-	// fp16 K and V — dedup per cache pointer per forward (shared layers
-	// reuse the source layer's fp16 buffers).
-	k_bf16_ptr := data(k_cache).ptr
-	v_bf16_ptr := data(v_cache).ptr
-	fp16_pair, fp16_already_done := gctx.fp16_kv_cache[k_bf16_ptr]
-	cache_bytes := u64(capacity * kv_size * 2)
-	if !fp16_already_done {
-		fp16_pair.k_fp16 = _activation_alloc(gctx, cache_bytes, loc)
-		fp16_pair.v_fp16 = _activation_alloc(gctx, cache_bytes, loc)
-		gctx.fp16_kv_cache[k_bf16_ptr] = fp16_pair
-
-		n_pairs := (capacity * kv_size) / 2
-		grid    := _div_up(n_pairs, 256)
-		n_pairs_i32 := i32(n_pairs)
-
-		k_args := [?]rawptr{ &k_bf16_ptr, &fp16_pair.k_fp16, &n_pairs_i32 }
-		_dispatch(_bf16_to_fp16_pairs_pipeline, grid, 1, 1, 256, 1, 1, 0, k_args[:], loc)
-		v_args := [?]rawptr{ &v_bf16_ptr, &fp16_pair.v_fp16, &n_pairs_i32 }
-		_dispatch(_bf16_to_fp16_pairs_pipeline, grid, 1, 1, 256, 1, 1, 0, v_args[:], loc)
-	}
-
-	q_token_count := q.shape[0]
-	q_size        := n_q_heads * head_size
-
-	// Q is already fp32 (post-ggml-shape pipeline). The MMA kernel reads
-	// Q as float2 directly.
-	q_fp32 := data(q).ptr
-
-	// fp32 dst writes directly into the op's output tensor (also fp32).
-	dst_fp32 := data(o).ptr
-	// dst_meta: 2 blocks × ne01.z (1) × ne02 (n_q_heads) × float2 (8) = 128 bytes for our case;
-	// allocate generously.
-	dst_meta := _activation_alloc(gctx, 4096, loc)
-
-	// Mask: 2 rows (ncols1) × capacity (ne11) × sizeof(half).
-	mask_bytes := u64(2 * capacity * 2)
-	_ensure_fa_mask(gctx, mask_bytes, loc)
-
-	// Strides and dims for ggml's kernel.
-	ne00 := i32(head_size)
-	// uint3 fastdiv values for ne01.z = q_token_count = 1: (mp=1, L=0, d=1).
-	// fastmodulo(x, ne01) returns 0 for any x.
-	ne01_packed: [3]u32 = { 1, 0, u32(q_token_count) }
-	ne02 := i32(n_q_heads)
-	ne03 := i32(1)
-	nb01 := i32(head_size * 4)         // fp32 Q: head_dim * sizeof(float)
-	nb02 := i32(q_token_count * head_size * 4)
-	nb03 := i32(n_q_heads * q_token_count * head_size * 4)
-
-	ne10 := i32(head_size)
-	ne11 := i32(capacity)
-	ne12 := i32(n_kv_heads)
-	ne13 := i32(1)
-	nb11 := i32(kv_size * 2)            // bf16/fp16: stride between seq rows in OUR layout
-	nb12 := i32(head_size * 2)          // stride between kv-heads at same seq
-	nb13 := i64(capacity * kv_size * 2) // stride per batch
-	nb21 := nb11
-	nb22 := nb12
-	nb23 := nb13
-
-	ne31 := i32(q_token_count)          // mask rows
-	ne32 := i32(1)
-	ne33 := i32(1)
-	nb31 := i32(capacity * 2)           // mask row stride (fp16)
-	nb32 := i32(0)
-	nb33 := i64(0)
-
-	scale         := f32(1.0 / math.sqrt_f32(f32(head_size)))
-	max_bias      := f32(0.0)
-	m0            := f32(0.0)
-	m1            := f32(0.0)
-	n_head_log2   := u32(0)
-	logit_softcap := f32(0.0)
-
-	null_ptr := cuda.DevicePtr(0)
-	mask_ptr := gctx.fa_mask_dev
-
-	args := [?]rawptr{
-		&q_fp32,           // Q (const char*)
-		&fp16_pair.k_fp16, // K
-		&fp16_pair.v_fp16, // V
-		&mask_ptr,         // mask
-		&null_ptr,         // sinks
-		&null_ptr,         // KV_max (const int*)
-		&dst_fp32,         // dst (float*)
-		&dst_meta,         // dst_meta (float2*)
-		&scale, &max_bias, &m0, &m1, &n_head_log2, &logit_softcap,
-		&ne00, &ne01_packed, &ne02, &ne03,
-		&nb01, &nb02, &nb03,
-		&ne10, &ne11, &ne12, &ne13,
-		&nb11, &nb12, &nb13,
-		&nb21, &nb22, &nb23,
-		&ne31, &ne32, &ne33,
-		&nb31, &nb32, &nb33,
-	}
-
-	// Grid: one block per output tile = (ne01/ncols1) * (ne02/(gqa_ratio if grouped else 1)) * ne12 * ne03.
-	// For decode q_token=1 ncols1=2: iter_j=1. For ncols2=4 gqa=4: iter_z_gqa=1.
-	// ne12=2 (n_kv_heads), ne03=1. Total output tiles = 2.
-	// Block: (warp_size=32, nwarps=2). Ampere config nthreads=64 for ncols=8.
-	_dispatch(_ggml_mma_d256_ncols2_4_pipeline, 2, 1, 1, 32, 2, 1, 99 * 1024, args[:], loc)
-}
-
 // ----- Attention with cache --------------------------------------------------
 //
 // Linear cache layout (= ggml's): K/V live in [0..capacity) by seq position,
@@ -1154,23 +1003,6 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	args := [?]rawptr{
 		&qp, &kcp, &vcp, &op_ptr,
 		&n_q_heads, &n_kv_heads, &hs, &qtc, &pos_dev, &qs, &kvs, &window, &cap,
-	}
-
-	// ggml MMA F16 kernel for the steady-state sliding decode path. Conditions:
-	//   - head_size == 256 (Gemma E4B sliding head_dim, what the PTX is compiled for).
-	//   - token_count == 1 (decode; ncols1=1, padded to 2 by ggml's dispatcher).
-	//   - gqa_ratio == 4 (Gemma E4B; matches ncols2=4 specialization).
-	//   - v.window > 0 && cache_position + 1 >= v.window (cache fully filled —
-	//     all sliding-window slots valid, all-zero mask is correct).
-	gqa_ratio := v.n_q_heads / v.n_kv_heads
-	use_mma   := head_size == 256 && token_count == 1 && gqa_ratio == 4 &&
-	             v.window > 0 && (v.cache_position + 1) >= v.window
-	if use_mma {
-		_dispatch_mma_attention_d256(gctx, q, k_cache, v_cache, o,
-			v.cache_position, capacity,
-			v.n_q_heads, v.n_kv_heads, head_size,
-			loc)
-		return
 	}
 
 	// ggml-style vec kernel with cooperative threads-per-K-dot and vectorized V
