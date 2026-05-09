@@ -4,7 +4,8 @@
 // `mul_mat_vec_q` with `has_fusion=true, use_gate=true, glu_op=GEGLU`
 // (mmvq.cu) — same outer + inner structure as `linear_q4_k_mmvq.cu`, with
 // a parallel `tmp_gate` accumulator alongside the regular `tmp` accumulator,
-// and a final `gelu_tanh(gate) * up` combine before writing fp32 output.
+// and a final `gelu_tanh(gate) * up` combine before writing bf16 output.
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #define QK4_K            256
@@ -89,7 +90,7 @@ void linear_q4_k_gate_up_geglu_bf16(
     const unsigned int * __restrict__ vy,         // q8_1 input row
     const unsigned int * __restrict__ vx_gate,    // q4_k gate weights, [N, K]
     const unsigned int * __restrict__ vx_up,      // q4_k up weights, [N, K]
-    float *              __restrict__ dst,         // fp32 output [N]
+    __nv_bfloat16 *      __restrict__ dst,         // bf16 output [N]
     int M, int K, int N) {
 
 	const int tid  = WARP_SIZE * threadIdx.y + threadIdx.x;
@@ -150,6 +151,6 @@ void linear_q4_k_gate_up_geglu_bf16(
 	}
 
 	if (threadIdx.x == 0 && row0 < N) {
-		dst[row0] = gelu_tanh(tmp_gate) * tmp_up;
+		dst[row0] = __float2bfloat16(gelu_tanh(tmp_gate) * tmp_up);
 	}
 }

@@ -12,7 +12,8 @@
 //     bytes 208..209   d (fp16 super-block scale)
 //   block_q8_1 (36 bytes / 32 weights / 9 uints): same as Q4_K mmvq.
 //
-// Output: float per row.
+// Output: bf16 per row.
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #define QK6_K            256
@@ -118,7 +119,7 @@ __launch_bounds__(NWARPS * WARP_SIZE, 1)
 void linear_q6_k_mmvq(
     const unsigned int* __restrict__ vy,    // q8_1 input row (one Q8_1 stream)
     const unsigned int* __restrict__ vx,    // q6_k weights, row-major [N, K]
-    float*              __restrict__ dst,    // fp32 output [N]
+    __nv_bfloat16*      __restrict__ dst,    // bf16 output [N]
     int M, int K, int N) {
 
 	const int tid  = WARP_SIZE * threadIdx.y + threadIdx.x;
@@ -159,6 +160,6 @@ void linear_q6_k_mmvq(
 	}
 
 	if (threadIdx.x == 0 && row0 < N) {
-		dst[row0] = tmp;
+		dst[row0] = __float2bfloat16(tmp);
 	}
 }

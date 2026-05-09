@@ -13,7 +13,8 @@
 //     uint  0      : d (low 16) | s (high 16)               — half2 packed
 //     uints 1..8   : qs[32 bytes = 8 ints]
 //
-// Output: float per row.
+// Output: bf16 per row.
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #define QK4_K            256
@@ -107,7 +108,7 @@ __launch_bounds__(NWARPS * WARP_SIZE, 1)
 void linear_q4_k_mmvq(
     const unsigned int * __restrict__ vy,    // q8_1 input row (one Q8_1 stream)
     const unsigned int * __restrict__ vx,    // q4_k weights, row-major [N, K]
-    float *              __restrict__ dst,    // fp32 output [N]
+    __nv_bfloat16 *      __restrict__ dst,    // bf16 output [N]
     int M, int K, int N) {
 
 	const int tid  = WARP_SIZE * threadIdx.y + threadIdx.x;
@@ -149,6 +150,6 @@ void linear_q4_k_mmvq(
 	}
 
 	if (threadIdx.x == 0 && row0 < N) {
-		dst[row0] = tmp;
+		dst[row0] = __float2bfloat16(tmp);
 	}
 }

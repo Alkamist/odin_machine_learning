@@ -18,7 +18,6 @@ _add_back_b_pipeline:      ^Pipeline
 _add_back_a_bf16_pipeline: ^Pipeline
 _add_back_b_bf16_pipeline: ^Pipeline
 _quantize_q8_1_pipeline:     ^Pipeline
-_quantize_q8_1_f32_pipeline: ^Pipeline
 _linear_q4_k_mmvq_pipeline: ^Pipeline
 _linear_q4_k_gate_up_geglu_bf16_pipeline: ^Pipeline
 _linear_q6_k_mmvq_pipeline: ^Pipeline
@@ -38,17 +37,13 @@ _add_rmsnorm_f32_pipeline:  ^Pipeline
 _rmsnorm_rope_bf16_pipeline:       ^Pipeline
 _rmsnorm_rope_f32_pipeline:        ^Pipeline
 _rmsnorm_rope_cache_bf16_pipeline: ^Pipeline
-_rmsnorm_rope_cache_f32_pipeline:  ^Pipeline
 _rope_pipeline:          ^Pipeline
 _rope_bf16_pipeline:     ^Pipeline
 _attention_bf16_pipeline:                ^Pipeline
 _attention_cache_bf16_pipeline:          ^Pipeline
 _attention_cache_vec_bf16_d256_pipeline: ^Pipeline
 _attention_cache_vec_bf16_d512_pipeline: ^Pipeline
-_attention_cache_vec_f32_d256_pipeline:  ^Pipeline
-_attention_cache_vec_f32_d512_pipeline:  ^Pipeline
 _cache_write_bf16_pipeline:              ^Pipeline
-_cache_write_f32_pipeline:               ^Pipeline
 _select_f32_pipeline:           ^Pipeline
 _select_bf16_pipeline:          ^Pipeline
 _slice_trailing_f32_pipeline:   ^Pipeline
@@ -68,23 +63,14 @@ _div_up :: #force_inline proc(a, b: int) -> u32 {
 	return u32((a + b - 1) / b)
 }
 
-// Lazy-compile + dispatch the cache_write kernel matching the source dtype.
-// Cache is always bf16 packed-pairs; the kernel converts the input on store.
+// Lazy-compile + dispatch the cache_write kernel. Source is bf16; cache is
+// also bf16 packed-pairs.
 _dispatch_cache_write :: proc(src_type: ml.Data_Type, grid: u32, args: []rawptr, loc: runtime.Source_Code_Location) {
-	#partial switch src_type {
-	case .Bf16:
-		if _cache_write_bf16_pipeline == nil {
-			_cache_write_bf16_pipeline = _compile_pipeline(CACHE_WRITE_BF16_SRC, "cache_write_bf16.cu", "cache_write_bf16")
-		}
-		_dispatch(_cache_write_bf16_pipeline, grid, 1, 1, 256, 1, 1, 0, args, loc)
-	case .F32:
-		if _cache_write_f32_pipeline == nil {
-			_cache_write_f32_pipeline = _compile_pipeline(CACHE_WRITE_F32_SRC, "cache_write_f32.cu", "cache_write_f32")
-		}
-		_dispatch(_cache_write_f32_pipeline, grid, 1, 1, 256, 1, 1, 0, args, loc)
-	case:
-		fmt.panicf("cache_write: unsupported src dtype %v", src_type, loc=loc)
+	fmt.assertf(src_type == .Bf16, "cache_write: unsupported src dtype %v", src_type, loc=loc)
+	if _cache_write_bf16_pipeline == nil {
+		_cache_write_bf16_pipeline = _compile_pipeline(CACHE_WRITE_BF16_SRC, "cache_write_bf16.cu", "cache_write_bf16")
 	}
+	_dispatch(_cache_write_bf16_pipeline, grid, 1, 1, 256, 1, 1, 0, args, loc)
 }
 
 // Quantize a single contiguous bf16 OR fp32 row to Q8_1 blocks. The result
@@ -93,32 +79,20 @@ _dispatch_cache_write :: proc(src_type: ml.Data_Type, grid: u32, args: []rawptr,
 // Caller is responsible for the `q8_1_cache` lookup/insert.
 _emit_quantize_q8_1 :: proc(gctx: ^Context, xp: cuda.DevicePtr, input_size: int, input_type: ml.Data_Type, loc: runtime.Source_Code_Location) -> cuda.DevicePtr {
 	xp := xp
+	fmt.assertf(input_type == .Bf16, "quantize_q8_1: unsupported input dtype %v", input_type, loc=loc)
 	q8_block_count := input_size / Q8_1_BLOCK_ELEMS
 	q8_byte_count  := q8_block_count * Q8_1_BLOCK_BYTES
 	q8 := _activation_alloc(gctx, u64(q8_byte_count), loc)
 	K  := i32(input_size)
 	args := [?]rawptr{ &xp, &q8, &K }
 
-	#partial switch input_type {
-	case .Bf16:
-		if _quantize_q8_1_pipeline == nil {
-			_quantize_q8_1_pipeline = _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC, "quantize_q8_1_bf16.cu", "quantize_q8_1_bf16")
-		}
-		_dispatch(_quantize_q8_1_pipeline,
-			_div_up(input_size, 256), 1, 1,
-			256, 1, 1,
-			0, args[:], loc)
-	case .F32:
-		if _quantize_q8_1_f32_pipeline == nil {
-			_quantize_q8_1_f32_pipeline = _compile_pipeline(QUANTIZE_Q8_1_F32_SRC, "quantize_q8_1_f32.cu", "quantize_q8_1_f32")
-		}
-		_dispatch(_quantize_q8_1_f32_pipeline,
-			_div_up(input_size, 256), 1, 1,
-			256, 1, 1,
-			0, args[:], loc)
-	case:
-		fmt.panicf("quantize_q8_1: unsupported input dtype %v", input_type, loc=loc)
+	if _quantize_q8_1_pipeline == nil {
+		_quantize_q8_1_pipeline = _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC, "quantize_q8_1_bf16.cu", "quantize_q8_1_bf16")
 	}
+	_dispatch(_quantize_q8_1_pipeline,
+		_div_up(input_size, 256), 1, 1,
+		256, 1, 1,
+		0, args[:], loc)
 	return q8
 }
 
@@ -309,7 +283,7 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 
 	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q4_k: K must be a multiple of 256, got %v", input_size, loc=loc)
 	fmt.assertf(count == 1, "cuda linear_q4_k currently supports M=1 (decode); got M=%v", count, loc=loc)
-	fmt.assertf(output.type == .F32, "cuda linear_q4_k requires F32 output (got %v)", output.type, loc=loc)
+	fmt.assertf(output.type == .Bf16, "cuda linear_q4_k requires Bf16 output (got %v)", output.type, loc=loc)
 
 	if _linear_q4_k_mmvq_pipeline == nil {
 		_linear_q4_k_mmvq_pipeline = _compile_pipeline(LINEAR_Q4_K_MMVQ_SRC, "linear_q4_k_mmvq.cu", "linear_q4_k_mmvq")
@@ -356,7 +330,7 @@ _linear_q4_k_gate_up_geglu_forward :: proc(op: ml.Operation, loc: runtime.Source
 
 	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q4_k_gate_up_geglu: K must be a multiple of 256, got %v", input_size, loc=loc)
 	fmt.assertf(count == 1, "cuda linear_q4_k_gate_up_geglu requires M=1 (decode); got M=%v", count, loc=loc)
-	fmt.assertf(output.type == .F32, "cuda linear_q4_k_gate_up_geglu requires F32 output (got %v)", output.type, loc=loc)
+	fmt.assertf(output.type == .Bf16, "cuda linear_q4_k_gate_up_geglu requires Bf16 output (got %v)", output.type, loc=loc)
 
 	if _linear_q4_k_gate_up_geglu_bf16_pipeline == nil {
 		_linear_q4_k_gate_up_geglu_bf16_pipeline = _compile_pipeline(LINEAR_Q4_K_GATE_UP_GEGLU_BF16_SRC, "linear_q4_k_gate_up_geglu_bf16.cu", "linear_q4_k_gate_up_geglu_bf16")
@@ -749,20 +723,11 @@ _rmsnorm_rope_write_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_
 	cap    := i32(v.cache_capacity)
 	args := [?]rawptr{ &xp, &wp, &cp, &tc, &hc, &hs, &eps, &base, &pos_dev, &rpc, &cap }
 
-	#partial switch x.type {
-	case .Bf16:
-		if _rmsnorm_rope_cache_bf16_pipeline == nil {
-			_rmsnorm_rope_cache_bf16_pipeline = _compile_pipeline(RMSNORM_ROPE_CACHE_BF16_SRC, "rmsnorm_rope_cache_bf16.cu", "rmsnorm_rope_cache_bf16")
-		}
-		_dispatch(_rmsnorm_rope_cache_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
-	case .F32:
-		if _rmsnorm_rope_cache_f32_pipeline == nil {
-			_rmsnorm_rope_cache_f32_pipeline = _compile_pipeline(RMSNORM_ROPE_CACHE_F32_SRC, "rmsnorm_rope_cache_f32.cu", "rmsnorm_rope_cache_f32")
-		}
-		_dispatch(_rmsnorm_rope_cache_f32_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("rmsnorm_rope_write_cache: unsupported input dtype %v", x.type, loc=loc)
+	fmt.assertf(x.type == .Bf16, "rmsnorm_rope_write_cache: unsupported input dtype %v", x.type, loc=loc)
+	if _rmsnorm_rope_cache_bf16_pipeline == nil {
+		_rmsnorm_rope_cache_bf16_pipeline = _compile_pipeline(RMSNORM_ROPE_CACHE_BF16_SRC, "rmsnorm_rope_cache_bf16.cu", "rmsnorm_rope_cache_bf16")
 	}
+	_dispatch(_rmsnorm_rope_cache_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 
 	// Tell `_attention_cache_forward` the K cache row is already populated.
 	gctx.k_cache_written_this_forward[cp] = true
@@ -818,7 +783,7 @@ _linear_q6_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 
 	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q6_k: K must be a multiple of 256, got %v", input_size, loc=loc)
 	fmt.assertf(count == 1, "cuda linear_q6_k currently supports M=1 (decode); got M=%v", count, loc=loc)
-	fmt.assertf(output.type == .F32, "cuda linear_q6_k requires F32 output (got %v)", output.type, loc=loc)
+	fmt.assertf(output.type == .Bf16, "cuda linear_q6_k requires Bf16 output (got %v)", output.type, loc=loc)
 
 	if _linear_q6_k_mmvq_pipeline == nil {
 		_linear_q6_k_mmvq_pipeline = _compile_pipeline(LINEAR_Q6_K_MMVQ_SRC, "linear_q6_k_mmvq.cu", "linear_q6_k_mmvq")
@@ -913,7 +878,7 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	kv_size     := k.shape[1]
 	head_size   := q_size / v.n_q_heads
 	fmt.assertf(head_size <= 512, "cuda attention_with_cache caps head_size at 512 (got %v)", head_size, loc=loc)
-	fmt.assertf(q.type == .Bf16 || q.type == .F32, "cuda attention_with_cache supports Bf16 or F32 Q (got %v)", q.type, loc=loc)
+	fmt.assertf(q.type == .Bf16, "cuda attention_with_cache requires Bf16 Q (got %v)", q.type, loc=loc)
 	fmt.assertf(k_cache.type == .Bf16, "cuda attention_with_cache requires Bf16 K cache (got %v)", k_cache.type, loc=loc)
 	fmt.assertf(head_size % 2 == 0, "cuda attention_with_cache requires even head_size (got %v)", head_size, loc=loc)
 
@@ -1006,39 +971,20 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	}
 
 	// ggml-style vec kernel with cooperative threads-per-K-dot and vectorized V
-	// loads. Compiled per-(D, Q dtype) via NVRTC so per-D loops unroll at
-	// compile time. K/V cache stays bf16 in either path; only Q (and the
-	// attention output) differs.
-	is_f32 := q.type == .F32
+	// loads. Compiled per-D via NVRTC so per-D loops unroll at compile time.
 	switch head_size {
 	case 256:
-		if is_f32 {
-			if _attention_cache_vec_f32_d256_pipeline == nil {
-				opts := [?]cstring{"-DD_HEAD=256"}
-				_attention_cache_vec_f32_d256_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_F32_SRC, "attention_cache_vec_f32_d256.cu", "attention_cache_vec_f32", opts[:])
-			}
-			_dispatch(_attention_cache_vec_f32_d256_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
-		} else {
-			if _attention_cache_vec_bf16_d256_pipeline == nil {
-				opts := [?]cstring{"-DD_HEAD=256"}
-				_attention_cache_vec_bf16_d256_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d256.cu", "attention_cache_vec_bf16", opts[:])
-			}
-			_dispatch(_attention_cache_vec_bf16_d256_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
+		if _attention_cache_vec_bf16_d256_pipeline == nil {
+			opts := [?]cstring{"-DD_HEAD=256"}
+			_attention_cache_vec_bf16_d256_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d256.cu", "attention_cache_vec_bf16", opts[:])
 		}
+		_dispatch(_attention_cache_vec_bf16_d256_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
 	case 512:
-		if is_f32 {
-			if _attention_cache_vec_f32_d512_pipeline == nil {
-				opts := [?]cstring{"-DD_HEAD=512"}
-				_attention_cache_vec_f32_d512_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_F32_SRC, "attention_cache_vec_f32_d512.cu", "attention_cache_vec_f32", opts[:])
-			}
-			_dispatch(_attention_cache_vec_f32_d512_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
-		} else {
-			if _attention_cache_vec_bf16_d512_pipeline == nil {
-				opts := [?]cstring{"-DD_HEAD=512"}
-				_attention_cache_vec_bf16_d512_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d512.cu", "attention_cache_vec_bf16", opts[:])
-			}
-			_dispatch(_attention_cache_vec_bf16_d512_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
+		if _attention_cache_vec_bf16_d512_pipeline == nil {
+			opts := [?]cstring{"-DD_HEAD=512"}
+			_attention_cache_vec_bf16_d512_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d512.cu", "attention_cache_vec_bf16", opts[:])
 		}
+		_dispatch(_attention_cache_vec_bf16_d512_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
 	case:
 		if _attention_cache_bf16_pipeline == nil {
 			_attention_cache_bf16_pipeline = _compile_pipeline(ATTENTION_CACHE_BF16_SRC, "attention_cache_bf16.cu", "attention_cache_bf16")

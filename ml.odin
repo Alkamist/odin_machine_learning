@@ -1145,7 +1145,7 @@ linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 
 	new_shape: [MAX_TENSOR_RANK]int = input.shape
 	new_shape[input.rank - 1] = output_size
-	output = zeros(.F32, new_shape[:input.rank], loc=loc)
+	output = zeros(.Bf16, new_shape[:input.rank], loc=loc)
 
 	op := Operation{
 		input   = input,
@@ -1181,7 +1181,7 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 	if _leading_count(input) == 1 && .Linear_Q4_K_Gate_Up_Geglu in _current_ctx.backend.capabilities {
 		new_shape: [MAX_TENSOR_RANK]int = input.shape
 		new_shape[input.rank - 1] = output_size
-		output = zeros(.F32, new_shape[:input.rank], loc=loc)
+		output = zeros(.Bf16, new_shape[:input.rank], loc=loc)
 		op := Operation{
 			input   = input,
 			output  = output,
@@ -1217,7 +1217,7 @@ linear_q6_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 
 	new_shape                := input.shape
 	new_shape[input.rank - 1] = output_size
-	output = zeros(.F32, new_shape[:input.rank], loc=loc)
+	output = zeros(.Bf16, new_shape[:input.rank], loc=loc)
 
 	op := Operation{
 		input   = input,
