@@ -727,8 +727,14 @@ _rmsnorm_rope_write_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_
 	// the full sequence so the shift never triggers.
 	kv_size      := v.cache.shape[1]
 	row_bytes    := uint(kv_size) * 2
+	// The cache_write kernel writes new rows at slots [cap-tc, cap) once
+	// pos >= cap-tc; the host's job here is to shift the still-valid prefix
+	// back by exactly the number of rows being dropped, which is
+	// min(before_count + tc - cap, tc) = clamp(excess, 0, tc). The naive
+	// `shift_amount = excess` over-shifts (and underflows preserved_rows)
+	// once pos exceeds cap, e.g. cache.length = 2*sliding_window.
 	excess       := v.position_offset + token_count - v.cache_capacity
-	shift_amount := excess > 0 ? excess : 0
+	shift_amount := min(max(excess, 0), token_count)
 	if shift_amount > 0 && !(cp in gctx.k_cache_written_this_forward) {
 		preserved_rows  := v.cache_capacity - shift_amount
 		preserved_bytes := uint(preserved_rows) * row_bytes
@@ -1085,8 +1091,11 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	row_bytes  := uint(kv_size) * 2 // bf16 = 2 bytes per element
 	shift_amount := 0
 	if v.window > 0 {
+		// See note in `_rmsnorm_rope_write_cache_forward`: clamp shift to
+		// `token_count` so we don't over-shift (and underflow preserved_rows)
+		// once cache_position exceeds capacity.
 		excess := v.cache_position + token_count - capacity
-		if excess > 0 { shift_amount = excess }
+		shift_amount = min(max(excess, 0), token_count)
 	}
 
 	if shift_amount > 0 {
