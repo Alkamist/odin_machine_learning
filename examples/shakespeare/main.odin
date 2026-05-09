@@ -35,6 +35,9 @@ WARMUP_STEPS  :: 100
 WEIGHT_DECAY  :: 0.1
 SEED          :: 0xC0FFEE
 
+CPU_ARENA   :: 256 * 1024 * 1024
+CPU_THREADS :: 8
+
 base_config :: proc(use_qk_norm: bool) -> llama.Config {
 	return llama.Config{
 		layer_count       = 6,
@@ -54,8 +57,12 @@ main :: proc() {
 	defer fmt.println("Finished")
 
 	use_qk_norm := false
-	if builtin.len(os.args) > 1 && os.args[1] == "qknorm" {
-		use_qk_norm = true
+	use_cpu     := false
+	for arg in os.args[1:] {
+		switch arg {
+		case "qknorm":      use_qk_norm = true
+		case "cpu", "--cpu": use_cpu = true
+		}
 	}
 	rand.reset(SEED)
 	config := base_config(use_qk_norm)
@@ -76,8 +83,20 @@ main :: proc() {
 	train_set := corpus[:split]
 	val_set   := corpus[split:]
 
-	ctx := gpu.context_create()
-	defer gpu.context_destroy(ctx)
+	if use_cpu {
+		cpu.set_thread_count(CPU_THREADS)
+	}
+
+	ctx := cpu.context_create(CPU_ARENA) if use_cpu else gpu.context_create()
+	defer {
+		if use_cpu {
+			cpu.context_destroy(ctx)
+		} else {
+			gpu.context_destroy(ctx)
+		}
+	}
+
+	fmt.printfln("Backend: %v", "CPU" if use_cpu else "GPU")
 
 	ml.context_scope(ctx)
 

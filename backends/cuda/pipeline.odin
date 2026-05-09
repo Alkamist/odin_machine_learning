@@ -13,12 +13,9 @@ import "bindings/nvrtc"
 // NVRTC needs an explicit include path to find toolkit headers like
 // `cuda_bf16.h` (it can't see anything in `<CUDA_PATH>\include` on its own).
 // Resolved once at first compile and cached.
-@(private="file")
-_include_arg: cstring
-@(private="file")
+_include_arg:     cstring
 _include_arg_buf: [256]u8
 
-@(private="file")
 _resolve_include_arg :: proc() -> cstring {
 	if _include_arg != nil { return _include_arg }
 
@@ -52,10 +49,8 @@ _resolve_include_arg :: proc() -> cstring {
 // Caches by source pointer so multiple compiles of the same file share the
 // same cstring buffer. The buffers leak by design â€” kernel sources are
 // embedded statics, the pointer set is small and bounded.
-@(private="file")
 _kernel_cstring_cache: map[rawptr]cstring
 
-@(private="file")
 _bytes_to_cstring :: proc(src: []u8) -> cstring {
 	key := rawptr(raw_data(src))
 	if c, ok := _kernel_cstring_cache[key]; ok { return c }
@@ -214,4 +209,3 @@ _dispatch :: proc(
 		), loc=loc)
 	}
 }
-
