@@ -300,10 +300,6 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 	candidate_count := top_k > 0 ? min(top_k, n) : n
 	indices := make([]int, candidate_count, context.temp_allocator)
 
-	// Min-heap of size candidate_count tracking the largest logits seen so
-	// far. Streaming the remaining vocab and replacing the heap min on each
-	// larger logit gives O(n log k) instead of the O(n*k) selection sort
-	// that was dominating decode wall time.
 	for i in 0 ..< candidate_count do indices[i] = i
 	for i := candidate_count / 2 - 1; i >= 0; i -= 1 {
 		_sift_down_min_logit(indices, logits, i, candidate_count)
@@ -314,8 +310,6 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 			_sift_down_min_logit(indices, logits, 0, candidate_count)
 		}
 	}
-	// Heap-sort the min-heap into descending order so indices[0] is the
-	// largest logit and indices[candidate_count-1] is the k-th largest.
 	for end := candidate_count - 1; end > 0; end -= 1 {
 		indices[0], indices[end] = indices[end], indices[0]
 		_sift_down_min_logit(indices, logits, 0, end)

@@ -24,7 +24,7 @@ import "core:os"
 import "core:time"
 
 import ml    "../../"
-import gpu   "../../backends/vulkan"
+import gpu   "../../backends/cuda"
 import llama "../../networks/llama"
 
 DATA_DIR        :: "examples/data"

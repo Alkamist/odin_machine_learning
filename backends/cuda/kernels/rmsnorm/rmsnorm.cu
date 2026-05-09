@@ -1,28 +1,26 @@
-// F32 rmsnorm with bf16 weight. One block per row, 256-wide butterfly
-// reduction. Activations are fp32 (the post-ggml-shape pipeline default);
-// weights are bf16 packed-pairs (the model's stored dtype).
-#include <cuda_bf16.h>
+// F32 rmsnorm with f32 weight. One block per row, 256-wide butterfly
+// reduction. Used by training paths (Llama defaults to F32 weights).
+// Stores per-row `rstd` so backward doesn't have to recompute.
 
 #define RMS_WG     256
 #define RMS_NWARPS (RMS_WG / 32)
 
 extern "C" __global__
-void rmsnorm_f32(const float*        __restrict__ x,
-                 const unsigned int* __restrict__ w,
-                 float*              __restrict__ y,
+void rmsnorm_f32(const float* __restrict__ x,
+                 const float* __restrict__ w,
+                 float*       __restrict__ y,
+                 float*       __restrict__ rstd_out,
                  int count, int size, float eps) {
 	int row = blockIdx.x;
 	int tid = threadIdx.x;
 	if (row >= count) return;
 
-	int pair_count = size >> 1;
-	int row_base   = row * size;
+	int row_base = row * size;
 
 	float s2 = 0.0f;
-	for (int pi = tid; pi < pair_count; pi += RMS_WG) {
-		float v0 = x[row_base + 2*pi + 0];
-		float v1 = x[row_base + 2*pi + 1];
-		s2 += v0 * v0 + v1 * v1;
+	for (int i = tid; i < size; i += RMS_WG) {
+		float v = x[row_base + i];
+		s2 += v * v;
 	}
 
 	#pragma unroll
@@ -39,14 +37,9 @@ void rmsnorm_f32(const float*        __restrict__ x,
 	for (int i = 0; i < RMS_NWARPS; ++i) total += warp_sums[i];
 
 	float rstd = rsqrtf(total / (float)size + eps);
+	if (tid == 0) rstd_out[row] = rstd;
 
-	for (int pi = tid; pi < pair_count; pi += RMS_WG) {
-		float v0 = x[row_base + 2*pi + 0];
-		float v1 = x[row_base + 2*pi + 1];
-		unsigned int wp = w[pi];
-		float w0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(wp & 0xffffu)));
-		float w1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((wp >> 16) & 0xffffu)));
-		y[row_base + 2*pi + 0] = v0 * rstd * w0;
-		y[row_base + 2*pi + 1] = v1 * rstd * w1;
+	for (int i = tid; i < size; i += RMS_WG) {
+		y[row_base + i] = x[row_base + i] * rstd * w[i];
 	}
 }

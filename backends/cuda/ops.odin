@@ -49,6 +49,26 @@ _select_bf16_pipeline:          ^Pipeline
 _slice_trailing_f32_pipeline:   ^Pipeline
 _slice_trailing_bf16_pipeline:  ^Pipeline
 
+_adam_f32_pipeline: ^Pipeline
+
+_silu_f32_pipeline:      ^Pipeline
+_silu_back_f32_pipeline: ^Pipeline
+
+_cross_entropy_f32_pipeline:      ^Pipeline
+_cross_entropy_back_f32_pipeline: ^Pipeline
+
+_mul_back_a_f32_pipeline: ^Pipeline
+_mul_back_b_f32_pipeline: ^Pipeline
+
+_select_back_f32_pipeline: ^Pipeline
+
+_rope_back_f32_pipeline: ^Pipeline
+
+_rmsnorm_back_f32_pipeline: ^Pipeline
+
+_attention_train_f32_pipeline:      ^Pipeline
+_attention_train_back_f32_pipeline: ^Pipeline
+
 @(require_results)
 data :: #force_inline proc(t: ml.Tensor) -> Gpu_Buffer {
 	return transmute(Gpu_Buffer)t.buffers[.Data]
@@ -131,6 +151,7 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Add:          _add_forward(op, loc)
 	case ml.Mul:          _mul_forward(op, loc)
 	case ml.Gelu_Mul:     _gelu_mul_forward(op, loc)
+	case ml.Silu:         _silu_forward(op, loc)
 	case ml.Tanh:         _tanh_forward(op, loc)
 	case ml.Cast:         _cast_forward(op, loc)
 	case ml.Linear:       _linear_forward(op, loc)
@@ -144,6 +165,7 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Rope:            _rope_forward(op, loc)
 	case ml.Attention:       _attention_forward(op, loc)
 	case ml.Attention_Cache: _attention_cache_forward(op, loc)
+	case ml.Cross_Entropy:   _cross_entropy_forward(op, loc)
 	case ml.Select:          _select_forward(op, loc)
 	case ml.Slice_Trailing:  _slice_trailing_forward(op, loc)
 	case: fmt.panicf("cuda backend: forward not implemented for op variant %T", op.variant, loc=loc)
@@ -152,14 +174,41 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 _backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	#partial switch _ in op.variant {
-	case ml.Add:    _add_backward(op, loc)
-	case ml.Linear: _linear_backward(op, loc)
-	case:           fmt.panicf("cuda backend: backward not implemented for op variant %T", op.variant, loc=loc)
+	case ml.Add:           _add_backward(op, loc)
+	case ml.Mul:           _mul_backward(op, loc)
+	case ml.Linear:        _linear_backward(op, loc)
+	case ml.Silu:          _silu_backward(op, loc)
+	case ml.Select:        _select_backward(op, loc)
+	case ml.Rmsnorm:       _rmsnorm_backward(op, loc)
+	case ml.Rope:          _rope_backward(op, loc)
+	case ml.Attention:     _attention_backward(op, loc)
+	case ml.Cross_Entropy: _cross_entropy_backward(op, loc)
+	case:                  fmt.panicf("cuda backend: backward not implemented for op variant %T", op.variant, loc=loc)
 	}
 }
 
 _update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) {
-	fmt.panicf("cuda backend: update not implemented", loc=loc)
+	fmt.assertf(t.type == .F32, "cuda update requires F32 tensor (got %v); bf16 mixed-precision lands in a follow-up", t.type, loc=loc)
+
+	if _adam_f32_pipeline == nil {
+		_adam_f32_pipeline = _compile_pipeline(ADAM_F32_SRC, "adam_f32.cu", "adam_f32")
+	}
+
+	d := data    (t).ptr
+	g := gradient(t).ptr
+	m := transmute(Gpu_Buffer)t.buffers[.Adam_M]
+	v := transmute(Gpu_Buffer)t.buffers[.Adam_V]
+	fmt.assertf(m.ptr != 0, "cuda update: tensor missing Adam_M buffer", loc=loc)
+	fmt.assertf(v.ptr != 0, "cuda update: tensor missing Adam_V buffer", loc=loc)
+	mp := m.ptr; vp := v.ptr
+
+	n  := i32(t.count)
+	b1 := opt.beta1; b2 := opt.beta2
+	c1 := opt.bias_correction1; c2 := opt.bias_correction2
+	lr := opt.learning_rate; wd := opt.weight_decay; eps := opt.epsilon
+
+	args := [?]rawptr{ &d, &g, &mp, &vp, &n, &b1, &b2, &c1, &c2, &lr, &wd, &eps }
+	_dispatch(_adam_f32_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 }
 
 // ----- Linear ----------------------------------------------------------------
@@ -582,7 +631,6 @@ _rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	xp := data(x).ptr; wp := data(v.weight).ptr; yp := data(y).ptr
 	c   := i32(count); s := i32(size); eps := v.eps
-	args := [?]rawptr{ &xp, &wp, &yp, &c, &s, &eps }
 
 	#partial switch x.type {
 	case .Bf16:
@@ -590,12 +638,16 @@ _rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		if _rmsnorm_bf16_pipeline == nil {
 			_rmsnorm_bf16_pipeline = _compile_pipeline(RMSNORM_BF16_SRC,      "rmsnorm_bf16.cu",  "rmsnorm_bf16")
 		}
+		args := [?]rawptr{ &xp, &wp, &yp, &c, &s, &eps }
 		_dispatch(_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
-		fmt.assertf(size % 2 == 0, "rmsnorm f32 requires even size (got %v)", size, loc=loc)
+		// F32 rmsnorm (training): f32 weight, writes per-row rstd for backward.
+		fmt.assertf(v.weight.type == .F32, "rmsnorm f32 requires F32 weight (got %v)", v.weight.type, loc=loc)
 		if _rmsnorm_pipeline == nil {
-			_rmsnorm_pipeline = _compile_pipeline(RMSNORM_F32_SRC,       "rmsnorm.cu",       "rmsnorm_f32")
+			_rmsnorm_pipeline = _compile_pipeline(RMSNORM_F32_SRC, "rmsnorm.cu", "rmsnorm_f32")
 		}
+		rstd_p := data(v.rstd).ptr
+		args := [?]rawptr{ &xp, &wp, &yp, &rstd_p, &c, &s, &eps }
 		_dispatch(_rmsnorm_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("rmsnorm: unsupported dtype %v", x.type, loc=loc)
@@ -831,26 +883,44 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 	kv_size     := k.shape[1]
 	head_size   := q_size / v.n_q_heads
 	fmt.assertf(head_size <= 512, "cuda attention caps head_size at 512 (got %v)", head_size, loc=loc)
-	fmt.assertf(q.type == .Bf16,  "cuda attention only supports Bf16 (got %v)", q.type, loc=loc)
-	fmt.assertf(head_size % 2 == 0, "cuda bf16 attention requires even head_size (got %v)", head_size, loc=loc)
 	fmt.assertf(v.window == 0 || v.causal, "cuda attention window > 0 requires causal=true", loc=loc)
 
-	if _attention_bf16_pipeline == nil {
-		_attention_bf16_pipeline = _compile_pipeline(ATTENTION_BF16_SRC, "attention_bf16.cu", "attention_bf16")
-	}
-
 	qp := data(q).ptr; kp := data(k).ptr; vp := data(val).ptr; op_ptr := data(o).ptr
-	lse_ptr := data(v.lse).ptr
 	n_q_heads  := i32(v.n_q_heads)
 	n_kv_heads := i32(v.n_kv_heads)
 	hs := i32(head_size); tc := i32(token_count); qs := i32(q_size); kvs := i32(kv_size)
 	causal := i32(v.causal ? 1 : 0); window := i32(v.window)
 
-	args := [?]rawptr{
-		&qp, &kp, &vp, &op_ptr, &lse_ptr,
-		&n_q_heads, &n_kv_heads, &hs, &tc, &qs, &kvs, &causal, &window,
+	#partial switch q.type {
+	case .Bf16:
+		fmt.assertf(head_size % 2 == 0, "cuda bf16 attention requires even head_size (got %v)", head_size, loc=loc)
+		if _attention_bf16_pipeline == nil {
+			_attention_bf16_pipeline = _compile_pipeline(ATTENTION_BF16_SRC, "attention_bf16.cu", "attention_bf16")
+		}
+		lse_ptr := data(v.lse).ptr
+		args := [?]rawptr{
+			&qp, &kp, &vp, &op_ptr, &lse_ptr,
+			&n_q_heads, &n_kv_heads, &hs, &tc, &qs, &kvs, &causal, &window,
+		}
+		_dispatch(_attention_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
+
+	case .F32:
+		// Training-style attention: materialises softmax_outputs for backward.
+		// Limited to T <= 1024 due to shared-memory `d_p_row` in the backward kernel.
+		fmt.assertf(token_count <= 1024, "cuda attention_train_f32 caps token_count at 1024 (got %v)", token_count, loc=loc)
+		if _attention_train_f32_pipeline == nil {
+			_attention_train_f32_pipeline = _compile_pipeline(ATTENTION_TRAIN_F32_SRC, "attention_train_f32.cu", "attention_train_f32")
+		}
+		sm_ptr := data(v.softmax_outputs).ptr
+		args := [?]rawptr{
+			&qp, &kp, &vp, &op_ptr, &sm_ptr,
+			&n_q_heads, &n_kv_heads, &hs, &tc, &qs, &kvs, &causal, &window,
+		}
+		_dispatch(_attention_train_f32_pipeline, u32(v.n_q_heads), u32(token_count), 1, 256, 1, 1, 0, args[:], loc)
+
+	case:
+		fmt.panicf("attention: unsupported dtype %v", q.type, loc=loc)
 	}
-	_dispatch(_attention_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
 }
 
 // ----- Attention with cache --------------------------------------------------
@@ -1073,4 +1143,235 @@ _slice_trailing_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 	case:
 		fmt.panicf("slice_trailing: unsupported dtype %v", x.type, loc=loc)
 	}
+}
+
+// ----- Silu ------------------------------------------------------------------
+_silu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "cuda silu requires F32 (got %v)", x.type, loc=loc)
+
+	if _silu_f32_pipeline == nil {
+		_silu_f32_pipeline = _compile_pipeline(SILU_F32_SRC, "silu_f32.cu", "silu_f32")
+	}
+
+	xp := data(x).ptr; yp := data(y).ptr
+	n  := i32(ml.len(x))
+	args := [?]rawptr{ &xp, &yp, &n }
+	_dispatch(_silu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_silu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "cuda silu backward requires F32 (got %v)", x.type, loc=loc)
+
+	if _silu_back_f32_pipeline == nil {
+		_silu_back_f32_pipeline = _compile_pipeline(SILU_BACK_F32_SRC, "silu_back_f32.cu", "silu_back_f32")
+	}
+
+	xp  := data(x).ptr
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	n   := i32(ml.len(x))
+	args := [?]rawptr{ &xp, &dyp, &dxp, &n }
+	_dispatch(_silu_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+// ----- Cross_Entropy ---------------------------------------------------------
+_cross_entropy_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Cross_Entropy)
+	fmt.assertf(x.type == .F32, "cuda cross_entropy requires F32 (got %v)", x.type, loc=loc)
+
+	if _cross_entropy_f32_pipeline == nil {
+		_cross_entropy_f32_pipeline = _compile_pipeline(CROSS_ENTROPY_F32_SRC, "cross_entropy_f32.cu", "cross_entropy_f32")
+	}
+
+	gctx := _gctx(loc)
+	idx_ptr := _upload_indices(gctx, v.targets, loc)
+
+	xp := data(x).ptr
+	pp := data(v.probabilities).ptr
+	yp := data(y).ptr
+	class_size := i32(x.shape[x.rank - 1])
+	sample_count := builtin.len(v.targets)
+
+	args := [?]rawptr{ &xp, &idx_ptr, &pp, &yp, &class_size }
+	_dispatch(_cross_entropy_f32_pipeline, u32(sample_count), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_cross_entropy_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Cross_Entropy)
+
+	if _cross_entropy_back_f32_pipeline == nil {
+		_cross_entropy_back_f32_pipeline = _compile_pipeline(CROSS_ENTROPY_BACK_F32_SRC, "cross_entropy_back_f32.cu", "cross_entropy_back_f32")
+	}
+
+	gctx := _gctx(loc)
+	idx_ptr := _upload_indices(gctx, v.targets, loc)
+
+	pp  := data(v.probabilities).ptr
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	class_size   := i32(x.shape[x.rank - 1])
+	sample_count := i32(builtin.len(v.targets))
+	total        := int(class_size) * int(sample_count)
+
+	args := [?]rawptr{ &pp, &idx_ptr, &dyp, &dxp, &sample_count, &class_size }
+	_dispatch(_cross_entropy_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+// ----- Mul backward ----------------------------------------------------------
+_mul_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a := op.input
+	b := op.variant.(ml.Mul).b
+	c := op.output
+	fmt.assertf(a.type == .F32, "cuda mul backward requires F32 (got %v)", a.type, loc=loc)
+
+	if _mul_back_a_f32_pipeline == nil {
+		_mul_back_a_f32_pipeline = _compile_pipeline(MUL_BACK_A_F32_SRC, "mul_back_a_f32.cu", "mul_back_a_f32")
+	}
+	if _mul_back_b_f32_pipeline == nil {
+		_mul_back_b_f32_pipeline = _compile_pipeline(MUL_BACK_B_F32_SRC, "mul_back_b_f32.cu", "mul_back_b_f32")
+	}
+
+	ap  := data(a).ptr
+	bp  := data(b).ptr
+	dyp := gradient(c).ptr
+	dap := gradient(a).ptr
+	dbp := gradient(b).ptr
+	n_a := i32(ml.len(a))
+	n_b := i32(ml.len(b))
+
+	args_a := [?]rawptr{ &bp,  &dyp, &dap, &n_a, &n_b }
+	_dispatch(_mul_back_a_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
+
+	args_b := [?]rawptr{ &ap,  &dyp, &dbp, &n_a, &n_b }
+	_dispatch(_mul_back_b_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
+}
+
+// ----- Select backward -------------------------------------------------------
+_select_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	w := op.input            // weight (e.g. token embeddings)
+	y := op.output
+	indices := op.variant.(ml.Select).indices
+	fmt.assertf(w.type == .F32, "cuda select backward requires F32 (got %v)", w.type, loc=loc)
+
+	if _select_back_f32_pipeline == nil {
+		_select_back_f32_pipeline = _compile_pipeline(SELECT_BACK_F32_SRC, "select_back_f32.cu", "select_back_f32")
+	}
+
+	gctx := _gctx(loc)
+	idx_ptr := _upload_indices(gctx, indices, loc)
+
+	dyp := gradient(y).ptr
+	dwp := gradient(w).ptr
+	row_size := ml.len(y) / builtin.len(indices)
+	n_idx    := i32(builtin.len(indices))
+	rs       := i32(row_size)
+	total    := builtin.len(indices) * row_size
+
+	args := [?]rawptr{ &dyp, &idx_ptr, &dwp, &n_idx, &rs }
+	_dispatch(_select_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+// ----- Rmsnorm backward ------------------------------------------------------
+_rmsnorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Rmsnorm)
+	fmt.assertf(x.type == .F32, "cuda rmsnorm backward requires F32 (got %v)", x.type, loc=loc)
+	fmt.assertf(v.weight.type == .F32, "cuda rmsnorm backward requires F32 weight (got %v)", v.weight.type, loc=loc)
+
+	if _rmsnorm_back_f32_pipeline == nil {
+		_rmsnorm_back_f32_pipeline = _compile_pipeline(RMSNORM_BACK_F32_SRC, "rmsnorm_back_f32.cu", "rmsnorm_back_f32")
+	}
+
+	size  := x.shape[x.rank - 1]
+	count := ml.len(x) / size
+
+	xp     := data(x).ptr
+	wp     := data(v.weight).ptr
+	rstd_p := data(v.rstd).ptr
+	dyp    := gradient(y).ptr
+	dxp    := gradient(x).ptr
+	dwp    := gradient(v.weight).ptr
+	c      := i32(count); s := i32(size)
+
+	args := [?]rawptr{ &xp, &wp, &rstd_p, &dyp, &dxp, &dwp, &c, &s }
+	_dispatch(_rmsnorm_back_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+// ----- Rope backward ---------------------------------------------------------
+_rope_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Rope)
+	fmt.assertf(x.type == .F32, "cuda rope backward requires F32 (got %v)", x.type, loc=loc)
+
+	if _rope_back_f32_pipeline == nil {
+		_rope_back_f32_pipeline = _compile_pipeline(ROPE_BACK_F32_SRC, "rope_back_f32.cu", "rope_back_f32")
+	}
+
+	gctx := _gctx(loc)
+	_emit_position_upload(gctx, v.position_offset, loc)
+
+	token_count := x.shape[0]
+	head_size   := x.shape[x.rank - 1] / v.head_count
+	total_pairs := token_count * v.head_count * (head_size / 2)
+
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	tc := i32(token_count); hc := i32(v.head_count); hs := i32(head_size)
+	base := v.base; pos_dev := gctx.position_dev; rpc := i32(v.rotate_pair_count)
+	args := [?]rawptr{ &dyp, &dxp, &tc, &hc, &hs, &base, &pos_dev, &rpc }
+	_dispatch(_rope_back_f32_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+// ----- Attention backward ----------------------------------------------------
+_attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	q   := op.input
+	o   := op.output
+	v   := op.variant.(ml.Attention)
+	k   := v.key
+	val := v.value
+	fmt.assertf(q.type == .F32, "cuda attention backward requires F32 (got %v)", q.type, loc=loc)
+
+	if _attention_train_back_f32_pipeline == nil {
+		_attention_train_back_f32_pipeline = _compile_pipeline(ATTENTION_TRAIN_BACK_F32_SRC, "attention_train_back_f32.cu", "attention_train_back_f32")
+	}
+
+	token_count := q.shape[0]
+	q_size      := q.shape[1]
+	kv_size     := k.shape[1]
+	head_size   := q_size / v.n_q_heads
+	gqa         := v.n_q_heads / v.n_kv_heads
+
+	qp  := data(q).ptr
+	kp  := data(k).ptr
+	vp  := data(val).ptr
+	smp := data(v.softmax_outputs).ptr
+	dyp := gradient(o).ptr
+	dqp := gradient(q).ptr
+	dkp := gradient(k).ptr
+	dvp := gradient(val).ptr
+
+	n_q_heads  := i32(v.n_q_heads)
+	n_kv_heads := i32(v.n_kv_heads)
+	hs := i32(head_size); tc := i32(token_count); qs := i32(q_size); kvs := i32(kv_size)
+	causal := i32(v.causal ? 1 : 0); window := i32(v.window)
+
+	args := [?]rawptr{
+		&qp, &kp, &vp, &smp, &dyp, &dqp, &dkp, &dvp,
+		&n_q_heads, &n_kv_heads, &hs, &tc, &qs, &kvs, &causal, &window,
+	}
+	// Grid: (kv_head, q_head_in_group, t_q). 256 threads/block.
+	_dispatch(_attention_train_back_f32_pipeline,
+		u32(v.n_kv_heads), u32(gqa), u32(token_count),
+		256, 1, 1,
+		0, args[:], loc)
 }

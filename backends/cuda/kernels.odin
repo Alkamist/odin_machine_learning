@@ -63,3 +63,23 @@ SELECT_BF16_SRC          :: #load("kernels/select/select_bf16.cu",             [
 
 SLICE_TRAILING_F32_SRC   :: #load("kernels/slice_trailing/slice_trailing.cu",      []u8)
 SLICE_TRAILING_BF16_SRC  :: #load("kernels/slice_trailing/slice_trailing_bf16.cu", []u8)
+
+ADAM_F32_SRC :: #load("kernels/optimizer/adam_f32.cu", []u8)
+
+SILU_F32_SRC      :: #load("kernels/silu/silu_f32.cu",      []u8)
+SILU_BACK_F32_SRC :: #load("kernels/silu/silu_back_f32.cu", []u8)
+
+CROSS_ENTROPY_F32_SRC      :: #load("kernels/cross_entropy/cross_entropy_f32.cu",      []u8)
+CROSS_ENTROPY_BACK_F32_SRC :: #load("kernels/cross_entropy/cross_entropy_back_f32.cu", []u8)
+
+MUL_BACK_A_F32_SRC :: #load("kernels/mul/mul_back_a_f32.cu", []u8)
+MUL_BACK_B_F32_SRC :: #load("kernels/mul/mul_back_b_f32.cu", []u8)
+
+SELECT_BACK_F32_SRC :: #load("kernels/select/select_back_f32.cu", []u8)
+
+ROPE_BACK_F32_SRC :: #load("kernels/rope/rope_back_f32.cu", []u8)
+
+RMSNORM_BACK_F32_SRC :: #load("kernels/rmsnorm/rmsnorm_back_f32.cu", []u8)
+
+ATTENTION_TRAIN_F32_SRC      :: #load("kernels/attention/attention_train_f32.cu",      []u8)
+ATTENTION_TRAIN_BACK_F32_SRC :: #load("kernels/attention/attention_train_back_f32.cu", []u8)

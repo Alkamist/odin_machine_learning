@@ -13,7 +13,7 @@ import "core:os"
 import "core:time"
 
 import ml    "../../"
-import gpu   "../../backends/vulkan"
+import gpu   "../../backends/cuda"
 import cpu   "../../backends/cpu"
 import llama "../../networks/llama"
 
@@ -76,13 +76,8 @@ main :: proc() {
 	train_set := corpus[:split]
 	val_set   := corpus[split:]
 
-	cpu.set_thread_count(24)
-
-	ctx := cpu.context_create(1024 * 1024 * 1024)
-	defer cpu.context_destroy(ctx)
-
-	// ctx := gpu.context_create()
-	// defer gpu.context_destroy(ctx)
+	ctx := gpu.context_create()
+	defer gpu.context_destroy(ctx)
 
 	ml.context_scope(ctx)
 
@@ -209,41 +204,40 @@ evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
 }
 
 sample :: proc(model: llama.Llama, prompt: string, gen_count: int, valid_bytes: []bool) {
-	t_max := builtin.len(prompt) + gen_count + 4
-	cache := llama.cache_make(model, t_max)
-	defer llama.cache_destroy(cache)
-
-	prompt_tokens := make([]int, builtin.len(prompt), context.temp_allocator)
+	// Sampling reuses the non-cached `llama.forward` so it goes through the
+	// same f32 attention path as training. Slower than KV-cached generation
+	// (recomputes attention over the full prefix each step), but the
+	// sampling budget is small and avoids needing an f32 attention_with_cache.
+	//
+	// `tokens` lives in the default allocator — the loop body free_all's the
+	// temp allocator after each forward, so a temp-allocator dynamic array
+	// would be wiped between iterations.
+	tokens := make([dynamic]int, 0, builtin.len(prompt) + gen_count)
+	defer delete(tokens)
 	for i in 0 ..< builtin.len(prompt) {
-		prompt_tokens[i] = int(prompt[i])
+		append(&tokens, int(prompt[i]))
 	}
-
-	ml.clear({.No_Gradients})
-	logits := llama.forward_cached(model, &cache, prompt_tokens)
 
 	last_logits := make([]f32, VOCAB_SIZE)
 	defer delete(last_logits)
-	logits_buf  := make([]f32, ml.len(logits), context.temp_allocator)
-	ml.get_data(logits, logits_buf)
-	last_offset := (logits.shape[0] - 1) * VOCAB_SIZE
-	copy(last_logits, logits_buf[last_offset:last_offset + VOCAB_SIZE])
 
 	fmt.print(prompt)
 
-	mask_invalid(last_logits, valid_bytes)
-	next_token := sample_token(last_logits, SAMPLE_TEMP, SAMPLE_TOP_K)
-	fmt.print(rune(next_token))
-
-	for _ in 0 ..< gen_count - 1 {
+	for _ in 0 ..< gen_count {
 		defer free_all(context.temp_allocator)
 
 		ml.clear({.No_Gradients})
-		step_logits := llama.forward_cached(model, &cache, {next_token})
-		ml.get_data(step_logits, last_logits)
+		logits := llama.forward(model, tokens[:])
+
+		logits_buf := make([]f32, ml.len(logits), context.temp_allocator)
+		ml.get_data(logits, logits_buf)
+		last_offset := (logits.shape[0] - 1) * VOCAB_SIZE
+		copy(last_logits, logits_buf[last_offset:last_offset + VOCAB_SIZE])
 
 		mask_invalid(last_logits, valid_bytes)
-		next_token = sample_token(last_logits, SAMPLE_TEMP, SAMPLE_TOP_K)
+		next_token := sample_token(last_logits, SAMPLE_TEMP, SAMPLE_TOP_K)
 		fmt.print(rune(next_token))
+		append(&tokens, next_token)
 	}
 }
 
