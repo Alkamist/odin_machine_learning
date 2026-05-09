@@ -21,6 +21,7 @@ _quantize_q8_1_pipeline:   ^Pipeline
 _linear_q4_k_mmvq_pipeline: ^Pipeline
 _linear_q4_k_gate_up_geglu_bf16_pipeline: ^Pipeline
 _linear_q6_k_gemv_pipeline: ^Pipeline
+_pack_f32_to_bf16_pairs_pipeline: ^Pipeline
 
 _mul_pipeline:           ^Pipeline
 _mul_bf16_pipeline:      ^Pipeline
@@ -35,9 +36,11 @@ _add_rmsnorm_bf16_pipeline: ^Pipeline
 _rmsnorm_rope_bf16_pipeline: ^Pipeline
 _rope_pipeline:          ^Pipeline
 _rope_bf16_pipeline:     ^Pipeline
-_attention_bf16_pipeline:       ^Pipeline
-_attention_cache_bf16_pipeline: ^Pipeline
-_cache_write_bf16_pipeline:     ^Pipeline
+_attention_bf16_pipeline:                ^Pipeline
+_attention_cache_bf16_pipeline:          ^Pipeline
+_attention_cache_vec_bf16_d256_pipeline: ^Pipeline
+_attention_cache_vec_bf16_d512_pipeline: ^Pipeline
+_cache_write_bf16_pipeline:              ^Pipeline
 _select_f32_pipeline:           ^Pipeline
 _select_bf16_pipeline:          ^Pipeline
 _slice_trailing_f32_pipeline:   ^Pipeline
@@ -70,6 +73,20 @@ _emit_position_upload :: proc(gctx: ^Context, value: int, loc: runtime.Source_Co
 	(^i32)(gctx.position_pinned)^ = i32(value)
 	cuda.check(cuda.MemcpyHtoDAsync(gctx.position_dev, gctx.position_pinned, 4, gctx.stream), loc=loc)
 	gctx.position_written_this_forward = true
+}
+
+// Lazily (re)allocate the shift scratch used by sliding K/V cache writes.
+// Sized to the largest preserved-rows × kv_size byte count seen so far. The
+// pointer is stable across forwards once allocated, so the captured graph's
+// memcpy nodes reference a fixed device address; cuGraphExecUpdate only has
+// to patch the size if it changes.
+_ensure_shift_scratch :: proc(gctx: ^Context, byte_count: u64, loc: runtime.Source_Code_Location) {
+	if gctx.shift_scratch_size >= byte_count { return }
+	if gctx.shift_scratch_dev != 0 {
+		cuda.check(cuda.MemFree(gctx.shift_scratch_dev), loc=loc)
+	}
+	cuda.check(cuda.MemAlloc(&gctx.shift_scratch_dev, uint(byte_count)), loc=loc)
+	gctx.shift_scratch_size = byte_count
 }
 
 // Replace cuda.odin's stub. Routes by op variant.
@@ -225,28 +242,21 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	input_size  := weight.shape[1]
 	count       := ml.len(input) / input_size
 
-	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE  == 0, "linear_q4_k: K must be a multiple of 256, got %v", input_size, loc=loc)
-	fmt.assertf(output_size % Q4_K_MMVQ_ROWS_PER_WG == 0, "linear_q4_k: N must be a multiple of %v, got %v", Q4_K_MMVQ_ROWS_PER_WG, output_size, loc=loc)
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q4_k: K must be a multiple of 256, got %v", input_size, loc=loc)
 	fmt.assertf(count == 1, "cuda linear_q4_k currently supports M=1 (decode); got M=%v", count, loc=loc)
 
-	if _quantize_q8_1_pipeline    == nil { _quantize_q8_1_pipeline    = _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC, "quantize_q8_1_bf16.cu", "quantize_q8_1_bf16") }
-	if _linear_q4_k_mmvq_pipeline == nil { _linear_q4_k_mmvq_pipeline = _compile_pipeline(LINEAR_Q4_K_MMVQ_SRC,  "linear_q4_k_mmvq.cu", "linear_q4_k_mmvq")   }
+	if _quantize_q8_1_pipeline             == nil { _quantize_q8_1_pipeline             = _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC,     "quantize_q8_1_bf16.cu",        "quantize_q8_1_bf16")        }
+	if _linear_q4_k_mmvq_pipeline          == nil { _linear_q4_k_mmvq_pipeline          = _compile_pipeline(LINEAR_Q4_K_MMVQ_SRC,       "linear_q4_k_mmvq.cu",          "linear_q4_k_mmvq")          }
+	if _pack_f32_to_bf16_pairs_pipeline    == nil { _pack_f32_to_bf16_pairs_pipeline    = _compile_pipeline(PACK_F32_TO_BF16_PAIRS_SRC, "pack_f32_to_bf16_pairs.cu",    "pack_f32_to_bf16_pairs")    }
 
 	gctx := _gctx(loc)
 
-	// Scratch Q8_1 buffer for the quantized activation, sub-allocated from the
-	// per-context activation pool so it recycles across forward passes the same
-	// way the vulkan backend's `_create_pooled_activation_buffer` does.
 	q8_block_count := input_size / Q8_1_BLOCK_ELEMS
 	q8_byte_count  := q8_block_count * Q8_1_BLOCK_BYTES
 
 	xp := data(input).ptr
 	K  := i32(input_size)
 
-	// If a previous Q4_K matmul already quantized this exact input within the
-	// current forward (q/k/v sharing input_norm output, gate/up sharing
-	// pre_ff_norm output), reuse its q8_1 buffer. Saves ~half the
-	// quantize_q8_1 dispatches per token on Gemma-shaped models.
 	q8: cuda.DevicePtr
 	if cached, ok := gctx.q8_1_cache[xp]; ok {
 		q8 = cached
@@ -260,16 +270,32 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 		gctx.q8_1_cache[xp] = q8
 	}
 
-	// Stage 2: q4_k weight x q8_1 activation -> bf16 output row.
+	// Faithful ggml-style mmvq: ROWS_PER_BLOCK=1, fp32 output. We allocate an
+	// fp32 scratch from the activation pool, run the mmvq into it, then a
+	// trivial pack kernel converts to the bf16-packed-pair format the rest of
+	// the pipeline reads. Output size N must be a multiple of 2 only because
+	// the bf16 pair-packed output buffer is sized that way; the mmvq itself
+	// is fine for any N.
 	wp := data(weight).ptr
 	yp := data(output).ptr
 	M  := i32(count)
 	N  := i32(output_size)
-	mmvq_args := [?]rawptr{ &q8, &wp, &yp, &M, &K, &N }
+
+	scratch_bytes := u64(output_size * size_of(f32))
+	scratch       := _activation_alloc(gctx, scratch_bytes, loc)
+
+	mmvq_args := [?]rawptr{ &q8, &wp, &scratch, &M, &K, &N }
 	_dispatch(_linear_q4_k_mmvq_pipeline,
-		u32(output_size / Q4_K_MMVQ_ROWS_PER_WG), 1, 1,
-		32, 4, 1,
+		u32(output_size), 1, 1,    // ROWS_PER_BLOCK=1: one block per output row
+		32, 4, 1,                    // 4 warps × 32 lanes
 		0, mmvq_args[:], loc)
+
+	pair_count := (output_size + 1) / 2
+	pack_args  := [?]rawptr{ &scratch, &yp, &N }
+	_dispatch(_pack_f32_to_bf16_pairs_pipeline,
+		_div_up(pair_count, 256), 1, 1,
+		256, 1, 1,
+		0, pack_args[:], loc)
 }
 
 // Fused FFN front-half (gate + up + GEGLU) over Q4_K weights, decode (M=1).
@@ -286,12 +312,12 @@ _linear_q4_k_gate_up_geglu_forward :: proc(op: ml.Operation, loc: runtime.Source
 	input_size  := w_gate.shape[1]
 	count       := ml.len(input) / input_size
 
-	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE  == 0, "linear_q4_k_gate_up_geglu: K must be a multiple of 256, got %v", input_size, loc=loc)
-	fmt.assertf(output_size % Q4_K_MMVQ_ROWS_PER_WG == 0, "linear_q4_k_gate_up_geglu: N must be a multiple of %v, got %v", Q4_K_MMVQ_ROWS_PER_WG, output_size, loc=loc)
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q4_k_gate_up_geglu: K must be a multiple of 256, got %v", input_size, loc=loc)
 	fmt.assertf(count == 1, "cuda linear_q4_k_gate_up_geglu requires M=1 (decode); got M=%v", count, loc=loc)
 
-	if _quantize_q8_1_pipeline                      == nil { _quantize_q8_1_pipeline                      = _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC,             "quantize_q8_1_bf16.cu",             "quantize_q8_1_bf16") }
-	if _linear_q4_k_gate_up_geglu_bf16_pipeline     == nil { _linear_q4_k_gate_up_geglu_bf16_pipeline     = _compile_pipeline(LINEAR_Q4_K_GATE_UP_GEGLU_BF16_SRC, "linear_q4_k_gate_up_geglu_bf16.cu", "linear_q4_k_gate_up_geglu_bf16") }
+	if _quantize_q8_1_pipeline                  == nil { _quantize_q8_1_pipeline                  = _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC,             "quantize_q8_1_bf16.cu",             "quantize_q8_1_bf16") }
+	if _linear_q4_k_gate_up_geglu_bf16_pipeline == nil { _linear_q4_k_gate_up_geglu_bf16_pipeline = _compile_pipeline(LINEAR_Q4_K_GATE_UP_GEGLU_BF16_SRC, "linear_q4_k_gate_up_geglu_bf16.cu", "linear_q4_k_gate_up_geglu_bf16") }
+	if _pack_f32_to_bf16_pairs_pipeline         == nil { _pack_f32_to_bf16_pairs_pipeline         = _compile_pipeline(PACK_F32_TO_BF16_PAIRS_SRC,         "pack_f32_to_bf16_pairs.cu",         "pack_f32_to_bf16_pairs") }
 
 	gctx := _gctx(loc)
 
@@ -319,11 +345,22 @@ _linear_q4_k_gate_up_geglu_forward :: proc(op: ml.Operation, loc: runtime.Source
 	yp  := data(output).ptr
 	M   := i32(count)
 	N   := i32(output_size)
-	args := [?]rawptr{ &q8, &wgp, &wup, &yp, &M, &K, &N }
+
+	scratch_bytes := u64(output_size * size_of(f32))
+	scratch       := _activation_alloc(gctx, scratch_bytes, loc)
+
+	mmvq_args := [?]rawptr{ &q8, &wgp, &wup, &scratch, &M, &K, &N }
 	_dispatch(_linear_q4_k_gate_up_geglu_bf16_pipeline,
-		u32(output_size / Q4_K_MMVQ_ROWS_PER_WG), 1, 1,
+		u32(output_size), 1, 1,
 		32, 4, 1,
-		0, args[:], loc)
+		0, mmvq_args[:], loc)
+
+	pair_count := (output_size + 1) / 2
+	pack_args  := [?]rawptr{ &scratch, &yp, &N }
+	_dispatch(_pack_f32_to_bf16_pairs_pipeline,
+		_div_up(pair_count, 256), 1, 1,
+		256, 1, 1,
+		0, pack_args[:], loc)
 }
 
 _add_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -651,21 +688,32 @@ _linear_q6_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	input_size  := weight.shape[1]
 	count       := ml.len(input) / input_size
 
-	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE  == 0, "linear_q6_k: K must be a multiple of 256, got %v", input_size, loc=loc)
-	fmt.assertf(output_size % Q4_K_MMVQ_ROWS_PER_WG == 0, "linear_q6_k: N must be a multiple of %v, got %v", Q4_K_MMVQ_ROWS_PER_WG, output_size, loc=loc)
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q6_k: K must be a multiple of 256, got %v", input_size, loc=loc)
 	fmt.assertf(count == 1, "cuda linear_q6_k currently supports M=1 (decode); got M=%v", count, loc=loc)
 
-	if _linear_q6_k_gemv_pipeline == nil {
-		_linear_q6_k_gemv_pipeline = _compile_pipeline(LINEAR_Q6_K_GEMV_SRC, "linear_q6_k_gemv.cu", "linear_q6_k_gemv")
-	}
+	if _linear_q6_k_gemv_pipeline       == nil { _linear_q6_k_gemv_pipeline       = _compile_pipeline(LINEAR_Q6_K_GEMV_SRC,       "linear_q6_k_gemv.cu",       "linear_q6_k_gemv") }
+	if _pack_f32_to_bf16_pairs_pipeline == nil { _pack_f32_to_bf16_pairs_pipeline = _compile_pipeline(PACK_F32_TO_BF16_PAIRS_SRC, "pack_f32_to_bf16_pairs.cu", "pack_f32_to_bf16_pairs") }
+
+	gctx := _gctx(loc)
 
 	xp := data(input).ptr; wp := data(weight).ptr; yp := data(output).ptr
 	M  := i32(count); K := i32(input_size); N := i32(output_size)
-	args := [?]rawptr{ &xp, &wp, &yp, &M, &K, &N }
+
+	scratch_bytes := u64(output_size * size_of(f32))
+	scratch       := _activation_alloc(gctx, scratch_bytes, loc)
+
+	gemv_args := [?]rawptr{ &xp, &wp, &scratch, &M, &K, &N }
 	_dispatch(_linear_q6_k_gemv_pipeline,
-		u32(output_size / Q4_K_MMVQ_ROWS_PER_WG), 1, 1,
+		u32(output_size), 1, 1,
 		32, 4, 1,
-		0, args[:], loc)
+		0, gemv_args[:], loc)
+
+	pair_count := (output_size + 1) / 2
+	pack_args  := [?]rawptr{ &scratch, &yp, &N }
+	_dispatch(_pack_f32_to_bf16_pairs_pipeline,
+		_div_up(pair_count, 256), 1, 1,
+		256, 1, 1,
+		0, pack_args[:], loc)
 }
 
 // ----- Attention (no cache) --------------------------------------------------
@@ -709,9 +757,14 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 
 // ----- Attention with cache --------------------------------------------------
 //
-// New K/V rows are first copied into the ring buffer at `cache_position`,
-// wrapping if needed. Then the FA2 forward indexes into the ring with mod
-// t_capacity. No LSE writeout (decode path).
+// Linear cache layout (= ggml's): K/V live in [0..capacity) by seq position,
+// slot 0 oldest, slot cap-1 newest. For sliding layers in steady state
+// (cache_position + n_rows > capacity), the host shifts the cache contents
+// back by `shift_amount` rows via two cuMemcpyDtoDAsync (through a per-
+// context scratch) before cache_write writes the new rows at the end of the
+// cache. For full layers and sliding layers in their first `capacity`
+// tokens, no shift is needed; cache_write linear-appends at slot
+// `cache_position`.
 
 _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	q       := op.input
@@ -732,19 +785,53 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 
 	gctx := _gctx(loc)
 
-	t_capacity := k_cache.shape[0]
+	capacity := k_cache.shape[0]
 
-	// K/V cache writes go through `cache_write_bf16`, which computes the dst
-	// row index device-side as `(*pos_dev + row) % t_capacity`. This replaces
-	// two host-issued cuMemcpyDtoDAsync calls (one each for K and V) plus the
-	// optional wrap pair: every step's captured graph used to have a different
-	// dst pointer baked in, forcing `cuGraphExecUpdate` to patch on each step.
-	// With the kernel reading position from a stable device buffer, the args
-	// are bit-identical step-to-step.
-	if _cache_write_bf16_pipeline == nil {
-		_cache_write_bf16_pipeline = _compile_pipeline(CACHE_WRITE_BF16_SRC, "cache_write_bf16.cu", "cache_write_bf16")
+	fmt.assertf(token_count <= capacity, "cuda attention_with_cache: q_token_count (%v) cannot exceed cache capacity (%v); chunk multi-token prefill if needed", token_count, capacity, loc=loc)
+
+	// Gemma's KV-shared layers reuse the source layer's k_cache/v_cache and
+	// re-pass the same K/V tensors here; without dedup, each shared layer
+	// would re-shift and re-write the cache and clobber the source's history.
+	// Run the shift+write the first time we see this k_cache in the forward,
+	// skip subsequent calls. (The k_cache pointer is stable per-cache-tensor.)
+	k_cache_ptr := data(k_cache).ptr
+	cache_already_written := k_cache_ptr in gctx.cache_written_this_forward
+	gctx.cache_written_this_forward[k_cache_ptr] = true
+
+	// Shift sliding-layer cache contents back by `shift_amount` rows when the
+	// next write would overflow capacity. cache_write then writes the new
+	// rows at slots [cap - n_rows, cap). For full layers (window == 0) we
+	// allocate cache at the user's max context, so shift is never needed.
+	row_bytes  := uint(kv_size) * 2 // bf16 = 2 bytes per element
+	shift_amount := 0
+	if v.window > 0 && !cache_already_written {
+		excess := v.cache_position + token_count - capacity
+		if excess > 0 { shift_amount = excess }
 	}
-	{
+
+	if shift_amount > 0 {
+		preserved_rows  := capacity - shift_amount
+		preserved_bytes := uint(preserved_rows) * row_bytes
+		_ensure_shift_scratch(gctx, u64(preserved_bytes), loc)
+
+		k_dst := data(k_cache).ptr
+		v_dst := data(v_cache).ptr
+		shift_src_offset := uint(shift_amount) * row_bytes
+
+		// K shift: cache[shift..] -> scratch -> cache[0..]
+		cuda.check(cuda.MemcpyDtoDAsync(gctx.shift_scratch_dev, k_dst + cuda.DevicePtr(shift_src_offset), preserved_bytes, gctx.stream), loc=loc)
+		cuda.check(cuda.MemcpyDtoDAsync(k_dst, gctx.shift_scratch_dev, preserved_bytes, gctx.stream), loc=loc)
+		// V shift.
+		cuda.check(cuda.MemcpyDtoDAsync(gctx.shift_scratch_dev, v_dst + cuda.DevicePtr(shift_src_offset), preserved_bytes, gctx.stream), loc=loc)
+		cuda.check(cuda.MemcpyDtoDAsync(v_dst, gctx.shift_scratch_dev, preserved_bytes, gctx.stream), loc=loc)
+	}
+
+	_emit_position_upload(gctx, v.cache_position, loc)
+
+	if !cache_already_written {
+		if _cache_write_bf16_pipeline == nil {
+			_cache_write_bf16_pipeline = _compile_pipeline(CACHE_WRITE_BF16_SRC, "cache_write_bf16.cu", "cache_write_bf16")
+		}
 		k_src := data(k).ptr
 		k_dst := data(k_cache).ptr
 		v_src := data(val).ptr
@@ -752,35 +839,51 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 		pos_dev := gctx.position_dev
 		nr  := i32(token_count)
 		kvs := i32(kv_size)
-		tc  := i32(t_capacity)
+		cap := i32(capacity)
 
 		pairs_total := token_count * (kv_size / 2)
 		grid        := _div_up(pairs_total, 256)
 
-		k_args := [?]rawptr{ &k_src, &k_dst, &pos_dev, &nr, &kvs, &tc }
+		k_args := [?]rawptr{ &k_src, &k_dst, &pos_dev, &nr, &kvs, &cap }
 		_dispatch(_cache_write_bf16_pipeline, grid, 1, 1, 256, 1, 1, 0, k_args[:], loc)
 
-		v_args := [?]rawptr{ &v_src, &v_dst, &pos_dev, &nr, &kvs, &tc }
+		v_args := [?]rawptr{ &v_src, &v_dst, &pos_dev, &nr, &kvs, &cap }
 		_dispatch(_cache_write_bf16_pipeline, grid, 1, 1, 256, 1, 1, 0, v_args[:], loc)
 	}
-
-	if _attention_cache_bf16_pipeline == nil {
-		_attention_cache_bf16_pipeline = _compile_pipeline(ATTENTION_CACHE_BF16_SRC, "attention_cache_bf16.cu", "attention_cache_bf16")
-	}
-
-	_emit_position_upload(gctx, v.cache_position, loc)
 
 	qp := data(q).ptr; kcp := data(k_cache).ptr; vcp := data(v_cache).ptr; op_ptr := data(o).ptr
 	n_q_heads  := i32(v.n_q_heads)
 	n_kv_heads := i32(v.n_kv_heads)
 	hs := i32(head_size); qtc := i32(token_count); pos_dev := gctx.position_dev
-	qs := i32(q_size); kvs := i32(kv_size); window := i32(v.window); tcap := i32(t_capacity)
+	qs := i32(q_size); kvs := i32(kv_size); window := i32(v.window); cap := i32(capacity)
 
 	args := [?]rawptr{
 		&qp, &kcp, &vcp, &op_ptr,
-		&n_q_heads, &n_kv_heads, &hs, &qtc, &pos_dev, &qs, &kvs, &window, &tcap,
+		&n_q_heads, &n_kv_heads, &hs, &qtc, &pos_dev, &qs, &kvs, &window, &cap,
 	}
-	_dispatch(_attention_cache_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
+
+	// ggml-style vec kernel with cooperative threads-per-K-dot and vectorized V
+	// loads. Compiled twice via NVRTC `-DD_HEAD` so the per-D loops unroll at
+	// compile time. D=256 covers sliding-window layers, D=512 covers full.
+	switch head_size {
+	case 256:
+		if _attention_cache_vec_bf16_d256_pipeline == nil {
+			opts := [?]cstring{"-DD_HEAD=256"}
+			_attention_cache_vec_bf16_d256_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d256.cu", "attention_cache_vec_bf16", opts[:])
+		}
+		_dispatch(_attention_cache_vec_bf16_d256_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
+	case 512:
+		if _attention_cache_vec_bf16_d512_pipeline == nil {
+			opts := [?]cstring{"-DD_HEAD=512"}
+			_attention_cache_vec_bf16_d512_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d512.cu", "attention_cache_vec_bf16", opts[:])
+		}
+		_dispatch(_attention_cache_vec_bf16_d512_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
+	case:
+		if _attention_cache_bf16_pipeline == nil {
+			_attention_cache_bf16_pipeline = _compile_pipeline(ATTENTION_CACHE_BF16_SRC, "attention_cache_bf16.cu", "attention_cache_bf16")
+		}
+		_dispatch(_attention_cache_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
+	}
 }
 
 // ----- Select (embedding lookup) ---------------------------------------------

@@ -1,8 +1,8 @@
 # CUDA backend decode-perf notes
 
-Where decode throughput stands and what to try next on `gemma_chat_repl`.
-Pick this up by re-reading this file, then the diff in the files listed
-under "What's in tree."
+Where decode throughput stands on `gemma_chat_repl` and what to port from
+ggml next. Pick this up by re-reading this file, then the diff in the
+files listed under "What's in tree."
 
 ## Numbers
 
@@ -13,40 +13,29 @@ Test: `gemma_chat_repl --gguf gemma_data/model.gguf --max-tokens 128`,
 
 Headline (no `--timing`):
 
-| Stage                                            | tok/s |
-|--------------------------------------------------|-------|
-| Pre-session baseline                             | 45.8  |
-| + skip MemsetD8Async on activation Data buffers  | 54.3  |
-| + warp-shuffle reduction in rmsnorm-family       | 55.1  |
+| Stage                                            | tok/s | Δ    |
+|--------------------------------------------------|-------|------|
+| Pre-session baseline                             | 45.8  | —    |
+| + skip MemsetD8Async on activation Data buffers  | 54.3  | +8.5 |
+| + warp-shuffle reduction in rmsnorm-family       | 55.1  | +0.8 |
+| + Q4_K mmvq literal port from ggml               | 55.8  | +0.7 |
+| + fattn-vec port for decode attention (D=256)    | 58.8  | +3.0 |
+| + fattn-vec generalized to D=512                 | 60.7  | +1.9 |
+| + Q4_K gate_up_geglu literal port                | 61.5  | +0.8 |
+| + Q6_K literal port                              | 60.5  | wash |
+| + linear KV cache layout (foundation for MMA F16)| 61.7\*| wash |
+
+\* Pre-window decode (32 tokens). Post-window decode at 600 tokens runs
+~57 tok/s — the host-issued shift cuMemcpys add ~140 graph nodes per
+token of overhead. Acceptable for now; MMA F16 should swamp this.
+
+Total: **45.8 → ~60.5 tok/s (+32%)**.
 
 Reference target (ollama / llama.cpp on the same model+hw): ~130 tok/s.
 
 `--timing` slows the run because `cuEventRecord` fires twice per dispatch.
 Quote tok/s headlines from the no-`--timing` run; use `--timing` only
 for the kernel breakdown.
-
-## Where the time goes now
-
-`--timing` snapshot at the 55.1 tok/s headline (timing-on absolute ms is
-inflated by `cuEventRecord` overhead; treat shares, not absolutes, as
-representative — the no-timing run drops to ~32 tok/s under timing):
-
-| Kernel                              | share | notes |
-|-------------------------------------|-------|-------|
-| linear_q4_k_mmvq                    | ~24%  | q/k/v/o + down_proj |
-| quantize_q8_1_bf16                  | ~14%  | bf16 → q8_1 (q8_1_cache halves *some* dispatches) |
-| attention_cache_bf16                | ~13%  | inc. K/V memcpy + flash-attn-2 inner loop |
-| linear_q4_k_gate_up_geglu_bf16      | ~12%  | fused FFN front-half (gate + up + GEGLU) |
-| rmsnorm_bf16                        | ~12%  | rmsnorm + weight mul, fused |
-| linear_q6_k_gemv                    | ~9%   | a subset of weights are Q6_K |
-| add_rmsnorm_bf16                    | ~7%   | residual + pre_ff norm fused |
-| add_bf16 / mul_bf16 / others        | ~9%   | per-layer residuals + scalar mul |
-
-`gpu/wall ≈ 59%` with `--timing` on; without timing the host gap shrinks
-to ~3-5 ms/tok.
-
-**Q4_K matmul + quantize + gate_up_geglu = ~50% of GPU. This is the
-largest concentration and the most promising target.**
 
 ## What's in tree
 
@@ -55,151 +44,166 @@ All under `backends/cuda/` plus per-call sites in
 
 ### Auto CUDA-graph capture
 - `cuda.odin` / `graph.odin` / `buffer.odin` — `enable_decode_graph(true)`
-  flips on transparent stream capture. `clear()` begins capture for the
-  upcoming forward; `buffer_get` ends + `cuGraphExecUpdate`-or-
-  reinstantiates + launches. Mirrors the same pattern as ggml's
-  `ggml_cuda_graph_evaluate_and_capture`. Mutually exclusive with
-  `enable_timing`.
+  flips on transparent stream capture. `clear()` begins capture; `buffer_get`
+  ends + `cuGraphExecUpdate`-or-reinstantiates + launches. Mutually
+  exclusive with `enable_timing`.
 
-### Activation memset skip
+### Activation memset skip (biggest single win)
 - `ml.odin` — `Backend.buffer_alloc` takes a `Buffer_Kind`.
-- `backends/cuda/buffer.odin` (and Vulkan equivalent) skips the per-alloc
+- `backends/cuda/buffer.odin` (and Vulkan equivalent) skip the per-alloc
   zero-fill when `kind == .Data && !persist`. Forward kernels fully
-  overwrite their output, so the zero was wasted work AND each skipped
-  memset removes a node from the captured graph (~halves graph node
-  count, lowers `cuGraphExecUpdate` cost). **The single biggest win
-  this session: 45.8 → 54.3 tok/s.**
-- `backends/cpu/cpu.odin` accepts the new param (no behavior change;
-  `make` already zero-fills).
+  overwrite their output, AND each skipped memset removes a node from
+  the captured graph. **45.8 → 54.3 tok/s.**
 
 ### Warp-shuffle reductions in rmsnorm-family
 - `kernels/rmsnorm/rmsnorm_bf16.cu`, `add_rmsnorm_bf16.cu`,
-  `rmsnorm_rope_bf16.cu` — replaced shared-mem tree reductions with
-  intra-warp `__shfl_xor_sync` butterfly + lane-0 publish + a single
-  `__syncthreads` + local fold across `warp_sums[NWARPS]`. One sync
-  vs. ~log2(WG) before. Mirrors ggml's `norm.cu`.
+  `rmsnorm_rope_bf16.cu` — `__shfl_xor_sync` butterfly + lane-0 publish +
+  one `__syncthreads` + local fold across `warp_sums[NWARPS]`.
 
 ### q8_1 input reuse
 - `Context.q8_1_cache: map[DevicePtr]DevicePtr`, cleared in `clear()`.
   Q4_K matmul (and the fused gate+up+GEGLU) consult by input device
-  pointer; emit `quantize_q8_1` only on cache miss. Saves ~35 quantizes/
-  token via q/k/v dedup × 24 non-shared layers.
+  pointer; emit `quantize_q8_1` only on cache miss.
 
-### Quant matmul kernels (M=1 decode), ggml-aligned body
-- `linear_q4_k_mmvq.cu` — 4 warps × 32 lanes, `ROWS_PER_WG=2`, but the
-  inner work mirrors ggml's `vec_dot_q4_K_q8_1_impl_vmmq`: 16 threads
-  per K-block stride (`blocks_per_iter = 8`), each thread loads 2 q4
-  ints + 4 q8 ints once and runs 4 dp4a calls covering 16 weights via
-  low/high nibble passes. Min term uses our precomputed `q8_s` (one fp
-  mul per sub-block-pair, only one thread credits it) instead of ggml's
-  per-thread dp4a-of-1s trick.
-- `linear_q4_k_gate_up_geglu_bf16.cu` — fused gate + up + GEGLU. One
-  mmvq block accumulates two partial sums using shared q8_1 input loads.
-  (Hasn't been ported to the new mmvq pattern; still uses the older
-  body. Likely an additional small gain available there.)
-- `linear_q6_k_gemv.cu` — 4 warps × 32 lanes, ROWS_PER_WG=2, hoisted
-  bf16 input loads out of the row × quadrant inner loops.
+### Quant matmul kernels — literal ports of ggml's `mul_mat_vec_q`
+Ports of `ggml/src/ggml-cuda/mmvq.cu` + `vecdotq.cuh`, specialized for
+ncols_dst=1, no fusion variants, no MoE channels/strides. All write fp32
+output; `pack_f32_to_bf16_pairs.cu` converts to the bf16 pair-packed
+format the rest of the pipeline reads.
+
+- `linear_q4_k_mmvq.cu` — port of `vec_dot_q4_K_q8_1_impl_vmmq` body,
+  `mul_mat_vec_q` outer loop with `rows_per_cuda_block=1`, `nwarps=4`,
+  `blocks_per_iter=8`.
+- `linear_q4_k_gate_up_geglu_bf16.cu` — same with a parallel `tmp_gate`
+  alongside `tmp` (= `tmp_up`); shares q8_1 input loads between gate and
+  up matmuls; final `gelu_tanh(gate)*up` combine before the fp32 store.
+- `linear_q6_k_gemv.cu` — outer structure ported. Inner dot reads bf16
+  input directly rather than going through ggml's q8_1 + dp4a Q6_K path
+  (see "Gaps vs ggml #2").
+- `pack_f32_to_bf16_pairs.cu` — trivial f32→bf16-pair converter.
+
+### Flash attention — port of ggml's `fattn-vec.cuh`
+- `kernels/attention/attention_cache_vec_bf16.cu` — port of
+  `flash_attn_ext_vec`, stripped to bf16 K/V, ncols=1, causal + optional
+  sliding window. Compiled twice via NVRTC `-DD_HEAD={256,512}`.
+- NTHREADS_KQ = NTHREADS_V = 8 cooperate per K-row dot / V output element.
+  Q in registers pre-scaled by 1/sqrt(D). 128 threads/block, BC=128.
+- Note: ggml does NOT actually use fattn-vec for our case on this hw —
+  see "Gaps vs ggml #1".
 
 ### Position state in a device tensor
 - `Context.position_pinned` (4-byte pinned host buffer) +
   `Context.position_dev` (4-byte device buffer). `_emit_position_upload`
-  in `ops.odin` lazily writes the new `cache_position` to pinned and
-  emits one HtoDAsync per forward. `rmsnorm_rope_bf16`,
-  `rope_bf16`/`rope.cu`, and `attention_cache_bf16` take `const int*
-  position_offset_dev` and read once at kernel entry. Mirrors how ggml
-  keeps position offsets in tensors (their `pos` tensor src).
+  in `ops.odin` lazily writes `cache_position` to pinned and emits one
+  HtoDAsync per forward. `rmsnorm_rope_bf16`, `rope_bf16`/`rope.cu`,
+  and `attention_cache*_bf16` take `const int* position_offset_dev` and
+  read once at kernel entry.
 
-### K/V cache write via kernel
-- `kernels/attention/cache_write_bf16.cu` — copies a `[n_rows, kv_size]`
-  bf16 source into the `[t_capacity, kv_size]` cache slot at offset
-  `(*pos_dev + row) % t_capacity`. Replaces the host-issued
-  `cuMemcpyDtoDAsync` (one per K, one per V, plus optional wrap pair)
-  inside `_attention_cache_forward`. Similar in spirit to ggml's
-  `set-rows.cu`, but standalone rather than fused with rope.
+### Linear K/V cache layout (ggml-compatible)
+KV cache is stored linearly in seq order: slot 0 oldest, slot cap-1
+newest. No ring-buffer modulo anywhere — every cache-reading kernel
+iterates contiguous slot ranges, and ggml drop-in kernels (incl.
+`flash_attn_ext_f16` MMA, when ported) work without modification.
 
-### Attention
-- `attention_cache_bf16.cu` — vectorized inner K dot loop to `uint4`
-  loads (8 bf16 / load).
+- `kernels/attention/cache_write_bf16.cu` — writes new K/V rows at slot
+  `min(*pos_dev, capacity - n_rows) + row`. For full layers the cache
+  is sized to user max_context, so writes are pure linear append. For
+  sliding layers in steady state writes go at slots [cap-n_rows, cap)
+  after a host-emitted shift.
+- `_attention_cache_forward` (ops.odin) — when sliding cache would
+  overflow (`cache_position + n_rows > capacity`), emits two
+  `cuMemcpyDtoDAsync` (per K and per V) through `Context.shift_scratch_dev`
+  to shift contents back by `shift_amount = pos + n - cap` rows. Memcpy
+  size and topology are stable across decode steps, so the captured
+  graph is patchable via `cuGraphExecUpdate`.
+- Per-Q-token live K range computed from a unified formula:
+  `t_q_slot = min(cache_position + t_q, capacity - q_token_count + t_q)`.
+  Pre-fill / pre-shift: equals `cache_position + t_q`. Post-shift:
+  pinned to `capacity - q_token_count + t_q`. `t_k_max = t_q_slot + 1`
+  (causal); `t_k_min` from window param (for sliding) or 0 (full).
+- Gemma's KV-shared layers (18 of 42) re-pass the source layer's k_cache
+  pointer to `attention_with_cache`. `Context.cache_written_this_forward`
+  dedups the shift+write so only the source layer's call mutates the
+  cache; shared layers run attention only.
 
 ### Fused-op opt-in mechanism
 - `ml.odin` — `Backend_Capability` enum + `Backend_Capabilities` bit_set
-  on `Backend`. Procs that emit fused ops decompose to primitives when
-  the cap is absent. CUDA sets `.Linear_Q4_K_Gate_Up_Geglu`; CPU/Vulkan
-  do not, so they get the legacy gate/up/gelu_mul sequence.
+  on `Backend`. CUDA sets `.Linear_Q4_K_Gate_Up_Geglu`; CPU/Vulkan do not.
 
-## Findings on ggml (verified `ggml/src/ggml-cuda/ggml-cuda.cu`)
+## Gaps vs ggml — direct ports, no experiments
 
-- **ggml uses `cudaGraphExecUpdate`**, same as us. Their fast path is a
-  uid-keyed skip: when llama.cpp passes a cgraph with the same `uid` as
-  the previous compute, ggml short-circuits the node walk + update +
-  just relaunches the existing exec (`ggml_cuda_graph_update_required`
-  returns false on uid match, line 3141). We don't have an equivalent
-  uid mechanism — rebuilding stable HtoD source pointers + a heuristic
-  "stability detection" in our setup did not measurably move tok/s and
-  was reverted; leaving cuGraphExecUpdate to handle it on each step is
-  fine.
-- **Why the skip works for them**: all step-varying state lives in
-  tensors (= stable device buffers). Our cache_position-as-tensor and
-  cache_write-via-kernel changes adopt this pattern.
-- **Their Q4_K mmvq is 2-3× our throughput at the same nwarps/rows
-  shape** (own observation; matches `mmvq.cu:293-345` using
-  `nwarps=4, rows_per_block=1` on Ampere). A direct port of their inner
-  body to our kernel only narrowed the gap to ~4%; the remaining gap
-  is in something more subtle (likely register tiling, instruction
-  scheduling, or a difference in how their template specialization
-  generates code). **This is the largest remaining lever and the next
-  thing to investigate.**
+Things ggml does on the same model+hw that we don't, ordered by leverage.
+References are to `ggml/src/ggml-cuda/`.
+
+### 1. Flash attention via tensor cores (MMA F16) — biggest gap
+ggml's dispatcher (`fattn.cu:307` `ggml_cuda_get_best_fattn_kernel`)
+returns `BEST_FATTN_KERNEL_MMA_F16` for our case: bf16 K/V, gqa_ratio=4,
+mask present, max_bias=0, padded KV, on cc 8.6. The vec kernel is only
+chosen on Ada Lovelace (cc≥8.9) for non-quantized K/V. Both Gemma E4B
+attention head sizes (D=256 sliding, D=512 full) hit this path.
+
+MMA F16 uses 16×16 bf16 tensor-core fragments via `mma.cuh` plus
+`cp.async` (`cp-async.cuh`) for global→shared staging. Port surface is
+`fattn-mma-f16.cuh` (~600 LOC) plus 21 `fattn-mma-f16-instance-*.cu`
+template instances under `template-instances/`. Substantial effort but
+this is the dominant remaining decode gap.
+
+### 2. Q6_K via q8_1 + dp4a (not bf16 + scalar fp32)
+ggml's `vec_dot_q6_K_q8_1_impl_mmvq` (`vecdotq.cuh:624`) uses 2× `__dp4a`
+per K-block (8 i8×i8 MACs as 2 instructions plus a `__vsubss4`). Our
+`linear_q6_k_gemv.cu` does 8 scalar fp32 FMAs per K-block on bf16 input.
+Reusing the existing `q8_1_cache` adds zero quantize overhead since Q6_K
+matmuls in Gemma share inputs with Q4_K matmuls. Q6_K is ~7-9% of GPU.
+
+### 3. Vectorized 16-byte loads in fattn-vec
+ggml uses `ggml_cuda_memcpy_1<16>` (`common.cuh:756`, compiles to
+LD.E.128 on Volta+) for Q/K/V loads. We use 4-byte
+`__ldg(unsigned int*)` in 16-iteration loops at
+`attention_cache_vec_bf16.cu:99-104, 142-148, 201-208`. **4× more LDG
+transactions per K-row dot and per V-col load.** Applies even if we
+keep vec as a fallback for D=512 after #1 lands.
+
+### 4. q4_K mmvq small-K path
+`mmvq.cu:743 should_use_small_k` triggers when
+`K < nwarps × vdr × 32 / qi × QK_K = 2048` for Q4_K. The dispatcher
+sets `rows_per_cuda_block = nwarps = 4`: each warp owns a row instead
+of all warps cooperating on one. For Gemma E4B only `per_layer_projection`
+(K=256, N=2560) hits this from Q4_K. Limited impact for this model.
+
+### 5. `quantize_q8_1` block size 256, not 32
+`CUDA_QUANTIZE_BLOCK_SIZE = 256` (`quantize.cuh:8`). Each CUDA block
+handles 8 Q8_1 blocks via 8 warps; per-warp reduction with
+`warp_reduce_max<QK8_1>`. Our `quantize_q8_1_bf16.cu` runs 32 threads
+per block, one Q8_1 block per CUDA block. **8× fewer block launches
+per quantize**. 30-minute change.
+
+### 6. ROPE + K-cache-write fusion
+`rope.cu:154-157` (rope_neox `set_rows_stride` branch) writes directly
+into the K cache slot using `row_indices[i2]`. We have separate
+`rope_bf16` then `cache_write_bf16` kernels. Saves one launch per
+attention block.
 
 ## Things to NOT redo
 
 - Don't combine `auto_graph` with `enable_timing` — asserted off in code;
   `cuEventRecord` is not stream-capturable.
-- Don't pursue a uid-style "skip cuGraphExecUpdate" path. Tried both
-  Step A (skip update on heuristic stable detection) and Step B (full
-  bypass of `gemma.forward_cached` with stable-pinned host staging).
-  Step A was a no-op on this hardware; Step B was a regression. ggml's
-  uid skip works because their cgraph rebuild is cheaper than ours, and
-  their uid is set externally — we can't easily replicate that.
+- Don't pursue a "skip cuGraphExecUpdate" fast path. Tried both Step A
+  (skip update on heuristic stable detection) and Step B (full bypass
+  of `gemma.forward_cached` with stable-pinned host staging). Step A
+  was a no-op; Step B regressed. ggml's uid skip works because their
+  cgraph rebuild is cheap and uid is set externally — we can't easily
+  replicate that. Reverted.
 - Don't pursue `rmsnorm + quantize_q8_1` or `rmsnorm + mul_mat` fusion.
   ggml does neither.
-- Don't fold K/V cache writes into `attention_cache_bf16` without
+- Don't fold K/V cache writes into `attention_cache_vec_bf16` without
   cooperative-groups grid sync.
 - Don't skip the warmup forward before enabling capture — cuBLAS first-
   call algo selection isn't capturable cold (`auto_warmup_done` exists
   for this).
 
-## Next steps (kernel-focused, ordered by leverage)
-
-1. **Close the Q4_K mmvq gap.** Combined Q4_K mmvq + quantize_q8_1 +
-   gate_up_geglu = ~50% of GPU, and ggml's body is materially faster
-   than ours at the same shape. The first port (`linear_q4_k_mmvq.cu`)
-   adopted ggml's outer loop and inner vec_dot but only got 4%, far
-   below the apparent 2-3× headroom. Next angles to investigate:
-   - `__launch_bounds__` / register usage. Compare `cuobjdump` of our
-     kernel vs ggml's for register count and spilling. ggml uses 1
-     block per SM; we may differ.
-   - Try `ROWS_PER_WG=1` (matching ggml exactly) and use atomics for
-     the bf16 pair-packed output write.
-   - Inline `unpack_scale_min` differently — ggml's `aux[2]` packing
-     may produce better PTX than our branch-on-sub.
-   - Measure whether the bottleneck is bandwidth or compute. If
-     bandwidth, check whether we're hitting the L1/L2 line-fill rate.
-
-2. **Port mmvq pattern to `linear_q4_k_gate_up_geglu_bf16`.** It's 12%
-   of GPU and structurally similar to mmvq. Whatever closes the gap on
-   mmvq should apply here directly.
-
-3. **Port mmvq pattern to `linear_q6_k_gemv`.** 9% of GPU. Q6_K is its
-   own format but the per-thread-work / register-tiling lessons from
-   step 1 carry over.
-
-4. **Fuse `rope + K-cache write`** (= ggml's `rope + set_rows`). Our
-   `cache_write_bf16` is a partial step toward this. Full fusion would
-   eliminate the temp K bf16 writeback. Modest GPU bandwidth win.
-
 ## Open questions
 
 - Confirm Gemma E4B `q4_k`/`q6_k` weight assignment in the GGUF loader.
   `linear_q6_k_gemv` call count is higher than expected for a standard
-  Q4_K_M layout. If some Q6_K weights should be Q4_K, the fused gate+
-  up+GEGLU path applies to more layers than today.
+  Q4_K_M layout. If some Q6_K weights should be Q4_K, the fused
+  gate+up+GEGLU path applies to more layers than today.

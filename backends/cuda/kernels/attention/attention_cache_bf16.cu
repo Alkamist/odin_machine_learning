@@ -1,7 +1,13 @@
 // Bf16 flash-attention-2 forward against a growing K/V cache. Always causal.
-// Same online-softmax FA2 algorithm as attention_bf16.cu, but K/V indices
-// wrap into a fixed-capacity ring buffer and t_k_max accounts for cached
-// past tokens. No LSE writeout (decode-only path).
+// Same online-softmax FA2 algorithm as attention_bf16.cu. Cache layout is
+// linear (slot 0 oldest, slot cap-1 newest); see cache_write_bf16.cu and
+// attention_cache_vec_bf16.cu for the layout invariants.
+//
+// Per-Q-token live K range, computed unified for both layer types:
+//   t_q_slot = min(cache_position + t_q, capacity - q_token_count + t_q)
+//   t_k_max  = t_q_slot + 1                              (causal)
+//   t_k_min  = max(0, t_q_slot + 1 - window) if window>0 (sliding mask)
+//            = 0                              if window=0 (no window)
 #include <cuda_bf16.h>
 
 #define WG    64
@@ -32,7 +38,7 @@ void attention_cache_bf16(const unsigned int* __restrict__ q_buf,
                           int n_q_heads, int n_kv_heads, int head_size,
                           int q_token_count, const int* __restrict__ cache_position_dev,
                           int q_size, int kv_size,
-                          int window, int t_capacity) {
+                          int window, int capacity) {
 	int h    = blockIdx.x;
 	int t_q  = blockIdx.y;
 	int tid  = threadIdx.x;
@@ -42,9 +48,12 @@ void attention_cache_bf16(const unsigned int* __restrict__ q_buf,
 	int   kv_h = h * n_kv_heads / n_q_heads;
 	float inv_sqrt_d = rsqrtf((float)D);
 
-	int t_k_max = cache_position + t_q + 1;
-	int t_k_min = (window != 0 && t_k_max > window) ? (t_k_max - window) : 0;
-	int t_k0_start = (t_k_min / BC) * BC;
+	int linear_slot = cache_position + t_q;
+	int pinned_slot = capacity - q_token_count + t_q;
+	int t_q_slot    = linear_slot < pinned_slot ? linear_slot : pinned_slot;
+	int t_k_max     = t_q_slot + 1;
+	int t_k_min     = (window != 0 && t_k_max > window) ? (t_k_max - window) : 0;
+	int t_k0_start  = (t_k_min / BC) * BC;
 
 	int q_base = t_q * q_size + h * D;
 	int o_base = t_q * q_size + h * D;
@@ -71,12 +80,8 @@ void attention_cache_bf16(const unsigned int* __restrict__ q_buf,
 		int t_k = t_k0 + tid;
 		float score = NEG_INF;
 		if (tid < BC && t_k < t_k_max && t_k >= t_k_min) {
-			int k_base = (t_k % t_capacity) * kv_size + kv_h * D;
+			int k_base = t_k * kv_size + kv_h * D;
 			float dot = 0.0f;
-			// Vectorize K reads: one uint4 load = 8 bf16 elements vs 4 separate
-			// loads in the scalar version. K_base is a multiple of 8 elements
-			// in this codebase (kv_size and kv_h*D are multiples of 8 head-dim
-			// units), so the uint4 cast is well-aligned.
 			int d = 0;
 			int d_vec_end = D & ~7;
 			const uint4* k_vec = reinterpret_cast<const uint4*>(&k_buf[(k_base) >> 1]);
@@ -130,7 +135,9 @@ void attention_cache_bf16(const unsigned int* __restrict__ q_buf,
 				float contrib = 0.0f;
 				int j_max = min(BC, t_k_max - t_k0);
 				for (int j = 0; j < j_max; ++j) {
-					int v_base = ((t_k0 + j) % t_capacity) * kv_size + kv_h * D;
+					int t_v_slot = t_k0 + j;
+					if (t_v_slot < t_k_min) continue;
+					int v_base = t_v_slot * kv_size + kv_h * D;
 					contrib += score_tile[j] * load_bf16(v_buf, v_base + d);
 				}
 				o_acc[slot] = alpha * o_acc[slot] + contrib;

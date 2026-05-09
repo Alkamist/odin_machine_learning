@@ -1,183 +1,156 @@
-// Fused FFN front-half: y[n] = gelu_tanh(gate[n]) * up[n], where
-//   gate[n] = sum_k x[k] * w_gate[n,k]      (Q4_K x Q8_1 mmvq)
-//   up[n]   = sum_k x[k] * w_up  [n,k]
-//
-// Both matmuls share the same q8_1-quantized activation `x`, so the inner
-// loop loads each q8_1 block once and uses it for both dot products. Mirrors
-// ggml's `ffn_up + ffn_gate + glu` fusion in `mmvq.cu`. M=1 decode only;
-// prefill (multi-token) keeps the unfused coopmat path.
+// Fused FFN front-half over Q4_K weights: y[n] = gelu_tanh(gate[n]) * up[n]
+// where gate[n] = Σ_k x[k] * w_gate[n,k] and up[n] = Σ_k x[k] * w_up[n,k].
+// Both matmuls share the q8_1-quantized activation `x`. Mirrors ggml's
+// `mul_mat_vec_q` with `has_fusion=true, use_gate=true, glu_op=GEGLU`
+// (mmvq.cu) — same outer + inner structure as `linear_q4_k_mmvq.cu`, with
+// a parallel `tmp_gate` accumulator alongside the regular `tmp` accumulator,
+// and a final `gelu_tanh(gate) * up` combine before writing fp32 output.
+// The downstream `pack_f32_to_bf16_pairs` kernel converts to bf16.
 #include <cuda_fp16.h>
 
-#define GELU_SCALE 0.7978845608028654f
+#define QK4_K            256
+#define QI4_K_QS         32
+#define BQ4_K_UINTS      36
+#define QK8_1            32
+#define QI8_1            8
+#define BQ8_1_UINTS      9
+#define QR4_K            2
+#define VDR_Q4_K_Q8_1    2
+
+#define NWARPS           4
+#define WARP_SIZE        32
+#define ROWS_PER_BLOCK   1
+#define BLOCKS_PER_ITER  (VDR_Q4_K_Q8_1 * NWARPS * WARP_SIZE / QI4_K_QS)  // = 8
+
+#define GELU_SCALE       0.7978845608028654f
 
 __device__ __forceinline__ float gelu_tanh(float v) {
 	float cube = 0.044715f * v * v * v;
 	return 0.5f * v * (1.0f + tanhf(GELU_SCALE * (v + cube)));
 }
 
-__device__ __forceinline__ void unpack_scale_min(int sub,
-                                                 unsigned int sw0,
-                                                 unsigned int sw1,
-                                                 unsigned int sw2,
-                                                 int& scale,
-                                                 int& min_v) {
-	if (sub < 4) {
-		int shift = sub * 8;
-		scale = (int)((sw0 >> shift) & 0x3Fu);
-		min_v = (int)((sw1 >> shift) & 0x3Fu);
-	} else {
-		int shift = (sub - 4) * 8;
-		unsigned int b_low = (sw2 >> shift) & 0xFFu;
-		unsigned int b_sc  = (sw0 >> shift) & 0xFFu;
-		unsigned int b_mn  = (sw1 >> shift) & 0xFFu;
-		scale = (int)((b_low & 0x0Fu) | ((b_sc >> 6) << 4));
-		min_v = (int)((b_low >>  4)  | ((b_mn >> 6) << 4));
+__device__ __forceinline__ float vec_dot_q4_K_q8_1_impl(
+    const int * __restrict__ v, const int * __restrict__ u,
+    const unsigned char * __restrict__ sc, const unsigned char * __restrict__ m,
+    unsigned int dm_packed, const float * __restrict__ d8) {
+
+	float sumf_d = 0.0f;
+	float sumf_m = 0.0f;
+
+	#pragma unroll
+	for (int i = 0; i < QR4_K; ++i) {
+		const int v0i = (v[0] >> (4 * i)) & 0x0F0F0F0F;
+		const int v1i = (v[1] >> (4 * i)) & 0x0F0F0F0F;
+
+		const int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i + 0], 0));
+		const int dot2 = __dp4a(0x01010101, u[2 * i + 1], __dp4a(0x01010101, u[2 * i + 0], 0));
+
+		sumf_d += d8[i] * (dot1 * sc[i]);
+		sumf_m += d8[i] * (dot2 * m[i]);
 	}
+
+	float d    = __half2float(__ushort_as_half((unsigned short)(dm_packed & 0xffffu)));
+	float dmin = __half2float(__ushort_as_half((unsigned short)((dm_packed >> 16) & 0xffffu)));
+	return d * sumf_d - dmin * sumf_m;
 }
 
-__device__ __forceinline__ unsigned int bf16_from_f32(float v) {
-	unsigned int bits = __float_as_uint(v);
-	if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;  // NaN
-	unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
-	return (rounded >> 16) & 0xffffu;
-}
+// vec_dot specialized to take pre-loaded u/d8 (shared across the gate and up
+// dot products since both matmuls use the same q8_1 input). Returns the dot
+// for a single Q4_K weight matrix slice.
+__device__ __forceinline__ float vec_dot_q4_K_with_u(
+    const unsigned int * __restrict__ vx_row, int kbx, int bq8_offset, int idx,
+    const int * __restrict__ u, const float * __restrict__ d8) {
 
-#define ROWS_PER_WG 2
-#define NWARPS      4
-#define WARP_SIZE   32
-#define BLOCK_UINTS 36   // Q4_K block: 144 / 4 uints
+	const unsigned int * bq4_K = vx_row + kbx * BQ4_K_UINTS;
+
+	int v[2];
+	const unsigned int * q4 = bq4_K + 4 + 4 * bq8_offset + idx;
+	v[0] = (int)__ldg(q4 + 0);
+	v[1] = (int)__ldg(q4 + 4);
+
+	const unsigned short * scales = (const unsigned short *)(bq4_K + 1);
+	unsigned short aux[2];
+	const int j = bq8_offset / 2;
+	if (j < 2) {
+		aux[0] = scales[j + 0] & 0x3f3f;
+		aux[1] = scales[j + 2] & 0x3f3f;
+	} else {
+		aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+		aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+	}
+	const unsigned char * sc = (const unsigned char *)aux;
+	const unsigned char * m  = sc + 2;
+
+	return vec_dot_q4_K_q8_1_impl(v, u, sc, m, __ldg(bq4_K + 0), d8);
+}
 
 extern "C" __global__
 __launch_bounds__(NWARPS * WARP_SIZE, 1)
-void linear_q4_k_gate_up_geglu_bf16(const unsigned int* __restrict__ x,        // q8_1 stream
-                                    const unsigned int* __restrict__ w_gate,   // Q4_K
-                                    const unsigned int* __restrict__ w_up,     // Q4_K
-                                    unsigned int*       __restrict__ y,        // bf16 packed pairs
-                                    int M, int K, int N) {
-	int n_base = blockIdx.x * ROWS_PER_WG;
-	int wid    = threadIdx.y;
-	int lane   = threadIdx.x;
+void linear_q4_k_gate_up_geglu_bf16(
+    const unsigned int * __restrict__ vy,         // q8_1 input row
+    const unsigned int * __restrict__ vx_gate,    // q4_k gate weights, [N, K]
+    const unsigned int * __restrict__ vx_up,      // q4_k up weights, [N, K]
+    float *              __restrict__ dst,         // fp32 output [N]
+    int M, int K, int N) {
 
-	int num_blocks = K / 256;
+	const int tid  = WARP_SIZE * threadIdx.y + threadIdx.x;
+	const int row0 = ROWS_PER_BLOCK * blockIdx.x;
+	const int blocks_per_row = K / QK4_K;
 
-	float acc_gate[ROWS_PER_WG];
-	float acc_up  [ROWS_PER_WG];
-	#pragma unroll
-	for (int r = 0; r < ROWS_PER_WG; ++r) { acc_gate[r] = 0.0f; acc_up[r] = 0.0f; }
+	const unsigned int * vy_row = vy;
 
-	int t_sub_0 = lane >> 3;
-	int t_inner = lane & 7;
-	int t_sub_1 = t_sub_0 + 4;
+	float tmp_gate = 0.0f;
+	float tmp_up   = 0.0f;
 
-	for (int b = wid; b < num_blocks; b += NWARPS) {
-		int q8_block_base = b * 8;
+	for (int kbx = tid / (QI4_K_QS / VDR_Q4_K_Q8_1); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+		const int kby = kbx * (QK4_K / QK8_1);
+		const int kqs = VDR_Q4_K_Q8_1 * (tid % (QI4_K_QS / VDR_Q4_K_Q8_1));
+		const int bq8_offset = QR4_K * ((kqs / 2) / (QI8_1 / 2));
+		const int idx        = (kqs / 2) % 4;
 
-		int          q8_packed_0 = (int)__ldg(&x[(q8_block_base + t_sub_0) * 9 + 1 + t_inner]);
-		int          q8_packed_1 = (int)__ldg(&x[(q8_block_base + t_sub_1) * 9 + 1 + t_inner]);
-		unsigned int q8_ds_0 = __ldg(&x[(q8_block_base + t_sub_0) * 9]);
-		unsigned int q8_ds_1 = __ldg(&x[(q8_block_base + t_sub_1) * 9]);
-		float q8_d_0 = __half2float(__ushort_as_half((unsigned short)(q8_ds_0 & 0xffff)));
-		float q8_s_0 = __half2float(__ushort_as_half((unsigned short)((q8_ds_0 >> 16) & 0xffff)));
-		float q8_d_1 = __half2float(__ushort_as_half((unsigned short)(q8_ds_1 & 0xffff)));
-		float q8_s_1 = __half2float(__ushort_as_half((unsigned short)((q8_ds_1 >> 16) & 0xffff)));
-
+		// Shared q8_1 loads: u[0..3] and d8[0..1] are independent of which
+		// weight matrix we're dotting against.
+		int   u[2 * QR4_K];
+		float d8[QR4_K];
+		const unsigned int * vy_kby = vy_row + kby * BQ8_1_UINTS;
 		#pragma unroll
-		for (int r = 0; r < ROWS_PER_WG; ++r) {
-			int n = n_base + r;
-			if (n >= N) continue;
-
-			int block_off = (n * num_blocks + b) * BLOCK_UINTS;
-
-			// Two passes: same code shape as the single-matmul kernel, run once
-			// per weight tensor. Loop body identical to linear_q4_k_mmvq; only
-			// the destination accumulator differs.
-			#pragma unroll
-			for (int side = 0; side < 2; ++side) {
-				const unsigned int * __restrict__ w = (side == 0) ? w_gate : w_up;
-
-				uint4 hdr = __ldg(reinterpret_cast<const uint4*>(&w[block_off]));
-				unsigned int dm = hdr.x;
-				float d    = __half2float(__ushort_as_half((unsigned short)(dm & 0xffff)));
-				float dmin = __half2float(__ushort_as_half((unsigned short)((dm >> 16) & 0xffff)));
-				unsigned int sw0 = hdr.y;
-				unsigned int sw1 = hdr.z;
-				unsigned int sw2 = hdr.w;
-
-				float row_acc = 0.0f;
-				{
-					unsigned int nib_word = __ldg(&w[block_off + 4 + (t_sub_0 >> 1) * 8 + t_inner]);
-					int shift     = (t_sub_0 & 1) * 4;
-					int q4_packed = (int)((nib_word >> shift) & 0x0F0F0F0Fu);
-					int int_dot   = __dp4a(q4_packed, q8_packed_0, 0);
-
-					int scale, min_v;
-					unpack_scale_min(t_sub_0, sw0, sw1, sw2, scale, min_v);
-
-					row_acc += d * (float)scale * q8_d_0 * (float)int_dot;
-					if (t_inner == 0) row_acc -= dmin * (float)min_v * q8_s_0;
-				}
-				{
-					unsigned int nib_word = __ldg(&w[block_off + 4 + (t_sub_1 >> 1) * 8 + t_inner]);
-					int shift     = (t_sub_1 & 1) * 4;
-					int q4_packed = (int)((nib_word >> shift) & 0x0F0F0F0Fu);
-					int int_dot   = __dp4a(q4_packed, q8_packed_1, 0);
-
-					int scale, min_v;
-					unpack_scale_min(t_sub_1, sw0, sw1, sw2, scale, min_v);
-
-					row_acc += d * (float)scale * q8_d_1 * (float)int_dot;
-					if (t_inner == 0) row_acc -= dmin * (float)min_v * q8_s_1;
-				}
-
-				if (side == 0) acc_gate[r] += row_acc;
-				else           acc_up  [r] += row_acc;
-			}
+		for (int i = 0; i < QR4_K; ++i) {
+			const unsigned int * bq8i = vy_kby + (bq8_offset + i) * BQ8_1_UINTS;
+			unsigned int ds = __ldg(bq8i + 0);
+			d8[i] = __half2float(__ushort_as_half((unsigned short)(ds & 0xffffu)));
+			const unsigned int * q8 = bq8i + 1 + idx;
+			u[2 * i + 0] = (int)__ldg(q8 + 0);
+			u[2 * i + 1] = (int)__ldg(q8 + 4);
 		}
+
+		const unsigned int * vx_gate_row = vx_gate + (size_t)row0 * blocks_per_row * BQ4_K_UINTS;
+		const unsigned int * vx_up_row   = vx_up   + (size_t)row0 * blocks_per_row * BQ4_K_UINTS;
+
+		tmp_gate += vec_dot_q4_K_with_u(vx_gate_row, kbx, bq8_offset, idx, u, d8);
+		tmp_up   += vec_dot_q4_K_with_u(vx_up_row,   kbx, bq8_offset, idx, u, d8);
 	}
 
-	#pragma unroll
-	for (int r = 0; r < ROWS_PER_WG; ++r) {
-		#pragma unroll
-		for (int off = 16; off > 0; off >>= 1) {
-			acc_gate[r] += __shfl_xor_sync(0xffffffffu, acc_gate[r], off);
-			acc_up  [r] += __shfl_xor_sync(0xffffffffu, acc_up  [r], off);
-		}
-	}
-
-	__shared__ float warp_sums_gate[NWARPS][ROWS_PER_WG];
-	__shared__ float warp_sums_up  [NWARPS][ROWS_PER_WG];
-	if (lane == 0) {
-		#pragma unroll
-		for (int r = 0; r < ROWS_PER_WG; ++r) {
-			warp_sums_gate[wid][r] = acc_gate[r];
-			warp_sums_up  [wid][r] = acc_up  [r];
-		}
+	__shared__ float tmp_shared_gate[NWARPS - 1][WARP_SIZE];
+	__shared__ float tmp_shared_up  [NWARPS - 1][WARP_SIZE];
+	if (threadIdx.y > 0) {
+		tmp_shared_gate[threadIdx.y - 1][threadIdx.x] = tmp_gate;
+		tmp_shared_up  [threadIdx.y - 1][threadIdx.x] = tmp_up;
 	}
 	__syncthreads();
+	if (threadIdx.y > 0) return;
 
-	if (wid != 0 || lane != 0) return;
-
-	float final_gate[ROWS_PER_WG];
-	float final_up  [ROWS_PER_WG];
 	#pragma unroll
-	for (int r = 0; r < ROWS_PER_WG; ++r) {
-		float sg = 0.0f, su = 0.0f;
-		#pragma unroll
-		for (int w = 0; w < NWARPS; ++w) {
-			sg += warp_sums_gate[w][r];
-			su += warp_sums_up  [w][r];
-		}
-		final_gate[r] = sg;
-		final_up  [r] = su;
+	for (int l = 0; l < NWARPS - 1; ++l) {
+		tmp_gate += tmp_shared_gate[l][threadIdx.x];
+		tmp_up   += tmp_shared_up  [l][threadIdx.x];
+	}
+	#pragma unroll
+	for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+		tmp_gate += __shfl_xor_sync(0xffffffffu, tmp_gate, off);
+		tmp_up   += __shfl_xor_sync(0xffffffffu, tmp_up,   off);
 	}
 
-	int n_lo = n_base;
-	if (n_lo >= N) return;
-	int n_hi = n_lo + 1;
-
-	float v_lo = gelu_tanh(final_gate[0]) * final_up[0];
-	float v_hi = (n_hi < N) ? gelu_tanh(final_gate[1]) * final_up[1] : 0.0f;
-	unsigned int lo = bf16_from_f32(v_lo);
-	unsigned int hi = (n_hi < N) ? bf16_from_f32(v_hi) : 0u;
-	y[n_lo >> 1] = (hi << 16) | lo;
+	if (threadIdx.x == 0 && row0 < N) {
+		dst[row0] = gelu_tanh(tmp_gate) * tmp_up;
+	}
 }

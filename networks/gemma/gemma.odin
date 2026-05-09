@@ -418,9 +418,11 @@ _qkv_norm :: proc(model: Gemma, x: ml.Tensor, weight: ml.Tensor, n_heads, head_d
 // `num_kv_shared_layers`) carry empty handles — `forward_cached` reuses the
 // source layer's K/V tensors directly within a single forward.
 //
-// Sliding-attention layers store only `sliding_window` rows and are written
-// as a ring buffer (the attention op modulo-indexes by `t_capacity`). At
-// 128k context this cuts each sliding layer's cache from ~256MB to ~1MB.
+// Sliding-attention layers store only `sliding_window` rows. The cache is
+// laid out linearly in seq order; once it fills, the backend shifts contents
+// back by n_rows on each new write so the cache always holds the most
+// recent `sliding_window` tokens at slots [0..sliding_window). At 128k
+// context this cuts each sliding layer's cache from ~256MB to ~1MB.
 Layer_Cache :: struct {
 	k: ml.Tensor, // [t_capacity, num_kv_heads * head_dim] (t_capacity = sliding_window for sliding layers, t_max otherwise)
 	v: ml.Tensor,
@@ -491,7 +493,7 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 
 	// Per-layer K/V tensors produced in this forward. Shared layers reuse
 	// their source layer's K/V directly instead of slicing it back out of
-	// the (possibly ring-wrapped) cache buffer.
+	// the cache buffer.
 	Step_KV :: struct { k, v: ml.Tensor }
 	step_kvs := builtin.make([]Step_KV, cfg.num_hidden_layers, context.temp_allocator)
 

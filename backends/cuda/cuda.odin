@@ -79,6 +79,16 @@ Context :: struct {
 	// quantize_q8_1 dispatch. Cleared on every `clear()`.
 	q8_1_cache: map[cuda.DevicePtr]cuda.DevicePtr,
 
+	// Per-forward set of K/V caches whose `cache_write` (and shift, for
+	// sliding) has already been emitted this forward. Gemma's KV-shared
+	// layers point at the source layer's k_cache/v_cache; the source runs
+	// first and produces the new K/V, then shared layers re-pass the same
+	// k_cache/v_cache to attention_with_cache. Without dedup, each shared
+	// layer would re-shift the cache and corrupt history. Cleared every
+	// `clear()`. Storing one of {k_cache, v_cache}; in our model they
+	// always come paired.
+	cache_written_this_forward: map[cuda.DevicePtr]bool,
+
 	// Decode-position upload state. Position-bearing kernels (rmsnorm_rope,
 	// rope, attention_cache) read `cache_position` from `position_dev` instead
 	// of taking it as a scalar kernel arg. The first position-bearing dispatch
@@ -92,6 +102,15 @@ Context :: struct {
 	position_pinned:                rawptr,         // pinned 4-byte host buffer
 	position_dev:                   cuda.DevicePtr, // 4-byte device buffer
 	position_written_this_forward:  bool,
+
+	// Shift scratch for sliding K/V cache layers. The cache is laid out
+	// linearly (slot 0 is oldest, slot cap-1 is newest); on every cache_write
+	// we shift contents back by n_rows before writing the new rows at slot
+	// [cap-n_rows..cap). The shift goes through this scratch buffer (two
+	// cuMemcpyDtoDAsync per K/V) since cuMemcpy doesn't support overlapping
+	// dst/src. Sized lazily to the max (cap-1)*kv_size bytes seen.
+	shift_scratch_dev:  cuda.DevicePtr,
+	shift_scratch_size: u64,
 }
 
 Activation_Slot :: struct {
@@ -259,6 +278,7 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 		gctx.auto_exec = nil
 	}
 	delete(gctx.q8_1_cache)
+	delete(gctx.cache_written_this_forward)
 
 	if gctx.position_dev != 0 {
 		cuda.MemFree(gctx.position_dev)
@@ -267,6 +287,11 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	if gctx.position_pinned != nil {
 		cuda.MemFreeHost(gctx.position_pinned)
 		gctx.position_pinned = nil
+	}
+	if gctx.shift_scratch_dev != 0 {
+		cuda.MemFree(gctx.shift_scratch_dev)
+		gctx.shift_scratch_dev = 0
+		gctx.shift_scratch_size = 0
 	}
 
 	if gctx.cublas_handle != nil {
@@ -322,6 +347,9 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 	// Drop q8_1 reuse cache: keyed by activation-pool pointers, which are
 	// stable across forwards but the *contents* are stale once we rewind.
 	builtin.clear(&gctx.q8_1_cache)
+
+	// Reset KV-cache shift/write dedup set. New forward = new shift cycle.
+	builtin.clear(&gctx.cache_written_this_forward)
 
 	// Position upload happens lazily on the first position-bearing dispatch
 	// of the new forward (see `_emit_position_upload` in ops.odin).
