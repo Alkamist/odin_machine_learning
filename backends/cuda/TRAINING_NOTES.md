@@ -50,10 +50,14 @@ work — they're added too.
   `attention_with_cache` is bf16-only after the inference cleanup.
   Slower than KV-cached generation but fine for the small sample
   budget.
-- `examples/tinystories/main.odin`, `examples/dac_lm/main.odin` —
-  imports switched from the deleted `vulkan` backend to `cuda`. Not
-  tested end-to-end this session; should run since they use the same
-  Llama op set as shakespeare.
+- `examples/tinystories/main.odin` — same fix applied to its
+  `sample()`. Imports switched from `vulkan` to `cuda`.
+- `examples/dac_lm/main.odin` — imports switched from `vulkan` to
+  `cuda`, but its sampling code (`forward_cached` calls at
+  `main.odin:278`, `:287`, `:417`, `:433`) still hits the bf16-only
+  `attention_with_cache` and will crash. Not tested end-to-end.
+  Either apply the same `forward` rewrite or wait until Phase 5
+  restores f32 `attention_with_cache`.
 
 ## What's left
 

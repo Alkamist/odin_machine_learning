@@ -211,36 +211,40 @@ evaluate :: proc(model: llama.Llama, corpus: []int, batches: int) -> f32 {
 }
 
 sample :: proc(model: llama.Llama, tokenizer: ^gpt2.Tokenizer, prompt: string, gen_count: int) {
+	// Sampling uses non-cached `llama.forward` so it goes through the same
+	// f32 attention path as training. Slower than KV-cached generation
+	// (recomputes attention over the full prefix each step), but avoids
+	// needing an f32 attention_with_cache; the sampling budget here is small.
+	//
+	// `all_tokens` lives in the default allocator — keeping it on the temp
+	// allocator while the loop body's temp churn happens elsewhere risks
+	// the array vanishing under us between iterations.
 	prompt_tokens := gpt2.encode(tokenizer, prompt, context.temp_allocator)
 	if builtin.len(prompt_tokens) == 0 {
 		fmt.println("(empty prompt tokenization)")
 		return
 	}
 
-	t_max := builtin.len(prompt_tokens) + gen_count + 4
-	cache := llama.cache_make(model, t_max)
-	defer llama.cache_destroy(cache)
-
 	last_logits := make([]f32, VOCAB_SIZE)
 	defer delete(last_logits)
 
-	ml.clear({.No_Gradients})
-	logits := llama.forward_cached(model, &cache, prompt_tokens)
-	logits_buf := make([]f32, ml.len(logits), context.temp_allocator)
-	ml.get_data(logits, logits_buf)
-	last_offset := (logits.shape[0] - 1) * VOCAB_SIZE
-	copy(last_logits, logits_buf[last_offset : last_offset + VOCAB_SIZE])
-
-	all_tokens: [dynamic]int
-	all_tokens.allocator = context.temp_allocator
+	all_tokens := make([dynamic]int, 0, builtin.len(prompt_tokens) + gen_count)
+	defer delete(all_tokens)
 	append(&all_tokens, ..prompt_tokens)
 
-	previous_decoded_length := 0
 	prompt_text := gpt2.decode(tokenizer, prompt_tokens, context.temp_allocator)
 	fmt.print(prompt_text)
-	previous_decoded_length = builtin.len(prompt_text)
+	previous_decoded_length := builtin.len(prompt_text)
 
 	for _ in 0 ..< gen_count {
+		ml.clear({.No_Gradients})
+		logits := llama.forward(model, all_tokens[:])
+
+		logits_buf := make([]f32, ml.len(logits), context.temp_allocator)
+		ml.get_data(logits, logits_buf)
+		last_offset := (logits.shape[0] - 1) * VOCAB_SIZE
+		copy(last_logits, logits_buf[last_offset : last_offset + VOCAB_SIZE])
+
 		next_token := sample_token(last_logits, SAMPLE_TEMP, SAMPLE_TOP_K)
 		append(&all_tokens, next_token)
 
@@ -250,11 +254,6 @@ sample :: proc(model: llama.Llama, tokenizer: ^gpt2.Tokenizer, prompt: string, g
 			os.flush(os.stdout)
 			previous_decoded_length = builtin.len(decoded)
 		}
-
-		ml.clear({.No_Gradients})
-		single := [1]int{next_token}
-		step_logits := llama.forward_cached(model, &cache, single[:])
-		ml.get_data(step_logits, last_logits)
 	}
 }
 
