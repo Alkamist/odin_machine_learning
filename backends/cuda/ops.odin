@@ -21,6 +21,8 @@ _quantize_q8_1_pipeline:                  ^Pipeline
 _linear_q4_k_mmvq_pipeline:               ^Pipeline
 _linear_q4_k_gate_up_geglu_bf16_pipeline: ^Pipeline
 _linear_q6_k_mmvq_pipeline:               ^Pipeline
+_dequantize_q4_k_to_bf16_pipeline:        ^Pipeline
+_dequantize_q6_k_to_bf16_pipeline:        ^Pipeline
 
 _mul_pipeline:      ^Pipeline
 _mul_bf16_pipeline: ^Pipeline
@@ -28,11 +30,19 @@ _mul_bf16_pipeline: ^Pipeline
 _gelu_mul_bf16_pipeline: ^Pipeline
 _gelu_mul_f32_pipeline:  ^Pipeline
 
-_tanh_pipeline:      ^Pipeline
-_tanh_bf16_pipeline: ^Pipeline
+_gelu_f32_pipeline:       ^Pipeline
+_gelu_bf16_pipeline:      ^Pipeline
+_gelu_back_f32_pipeline:  ^Pipeline
+_gelu_back_bf16_pipeline: ^Pipeline
+
+_tanh_pipeline:           ^Pipeline
+_tanh_bf16_pipeline:      ^Pipeline
+_tanh_back_f32_pipeline:  ^Pipeline
+_tanh_back_bf16_pipeline: ^Pipeline
 
 _cast_bf16_to_f32_pipeline: ^Pipeline
 _cast_f32_to_bf16_pipeline: ^Pipeline
+_cast_back_f32_pipeline:    ^Pipeline
 
 _rmsnorm_pipeline:       ^Pipeline
 _rmsnorm_bf16_pipeline:  ^Pipeline
@@ -56,28 +66,39 @@ _cache_write_bf16_pipeline:              ^Pipeline
 _select_f32_pipeline:  ^Pipeline
 _select_bf16_pipeline: ^Pipeline
 
-_slice_trailing_f32_pipeline:  ^Pipeline
-_slice_trailing_bf16_pipeline: ^Pipeline
+_slice_trailing_f32_pipeline:       ^Pipeline
+_slice_trailing_bf16_pipeline:      ^Pipeline
+_slice_trailing_back_f32_pipeline:  ^Pipeline
+_slice_trailing_back_bf16_pipeline: ^Pipeline
 
-_adam_f32_pipeline: ^Pipeline
+_adam_f32_pipeline:  ^Pipeline
+_adam_bf16_pipeline: ^Pipeline
 
-_silu_f32_pipeline:      ^Pipeline
-_silu_back_f32_pipeline: ^Pipeline
+_silu_f32_pipeline:       ^Pipeline
+_silu_back_f32_pipeline:  ^Pipeline
+_silu_back_bf16_pipeline: ^Pipeline
 
 _cross_entropy_f32_pipeline:      ^Pipeline
 _cross_entropy_back_f32_pipeline: ^Pipeline
 
-_mul_back_a_f32_pipeline: ^Pipeline
-_mul_back_b_f32_pipeline: ^Pipeline
+_mul_back_a_f32_pipeline:  ^Pipeline
+_mul_back_b_f32_pipeline:  ^Pipeline
+_mul_back_a_bf16_pipeline: ^Pipeline
+_mul_back_b_bf16_pipeline: ^Pipeline
 
-_select_back_f32_pipeline: ^Pipeline
+_select_back_f32_pipeline:  ^Pipeline
+_select_back_bf16_pipeline: ^Pipeline
 
-_rope_back_f32_pipeline: ^Pipeline
+_rope_back_f32_pipeline:  ^Pipeline
+_rope_back_bf16_pipeline: ^Pipeline
 
-_rmsnorm_back_f32_pipeline: ^Pipeline
+_rmsnorm_back_f32_pipeline:  ^Pipeline
+_rmsnorm_back_bf16_pipeline: ^Pipeline
 
-_attention_train_f32_pipeline:      ^Pipeline
-_attention_train_back_f32_pipeline: ^Pipeline
+_attention_train_f32_pipeline:       ^Pipeline
+_attention_train_back_f32_pipeline:  ^Pipeline
+_attention_train_bf16_pipeline:      ^Pipeline
+_attention_train_back_bf16_pipeline: ^Pipeline
 
 @(require_results)
 data :: #force_inline proc(t: ml.Tensor) -> Gpu_Buffer {
@@ -145,6 +166,7 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Add:          _add_forward(op, loc)
 	case ml.Mul:          _mul_forward(op, loc)
 	case ml.Gelu_Mul:     _gelu_mul_forward(op, loc)
+	case ml.Gelu:         _gelu_forward(op, loc)
 	case ml.Silu:         _silu_forward(op, loc)
 	case ml.Tanh:         _tanh_forward(op, loc)
 	case ml.Cast:         _cast_forward(op, loc)
@@ -168,26 +190,44 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 _backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	#partial switch _ in op.variant {
-	case ml.Add:           _add_backward(op, loc)
-	case ml.Mul:           _mul_backward(op, loc)
-	case ml.Linear:        _linear_backward(op, loc)
-	case ml.Silu:          _silu_backward(op, loc)
-	case ml.Select:        _select_backward(op, loc)
-	case ml.Rmsnorm:       _rmsnorm_backward(op, loc)
-	case ml.Rope:          _rope_backward(op, loc)
-	case ml.Attention:     _attention_backward(op, loc)
-	case ml.Cross_Entropy: _cross_entropy_backward(op, loc)
-	case:                  fmt.panicf("cuda backend: backward not implemented for op variant %T", op.variant, loc=loc)
+	case ml.Add:            _add_backward(op, loc)
+	case ml.Mul:            _mul_backward(op, loc)
+	case ml.Linear:         _linear_backward(op, loc)
+	case ml.Linear_Q4_K:    _linear_q4_k_backward(op, loc)
+	case ml.Linear_Q6_K:    _linear_q6_k_backward(op, loc)
+	case ml.Silu:           _silu_backward(op, loc)
+	case ml.Gelu:           _gelu_backward(op, loc)
+	case ml.Tanh:           _tanh_backward(op, loc)
+	case ml.Select:         _select_backward(op, loc)
+	case ml.Slice_Trailing: _slice_trailing_backward(op, loc)
+	case ml.Rmsnorm:        _rmsnorm_backward(op, loc)
+	case ml.Rope:           _rope_backward(op, loc)
+	case ml.Attention:      _attention_backward(op, loc)
+	case ml.Cross_Entropy:  _cross_entropy_backward(op, loc)
+	case ml.Cast:           _cast_backward(op, loc)
+	case:                   fmt.panicf("cuda backend: backward not implemented for op variant %T", op.variant, loc=loc)
 	}
 }
 
-_update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) {
-	fmt.assertf(t.type == .F32, "cuda update requires F32 tensor (got %v); bf16 mixed-precision lands in a follow-up", t.type, loc=loc)
+_cast_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
 
-	if _adam_f32_pipeline == nil {
-		_adam_f32_pipeline = _compile_pipeline(ADAM_F32_SRC, "adam_f32.cu", "adam_f32")
+	// With F32 grads, cast backward is dx += dy in f32 regardless of the
+	// forward cast direction. The data-side conversion has no effect on
+	// the gradient flow.
+	if _cast_back_f32_pipeline == nil {
+		_cast_back_f32_pipeline = _compile_pipeline(CAST_BACK_F32_SRC, "cast_back_f32.cu", "cast_back_f32")
 	}
 
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	n   := i32(ml.len(x))
+	args := [?]rawptr{&dyp, &dxp, &n}
+	_dispatch(_cast_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) {
 	d := data(t).ptr
 	g := gradient(t).ptr
 	m := transmute(Gpu_Buffer)t.buffers[.Adam_M]
@@ -202,7 +242,21 @@ _update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Locati
 	lr := opt.learning_rate; wd := opt.weight_decay; eps := opt.epsilon
 
 	args := [?]rawptr{&d, &g, &mp, &vp, &n, &b1, &b2, &c1, &c2, &lr, &wd, &eps}
-	_dispatch(_adam_f32_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+
+	#partial switch t.type {
+	case .F32:
+		if _adam_f32_pipeline == nil {
+			_adam_f32_pipeline = _compile_pipeline(ADAM_F32_SRC, "adam_f32.cu", "adam_f32")
+		}
+		_dispatch(_adam_f32_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		if _adam_bf16_pipeline == nil {
+			_adam_bf16_pipeline = _compile_pipeline(ADAM_BF16_SRC, "adam_bf16.cu", "adam_bf16")
+		}
+		_dispatch(_adam_bf16_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda update: unsupported dtype %v", t.type, loc=loc)
+	}
 }
 
 _linear_dtype :: proc(t: ml.Data_Type, loc: runtime.Source_Code_Location) -> cublas.DataType {
@@ -257,7 +311,6 @@ _linear_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	count       := i32(ml.len(input) / int(input_size))
 
 	gctx := _gctx(loc)
-	dt   := _linear_dtype(input.type, loc)
 
 	alpha := f32(1.0)
 	beta  := f32(1.0)
@@ -268,31 +321,65 @@ _linear_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	dx_ptr := gradient(input ).ptr
 	dw_ptr := gradient(weight).ptr
 
-	cublas.check(cublas.GemmEx(
-		gctx.cublas_handle,
-		.N, .N,
-		input_size, count, output_size,
-		&alpha,
-		rawptr(uintptr(w_ptr )), dt, input_size,
-		rawptr(uintptr(dy_ptr)), dt, output_size,
-		&beta,
-		rawptr(uintptr(dx_ptr)), dt, input_size,
-		._32F,
-		.DEFAULT,
-	), loc=loc)
+	// Frozen weight (e.g. QLoRA base): no gradient buffer, skip dW GEMM.
+	have_dw := dw_ptr != 0
+	have_dx := dx_ptr != 0
 
-	cublas.check(cublas.GemmEx(
-		gctx.cublas_handle,
-		.N, .T,
-		input_size, output_size, count,
-		&alpha,
-		rawptr(uintptr(x_ptr )), dt, input_size,
-		rawptr(uintptr(dy_ptr)), dt, output_size,
-		&beta,
-		rawptr(uintptr(dw_ptr)), dt, input_size,
-		._32F,
-		.DEFAULT,
-	), loc=loc)
+	// Gradients are f32 always. For bf16 weights/inputs we cast f32 dy down
+	// to bf16 once, then run two Tensor-Core GEMMs (bf16 x bf16 -> f32).
+	x_dt := _linear_dtype(input.type, loc)
+	w_dt := _linear_dtype(weight.type, loc)
+	dy_for_gemm := dy_ptr
+	dy_dt := cublas.DataType.R_32F
+
+	if input.type == .Bf16 {
+		dy_count   := int(count) * int(output_size)
+		dy_bf_size := uintptr(dy_count) * 2
+		dy_bf_ptr  := _activation_alloc(gctx, u64(dy_bf_size), loc)
+
+		if _cast_f32_to_bf16_pipeline == nil {
+			_cast_f32_to_bf16_pipeline = _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
+		}
+		dy_p := dy_ptr
+		bf_p := dy_bf_ptr
+		nc   := i32(dy_count)
+		pc   := i32((dy_count + 1) / 2)
+		cast_args := [?]rawptr{&dy_p, &bf_p, &nc, &pc}
+		_dispatch(_cast_f32_to_bf16_pipeline, _div_up((dy_count + 1) / 2, 256), 1, 1, 256, 1, 1, 0, cast_args[:], loc)
+
+		dy_for_gemm = dy_bf_ptr
+		dy_dt       = .R_16BF
+	}
+
+	if have_dx {
+		cublas.check(cublas.GemmEx(
+			gctx.cublas_handle,
+			.N, .N,
+			input_size, count, output_size,
+			&alpha,
+			rawptr(uintptr(w_ptr      )), w_dt,    input_size,
+			rawptr(uintptr(dy_for_gemm)), dy_dt,   output_size,
+			&beta,
+			rawptr(uintptr(dx_ptr     )), .R_32F,  input_size,
+			._32F,
+			.DEFAULT,
+		), loc=loc)
+	}
+
+	if have_dw {
+		cublas.check(cublas.GemmEx(
+			gctx.cublas_handle,
+			.N, .T,
+			input_size, output_size, count,
+			&alpha,
+			rawptr(uintptr(x_ptr      )), x_dt,    input_size,
+			rawptr(uintptr(dy_for_gemm)), dy_dt,   output_size,
+			&beta,
+			rawptr(uintptr(dw_ptr     )), .R_32F,  input_size,
+			._32F,
+			.DEFAULT,
+		), loc=loc)
+	}
 }
 
 _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -304,8 +391,44 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	count       := ml.len(input) / input_size
 
 	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q4_k: K must be a multiple of 256, got %v", input_size, loc=loc)
-	fmt.assertf(count == 1, "cuda linear_q4_k currently supports M=1 (decode); got M=%v", count, loc=loc)
 	fmt.assertf(output.type == .Bf16, "cuda linear_q4_k requires Bf16 output (got %v)", output.type, loc=loc)
+
+	if count == 1 {
+		// Decode-time fast path: per-element fused dequant+matmul.
+		_linear_q4_k_forward_mmvq(op, loc)
+		return
+	}
+
+	// Training / multi-token path: dequantize the whole weight to bf16
+	// scratch, run a Tensor-Core bf16 GEMM. Scratch is freed after the
+	// activation pool resets.
+	gctx := _gctx(loc)
+	w_bf := _dequantize_q4_k(gctx, data(weight).ptr, output_size, input_size, loc)
+	xp   := data(input).ptr
+	yp   := data(output).ptr
+
+	alpha := f32(1.0)
+	beta  := f32(0.0)
+	cublas.check(cublas.GemmEx(
+		gctx.cublas_handle,
+		.T,  .N,
+		i32(output_size), i32(count), i32(input_size),
+		&alpha,
+		rawptr(uintptr(w_bf)), .R_16BF, i32(input_size),
+		rawptr(uintptr(xp)),   .R_16BF, i32(input_size),
+		&beta,
+		rawptr(uintptr(yp)),   .R_16BF, i32(output_size),
+		._32F,
+		.DEFAULT,
+	), loc=loc)
+}
+
+_linear_q4_k_forward_mmvq :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	input       := op.input
+	weight      := op.variant.(ml.Linear_Q4_K).weight
+	output      := op.output
+	output_size := weight.shape[0]
+	input_size  := weight.shape[1]
 
 	if _linear_q4_k_mmvq_pipeline == nil {
 		_linear_q4_k_mmvq_pipeline = _compile_pipeline(LINEAR_Q4_K_MMVQ_SRC, "linear_q4_k_mmvq.cu", "linear_q4_k_mmvq")
@@ -325,7 +448,7 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 
 	wp := data(weight).ptr
 	yp := data(output).ptr
-	M  := i32(count)
+	M  := i32(1)
 	K  := i32(input_size)
 	N  := i32(output_size)
 
@@ -334,6 +457,90 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 		u32(output_size), 1, 1,
 		32, 4, 1,
 		0, mmvq_args[:], loc)
+}
+
+// Backward for Linear_Q4_K: only computes dx (Q4_K weight is frozen by
+// design — that's the QLoRA recipe). Dequantizes W to bf16 scratch,
+// casts f32 dy to bf16 scratch, runs a Tensor-Core bf16 GEMM with f32
+// output for dx.
+_linear_q4_k_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	input       := op.input
+	weight      := op.variant.(ml.Linear_Q4_K).weight
+	output      := op.output
+	output_size := weight.shape[0]
+	input_size  := weight.shape[1]
+	count       := ml.len(input) / input_size
+
+	dxp := gradient(input).ptr
+	if dxp == 0 {
+		// No gradient consumer downstream; nothing to do.
+		return
+	}
+
+	gctx := _gctx(loc)
+
+	// Dequantize W to bf16 scratch.
+	w_bf := _dequantize_q4_k(gctx, data(weight).ptr, output_size, input_size, loc)
+
+	// Cast f32 dy to bf16 scratch.
+	dy_count   := count * output_size
+	dy_bf_size := uintptr(dy_count) * 2
+	dy_bf_ptr  := _activation_alloc(gctx, u64(dy_bf_size), loc)
+	if _cast_f32_to_bf16_pipeline == nil {
+		_cast_f32_to_bf16_pipeline = _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
+	}
+	dy_p := gradient(output).ptr
+	bf_p := dy_bf_ptr
+	nc   := i32(dy_count)
+	pc   := i32((dy_count + 1) / 2)
+	cast_args := [?]rawptr{&dy_p, &bf_p, &nc, &pc}
+	_dispatch(_cast_f32_to_bf16_pipeline, _div_up((dy_count + 1) / 2, 256), 1, 1, 256, 1, 1, 0, cast_args[:], loc)
+
+	// dx (f32) = W^T (output_size x input_size, transposed) @ dy_bf
+	// Forward: y = x @ W^T (W stored as [out, in])
+	// dx = dy @ W (no transpose on W since y = x @ W^T means dx = dy @ (W^T)^T = dy @ W)
+	alpha := f32(1.0)
+	beta  := f32(1.0)
+	cublas.check(cublas.GemmEx(
+		gctx.cublas_handle,
+		.N, .N,
+		i32(input_size), i32(count), i32(output_size),
+		&alpha,
+		rawptr(uintptr(w_bf)),    .R_16BF, i32(input_size),
+		rawptr(uintptr(dy_bf_ptr)), .R_16BF, i32(output_size),
+		&beta,
+		rawptr(uintptr(dxp)),     .R_32F,  i32(input_size),
+		._32F,
+		.DEFAULT,
+	), loc=loc)
+}
+
+// Dequantize a Q4_K weight buffer to a bf16 scratch tensor.
+//
+// The result is cached in `gctx.dequant_cache` keyed by the source weight
+// pointer, so a forward followed by a backward over the same weight only
+// pays for one dequantization. The scratch lives in the activation pool
+// and is invalidated at the next ml.clear() (which also clears the cache).
+_dequantize_q4_k :: proc(gctx: ^Context, src: cuda.DevicePtr, output_size, input_size: int, loc: runtime.Source_Code_Location) -> cuda.DevicePtr {
+	if cached, ok := gctx.dequant_cache[src]; ok {
+		return cached
+	}
+	src := src
+	count := output_size * input_size
+	fmt.assertf(count % ml.K_QUANT_BLOCK_SIZE == 0, "_dequantize_q4_k: count %v not divisible by 256", count, loc=loc)
+	num_blocks := count / ml.K_QUANT_BLOCK_SIZE
+
+	dst := _activation_alloc(gctx, u64(count) * 2, loc)
+
+	if _dequantize_q4_k_to_bf16_pipeline == nil {
+		_dequantize_q4_k_to_bf16_pipeline = _compile_pipeline(DEQUANTIZE_Q4_K_TO_BF16_SRC, "dequantize_q4_k_to_bf16.cu", "dequantize_q4_k_to_bf16")
+	}
+	total := i32(count)
+	args := [?]rawptr{&src, &dst, &total}
+	_dispatch(_dequantize_q4_k_to_bf16_pipeline, u32(num_blocks), 1, 1, 256, 1, 1, 0, args[:], loc)
+
+	gctx.dequant_cache[src] = dst
+	return dst
 }
 
 _linear_q4_k_gate_up_geglu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -600,7 +807,8 @@ _rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		if _rmsnorm_bf16_pipeline == nil {
 			_rmsnorm_bf16_pipeline = _compile_pipeline(RMSNORM_BF16_SRC,      "rmsnorm_bf16.cu",  "rmsnorm_bf16")
 		}
-		args := [?]rawptr{&xp, &wp, &yp, &c, &s, &eps }
+		rstd_p := data(v.rstd).ptr
+		args := [?]rawptr{&xp, &wp, &yp, &rstd_p, &c, &s, &eps}
 		_dispatch(_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
 		fmt.assertf(v.weight.type == .F32, "rmsnorm f32 requires F32 weight (got %v)", v.weight.type, loc=loc)
@@ -769,8 +977,40 @@ _linear_q6_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	count       := ml.len(input) / input_size
 
 	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q6_k: K must be a multiple of 256, got %v", input_size, loc=loc)
-	fmt.assertf(count == 1, "cuda linear_q6_k currently supports M=1 (decode); got M=%v", count, loc=loc)
 	fmt.assertf(output.type == .Bf16, "cuda linear_q6_k requires Bf16 output (got %v)", output.type, loc=loc)
+
+	if count == 1 {
+		_linear_q6_k_forward_mmvq(op, loc)
+		return
+	}
+
+	gctx := _gctx(loc)
+	w_bf := _dequantize_q6_k(gctx, data(weight).ptr, output_size, input_size, loc)
+	xp   := data(input).ptr
+	yp   := data(output).ptr
+
+	alpha := f32(1.0)
+	beta  := f32(0.0)
+	cublas.check(cublas.GemmEx(
+		gctx.cublas_handle,
+		.T,  .N,
+		i32(output_size), i32(count), i32(input_size),
+		&alpha,
+		rawptr(uintptr(w_bf)), .R_16BF, i32(input_size),
+		rawptr(uintptr(xp)),   .R_16BF, i32(input_size),
+		&beta,
+		rawptr(uintptr(yp)),   .R_16BF, i32(output_size),
+		._32F,
+		.DEFAULT,
+	), loc=loc)
+}
+
+_linear_q6_k_forward_mmvq :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	input       := op.input
+	weight      := op.variant.(ml.Linear_Q6_K).weight
+	output      := op.output
+	output_size := weight.shape[0]
+	input_size  := weight.shape[1]
 
 	if _linear_q6_k_mmvq_pipeline == nil {
 		_linear_q6_k_mmvq_pipeline = _compile_pipeline(LINEAR_Q6_K_MMVQ_SRC, "linear_q6_k_mmvq.cu", "linear_q6_k_mmvq")
@@ -790,7 +1030,7 @@ _linear_q6_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 
 	wp := data(weight).ptr
 	yp := data(output).ptr
-	M  := i32(count)
+	M  := i32(1)
 	K  := i32(input_size)
 	N  := i32(output_size)
 
@@ -799,6 +1039,73 @@ _linear_q6_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 		u32(output_size), 1, 1,
 		32, 4, 1,
 		0, mmvq_args[:], loc)
+}
+
+_dequantize_q6_k :: proc(gctx: ^Context, src: cuda.DevicePtr, output_size, input_size: int, loc: runtime.Source_Code_Location) -> cuda.DevicePtr {
+	if cached, ok := gctx.dequant_cache[src]; ok {
+		return cached
+	}
+	src := src
+	count := output_size * input_size
+	fmt.assertf(count % ml.K_QUANT_BLOCK_SIZE == 0, "_dequantize_q6_k: count %v not divisible by 256", count, loc=loc)
+	num_blocks := count / ml.K_QUANT_BLOCK_SIZE
+
+	dst := _activation_alloc(gctx, u64(count) * 2, loc)
+
+	if _dequantize_q6_k_to_bf16_pipeline == nil {
+		_dequantize_q6_k_to_bf16_pipeline = _compile_pipeline(DEQUANTIZE_Q6_K_TO_BF16_SRC, "dequantize_q6_k_to_bf16.cu", "dequantize_q6_k_to_bf16")
+	}
+	total := i32(count)
+	args := [?]rawptr{&src, &dst, &total}
+	_dispatch(_dequantize_q6_k_to_bf16_pipeline, u32(num_blocks), 1, 1, 256, 1, 1, 0, args[:], loc)
+
+	gctx.dequant_cache[src] = dst
+	return dst
+}
+
+_linear_q6_k_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	input       := op.input
+	weight      := op.variant.(ml.Linear_Q6_K).weight
+	output      := op.output
+	output_size := weight.shape[0]
+	input_size  := weight.shape[1]
+	count       := ml.len(input) / input_size
+
+	dxp := gradient(input).ptr
+	if dxp == 0 {
+		return
+	}
+
+	gctx := _gctx(loc)
+	w_bf := _dequantize_q6_k(gctx, data(weight).ptr, output_size, input_size, loc)
+
+	dy_count   := count * output_size
+	dy_bf_size := uintptr(dy_count) * 2
+	dy_bf_ptr  := _activation_alloc(gctx, u64(dy_bf_size), loc)
+	if _cast_f32_to_bf16_pipeline == nil {
+		_cast_f32_to_bf16_pipeline = _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
+	}
+	dy_p := gradient(output).ptr
+	bf_p := dy_bf_ptr
+	nc   := i32(dy_count)
+	pc   := i32((dy_count + 1) / 2)
+	cast_args := [?]rawptr{&dy_p, &bf_p, &nc, &pc}
+	_dispatch(_cast_f32_to_bf16_pipeline, _div_up((dy_count + 1) / 2, 256), 1, 1, 256, 1, 1, 0, cast_args[:], loc)
+
+	alpha := f32(1.0)
+	beta  := f32(1.0)
+	cublas.check(cublas.GemmEx(
+		gctx.cublas_handle,
+		.N, .N,
+		i32(input_size), i32(count), i32(output_size),
+		&alpha,
+		rawptr(uintptr(w_bf)),     .R_16BF, i32(input_size),
+		rawptr(uintptr(dy_bf_ptr)), .R_16BF, i32(output_size),
+		&beta,
+		rawptr(uintptr(dxp)),      .R_32F,  i32(input_size),
+		._32F,
+		.DEFAULT,
+	), loc=loc)
 }
 
 _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -824,15 +1131,32 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 	#partial switch q.type {
 	case .Bf16:
 		fmt.assertf(head_size % 2 == 0, "cuda bf16 attention requires even head_size (got %v)", head_size, loc=loc)
-		if _attention_bf16_pipeline == nil {
-			_attention_bf16_pipeline = _compile_pipeline(ATTENTION_BF16_SRC, "attention_bf16.cu", "attention_bf16")
+		// Training mode (no .No_Gradients flag): use the materialising
+		// train kernel so backward has the softmax matrix.
+		gctx := _gctx(loc)
+		training := !(.No_Gradients in gctx.clear_flags)
+		if training {
+			fmt.assertf(token_count <= 1024, "cuda attention_train_bf16 caps token_count at 1024 (got %v)", token_count, loc=loc)
+			if _attention_train_bf16_pipeline == nil {
+				_attention_train_bf16_pipeline = _compile_pipeline(ATTENTION_TRAIN_BF16_SRC, "attention_train_bf16.cu", "attention_train_bf16")
+			}
+			sm_ptr := data(v.softmax_outputs).ptr
+			args := [?]rawptr{
+				&qp, &kp, &vp, &op_ptr, &sm_ptr,
+				&n_q_heads, &n_kv_heads, &hs, &tc, &qs, &kvs, &causal, &window,
+			}
+			_dispatch(_attention_train_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 256, 1, 1, 0, args[:], loc)
+		} else {
+			if _attention_bf16_pipeline == nil {
+				_attention_bf16_pipeline = _compile_pipeline(ATTENTION_BF16_SRC, "attention_bf16.cu", "attention_bf16")
+			}
+			lse_ptr := data(v.lse).ptr
+			args := [?]rawptr{
+				&qp, &kp, &vp, &op_ptr, &lse_ptr,
+				&n_q_heads, &n_kv_heads, &hs, &tc, &qs, &kvs, &causal, &window,
+			}
+			_dispatch(_attention_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
 		}
-		lse_ptr := data(v.lse).ptr
-		args := [?]rawptr{
-			&qp, &kp, &vp, &op_ptr, &lse_ptr,
-			&n_q_heads, &n_kv_heads, &hs, &tc, &qs, &kvs, &causal, &window,
-		}
-		_dispatch(_attention_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
 
 	case .F32:
 		fmt.assertf(token_count <= 1024, "cuda attention_train_f32 caps token_count at 1024 (got %v)", token_count, loc=loc)
@@ -1057,21 +1381,141 @@ _silu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	_dispatch(_silu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 }
 
-_silu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+_gelu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
-	fmt.assertf(x.type == .F32, "cuda silu backward requires F32 (got %v)", x.type, loc=loc)
 
-	if _silu_back_f32_pipeline == nil {
-		_silu_back_f32_pipeline = _compile_pipeline(SILU_BACK_F32_SRC, "silu_back_f32.cu", "silu_back_f32")
+	xp := data(x).ptr; yp := data(y).ptr
+	n  := i32(ml.len(x))
+
+	#partial switch x.type {
+	case .F32:
+		if _gelu_f32_pipeline == nil {
+			_gelu_f32_pipeline = _compile_pipeline(GELU_F32_SRC, "gelu_f32.cu", "gelu_f32")
+		}
+		args := [?]rawptr{&xp, &yp, &n}
+		_dispatch(_gelu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		if _gelu_bf16_pipeline == nil {
+			_gelu_bf16_pipeline = _compile_pipeline(GELU_BF16_SRC, "gelu_bf16.cu", "gelu_bf16")
+		}
+		pair_count := (ml.len(x) + 1) / 2
+		pc := i32(pair_count)
+		args := [?]rawptr{&xp, &yp, &n, &pc}
+		_dispatch(_gelu_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda gelu: unsupported dtype %v", x.type, loc=loc)
 	}
+}
+
+_gelu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
 
 	xp  := data(x).ptr
 	dyp := gradient(y).ptr
 	dxp := gradient(x).ptr
 	n   := i32(ml.len(x))
 	args := [?]rawptr{&xp, &dyp, &dxp, &n}
-	_dispatch(_silu_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+
+	#partial switch x.type {
+	case .F32:
+		if _gelu_back_f32_pipeline == nil {
+			_gelu_back_f32_pipeline = _compile_pipeline(GELU_BACK_F32_SRC, "gelu_back_f32.cu", "gelu_back_f32")
+		}
+		_dispatch(_gelu_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		if _gelu_back_bf16_pipeline == nil {
+			_gelu_back_bf16_pipeline = _compile_pipeline(GELU_BACK_BF16_SRC, "gelu_back_bf16.cu", "gelu_back_bf16")
+		}
+		_dispatch(_gelu_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda gelu backward: unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_tanh_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+
+	yp  := data(y).ptr
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	n   := i32(ml.len(x))
+	args := [?]rawptr{&yp, &dyp, &dxp, &n}
+
+	#partial switch x.type {
+	case .F32:
+		if _tanh_back_f32_pipeline == nil {
+			_tanh_back_f32_pipeline = _compile_pipeline(TANH_BACK_F32_SRC, "tanh_back_f32.cu", "tanh_back_f32")
+		}
+		_dispatch(_tanh_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		if _tanh_back_bf16_pipeline == nil {
+			_tanh_back_bf16_pipeline = _compile_pipeline(TANH_BACK_BF16_SRC, "tanh_back_bf16.cu", "tanh_back_bf16")
+		}
+		_dispatch(_tanh_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda tanh backward: unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_slice_trailing_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Slice_Trailing)
+
+	trailing     := x.shape[x.rank - 1]
+	new_trailing := y.shape[y.rank - 1]
+	leading      := ml.len(x) / trailing
+	total        := leading * new_trailing
+
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	ld := i32(leading); tr := i32(trailing); nt := i32(new_trailing); st := i32(v.start)
+	args := [?]rawptr{&dyp, &dxp, &ld, &tr, &nt, &st}
+
+	// F32 grads everywhere now -> bf16 and f32 paths are byte-identical.
+	#partial switch x.type {
+	case .F32:
+		if _slice_trailing_back_f32_pipeline == nil {
+			_slice_trailing_back_f32_pipeline = _compile_pipeline(SLICE_TRAILING_BACK_F32_SRC, "slice_trailing_back_f32.cu", "slice_trailing_back_f32")
+		}
+		_dispatch(_slice_trailing_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		if _slice_trailing_back_bf16_pipeline == nil {
+			_slice_trailing_back_bf16_pipeline = _compile_pipeline(SLICE_TRAILING_BACK_BF16_SRC, "slice_trailing_back_bf16.cu", "slice_trailing_back_bf16")
+		}
+		_dispatch(_slice_trailing_back_bf16_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda slice_trailing backward: unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_silu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+
+	xp  := data(x).ptr
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	n   := i32(ml.len(x))
+	args := [?]rawptr{&xp, &dyp, &dxp, &n}
+
+	#partial switch x.type {
+	case .F32:
+		if _silu_back_f32_pipeline == nil {
+			_silu_back_f32_pipeline = _compile_pipeline(SILU_BACK_F32_SRC, "silu_back_f32.cu", "silu_back_f32")
+		}
+		_dispatch(_silu_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		if _silu_back_bf16_pipeline == nil {
+			_silu_back_bf16_pipeline = _compile_pipeline(SILU_BACK_BF16_SRC, "silu_back_bf16.cu", "silu_back_bf16")
+		}
+		_dispatch(_silu_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda silu backward: unsupported dtype %v", x.type, loc=loc)
+	}
 }
 
 _cross_entropy_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -1124,14 +1568,6 @@ _mul_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	a := op.input
 	b := op.variant.(ml.Mul).b
 	c := op.output
-	fmt.assertf(a.type == .F32, "cuda mul backward requires F32 (got %v)", a.type, loc=loc)
-
-	if _mul_back_a_f32_pipeline == nil {
-		_mul_back_a_f32_pipeline = _compile_pipeline(MUL_BACK_A_F32_SRC, "mul_back_a_f32.cu", "mul_back_a_f32")
-	}
-	if _mul_back_b_f32_pipeline == nil {
-		_mul_back_b_f32_pipeline = _compile_pipeline(MUL_BACK_B_F32_SRC, "mul_back_b_f32.cu", "mul_back_b_f32")
-	}
 
 	ap  := data(a).ptr
 	bp  := data(b).ptr
@@ -1141,28 +1577,62 @@ _mul_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	n_a := i32(ml.len(a))
 	n_b := i32(ml.len(b))
 
-	args_a := [?]rawptr{&bp,  &dyp, &dap, &n_a, &n_b}
-	_dispatch(_mul_back_a_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
+	// Skip the b-side accumulation when b has no gradient buffer (frozen
+	// constant scalar). Saves the slow bf16 CAS path in the typical broadcast
+	// case where many a-elements target one b cell.
+	have_a_grad := dap != 0
+	have_b_grad := dbp != 0
 
-	args_b := [?]rawptr{&ap,  &dyp, &dbp, &n_a, &n_b}
-	_dispatch(_mul_back_b_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
+	args_a := [?]rawptr{&bp, &dyp, &dap, &n_a, &n_b}
+	args_b := [?]rawptr{&ap, &dyp, &dbp, &n_a, &n_b}
+
+	#partial switch a.type {
+	case .F32:
+		if have_a_grad {
+			if _mul_back_a_f32_pipeline == nil {
+				_mul_back_a_f32_pipeline = _compile_pipeline(MUL_BACK_A_F32_SRC, "mul_back_a_f32.cu", "mul_back_a_f32")
+			}
+			_dispatch(_mul_back_a_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
+		}
+		if have_b_grad {
+			if _mul_back_b_f32_pipeline == nil {
+				_mul_back_b_f32_pipeline = _compile_pipeline(MUL_BACK_B_F32_SRC, "mul_back_b_f32.cu", "mul_back_b_f32")
+			}
+			_dispatch(_mul_back_b_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
+		}
+	case .Bf16:
+		if have_a_grad {
+			if _mul_back_a_bf16_pipeline == nil {
+				_mul_back_a_bf16_pipeline = _compile_pipeline(MUL_BACK_A_BF16_SRC, "mul_back_a_bf16.cu", "mul_back_a_bf16")
+			}
+			_dispatch(_mul_back_a_bf16_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
+		}
+		if have_b_grad {
+			if _mul_back_b_bf16_pipeline == nil {
+				_mul_back_b_bf16_pipeline = _compile_pipeline(MUL_BACK_B_BF16_SRC, "mul_back_b_bf16.cu", "mul_back_b_bf16")
+			}
+			_dispatch(_mul_back_b_bf16_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
+		}
+	case:
+		fmt.panicf("cuda mul backward: unsupported dtype %v", a.type, loc=loc)
+	}
 }
 
 _select_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	w := op.input
 	y := op.output
 	indices := op.variant.(ml.Select).indices
-	fmt.assertf(w.type == .F32, "cuda select backward requires F32 (got %v)", w.type, loc=loc)
 
-	if _select_back_f32_pipeline == nil {
-		_select_back_f32_pipeline = _compile_pipeline(SELECT_BACK_F32_SRC, "select_back_f32.cu", "select_back_f32")
+	dwp := gradient(w).ptr
+	if dwp == 0 {
+		// Frozen embedding (e.g. QLoRA): no gradient to accumulate.
+		return
 	}
 
 	gctx := _gctx(loc)
 	idx_ptr := _upload_indices(gctx, indices, loc)
 
 	dyp := gradient(y).ptr
-	dwp := gradient(w).ptr
 
 	row_size := ml.len(y) / builtin.len(indices)
 	n_idx    := i32(builtin.len(indices))
@@ -1170,19 +1640,28 @@ _select_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	total    := builtin.len(indices) * row_size
 
 	args := [?]rawptr{&dyp, &idx_ptr, &dwp, &n_idx, &rs}
-	_dispatch(_select_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+
+	#partial switch w.type {
+	case .F32:
+		if _select_back_f32_pipeline == nil {
+			_select_back_f32_pipeline = _compile_pipeline(SELECT_BACK_F32_SRC, "select_back_f32.cu", "select_back_f32")
+		}
+		_dispatch(_select_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		if _select_back_bf16_pipeline == nil {
+			_select_back_bf16_pipeline = _compile_pipeline(SELECT_BACK_BF16_SRC, "select_back_bf16.cu", "select_back_bf16")
+		}
+		_dispatch(_select_back_bf16_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda select backward: unsupported dtype %v", w.type, loc=loc)
+	}
 }
 
 _rmsnorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
 	v := op.variant.(ml.Rmsnorm)
-	fmt.assertf(x.type == .F32, "cuda rmsnorm backward requires F32 (got %v)", x.type, loc=loc)
-	fmt.assertf(v.weight.type == .F32, "cuda rmsnorm backward requires F32 weight (got %v)", v.weight.type, loc=loc)
-
-	if _rmsnorm_back_f32_pipeline == nil {
-		_rmsnorm_back_f32_pipeline = _compile_pipeline(RMSNORM_BACK_F32_SRC, "rmsnorm_back_f32.cu", "rmsnorm_back_f32")
-	}
+	fmt.assertf(v.weight.type == x.type, "cuda rmsnorm backward requires weight dtype to match input (x=%v, w=%v)", x.type, v.weight.type, loc=loc)
 
 	size  := x.shape[x.rank - 1]
 	count := ml.len(x) / size
@@ -1196,18 +1675,28 @@ _rmsnorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	c      := i32(count); s := i32(size)
 
 	args := [?]rawptr{&xp, &wp, &rstd_p, &dyp, &dxp, &dwp, &c, &s}
-	_dispatch(_rmsnorm_back_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
+
+	#partial switch x.type {
+	case .F32:
+		if _rmsnorm_back_f32_pipeline == nil {
+			_rmsnorm_back_f32_pipeline = _compile_pipeline(RMSNORM_BACK_F32_SRC, "rmsnorm_back_f32.cu", "rmsnorm_back_f32")
+		}
+		_dispatch(_rmsnorm_back_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		fmt.assertf(size % 2 == 0, "cuda rmsnorm backward bf16 requires even trailing dim (got %v)", size, loc=loc)
+		if _rmsnorm_back_bf16_pipeline == nil {
+			_rmsnorm_back_bf16_pipeline = _compile_pipeline(RMSNORM_BACK_BF16_SRC, "rmsnorm_back_bf16.cu", "rmsnorm_back_bf16")
+		}
+		_dispatch(_rmsnorm_back_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda rmsnorm backward: unsupported dtype %v", x.type, loc=loc)
+	}
 }
 
 _rope_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
 	v := op.variant.(ml.Rope)
-	fmt.assertf(x.type == .F32, "cuda rope backward requires F32 (got %v)", x.type, loc=loc)
-
-	if _rope_back_f32_pipeline == nil {
-		_rope_back_f32_pipeline = _compile_pipeline(ROPE_BACK_F32_SRC, "rope_back_f32.cu", "rope_back_f32")
-	}
 
 	gctx := _gctx(loc)
 	_emit_position_upload(gctx, v.position_offset, loc)
@@ -1221,7 +1710,22 @@ _rope_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	tc := i32(token_count); hc := i32(v.head_count); hs := i32(head_size)
 	base := v.base; pos_dev := gctx.position_dev; rpc := i32(v.rotate_pair_count)
 	args := [?]rawptr{&dyp, &dxp, &tc, &hc, &hs, &base, &pos_dev, &rpc}
-	_dispatch(_rope_back_f32_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+
+	#partial switch x.type {
+	case .F32:
+		if _rope_back_f32_pipeline == nil {
+			_rope_back_f32_pipeline = _compile_pipeline(ROPE_BACK_F32_SRC, "rope_back_f32.cu", "rope_back_f32")
+		}
+		_dispatch(_rope_back_f32_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		fmt.assertf(head_size % 2 == 0, "cuda rope backward bf16 requires even head_size (got %v)", head_size, loc=loc)
+		if _rope_back_bf16_pipeline == nil {
+			_rope_back_bf16_pipeline = _compile_pipeline(ROPE_BACK_BF16_SRC, "rope_back_bf16.cu", "rope_back_bf16")
+		}
+		_dispatch(_rope_back_bf16_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda rope backward: unsupported dtype %v", x.type, loc=loc)
+	}
 }
 
 _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -1230,11 +1734,6 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 	v   := op.variant.(ml.Attention)
 	k   := v.key
 	val := v.value
-	fmt.assertf(q.type == .F32, "cuda attention backward requires F32 (got %v)", q.type, loc=loc)
-
-	if _attention_train_back_f32_pipeline == nil {
-		_attention_train_back_f32_pipeline = _compile_pipeline(ATTENTION_TRAIN_BACK_F32_SRC, "attention_train_back_f32.cu", "attention_train_back_f32")
-	}
 
 	token_count := q.shape[0]
 	q_size      := q.shape[1]
@@ -1261,9 +1760,28 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 		&n_q_heads, &n_kv_heads, &hs, &tc, &qs, &kvs, &causal, &window,
 	}
 
-	_dispatch(_attention_train_back_f32_pipeline,
-		u32(v.n_kv_heads), u32(gqa), u32(token_count),
-		256, 1, 1,
-		0, args[:], loc,
-	)
+	#partial switch q.type {
+	case .F32:
+		if _attention_train_back_f32_pipeline == nil {
+			_attention_train_back_f32_pipeline = _compile_pipeline(ATTENTION_TRAIN_BACK_F32_SRC, "attention_train_back_f32.cu", "attention_train_back_f32")
+		}
+		_dispatch(_attention_train_back_f32_pipeline,
+			u32(v.n_kv_heads), u32(gqa), u32(token_count),
+			256, 1, 1,
+			0, args[:], loc,
+		)
+	case .Bf16:
+		fmt.assertf(token_count <= 1024, "cuda attention_train_back_bf16 caps token_count at 1024 (got %v)", token_count, loc=loc)
+		fmt.assertf(head_size % 2 == 0, "cuda attention backward bf16 requires even head_size (got %v)", head_size, loc=loc)
+		if _attention_train_back_bf16_pipeline == nil {
+			_attention_train_back_bf16_pipeline = _compile_pipeline(ATTENTION_TRAIN_BACK_BF16_SRC, "attention_train_back_bf16.cu", "attention_train_back_bf16")
+		}
+		_dispatch(_attention_train_back_bf16_pipeline,
+			u32(v.n_kv_heads), u32(gqa), u32(token_count),
+			256, 1, 1,
+			0, args[:], loc,
+		)
+	case:
+		fmt.panicf("cuda attention backward: unsupported dtype %v", q.type, loc=loc)
+	}
 }

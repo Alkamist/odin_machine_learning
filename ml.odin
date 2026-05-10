@@ -192,6 +192,19 @@ shape_element_count :: proc(shape: []int) -> int {
 DEFAULT_ACTIVATION_BUFFERS :: Buffer_Set{.Data, .Gradient}
 DEFAULT_PARAMETER_BUFFERS  :: Buffer_Set{.Data, .Gradient, .Adam_M, .Adam_V}
 
+// Mixed-precision rule: only the .Data buffer follows the tensor's primary
+// dtype. Gradient and Adam moments are always F32 — keeps gradient
+// accumulation precise (no bf16 += across many threads losing ULPs) and
+// lets backward kernels use native atomicAdd instead of CAS-based bf16
+// emulation, which was ~25x slower on the previous all-bf16 path.
+@(require_results)
+buffer_dtype :: #force_inline proc(tensor_type: Data_Type, kind: Buffer_Kind) -> Data_Type {
+	if kind == .Data {
+		return tensor_type
+	}
+	return .F32
+}
+
 @(require_results)
 alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_Set, loc := #caller_location) -> (t: Tensor) {
 	assert(_current_ctx != nil, "Did you forget to call context_create / context_scope?", loc=loc)
@@ -200,10 +213,6 @@ alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_S
 
 	element_count := shape_element_count(shape)
 	assert(element_count > 0, "Tensor element count must be positive", loc=loc)
-
-	byte_count := _data_byte_count(type, element_count)
-	assert(byte_count > 0, "Tensor byte count must be positive", loc=loc)
-	byte_count = (byte_count + 3) & ~int(3)
 
 	t.backend = &_current_ctx.backend
 	t.type    = type
@@ -216,6 +225,10 @@ alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_S
 
 	for kind in Buffer_Kind {
 		if kind in buffers {
+			kind_type  := buffer_dtype(type, kind)
+			byte_count := _data_byte_count(kind_type, element_count)
+			assert(byte_count > 0, "Tensor byte count must be positive", loc=loc)
+			byte_count = (byte_count + 3) & ~int(3)
 			t.buffers[kind] = t.backend.buffer_alloc(byte_count, kind, persistent, loc)
 		}
 	}
@@ -814,6 +827,13 @@ gelu_mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(len(a) % len(b) == 0, "gelu_mul: A length must be divisible by B length", loc=loc)
 	assert(a.type == b.type, "gelu_mul inputs must have the same dtype", loc=loc)
 
+	// Decompose for training (any dtype) so backward can route through
+	// gelu and mul individually. Fused gelu_mul has no backward kernel.
+	training := !(.No_Gradients in _current_ctx.clear_flags)
+	if a.type == .F32 || training {
+		return mul(gelu(a, loc=loc), b, loc=loc)
+	}
+
 	output = zeros_like(a, loc=loc)
 
 	op := Operation{
@@ -1384,6 +1404,14 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
 	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
 
+	training := !(.No_Gradients in _current_ctx.clear_flags)
+	if input.type == .F32 || training {
+		view   := reshape(input, []int{input.shape[0] * head_count, head_size}, loc=loc)
+		normed := rmsnorm(view, weight, eps, loc=loc)
+		normed  = reshape(normed, []int{input.shape[0], head_count * head_size}, loc=loc)
+		return rope(normed, head_count, base, position_offset, rope_fraction, loc=loc)
+	}
+
 	output = zeros_like(input, loc=loc)
 
 	op := Operation{
@@ -1471,6 +1499,13 @@ add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc :=
 	assert(eps > 0, "add_rmsnorm eps must be positive", loc=loc)
 	for d in 0 ..< a.rank {
 		assert(a.shape[d] == b.shape[d], "add_rmsnorm a/b shape must match", loc=loc)
+	}
+
+	training := !(.No_Gradients in _current_ctx.clear_flags)
+	if a.type == .F32 || training {
+		residual_new = add(a, b, loc=loc)
+		normed       = rmsnorm(residual_new, weight, eps, loc=loc)
+		return
 	}
 
 	residual_new = zeros_like(a, loc=loc)

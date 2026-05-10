@@ -56,7 +56,7 @@ void rmsnorm_back_f32(const float* __restrict__ x,
 		float dy_v = dy[row_base + i];
 		float norm = xv * r;
 		float dnorm = wv * dy_v;
-		dx[row_base + i] += (dnorm - norm * mean) * r;
-		atomicAdd(&dw[i], dy_v * norm);
+		if (dx) dx[row_base + i] += (dnorm - norm * mean) * r;
+		if (dw) atomicAdd(&dw[i], dy_v * norm);
 	}
 }

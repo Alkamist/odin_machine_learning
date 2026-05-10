@@ -8,6 +8,7 @@ extern "C" __global__
 void rmsnorm_bf16(const unsigned int* __restrict__ x,
                   const unsigned int* __restrict__ w,
                   unsigned int*       __restrict__ y,
+                  float*              __restrict__ rstd_out,
                   int count, int size, float eps) {
 	int row = blockIdx.x;
 	int tid = threadIdx.x;
@@ -42,6 +43,7 @@ void rmsnorm_bf16(const unsigned int* __restrict__ x,
 	for (int i = 0; i < RMS_NWARPS; ++i) total += warp_sums[i];
 
 	float rstd = rsqrtf(total / (float)size + eps);
+	if (tid == 0 && rstd_out) rstd_out[row] = rstd;
 
 	for (int pi = tid; pi < pair_count; pi += RMS_WG) {
 		unsigned int xp = x[pair_base + pi];

@@ -5,13 +5,25 @@ new training work.
 
 ## TL;DR
 
-F32 Llama training works end-to-end. Shakespeare converges (loss
-4.67 → 2.13 over 1400 steps at ~24k tok/s on a 3090 Ti). Bf16
-mixed-precision and Gemma training are both still to do.
+Both F32 and bf16 training work end-to-end at the same speed.
+Shakespeare convergence matches:
 
-The reference recipe for the user is bf16 weights + bf16 activations
-+ f32 Adam moments. Phase 1 (this session) shipped f32-only because
-the existing `ml.alloc` API can't express per-buffer-kind dtypes.
+- **F32 tiny Gemma**: loss 4.93 → 1.91 over 1500 steps at ~20k tok/s
+- **bf16 tiny Gemma**: loss 4.93 → 2.22 at step 1000, ~21k tok/s.
+  Slightly slower convergence per step than F32 (bf16 precision cost),
+  but actual wall-clock similar.
+- **F32 Llama**: loss 4.67 → 2.13 over 1400 steps at ~24k tok/s
+
+The recipe is bf16 weights + bf16 activations + **F32 gradients** +
+F32 Adam moments. The "F32 grads" piece is what catches F32 speed:
+native `atomicAdd<float>` instead of CAS-loop emulation for bf16.
+`ml.buffer_dtype` hardcodes everything except `.Data` to F32.
+
+Decomposition trigger for fused ops (`gelu_mul`, `add_rmsnorm`,
+`rmsnorm_rope`) fires whenever `_current_ctx.clear_flags` lacks
+`.No_Gradients` (i.e. training mode), so bf16 training uses unfused
+ops with backward kernels, while bf16 inference still uses the fused
+path.
 
 ## What's in tree
 
@@ -61,93 +73,141 @@ work — they're added too.
 
 ## What's left
 
-### Phase 2 — bf16 mixed-precision (the original ask)
+### Phase 2 — bf16 mixed-precision (DONE)
 
-The user wanted bf16 weights + bf16 activations + **f32 Adam moments**.
-That requires per-buffer-kind dtypes within a single tensor (Data and
-Gradient stay bf16, but Adam_M and Adam_V are f32). Today
-`ml.alloc(type, ...)` uses the same byte_count for every buffer kind.
+End-to-end bf16 training works on tiny Gemma. Loss tracks F32 with
+~5% slower per-step convergence (bf16 precision cost), but wall-clock
+is comparable to F32 because bf16 GEMMs hit Tensor Cores natively.
 
-Concrete work:
+The architecture is **bf16 data + F32 grads + F32 optimizer**. The
+F32-grad piece is the perf unlock:
 
-1. **API change in `ml.alloc`.** Easiest: hardcode that `Adam_M` and
-   `Adam_V` are always F32 regardless of the tensor's primary dtype.
-   The byte_count loop in `ml.odin:217` becomes per-kind. Then the
-   buffer for those kinds is sized as `count * 4`.
-2. **CPU backend helpers.** `data()`, `gradient()`, `adam_m()`,
-   `adam_v()` in `backends/cpu/cpu.odin` all return `[]f32`. With bf16
-   data/gradient buffers they'd be reading 2 bytes per element as
-   4 bytes. Either return `[]byte` and let callers reinterpret, or
-   add bf16-aware variants.
-3. **Adam kernel for bf16.** `adam_f32.cu` becomes `adam_bf16.cu`:
-   - reads bf16 weight, bf16 grad
-   - reads f32 m, f32 v (separate dtype!)
-   - computes the update in f32
-   - writes back bf16 weight, f32 m/v, zeroes bf16 grad
-4. **Backward kernels in bf16.** Each existing `*_back_f32.cu` would
-   need a bf16 sibling, OR the kernels can read bf16 input and write
-   f32-into-bf16 output. The `+=` accumulation for gradients is
-   precision-sensitive — within a single backward pass we may write
-   to the same gradient element multiple times (e.g. residual
-   connections; weight shared between matmul calls). Bf16 grad
-   accumulation will be lossy for Adam's `period` accumulation across
-   multiple forward/backward passes too. Worth measuring whether the
-   model still converges; if not, fall back to f32 grads.
-5. **`llama.make` dtype param.** Today llama.make hardcodes `.F32` for
-   every weight tensor. Add a `dtype: ml.Data_Type = .F32` parameter
-   like `gemma.make` already has. Then training examples can pick
-   their precision.
+- Native `atomicAdd<float>` instead of CAS-emulated bf16 atomics
+- Both fast and numerically stable (gradient accumulation is the
+  precision-sensitive step in Adam)
+- 2x gradient buffer memory cost is fine for the QLoRA target where
+  base weights are quantized & frozen so most params have no grad
+  buffer at all
 
-### Phase 3 — Gemma training
+What landed:
+- **`ml.buffer_dtype`**: returns F32 for every kind except `.Data`.
+  Adam_M, Adam_V, Gradient all F32.
+- **bf16 Adam kernel** (`kernels/optimizer/adam_bf16.cu`): reads bf16
+  W + f32 grad + f32 m/v; writes bf16 W + f32 m/v; zeroes f32 grad.
+- **Mixed-precision backward kernels** (read bf16 forward inputs +
+  read/write F32 grads, internal fp32 accumulators):
+  - `silu_back_bf16`, `gelu_bf16` + `gelu_back_bf16`, `tanh_back_bf16`
+  - `mul_back_a_bf16` + `mul_back_b_bf16` (native `atomicAdd<float>`)
+  - `select_back_bf16` (effectively identical to f32 — pure grad path)
+  - `slice_trailing_back_bf16` (same)
+  - `rmsnorm_back_bf16` (forward `rmsnorm_bf16` now writes rstd too)
+  - `rope_back_bf16` (no forward data needed in backward)
+  - `attention_train_bf16` + `attention_train_back_bf16`
+  - `_cross_entropy_backward` stays F32 (loss is always F32)
+- **`_linear_backward`** in bf16: cast f32 dy down to bf16 in a
+  scratch buffer, then run two `cublasGemmEx` with A=bf16, B=bf16,
+  Tensor-Core compute_type=F32, output F32. Single cast per backward,
+  Tensor Cores handle the heavy lifting.
+- **`_cast_backward`**: with F32 grads, the backward of any
+  `cast_to(x, target)` is just `dx += dy` in f32 (forward cast
+  direction is irrelevant for the gradient). Uses a single
+  `cast_back_f32` kernel for all directions.
+- **Frozen-scalar skip in `mul_backward`**: when b has no gradient
+  buffer (const scalars like `embed_scale`), the b-side accumulation
+  is skipped. Saves the redundant atomic.
+- **Decomposition trigger** for `gelu_mul` / `add_rmsnorm` /
+  `rmsnorm_rope` fires when training is active (clear_flags lacks
+  `.No_Gradients`). bf16 inference still uses fused.
+- **Attention forward dispatch in bf16** routes to
+  `attention_train_bf16` (materialises softmax) when training, or
+  `attention_bf16` (flash) for inference.
 
-Gemma's forward uses additional ops beyond Llama:
-- `ml.gelu_mul` (PLE block)
-- `ml.tanh` (final softcap)
-- `ml.slice_trailing` (per-layer inputs)
-- `ml.add_rmsnorm` (fused residual + norm)
-- `ml.rmsnorm_rope` (fused norm + rope)
+What's still optional:
+1. **`llama.make` dtype param.** Today llama.make hardcodes `.F32`
+   for every weight tensor. Add a `dtype: ml.Data_Type = .F32`
+   parameter like `gemma.make` has, so Llama training examples can
+   pick their precision.
 
-`gemma.make` already has a `for_training: bool` argument that
-allocates the Gradient/Adam_M/Adam_V buffers, so the model side
-doesn't need changes — it's purely about backward kernel coverage.
+### Phase 3 — Gemma F32 training (DONE)
 
-What's needed:
+Shipped. F32 Gemma training works end-to-end on tiny config
+(4 layers, hidden=256, head_dim=64, vocab=256, seq_len=128). See
+`examples/gemma_shakespeare/main.odin`. Converges 4.93 → 1.91 over
+1500 steps at ~20k tok/s.
 
-1. **Tanh backward.** Standard `(1 - tanh^2(x)) * dy`. Trivial.
-2. **Slice_Trailing backward.** Output gradient is dy at offset
-   `[start, end)`; scatter it back into the wider input gradient.
-   Trivial.
-3. **Gelu_Mul.** Two options:
-   - Add a backward kernel for the fused op, OR
-   - Decompose at the `ml.gelu_mul` call site for training: emit a
-     `gelu` op + `mul` op instead. Requires a `gelu` (non-fused)
-     backward kernel which doesn't exist yet either, but it's a
-     standard unary backward.
-   - The decomposition path is cleaner and parallels how
-     `linear_q4_k_gate_up_geglu` decomposes when the capability bit
-     is missing.
-4. **Add_Rmsnorm.** Same options. Decomposition is `ml.add` then
-   `ml.rmsnorm` — both have f32 backward now. Just need to gate
-   the fused emission on a backend capability bit.
-5. **Rmsnorm_Rope.** Same options. Decomposition is `ml.rmsnorm`
-   then `ml.rope` — both have f32 backward.
+What landed:
 
-The capability gating model is already in place. CUDA's
-`Backend.capabilities` advertises `.Linear_Q4_K_Gate_Up_Geglu` and
-`.Rmsnorm_Rope_Write_Cache`; for training we'd add capability bits
-for the other fused ops and have CUDA either advertise them with
-backward kernels or omit them so `ml.gelu_mul` etc. decompose.
+- **Tanh backward.** `kernels/tanh/tanh_back_f32.cu`. Uses cached
+  forward output (`y = tanh(x)`); `dx += dy * (1 - y^2)`.
+- **Slice_Trailing backward.** `kernels/slice_trailing/slice_trailing_back_f32.cu`.
+  Each output element maps to one input element so no atomics needed.
+- **Gelu forward + backward.** `kernels/gelu/gelu_f32.cu` and
+  `gelu_back_f32.cu`. Matches the CPU tanh-approximation
+  formulation in `gelu_forward` / `gelu_backward`.
+- **Decomposition for fused ops in F32.** `ml.gelu_mul`,
+  `ml.add_rmsnorm`, and `ml.rmsnorm_rope` now check the input dtype
+  at the call site and decompose to unfused ops when input is F32.
+  Bf16 still uses the fused path (no backward needed for inference).
+  This avoids writing fused-op backward kernels.
+- **Per-layer-input frozen lookup.** Gemma's
+  `embed_tokens_per_layer_bytes` is host-side bytes, not a Tensor.
+  In training-from-scratch this is initialised to small normal
+  values via `_fill_per_layer_bytes_normal` and not updated by
+  Adam. Effectively a frozen learned embedding. Restructuring it as
+  a trainable Tensor is its own follow-up; the model still learns
+  fine without it being trainable.
+- **Const-scalar gradient buffers.** `_make_const_scalar` (embed_scale,
+  ple_token_scale, softcap, etc.) takes a `buffers: ml.Buffer_Set`
+  param now. In training mode `make` passes `.Data + .Gradient` so
+  `mul(x, scalar)` backward has somewhere to write. The scalars
+  themselves are excluded from `gemma.update`, so they stay constant.
+- **Gemma `randomize`, `update`, `copy` procs.** Mirror llama's,
+  iterate the right tensors, skip kv-shared layers correctly.
 
-### Phase 4 — pretrained weights for fine-tuning
+### Phase 4 — QLoRA on Gemma E4B (DONE)
 
-`gemma.load_safetensors` and `gemma.load_gguf` exist, but:
-- The GGUF loader produces Q4_K quantized weights that are
-  forward-only (no Linear_Q4_K backward exists on either backend).
-  Fine-tuning from GGUF would need either dequantization on load or
-  a Linear_Q4_K backward.
-- The safetensors loader produces bf16 weights. With Phase 2's
-  mixed-precision support, fine-tuning from safetensors should work
-  as soon as the backward kernels are bf16-capable.
+QLoRA training works: Q4_K-quantized base (frozen) + bf16 LoRA
+adapters on attention projections, all gradients F32.
+
+What landed:
+- **`networks/lora/lora.odin`** — generic LoRA Adapter struct (A,
+  B matrices + alpha/rank scale). `lora.apply(input, base_output,
+  adapter)` augments any base linear's output with the adapter
+  contribution. Standard QLoRA init: A ~ N(0, 0.02), B = 0.
+- **Gemma + LoRA integration** — `LoRA_Config` with rank/alpha and
+  per-target bit_set ({Q, K, V, O, Gate, Up, Down}). `gemma.make`
+  with `lora_cfg=...` allocates the base with `.Data`-only buffers
+  (frozen) and the adapters with full Adam state. `update_lora`
+  steps only adapter params; `randomize_lora` initialises them.
+- **Frozen-weight skip in linear/select/rmsnorm backwards** — when a
+  weight has no Gradient buffer the dW path is skipped (no crash,
+  no wasted compute). Same `if (dw) atomicAdd(...)` guard inside
+  the rmsnorm CUDA kernel.
+- **Q4_K / Q6_K linear forward for arbitrary M** — the existing M=1
+  mmvq paths are preserved for inference. M>1 dequantizes the Q4_K
+  / Q6_K weight to bf16 scratch (`dequantize_q4_k_to_bf16.cu`,
+  `dequantize_q6_k_to_bf16.cu`) and runs a Tensor-Core bf16 GEMM
+  with F32 accumulation/output.
+- **Q4_K / Q6_K linear backward** — computes dx only (W is frozen
+  by design): reuse cached dequantized W, cast f32 dy down to bf16,
+  Tensor-Core GEMM. No dW.
+- **Dequant cache** (`gctx.dequant_cache`) — keyed by source weight
+  pointer, value is the bf16 scratch from the activation pool.
+  Forward populates it; backward reads from it. Cleared in
+  `clear()` along with the activation pool. Speedup: ~4x measured
+  on E4B QLoRA (158 → 642 tok/s at step 30, still ramping when
+  measured).
+- **`examples/gemma_qlora`** — load E4B from GGUF, attach LoRA
+  adapters on attention projections, train on a tokenized text
+  corpus. Saves adapter weights as a simple binary at the end
+  (LORA0001 magic, per-layer (rank, in, out, A bytes, B bytes)).
+
+Memory budget on a 3090 Ti for E4B QLoRA:
+- Q4_K base weights: ~2 GB (kept in 4-bit)
+- bf16 embeddings (lm_head tied): ~1.34 GB
+- LoRA adapters + F32 grad + F32 Adam: ~30-50 MB
+- Activations + dequant scratch: ~3-5 GB at seq_len=256
+- Total: ~7-9 GB. Comfortable headroom on 24 GB.
 
 ### Phase 5 — fast cached sampling (optional)
 
@@ -162,7 +222,7 @@ back from git history if desired. Not on the critical path.
 
 ## Calibration notes
 
-### Loss curve (shakespeare, current f32 path)
+### Loss curve (shakespeare, llama, f32 path)
 - step 50:  4.67
 - step 500: 2.66 (val 2.56)
 - step 1000: 2.30 (val 2.31)
@@ -171,6 +231,26 @@ back from git history if desired. Not on the critical path.
 This is the post-bug-fix curve (the temp-allocator bug in
 `sample()` — see "Things tried that didn't move the headline" — was
 sampling-only, training itself was correct from the start).
+
+### Loss curve (shakespeare, tiny gemma, f32 path)
+- step 50:   4.93
+- step 500:  2.39 (val 2.35)
+- step 1000: 2.12 (val 2.07)
+- step 1500: 1.91 (val 1.96)
+
+Tiny config: 4 layers, hidden=256, head_dim=64 (sliding=full), 4 q
+heads, 2 kv heads, vocab=256, seq_len=128, sliding_window=64,
+final_logit_softcap=0, ple_dim=64. ~3.4M parameters. ~20k tok/s.
+
+### Loss curve (shakespeare, tiny gemma, bf16 path with F32 grads)
+- step 50:   4.96
+- step 500:  2.43 (val 2.40)
+- step 1000: 2.22 (val 2.17)
+
+Same config as F32, just `gemma.make(cfg, .Bf16, for_training=true)`.
+~21k tok/s on the 3090 Ti — matches F32 wall-clock. Per-step
+convergence is ~5% slower than F32 (bf16 precision cost on weight
+updates).
 
 ### Speed
 ~24k tokens/sec end-to-end on a 3090 Ti for the shakespeare config
