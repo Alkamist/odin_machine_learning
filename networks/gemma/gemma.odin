@@ -1,9 +1,5 @@
 package machine_learning_network_gemma
 
-// Gemma 4 text-only forward pass. Mirrors `transformers.models.gemma4.modeling_gemma4`
-// closely enough to match HF logits within bf16 tolerance. Only inference for now.
-// See `tools/gemma_dump.py` for the reference logits the loader+forward target.
-
 import "base:builtin"
 
 import "core:fmt"
@@ -91,9 +87,6 @@ config_rope_fraction :: proc(cfg: Config, layer_idx: int) -> f32 {
 	return cfg.rope_fraction_full if cfg.layer_types[layer_idx] == .Full else f32(1.0)
 }
 
-// `kv_source_layer_idx` returns the layer index that supplies K/V for `layer_idx`.
-// Returns `layer_idx` itself for non-shared layers (i.e. they compute their own K/V).
-// For shared layers it returns the last non-shared layer of the same attention type.
 @(require_results)
 kv_source_layer_idx :: proc(cfg: Config, layer_idx: int) -> int {
 	first_shared := cfg.num_hidden_layers - cfg.num_kv_shared_layers
@@ -111,38 +104,33 @@ kv_source_layer_idx :: proc(cfg: Config, layer_idx: int) -> int {
 
 @(require_results)
 is_kv_shared_layer :: proc(cfg: Config, layer_idx: int) -> bool {
-	if cfg.num_kv_shared_layers == 0 do return false
+	if cfg.num_kv_shared_layers == 0 {
+		return false
+	}
 	return layer_idx >= cfg.num_hidden_layers - cfg.num_kv_shared_layers
 }
 
 Layer :: struct {
-	// Pre/post norms around attention and the feedforward.
 	input_norm_weight:            ml.Tensor, // [hidden_size]
 	post_attention_norm_weight:   ml.Tensor, // [hidden_size]
 	pre_feedforward_norm_weight:  ml.Tensor, // [hidden_size]
 	post_feedforward_norm_weight: ml.Tensor, // [hidden_size]
 
-	// Attention. q/k/v_proj output widths follow the layer's head_dim.
 	q_proj_weight: ml.Tensor, // [num_attention_heads * head_dim, hidden_size]
-	q_norm_weight: ml.Tensor, // [head_dim] — pre-baked with sqrt(head_dim) for `scaling=1.0`
+	q_norm_weight: ml.Tensor, // [head_dim] pre-baked with sqrt(head_dim) for scaling=1.0
 	k_proj_weight: ml.Tensor, // [num_kv_heads * head_dim, hidden_size] (omitted for shared layers)
 	k_norm_weight: ml.Tensor, // [head_dim] (omitted for shared layers)
 	v_proj_weight: ml.Tensor, // [num_kv_heads * head_dim, hidden_size] (omitted for shared layers)
 	o_proj_weight: ml.Tensor, // [hidden_size, num_attention_heads * head_dim]
 
-	// Feedforward (GeGLU with tanh-approx GeLU).
 	gate_proj_weight: ml.Tensor, // [intermediate_size, hidden_size]
 	up_proj_weight:   ml.Tensor, // [intermediate_size, hidden_size]
 	down_proj_weight: ml.Tensor, // [hidden_size, intermediate_size]
 
-	// Per-Layer Embedding (PLE) block.
 	per_layer_input_gate_weight:      ml.Tensor, // [hidden_size_per_layer_input, hidden_size]
 	per_layer_projection_weight:      ml.Tensor, // [hidden_size, hidden_size_per_layer_input]
 	post_per_layer_input_norm_weight: ml.Tensor, // [hidden_size]
 
-	// Per-layer trained scale applied to the block's residual at the very end.
-	// HF: `hidden_states *= self.layer_scalar`. Shape `[1]` in the checkpoint;
-	// stored as a scalar in our forward.
 	layer_scalar: ml.Tensor, // [1]
 }
 
@@ -150,35 +138,20 @@ Gemma :: struct {
 	config: Config,
 	dtype:  ml.Data_Type,
 
-	// Token embedding (scaled by sqrt(hidden_size) at lookup time) and tied LM head.
 	embed_tokens_weight: ml.Tensor, // [vocab_size, hidden_size]
 	output_norm_weight:  ml.Tensor, // [hidden_size]
 	lm_head_weight:      ml.Tensor, // tied to embed_tokens_weight
 
 	layers: []Layer,
 
-	// Per-Layer Embedding global pieces.
-	//
-	// `embed_tokens_per_layer` is `[vocab_size, num_hidden_layers * ple_dim]`
-	// = ~5.6 GB at bf16 for E4B, which exceeds Vulkan's per-buffer
-	// `maxStorageBufferRange` (2 GiB on most drivers). Since it's only used
-	// for a per-token lookup across the prompt, we keep it as raw bytes on
-	// the host and upload only the looked-up `[T, num_layers * ple_dim]`
-	// slice to the GPU each forward.
 	embed_tokens_per_layer_bytes:      []byte,
-	embed_tokens_per_layer_row_bytes:  int, // bytes per vocab row
+	embed_tokens_per_layer_row_bytes:  int,       // bytes per vocab row
 	per_layer_model_projection_weight: ml.Tensor, // [num_hidden_layers * ple_dim, hidden_size]
 	per_layer_projection_norm_weight:  ml.Tensor, // [hidden_size_per_layer_input]
 
-	// V-norm has `with_scale=False` in HF — we feed `ml.rmsnorm` an all-ones constant
-	// so we don't need a no-scale variant of the op. Created per head_dim used.
 	v_norm_ones_sliding: ml.Tensor, // [head_dim_sliding]
 	v_norm_ones_full:    ml.Tensor, // [head_dim_full]
 
-	// Persistent shape-[1] tensors holding constants used every forward pass.
-	// Without these we'd build a fresh `ml.scalar(...)` each call, which forces
-	// a synchronous host-to-device upload (= submit + waitidle) inside the
-	// forward graph and dominates per-token latency.
 	embed_scale:         ml.Tensor, // sqrt(hidden_size)
 	ple_token_scale:     ml.Tensor, // sqrt(ple_dim)
 	ple_ctx_scale:       ml.Tensor, // 1 / sqrt(hidden_size)
@@ -195,12 +168,10 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 	model.dtype  = dtype
 	model.layers = builtin.make([]Layer, config.num_hidden_layers)
 
-	// Inference allocates only `.Data`; training adds `.Gradient`, `.Adam_M`,
-	// `.Adam_V` so the optimizer can store its moments. The 4× memory
-	// difference matters: 8B × 2 bytes × 4 buffers = 64 GB and trips the
-	// driver immediately, while inference only needs ~9 GB at bf16.
 	buffers := ml.Buffer_Set{.Data}
-	if for_training do buffers = ml.DEFAULT_PARAMETER_BUFFERS
+	if for_training {
+		buffers = ml.DEFAULT_PARAMETER_BUFFERS
+	}
 
 	make_w :: proc(dtype: ml.Data_Type, shape: []int, buffers: ml.Buffer_Set) -> ml.Tensor {
 		return ml.alloc(dtype, shape, persistent=true, buffers=buffers)
@@ -256,8 +227,6 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 		layer.layer_scalar                     = make_w(dtype, {1}, buffers)
 	}
 
-	// Scalars/scales live in the activation dtype so `ml.mul` doesn't need
-	// a per-call cast.
 	model.embed_scale       = _make_const_scalar(dtype, math.sqrt(f32(config.hidden_size)))
 	model.ple_token_scale   = _make_const_scalar(dtype, math.sqrt(f32(config.hidden_size_per_layer_input)))
 	model.ple_ctx_scale     = _make_const_scalar(dtype, 1.0 / math.sqrt(f32(config.hidden_size)))
@@ -287,11 +256,15 @@ _make_const_scalar :: proc(dtype: ml.Data_Type, value: f32) -> ml.Tensor {
 
 destroy :: proc(model: Gemma) {
 	_destroy_if_set :: proc(t: ml.Tensor) {
-		if t.backend != nil do ml.destroy(t)
+		if t.backend != nil {
+			ml.destroy(t)
+		}
 	}
 
 	ml.destroy(model.embed_tokens_weight)
-	if !model.config.tie_word_embeddings do ml.destroy(model.lm_head_weight)
+	if !model.config.tie_word_embeddings {
+		ml.destroy(model.lm_head_weight)
+	}
 	ml.destroy(model.output_norm_weight)
 
 	delete(model.embed_tokens_per_layer_bytes)
@@ -336,10 +309,6 @@ destroy :: proc(model: Gemma) {
 	delete(model.layers)
 }
 
-// Dispatch a linear projection on the weight tensor's dtype. The two
-// k-quant formats (Q4_K, Q6_K — used by the GGUF loader) bundle scales
-// into the weight bytes; for unquantized weights we fall through to
-// the dense `ml.linear` op.
 @(require_results)
 _linear :: proc(input, weight: ml.Tensor) -> ml.Tensor {
 	#partial switch weight.type {
@@ -349,10 +318,6 @@ _linear :: proc(input, weight: ml.Tensor) -> ml.Tensor {
 	return ml.linear(input, weight)
 }
 
-// FFN front-half: produces `gelu(input @ w_gate.T) * (input @ w_up.T)`.
-// Routes through ml.linear_q4_k_gate_up_geglu (single mmvq dispatch on
-// CUDA decode) when both weights are Q4_K; otherwise emits the unfused
-// gate / up / gelu_mul sequence.
 _gate_up_geglu :: proc(input, w_gate, w_up: ml.Tensor) -> ml.Tensor {
 	if w_gate.type == .Q4_K && w_up.type == .Q4_K {
 		return ml.linear_q4_k_gate_up_geglu(input, w_gate, w_up)
@@ -362,10 +327,6 @@ _gate_up_geglu :: proc(input, w_gate, w_up: ml.Tensor) -> ml.Tensor {
 	return ml.gelu_mul(gate, up)
 }
 
-// Compute the per-layer-input table once per forward, mirroring
-// `Gemma4TextModel.get_per_layer_inputs` + `project_per_layer_inputs`.
-// Output is `[token_count, num_hidden_layers * ple_dim]` packed; layer `l`'s
-// slice is `[:, l * ple_dim : (l + 1) * ple_dim]`.
 @(require_results)
 _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor) -> ml.Tensor {
 	cfg         := model.config
@@ -373,8 +334,6 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	token_count := builtin.len(tokens)
 	ple_total   := cfg.num_hidden_layers * ple_dim
 
-	// Token-identity component: lookup rows of the host-side per-layer
-	// embedding table, upload as a small `[T, ple_total]` GPU tensor.
 	row_bytes := model.embed_tokens_per_layer_row_bytes
 	lookup_buf := builtin.make([]byte, token_count * row_bytes, context.temp_allocator)
 	for tok, t in tokens {
@@ -385,12 +344,9 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	ml.set_data_bytes(token_identity, lookup_buf)
 	token_identity = ml.mul(token_identity, model.ple_token_scale)
 
-	// Context-aware component: project inputs_embeds, scale by 1/sqrt(hidden), reshape, RMSNorm.
 	ctx_proj := _linear(inputs_embeds, model.per_layer_model_projection_weight)
 	ctx_proj  = ml.mul(ctx_proj, model.ple_ctx_scale)
 
-	// rmsnorm operates on the trailing dim. View as [T*num_layers, ple_dim] so the
-	// norm runs across each layer-slice independently.
 	flat_shape := []int{token_count * cfg.num_hidden_layers, ple_dim}
 	ctx_proj    = ml.reshape(ctx_proj, flat_shape)
 	ctx_proj    = ml.rmsnorm(ctx_proj, model.per_layer_projection_norm_weight, cfg.rms_norm_eps)
@@ -401,11 +357,6 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	return combined
 }
 
-// Apply Q-norm (or K-norm) across each head independently. Input is
-// `[T, n_heads * head_dim]`; we reshape to `[T*n_heads, head_dim]` so rmsnorm
-// runs per head, then reshape back. Q-norm weights are pre-baked at load time
-// with `sqrt(head_dim)` so the resulting Q absorbs the `1/sqrt(head_dim)`
-// scaling that `ml.attention` applies internally.
 @(require_results)
 _qkv_norm :: proc(model: Gemma, x: ml.Tensor, weight: ml.Tensor, n_heads, head_dim: int, eps: f32) -> ml.Tensor {
 	token_count := x.shape[0]
@@ -416,15 +367,6 @@ _qkv_norm :: proc(model: Gemma, x: ml.Tensor, weight: ml.Tensor, n_heads, head_d
 	return ml.reshape(normed, out_shape)
 }
 
-// Per-layer K/V cache for incremental decoding. Shared layers (the last
-// `num_kv_shared_layers`) carry empty handles — `forward_cached` reuses the
-// source layer's K/V tensors directly within a single forward.
-//
-// Sliding-attention layers store only `sliding_window` rows. The cache is
-// laid out linearly in seq order; once it fills, the backend shifts contents
-// back by n_rows on each new write so the cache always holds the most
-// recent `sliding_window` tokens at slots [0..sliding_window). At 128k
-// context this cuts each sliding layer's cache from ~256MB to ~1MB.
 Layer_Cache :: struct {
 	k: ml.Tensor, // [t_capacity, num_kv_heads * head_dim] (t_capacity = sliding_window for sliding layers, t_max otherwise)
 	v: ml.Tensor,
@@ -444,7 +386,9 @@ cache_make :: proc(model: Gemma, t_max: int, allocator := context.allocator) -> 
 	cache.layers = builtin.make([]Layer_Cache, cfg.num_hidden_layers, allocator)
 
 	for i in 0 ..< cfg.num_hidden_layers {
-		if is_kv_shared_layer(cfg, i) do continue
+		if is_kv_shared_layer(cfg, i) {
+			continue
+		}
 		head_dim   := config_head_dim(cfg, i)
 		kv_size    := cfg.num_key_value_heads * head_dim
 		is_sliding := cfg.layer_types[i] == .Sliding
@@ -452,13 +396,18 @@ cache_make :: proc(model: Gemma, t_max: int, allocator := context.allocator) -> 
 		cache.layers[i].k = ml.alloc(model.dtype, {t_cap, kv_size}, persistent=true, buffers={.Data})
 		cache.layers[i].v = ml.alloc(model.dtype, {t_cap, kv_size}, persistent=true, buffers={.Data})
 	}
+
 	return
 }
 
 cache_destroy :: proc(cache: Cache) {
 	for layer_cache in cache.layers {
-		if layer_cache.k.rank > 0 do ml.destroy(layer_cache.k)
-		if layer_cache.v.rank > 0 do ml.destroy(layer_cache.v)
+		if layer_cache.k.rank > 0 {
+			ml.destroy(layer_cache.k)
+		}
+		if layer_cache.v.rank > 0 {
+			ml.destroy(layer_cache.v)
+		}
 	}
 	delete(cache.layers)
 }
@@ -473,9 +422,6 @@ forward :: proc(model: Gemma, tokens: []int) -> (logits: ml.Tensor) {
 	return
 }
 
-// Incremental forward: extends `cache` with `new_tokens` (a prompt prefill on
-// the first call, then 1-token decodes). Position offset is taken from
-// `cache.length`. Caller must ensure `cache.length + len(new_tokens) <= t_max`.
 @(require_results)
 forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logits: ml.Tensor) {
 	cfg := model.config
@@ -493,10 +439,9 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 	per_layer_inputs := _per_layer_inputs(model, new_tokens, inputs_embeds)
 	ple_dim := cfg.hidden_size_per_layer_input
 
-	// Per-layer K/V tensors produced in this forward. Shared layers reuse
-	// their source layer's K/V directly instead of slicing it back out of
-	// the cache buffer.
-	Step_KV :: struct { k, v: ml.Tensor }
+	Step_KV :: struct {
+		k, v: ml.Tensor
+	}
 	step_kvs := builtin.make([]Step_KV, cfg.num_hidden_layers, context.temp_allocator)
 
 	residual := embeds
@@ -513,10 +458,6 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 		q := _linear(hidden, layer.q_proj_weight)
 		q  = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
 
-		// Shared layers reuse the source layer's K/V tensors (computed
-		// earlier in this same forward) and write into the source layer's
-		// cache buffer — `attention_with_cache` re-writes the same rows
-		// idempotently.
 		cache_layer_idx := layer_idx if !is_kv_shared_layer(cfg, layer_idx) else kv_source_layer_idx(cfg, layer_idx)
 		k_cache := cache.layers[cache_layer_idx].k
 		v_cache := cache.layers[cache_layer_idx].v
@@ -540,10 +481,13 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 		attn := ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window)
 		attn  = _linear(attn, layer.o_proj_weight)
 		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
+	
 		mlp_in: ml.Tensor
 		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
-		mlp    := _linear(_gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight), layer.down_proj_weight)
-		mlp     = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
+
+		mlp := _linear(_gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight), layer.down_proj_weight)
+		mlp  = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
+
 		residual = ml.add(residual, mlp)
 
 		ple_input := ml.slice_trailing(per_layer_inputs, layer_idx * ple_dim, (layer_idx + 1) * ple_dim)
@@ -557,43 +501,37 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 	}
 
 	final_hidden := ml.rmsnorm(residual, model.output_norm_weight, cfg.rms_norm_eps)
+
 	logits = _linear(final_hidden, model.lm_head_weight)
 	if cfg.final_logit_softcapping > 0 {
 		logits = ml.mul(logits, model.softcap_inv)
 		logits = ml.tanh(logits)
 		logits = ml.mul(logits, model.softcap)
 	}
-	if logits.type != .F32 do logits = ml.cast_to(logits, .F32)
+	if logits.type != .F32 {
+		logits = ml.cast_to(logits, .F32)
+	}
 
 	cache.length += token_count
+
 	return
 }
 
-// Variant that also returns the post-final-norm hidden state (the value that
-// feeds into `lm_head`). Useful for parity tests against HF reference.
 @(require_results)
 forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidden: ml.Tensor) {
 	cfg := model.config
 
-	// Scaled token embedding.
 	embeds := ml.select(model.embed_tokens_weight, tokens)
 	embeds  = ml.mul(embeds, model.embed_scale)
 	inputs_embeds := embeds
 
-	// Per-Layer Embedding inputs, shared across the layer loop.
 	per_layer_inputs := _per_layer_inputs(model, tokens, inputs_embeds)
 	ple_dim := cfg.hidden_size_per_layer_input
 
 	residual := embeds
 
-	// Cache K/V from the last non-shared layer of each attention type so shared
-	// layers can reuse them. Indexed by source layer index.
-	shared_keys:   map[int]ml.Tensor
-	shared_values: map[int]ml.Tensor
-	shared_keys.allocator   = context.temp_allocator
-	shared_values.allocator = context.temp_allocator
-	defer delete(shared_keys)
-	defer delete(shared_values)
+	shared_keys   := builtin.make(map[int]ml.Tensor, allocator=context.temp_allocator)
+	shared_values := builtin.make(map[int]ml.Tensor, allocator=context.temp_allocator)
 
 	for layer, layer_idx in model.layers {
 		head_dim      := config_head_dim(cfg, layer_idx)
@@ -602,7 +540,6 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		is_sliding    := cfg.layer_types[layer_idx] == .Sliding
 		window        := cfg.sliding_window if is_sliding else 0
 
-		// Pre-attn norm.
 		hidden := ml.rmsnorm(residual, layer.input_norm_weight, cfg.rms_norm_eps)
 
 		q := _linear(hidden, layer.q_proj_weight)
@@ -621,7 +558,6 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 			v = _linear(hidden, layer.v_proj_weight)
 			v = _qkv_norm(model, v, v_norm_ones, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
 
-			// Stash for any later shared layer of the same type.
 			shared_keys  [layer_idx] = k
 			shared_values[layer_idx] = v
 		}
@@ -630,14 +566,12 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		attn  = _linear(attn, layer.o_proj_weight)
 		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
 
-		// Feedforward.
 		mlp_in: ml.Tensor
 		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
 		mlp     := _linear(_gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight), layer.down_proj_weight)
 		mlp      = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
 		residual = ml.add(residual, mlp)
 
-		// Per-Layer Embedding residual block.
 		ple_input := ml.slice_trailing(per_layer_inputs, layer_idx * ple_dim, (layer_idx + 1) * ple_dim)
 		ple       := _linear(residual, layer.per_layer_input_gate_weight)
 		ple        = ml.gelu_mul(ple, ple_input)
@@ -645,7 +579,6 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		ple        = ml.rmsnorm(ple, layer.post_per_layer_input_norm_weight, cfg.rms_norm_eps)
 		residual   = ml.add(residual, ple)
 
-		// Per-layer trained scale.
 		residual = ml.mul(residual, layer.layer_scalar)
 	}
 

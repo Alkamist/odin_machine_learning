@@ -33,7 +33,9 @@ rolling_append :: proc(rolling: ^Rolling_f32($N), value: f32) {
 }
 
 rolling_average :: proc(rolling: Rolling_f32($N)) -> (res: f32) {
-	if rolling.len == 0 do return
+	if rolling.len == 0 {
+		return
+	}
 
 	for i in 0 ..< rolling.len {
 		res += rolling_value(rolling, i)
@@ -100,8 +102,12 @@ rotate :: proc(v: [2]f32, angle: f32) -> [2]f32 {
 @(require_results)
 normalize_angle :: proc(angle: f32) -> f32 {
 	result := angle
-	for result >  180.0 do result -= 360.0
-	for result < -180.0 do result += 360.0
+	for result >  180.0 {
+		result -= 360.0
+	}
+	for result < -180.0 {
+		result += 360.0
+	}
 	return result
 }
 

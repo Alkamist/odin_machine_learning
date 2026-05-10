@@ -194,7 +194,9 @@ _test_q6k_constructed_block :: proc() -> bool {
 // bugs) without requiring an external reference.
 _test_real_tensors :: proc(path: string) -> bool {
 	loader, ok := gguf.load(path)
-	if !ok do return false
+	if !ok {
+		return false
+	}
 	defer gguf.destroy(loader)
 
 	q4k_ok := _check_first_of_type(loader, .Q4_K)
@@ -204,20 +206,30 @@ _test_real_tensors :: proc(path: string) -> bool {
 
 _check_first_of_type :: proc(loader: gguf.Loader, ty: gguf.Tensor_Type) -> bool {
 	for name, info in loader.tensors {
-		if info.type != ty do continue
+		if info.type != ty {
+			continue
+		}
 		bytes, bytes_ok := gguf.get_bytes(loader, name)
-		if !bytes_ok do return false
+		if !bytes_ok {
+			return false
+		}
 
 		// Element count = product of shape dims.
 		count := 1
-		for d in info.shape do count *= d
+		for d in info.shape {
+			count *= d
+		}
 
 		// Dequantize at most the first ~4096 weights (16 Q4_K blocks or
 		// Q6_K blocks) so the test stays fast.
 		max_count := count
-		if max_count > 4096 do max_count = 4096
+		if max_count > 4096 {
+			max_count = 4096
+		}
 		max_count -= max_count % gguf.QK_K
-		if max_count == 0 do max_count = gguf.QK_K
+		if max_count == 0 {
+			max_count = gguf.QK_K
+		}
 
 		bytes_per_block := 0
 		#partial switch ty {
@@ -244,8 +256,12 @@ _check_first_of_type :: proc(loader: gguf.Loader, ty: gguf.Tensor_Type) -> bool 
 				inf_count += 1
 			} else {
 				a := v
-				if a < 0 do a = -a
-				if a > max_abs do max_abs = a
+				if a < 0 {
+					a = -a
+				}
+				if a > max_abs {
+					max_abs = a
+				}
 			}
 		}
 		fmt.printfln("    %v %v shape=%v max_abs=%.4f", ty, name, info.shape, max_abs)

@@ -100,6 +100,8 @@ main :: proc() {
 			&any_failed)
 	}
 
-	if any_failed do os.exit(1)
+	if any_failed {
+		os.exit(1)
+	}
 	fmt.println("ok")
 }

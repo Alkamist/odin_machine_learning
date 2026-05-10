@@ -114,7 +114,9 @@ main :: proc() {
 		fmt.println("(skipping real-tensor parity; pass GGUF path as first arg to enable)")
 	}
 
-	if any_failed do os.exit(1)
+	if any_failed {
+		os.exit(1)
+	}
 	fmt.println("ok")
 }
 
@@ -153,9 +155,13 @@ _make_synthetic_q6_k_bytes :: proc(rows: int) -> []byte {
 	for r in 0 ..< rows {
 		base := r * ml.Q6_K_BLOCK_BYTES
 		// ql[128]
-		for i in 0 ..< 128 do out[base +   0 + i] = u8(_lcg(&state) & 0xFF)
+		for i in 0 ..< 128 {
+			out[base +   0 + i] = u8(_lcg(&state) & 0xFF)
+		}
 		// qh[64]
-		for i in 0 ..<  64 do out[base + 128 + i] = u8(_lcg(&state) & 0xFF)
+		for i in 0 ..<  64 {
+			out[base + 128 + i] = u8(_lcg(&state) & 0xFF)
+		}
 		// scales[16] (i8). Modest magnitudes to keep dequant bounded.
 		for i in 0 ..<  16 {
 			s := i8(_lcg(&state) & 0xFF) >> 5 // Â±3-ish
@@ -303,9 +309,15 @@ _run_real_for_type :: proc(loader: gguf.Loader, ty: gguf.Tensor_Type, any_failed
 	chosen_info: gguf.Tensor_Info
 	found := false
 	for name, info in loader.tensors {
-		if info.type != ty do continue
-		if len(info.shape) != 2 do continue
-		if info.shape[1] % ml.K_QUANT_BLOCK_SIZE != 0 do continue
+		if info.type != ty {
+			continue
+		}
+		if len(info.shape) != 2 {
+			continue
+		}
+		if info.shape[1] % ml.K_QUANT_BLOCK_SIZE != 0 {
+			continue
+		}
 		// Pick the tensor with the smallest output_size Ã— input_size product
 		// to keep the test fast. Real Gemma 4 E4B Q6_K tensors all have
 		// output_size = 2560 (vocab/hidden dim), so capping output_size alone
@@ -586,12 +598,20 @@ _compare_with_tolerance_eps :: proc(got, expected: []ml.Bf16, label: string, any
 		g := ml.bf16_to_f32(got[i])
 		e := ml.bf16_to_f32(expected[i])
 		diff := g - e
-		if diff < 0 do diff = -diff
-		if diff > max_abs_err do max_abs_err = diff
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > max_abs_err {
+			max_abs_err = diff
+		}
 		ae := e
-		if ae < 0 do ae = -ae
+		if ae < 0 {
+			ae = -ae
+		}
 		rel := diff / (ae + abs_tol)
-		if rel > max_rel_err do max_rel_err = rel
+		if rel > max_rel_err {
+			max_rel_err = rel
+		}
 		if first_bad < 0 && diff > rel_tol * ae + abs_tol && !math.is_nan(g) {
 			first_bad = i
 		}
@@ -620,12 +640,20 @@ _compare_with_tolerance :: proc(got, expected: []ml.Bf16, label: string, any_fai
 		g := ml.bf16_to_f32(got[i])
 		e := ml.bf16_to_f32(expected[i])
 		diff := g - e
-		if diff < 0 do diff = -diff
-		if diff > max_abs_err do max_abs_err = diff
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > max_abs_err {
+			max_abs_err = diff
+		}
 		ae := e
-		if ae < 0 do ae = -ae
+		if ae < 0 {
+			ae = -ae
+		}
 		rel := diff / (ae + ABS_TOL)
-		if rel > max_rel_err do max_rel_err = rel
+		if rel > max_rel_err {
+			max_rel_err = rel
+		}
 		if first_bad < 0 && diff > REL_TOL * ae + ABS_TOL && !math.is_nan(g) {
 			first_bad = i
 		}
@@ -670,10 +698,18 @@ _run_real_gpu_coopmat_q4_k :: proc(loader: gguf.Loader, any_failed: ^bool) {
 	chosen_info: gguf.Tensor_Info
 	found := false
 	for name, info in loader.tensors {
-		if info.type != .Q4_K do continue
-		if len(info.shape) != 2 do continue
-		if info.shape[0] % 64 != 0 do continue
-		if info.shape[1] % 64 != 0 do continue
+		if info.type != .Q4_K {
+			continue
+		}
+		if len(info.shape) != 2 {
+			continue
+		}
+		if info.shape[0] % 64 != 0 {
+			continue
+		}
+		if info.shape[1] % 64 != 0 {
+			continue
+		}
 		if !found || info.shape[0] * info.shape[1] < chosen_info.shape[0] * chosen_info.shape[1] {
 			chosen_name = name
 			chosen_info = info
@@ -743,10 +779,18 @@ _run_real_gpu_coopmat_q6_k :: proc(loader: gguf.Loader, any_failed: ^bool) {
 	chosen_info: gguf.Tensor_Info
 	found := false
 	for name, info in loader.tensors {
-		if info.type != .Q6_K do continue
-		if len(info.shape) != 2 do continue
-		if info.shape[0] % 64 != 0 do continue
-		if info.shape[1] % 64 != 0 do continue
+		if info.type != .Q6_K {
+			continue
+		}
+		if len(info.shape) != 2 {
+			continue
+		}
+		if info.shape[0] % 64 != 0 {
+			continue
+		}
+		if info.shape[1] % 64 != 0 {
+			continue
+		}
 		if !found || info.shape[0] * info.shape[1] < chosen_info.shape[0] * chosen_info.shape[1] {
 			chosen_name = name
 			chosen_info = info
@@ -812,11 +856,19 @@ _run_real_gpu_for_type :: proc(loader: gguf.Loader, ty: gguf.Tensor_Type, any_fa
 	chosen_info: gguf.Tensor_Info
 	found := false
 	for name, info in loader.tensors {
-		if info.type != ty do continue
-		if len(info.shape) != 2 do continue
-		if info.shape[1] % ml.K_QUANT_BLOCK_SIZE != 0 do continue
+		if info.type != ty {
+			continue
+		}
+		if len(info.shape) != 2 {
+			continue
+		}
+		if info.shape[1] % ml.K_QUANT_BLOCK_SIZE != 0 {
+			continue
+		}
 		// Even output_size required by ROWS_PER_WG=2.
-		if info.shape[0] % 2 != 0 do continue
+		if info.shape[0] % 2 != 0 {
+			continue
+		}
 		if !found || info.shape[0] * info.shape[1] < chosen_info.shape[0] * chosen_info.shape[1] {
 			chosen_name = name
 			chosen_info = info

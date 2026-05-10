@@ -23,7 +23,7 @@ import "core:slice"
 //   pad to alignment
 //   tensor data blob
 
-GGUF_MAGIC             :: u32(0x4655_4747) // 'GGUF' little-endian
+GGUF_MAGIC             :: 0x4655_4747 // 'GGUF' little-endian
 GGUF_DEFAULT_ALIGNMENT :: 32
 
 Value_Type :: enum u32 {
@@ -199,7 +199,9 @@ load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, o
 		}
 
 		element_count := 1
-		for d in shape do element_count *= d
+		for d in shape {
+			element_count *= d
+		}
 
 		ty := Tensor_Type(ty_raw)
 		bc, bc_ok := _byte_count(ty, element_count)
@@ -261,7 +263,9 @@ get_info :: proc(loader: Loader, name: string) -> (info: Tensor_Info, ok: bool) 
 @(require_results)
 get_bytes :: proc(loader: Loader, name: string) -> ([]byte, bool) {
 	info, ok := loader.tensors[name]
-	if !ok do return nil, false
+	if !ok {
+		return nil, false
+	}
 	start := loader.data_start + info.data_offset
 	return loader.bytes[start : start + info.byte_count], true
 }
@@ -276,42 +280,54 @@ shapes_match :: proc(a, b: []int) -> bool {
 @(require_results)
 get_u32 :: proc(loader: Loader, key: string) -> (u32, bool) {
 	entry, found := loader.kv[key]
-	if !found || entry.type != .U32 do return 0, false
+	if !found || entry.type != .U32 {
+		return 0, false
+	}
 	return u32((^u32le)(raw_data(loader.bytes[entry.value_offset:]))^), true
 }
 
 @(require_results)
 get_i32 :: proc(loader: Loader, key: string) -> (i32, bool) {
 	entry, found := loader.kv[key]
-	if !found || entry.type != .I32 do return 0, false
+	if !found || entry.type != .I32 {
+		return 0, false
+	}
 	return i32((^i32le)(raw_data(loader.bytes[entry.value_offset:]))^), true
 }
 
 @(require_results)
 get_u64 :: proc(loader: Loader, key: string) -> (u64, bool) {
 	entry, found := loader.kv[key]
-	if !found || entry.type != .U64 do return 0, false
+	if !found || entry.type != .U64 {
+		return 0, false
+	}
 	return u64((^u64le)(raw_data(loader.bytes[entry.value_offset:]))^), true
 }
 
 @(require_results)
 get_i64 :: proc(loader: Loader, key: string) -> (i64, bool) {
 	entry, found := loader.kv[key]
-	if !found || entry.type != .I64 do return 0, false
+	if !found || entry.type != .I64 {
+		return 0, false
+	}
 	return i64((^i64le)(raw_data(loader.bytes[entry.value_offset:]))^), true
 }
 
 @(require_results)
 get_f32 :: proc(loader: Loader, key: string) -> (f32, bool) {
 	entry, found := loader.kv[key]
-	if !found || entry.type != .F32 do return 0, false
+	if !found || entry.type != .F32 {
+		return 0, false
+	}
 	return f32((^f32le)(raw_data(loader.bytes[entry.value_offset:]))^), true
 }
 
 @(require_results)
 get_bool :: proc(loader: Loader, key: string) -> (bool, bool) {
 	entry, found := loader.kv[key]
-	if !found || entry.type != .Bool do return false, false
+	if !found || entry.type != .Bool {
+		return false, false
+	}
 	return loader.bytes[entry.value_offset] != 0, true
 }
 
@@ -319,7 +335,9 @@ get_bool :: proc(loader: Loader, key: string) -> (bool, bool) {
 @(require_results)
 get_str :: proc(loader: Loader, key: string) -> (string, bool) {
 	entry, found := loader.kv[key]
-	if !found || entry.type != .String do return "", false
+	if !found || entry.type != .String {
+		return "", false
+	}
 	return _peek_str(loader.bytes, entry.value_offset)
 }
 
@@ -328,7 +346,9 @@ get_str :: proc(loader: Loader, key: string) -> (string, bool) {
 @(require_results)
 get_array_meta :: proc(loader: Loader, key: string) -> (elem_type: Value_Type, count: int, payload_offset: int, ok: bool) {
 	entry, found := loader.kv[key]
-	if !found || entry.type != .Array do return {}, 0, 0, false
+	if !found || entry.type != .Array {
+		return {}, 0, 0, false
+	}
 	return entry.array_type, entry.array_count, entry.value_offset + 12, true
 }
 
@@ -337,11 +357,15 @@ get_array_meta :: proc(loader: Loader, key: string) -> (elem_type: Value_Type, c
 @(require_results)
 get_array_str :: proc(loader: Loader, key: string, index: int) -> (string, bool) {
 	elem_type, count, base, ok := get_array_meta(loader, key)
-	if !ok || elem_type != .String || index < 0 || index >= count do return "", false
+	if !ok || elem_type != .String || index < 0 || index >= count {
+		return "", false
+	}
 	off := base
 	for _ in 0 ..< index {
 		s, s_ok := _peek_str(loader.bytes, off)
-		if !s_ok do return "", false
+		if !s_ok {
+			return "", false
+		}
 		off += 8 + len(s)
 	}
 	return _peek_str(loader.bytes, off)
@@ -356,7 +380,9 @@ Reader :: struct {
 
 @(require_results)
 _read_u32 :: proc(r: ^Reader) -> (u32, bool) {
-	if r.offset + 4 > len(r.bytes) do return 0, false
+	if r.offset + 4 > len(r.bytes) {
+		return 0, false
+	}
 	v := (^u32le)(raw_data(r.bytes[r.offset:]))^
 	r.offset += 4
 	return u32(v), true
@@ -364,7 +390,9 @@ _read_u32 :: proc(r: ^Reader) -> (u32, bool) {
 
 @(require_results)
 _read_u64 :: proc(r: ^Reader) -> (u64, bool) {
-	if r.offset + 8 > len(r.bytes) do return 0, false
+	if r.offset + 8 > len(r.bytes) {
+		return 0, false
+	}
 	v := (^u64le)(raw_data(r.bytes[r.offset:]))^
 	r.offset += 8
 	return u64(v), true
@@ -374,9 +402,13 @@ _read_u64 :: proc(r: ^Reader) -> (u64, bool) {
 @(require_results)
 _read_str :: proc(r: ^Reader, file_bytes: []byte) -> (string, bool) {
 	n, n_ok := _read_u64(r)
-	if !n_ok do return "", false
+	if !n_ok {
+		return "", false
+	}
 	end := r.offset + int(n)
-	if end > len(r.bytes) do return "", false
+	if end > len(r.bytes) {
+		return "", false
+	}
 	s := string(file_bytes[r.offset:end])
 	r.offset = end
 	return s, true
@@ -384,9 +416,13 @@ _read_str :: proc(r: ^Reader, file_bytes: []byte) -> (string, bool) {
 
 @(require_results)
 _peek_str :: proc(bytes: []byte, off: int) -> (string, bool) {
-	if off + 8 > len(bytes) do return "", false
+	if off + 8 > len(bytes) {
+		return "", false
+	}
 	n := int((^u64le)(raw_data(bytes[off:]))^)
-	if off + 8 + n > len(bytes) do return "", false
+	if off + 8 + n > len(bytes) {
+		return "", false
+	}
 	return string(bytes[off + 8 : off + 8 + n]), true
 }
 
@@ -400,12 +436,16 @@ _skip_scalar_payload :: proc(r: ^Reader, ty: Value_Type) -> bool {
 	case .U64, .I64, .F64:          bytes_to_skip = 8
 	case .String:
 		n, n_ok := _read_u64(r)
-		if !n_ok do return false
+		if !n_ok {
+			return false
+		}
 		bytes_to_skip = int(n)
 	case:
 		return false
 	}
-	if r.offset + bytes_to_skip > len(r.bytes) do return false
+	if r.offset + bytes_to_skip > len(r.bytes) {
+		return false
+	}
 	r.offset += bytes_to_skip
 	return true
 }
@@ -415,25 +455,37 @@ _skip_array_payload :: proc(r: ^Reader, elem_type: Value_Type, count: int) -> bo
 	#partial switch elem_type {
 	case .U8, .I8, .Bool:
 		need := count
-		if r.offset + need > len(r.bytes) do return false
+		if r.offset + need > len(r.bytes) {
+			return false
+		}
 		r.offset += need
 	case .U16, .I16:
 		need := count * 2
-		if r.offset + need > len(r.bytes) do return false
+		if r.offset + need > len(r.bytes) {
+			return false
+		}
 		r.offset += need
 	case .U32, .I32, .F32:
 		need := count * 4
-		if r.offset + need > len(r.bytes) do return false
+		if r.offset + need > len(r.bytes) {
+			return false
+		}
 		r.offset += need
 	case .U64, .I64, .F64:
 		need := count * 8
-		if r.offset + need > len(r.bytes) do return false
+		if r.offset + need > len(r.bytes) {
+			return false
+		}
 		r.offset += need
 	case .String:
 		for _ in 0 ..< count {
 			n, n_ok := _read_u64(r)
-			if !n_ok do return false
-			if r.offset + int(n) > len(r.bytes) do return false
+			if !n_ok {
+				return false
+			}
+			if r.offset + int(n) > len(r.bytes) {
+				return false
+			}
 			r.offset += int(n)
 		}
 	case:
@@ -466,7 +518,9 @@ _byte_count :: proc(ty: Tensor_Type, element_count: int) -> (int, bool) {
 
 @(require_results)
 _block_bytes :: proc(element_count, block_elements, block_bytes: int) -> (int, bool) {
-	if element_count % block_elements != 0 do return 0, false
+	if element_count % block_elements != 0 {
+		return 0, false
+	}
 	return (element_count / block_elements) * block_bytes, true
 }
 

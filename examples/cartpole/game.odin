@@ -35,16 +35,28 @@ human_action :: proc(previous: Action) -> (res: Action) {
 
 	res = previous
 
-	if rl.IsKeyPressed(.A) do res = .Left
-	if rl.IsKeyPressed(.D) do res = .Right
+	if rl.IsKeyPressed(.A) {
+		res = .Left
+	}
+	if rl.IsKeyPressed(.D) {
+		res = .Right
+	}
 
 	if rl.IsKeyReleased(.A) {
-		if rl.IsKeyDown(.D) do res = .Right
-		else                do res = .None
+		if rl.IsKeyDown(.D) {
+			res = .Right
+		}
+		else {
+			res = .None
+		}
 	}
 	if rl.IsKeyReleased(.D) {
-		if rl.IsKeyDown(.A) do res = .Left
-		else                do res = .None
+		if rl.IsKeyDown(.A) {
+			res = .Left
+		}
+		else {
+			res = .None
+		}
 	}
 
 	return
@@ -113,8 +125,12 @@ box_make :: proc(state: State, type: b2.BodyType, position, size: [2]f32, densit
 }
 
 box_destroy :: proc(box: Box) {
-	if box.shape != {} do b2.DestroyShape(box.shape, true)
-	if box.body  != {} do b2.DestroyBody(box.body)
+	if box.shape != {} {
+		b2.DestroyShape(box.shape, true)
+	}
+	if box.body  != {} {
+		b2.DestroyBody(box.body)
+	}
 }
 
 box_update :: proc(box: ^Box) {
@@ -173,9 +189,15 @@ init :: proc(state: ^State) {
 }
 
 destroy :: proc(state: ^State) {
-	if state.revolute_joint  != {} do b2.DestroyJoint(state.revolute_joint)
-	if state.prismatic_joint != {} do b2.DestroyJoint(state.prismatic_joint)
-	if state.anchor_body     != {} do b2.DestroyBody(state.anchor_body)
+	if state.revolute_joint  != {} {
+		b2.DestroyJoint(state.revolute_joint)
+	}
+	if state.prismatic_joint != {} {
+		b2.DestroyJoint(state.prismatic_joint)
+	}
+	if state.anchor_body     != {} {
+		b2.DestroyBody(state.anchor_body)
+	}
 	box_destroy(state.pole)
 	box_destroy(state.cart)
 	box_destroy(state.left_wall)
@@ -184,9 +206,15 @@ destroy :: proc(state: ^State) {
 }
 
 reset :: proc(state: ^State) {
-	if state.revolute_joint  != {} do b2.DestroyJoint(state.revolute_joint)
-	if state.prismatic_joint != {} do b2.DestroyJoint(state.prismatic_joint)
-	if state.anchor_body     != {} do b2.DestroyBody(state.anchor_body)
+	if state.revolute_joint  != {} {
+		b2.DestroyJoint(state.revolute_joint)
+	}
+	if state.prismatic_joint != {} {
+		b2.DestroyJoint(state.prismatic_joint)
+	}
+	if state.anchor_body     != {} {
+		b2.DestroyBody(state.anchor_body)
+	}
 	box_destroy(state.cart)
 	box_destroy(state.pole)
 	box_destroy(state.left_wall)

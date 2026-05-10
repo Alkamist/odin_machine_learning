@@ -42,7 +42,7 @@ SAMPLE_STEPS :: 50
 
 LEARNING_RATE :: 2e-4
 WEIGHT_DECAY  :: 0
-EMA_DECAY     :: f32(0.999)
+EMA_DECAY     :: 0.999
 SEED          :: 0xF10D1
 
 main :: proc() {
@@ -323,8 +323,12 @@ ema_make :: proc(params: []ml.Tensor, decay: f32) -> (ema: Ema) {
 }
 
 ema_destroy :: proc(ema: Ema) {
-	for s in ema.shadow do ml.destroy(s)
-	for b in ema.backup do delete(b)
+	for s in ema.shadow {
+		ml.destroy(s)
+	}
+	for b in ema.backup {
+		delete(b)
+	}
 	delete(ema.shadow)
 	delete(ema.backup)
 }
@@ -437,8 +441,12 @@ write_pgm_grid :: proc(path: string, samples: []f32, grid: int) {
 		for row in 0 ..< tile {
 			for col in 0 ..< tile {
 				value := (src[row * tile + col] + 1.0) * 0.5
-				if value < 0 do value = 0
-				if value > 1 do value = 1
+				if value < 0 {
+					value = 0
+				}
+				if value > 1 {
+					value = 1
+				}
 				dst_row := gy * tile + row
 				dst_col := gx * tile + col
 				pixels[dst_row * side + dst_col] = u8(value * 255.0)

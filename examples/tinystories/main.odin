@@ -35,11 +35,11 @@ SAMPLE_LEN   :: 200
 SAMPLE_TEMP  :: 0.8
 SAMPLE_TOP_K :: 40
 
-LEARNING_RATE :: f32(6e-4)
-MIN_LR_FRAC   :: f32(0.1)
+LEARNING_RATE :: 6e-4
+MIN_LR_FRAC   :: 0.1
 WARMUP_STEPS  :: 200
-WEIGHT_DECAY  :: f32(0.1)
-SEED          :: u64(0xC0FFEE)
+WEIGHT_DECAY  :: 0.1
+SEED          :: 0xC0FFEE
 
 CONFIG :: llama.Config{
 	layer_count       = 6,

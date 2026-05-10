@@ -936,7 +936,7 @@ main :: proc() {
 			got_y: [T * E]f32
 			ml.get_data(y, got_y[:])
 
-			tol :: f32(5e-2)
+			tol :: 5e-2
 			fwd_ok := true
 			for i in 0 ..< T * E {
 				if math.abs(got_y[i] - ref_out[i]) > tol { fwd_ok = false }
@@ -993,7 +993,7 @@ main :: proc() {
 			got_y: [T * E]f32
 			ml.get_data(y, got_y[:])
 
-			tol :: f32(5e-2)
+			tol :: 5e-2
 			fwd_ok := true
 			for i in 0 ..< T * E {
 				if math.abs(got_y[i] - ref_out[i]) > tol { fwd_ok = false }
@@ -1046,7 +1046,7 @@ main :: proc() {
 			got_out: [T * Q_E]f32
 			ml.get_data(y, got_out[:])
 
-			tol :: f32(5e-2)
+			tol :: 5e-2
 			fwd_ok := true
 			for i in 0 ..< T * Q_E {
 				if math.abs(got_out[i] - ref_out[i]) > tol { fwd_ok = false }
@@ -1452,7 +1452,7 @@ main :: proc() {
 				return out
 			}
 
-			BASE :: f32(10000)
+			BASE :: 10000
 			ref_y := rope_ref(x_src, BASE)
 
 			x_f32 := ml.tensor(x_src[:])
@@ -1463,7 +1463,7 @@ main :: proc() {
 
 			got_y: [N]f32
 			ml.get_data(y, got_y[:])
-			tol :: f32(5e-2)
+			tol :: 5e-2
 			fwd_ok := true
 			for i in 0 ..< N {
 				if math.abs(got_y[i] - ref_y[i]) > tol { fwd_ok = false }

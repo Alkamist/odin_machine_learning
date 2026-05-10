@@ -90,7 +90,9 @@ main :: proc() {
 			bf := make([]ml.Bf16, vocab_size)
 			defer delete(bf)
 			ml.get_data_bytes(logits, slice.bytes_from_ptr(raw_data(bf), vocab_size * 2))
-			for v, i in bf do row[i] = ml.bf16_to_f32(v)
+			for v, i in bf {
+				row[i] = ml.bf16_to_f32(v)
+			}
 		}
 		t_total := time.tick_since(t_step)
 		ml.clear()
@@ -139,19 +141,25 @@ main :: proc() {
 
 		overlap := 0
 		for id in ours_top {
-			for tid in theirs_top do if id == tid { overlap += 1; break }
+			for tid in theirs_top {
+				if id == tid { overlap += 1; break }
+			}
 		}
 
 		fmt.printfln("pos %v  ours top-5 = %v   theirs top-5 = %v   overlap=%v/5",
 			position, ours_top, theirs_top, overlap)
-		if overlap < 3 do any_failed = true
+		if overlap < 3 {
+			any_failed = true
+		}
 	}
 
 	max_abs_diff: f32
 	mean_abs_diff: f64
 	for i in 0 ..< builtin.len(all_logits) {
 		d := math.abs(all_logits[i] - expected_logits[i])
-		if d > max_abs_diff do max_abs_diff = d
+		if d > max_abs_diff {
+			max_abs_diff = d
+		}
 		mean_abs_diff += f64(d)
 	}
 	mean_abs_diff /= f64(builtin.len(all_logits))
@@ -167,11 +175,15 @@ main :: proc() {
 
 load_tokens :: proc(path: string) -> ([]int, bool) {
 	bytes, err := os.read_entire_file_from_path(path, context.allocator)
-	if err != nil do return nil, false
+	if err != nil {
+		return nil, false
+	}
 	defer delete(bytes)
 
 	count := int((^u32le)(raw_data(bytes))^)
-	if 4 + count * 4 > builtin.len(bytes) do return nil, false
+	if 4 + count * 4 > builtin.len(bytes) {
+		return nil, false
+	}
 
 	out := make([]int, count)
 	for i in 0 ..< count {
@@ -182,10 +194,14 @@ load_tokens :: proc(path: string) -> ([]int, bool) {
 
 load_tensor :: proc(path: string) -> ([]int, []f32, bool) {
 	bytes, err := os.read_entire_file_from_path(path, context.allocator)
-	if err != nil do return nil, nil, false
+	if err != nil {
+		return nil, nil, false
+	}
 	defer delete(bytes)
 
-	if string(bytes[0:4]) != "TNSR" do return nil, nil, false
+	if string(bytes[0:4]) != "TNSR" {
+		return nil, nil, false
+	}
 
 	rank := int((^u32le)(&bytes[4])^)
 	shape := make([]int, rank)
@@ -194,7 +210,9 @@ load_tensor :: proc(path: string) -> ([]int, []f32, bool) {
 	}
 
 	count := 1
-	for axis in shape do count *= axis
+	for axis in shape {
+		count *= axis
+	}
 
 	header := 8 + rank * 4
 	floats := make([]f32, count)
@@ -205,13 +223,17 @@ load_tensor :: proc(path: string) -> ([]int, []f32, bool) {
 
 top_k :: proc(values: []f32, k: int) -> []int {
 	indices := make([]int, builtin.len(values), context.temp_allocator)
-	for i in 0 ..< builtin.len(values) do indices[i] = i
+	for i in 0 ..< builtin.len(values) {
+		indices[i] = i
+	}
 
 	out := make([]int, k)
 	for slot in 0 ..< k {
 		best := slot
 		for j in slot + 1 ..< builtin.len(indices) {
-			if values[indices[j]] > values[indices[best]] do best = j
+			if values[indices[j]] > values[indices[best]] {
+				best = j
+			}
 		}
 		indices[slot], indices[best] = indices[best], indices[slot]
 		out[slot] = indices[slot]

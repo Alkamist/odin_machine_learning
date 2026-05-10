@@ -1318,7 +1318,7 @@ Rmsnorm :: struct {
 	eps:    f32,
 }
 
-RMSNORM_DEFAULT_EPS :: f32(1e-5)
+RMSNORM_DEFAULT_EPS :: 1e-5
 
 @(require_results)
 rmsnorm :: proc(input, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #caller_location) -> (output: Tensor) {
@@ -1469,7 +1469,9 @@ add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc :=
 	assert(weight.rank == 1, "add_rmsnorm weight must be 1-D", loc=loc)
 	assert(weight.shape[0] == a.shape[a.rank - 1], "add_rmsnorm weight length must equal trailing dim", loc=loc)
 	assert(eps > 0, "add_rmsnorm eps must be positive", loc=loc)
-	for d in 0 ..< a.rank do assert(a.shape[d] == b.shape[d], "add_rmsnorm a/b shape must match", loc=loc)
+	for d in 0 ..< a.rank {
+		assert(a.shape[d] == b.shape[d], "add_rmsnorm a/b shape must match", loc=loc)
+	}
 
 	residual_new = zeros_like(a, loc=loc)
 	normed       = zeros_like(a, loc=loc)

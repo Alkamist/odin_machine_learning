@@ -25,9 +25,9 @@ GGUF_PATH      :: DATA_DIR + "/model.gguf"
 TOKENIZER_PATH :: DATA_DIR + "/tokenizer.json"
 
 DEFAULT_MAX_TOKENS  :: 512
-DEFAULT_TEMPERATURE :: f32(0.8)
+DEFAULT_TEMPERATURE :: 0.8
 DEFAULT_TOP_K       :: 40
-DEFAULT_TOP_P       :: f32(0.95)
+DEFAULT_TOP_P       :: 0.95
 DEFAULT_T_MAX       :: 4096
 DEFAULT_CPU_ARENA   :: 2 * 1024 * 1024 * 1024
 DEFAULT_THREADS     :: 8
@@ -38,9 +38,9 @@ BOS_TEXT         :: "<bos>"
 
 main :: proc() {
 	max_new_tokens := DEFAULT_MAX_TOKENS
-	temperature    := DEFAULT_TEMPERATURE
+	temperature: f32 = DEFAULT_TEMPERATURE
 	top_k          := DEFAULT_TOP_K
-	top_p          := DEFAULT_TOP_P
+	top_p:       f32 = DEFAULT_TOP_P
 	t_max          := DEFAULT_T_MAX
 	use_cpu        := false
 	cpu_arena      := DEFAULT_CPU_ARENA
@@ -119,7 +119,9 @@ main :: proc() {
 
 	all_tokens: [dynamic]int
 	defer delete(all_tokens)
-	if bos_id >= 0 do append(&all_tokens, bos_id)
+	if bos_id >= 0 {
+		append(&all_tokens, bos_id)
+	}
 
 	fmt.println()
 	fmt.printfln("Gemma 4 chat (T=%.2f, top_k=%v, top_p=%.2f, t_max=%v, max_reply=%v).",
@@ -142,7 +144,9 @@ main :: proc() {
 			break
 		}
 		line = strings.trim_space(line)
-		if builtin.len(line) == 0 do continue
+		if builtin.len(line) == 0 {
+			continue
+		}
 
 		switch line {
 		case ":quit", ":exit", ":q":
@@ -150,7 +154,9 @@ main :: proc() {
 		case ":reset":
 			gemma.cache_reset(&cache)
 			clear(&all_tokens)
-			if bos_id >= 0 do append(&all_tokens, bos_id)
+			if bos_id >= 0 {
+				append(&all_tokens, bos_id)
+			}
 			fmt.println("(conversation reset)")
 			continue
 		}
@@ -184,8 +190,12 @@ main :: proc() {
 			for pos < n {
 				ml.clear({.No_Gradients})
 				take := PREFILL_CHUNK
-				if pos + take > n do take = n - pos
-				if take != PREFILL_CHUNK do take = 1
+				if pos + take > n {
+					take = n - pos
+				}
+				if take != PREFILL_CHUNK {
+					take = 1
+				}
 				chunk := new_tokens[pos : pos + take]
 				logits := gemma.forward_cached(model, &cache, chunk)
 				if pos + take == n {
@@ -229,7 +239,9 @@ main :: proc() {
 				previous_decoded_length = builtin.len(reply_so_far)
 			}
 
-			if step == max_new_tokens - 1 do break
+			if step == max_new_tokens - 1 {
+				break
+			}
 
 			ml.clear({.No_Gradients})
 			single := [1]int{next_id}
@@ -250,7 +262,9 @@ main :: proc() {
 			entries := gpu.timing_snapshot()
 			defer delete(entries)
 			gpu_total_ns: i64
-			for e in entries do gpu_total_ns += e.total_ns
+			for e in entries {
+				gpu_total_ns += e.total_ns
+			}
 			wall_ns := i64(time.duration_nanoseconds(time.tick_since(t_generate)))
 			gpu_ms_per_tok   := f64(gpu_total_ns) / f64(generated) / 1e6
 			wall_ms_per_tok  := f64(wall_ns)      / f64(generated) / 1e6
@@ -259,7 +273,9 @@ main :: proc() {
 				gpu_ms_per_tok, wall_ms_per_tok, gpu_pct)
 			shown := 0
 			for e in entries {
-				if shown >= 12 do break
+				if shown >= 12 {
+					break
+				}
 				avg_us := f64(e.total_ns) / f64(e.count) / 1e3
 				share  := 100.0 * f64(e.total_ns) / f64(gpu_total_ns) if gpu_total_ns > 0 else 0
 				fmt.printfln("    % 5.1f%%  % 7.1f us avg  x% -7d %s", share, avg_us, e.count, e.name)
@@ -277,15 +293,21 @@ read_line :: proc(buffer: []byte) -> (line: string, ok: bool) {
 	for cursor < builtin.len(buffer) {
 		n, err := os.read(os.stdin, one[:])
 		if err != nil || n == 0 {
-			if cursor == 0 do return "", false
+			if cursor == 0 {
+				return "", false
+			}
 			break
 		}
 		c := one[0]
-		if c == '\n' do break
+		if c == '\n' {
+			break
+		}
 		buffer[cursor] = c
 		cursor += 1
 	}
-	if cursor > 0 && buffer[cursor - 1] == '\r' do cursor -= 1
+	if cursor > 0 && buffer[cursor - 1] == '\r' {
+		cursor -= 1
+	}
 	return string(buffer[:cursor]), true
 }
 
@@ -293,14 +315,20 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 	n := builtin.len(logits)
 	if temperature <= 0 || top_k == 1 {
 		best := 0
-		for i in 1 ..< n do if logits[i] > logits[best] do best = i
+		for i in 1 ..< n {
+			if logits[i] > logits[best] {
+				best = i
+			}
+		}
 		return best
 	}
 
 	candidate_count := top_k > 0 ? min(top_k, n) : n
 	indices := make([]int, candidate_count, context.temp_allocator)
 
-	for i in 0 ..< candidate_count do indices[i] = i
+	for i in 0 ..< candidate_count {
+		indices[i] = i
+	}
 	for i := candidate_count / 2 - 1; i >= 0; i -= 1 {
 		_sift_down_min_logit(indices, logits, i, candidate_count)
 	}
@@ -322,7 +350,9 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 		probabilities[slot] = math.exp_f32((logits[indices[slot]] - max_logit) / temperature)
 		sum += probabilities[slot]
 	}
-	for slot in 0 ..< candidate_count do probabilities[slot] /= sum
+	for slot in 0 ..< candidate_count {
+		probabilities[slot] /= sum
+	}
 
 	keep := candidate_count
 	if top_p > 0 && top_p < 1 {
@@ -335,9 +365,13 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 			}
 		}
 		new_sum: f32
-		for slot in 0 ..< keep do new_sum += probabilities[slot]
+		for slot in 0 ..< keep {
+			new_sum += probabilities[slot]
+		}
 		if new_sum > 0 {
-			for slot in 0 ..< keep do probabilities[slot] /= new_sum
+			for slot in 0 ..< keep {
+				probabilities[slot] /= new_sum
+			}
 		}
 	}
 
@@ -345,7 +379,9 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 	cumulative: f32
 	for slot in 0 ..< keep {
 		cumulative += probabilities[slot]
-		if r <= cumulative do return indices[slot]
+		if r <= cumulative {
+			return indices[slot]
+		}
 	}
 	return indices[keep - 1]
 }
@@ -354,11 +390,15 @@ _sift_down_min_logit :: proc(indices: []int, logits: []f32, start, n: int) {
 	root := start
 	for {
 		child := 2 * root + 1
-		if child >= n do return
+		if child >= n {
+			return
+		}
 		if child + 1 < n && logits[indices[child + 1]] < logits[indices[child]] {
 			child += 1
 		}
-		if logits[indices[root]] <= logits[indices[child]] do return
+		if logits[indices[root]] <= logits[indices[child]] {
+			return
+		}
 		indices[root], indices[child] = indices[child], indices[root]
 		root = child
 	}
@@ -371,38 +411,54 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 		arg := args[i]
 		switch arg {
 		case "--max-tokens":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			max_new_tokens^ = _parse_int(args[i + 1])
 			i += 2
 		case "--temperature":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			temperature^ = f32(_parse_float(args[i + 1]))
 			i += 2
 		case "--top-k":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			top_k^ = _parse_int(args[i + 1])
 			i += 2
 		case "--top-p":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			top_p^ = f32(_parse_float(args[i + 1]))
 			i += 2
 		case "--t-max":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			t_max^ = _parse_int(args[i + 1])
 			i += 2
 		case "--cpu":
 			use_cpu^ = true
 			i += 1
 		case "--cpu-arena":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			cpu_arena^ = _parse_int(args[i + 1])
 			i += 2
 		case "--threads":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			threads^ = _parse_int(args[i + 1])
 			i += 2
 		case "--gguf":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			gguf_path^ = args[i + 1]
 			i += 2
 		case "--timing":
@@ -458,7 +514,9 @@ _parse_float :: proc(s: string) -> f64 {
 			in_frac = true
 		} else if c >= '0' && c <= '9' {
 			value = value * 10 + f64(c - '0')
-			if in_frac do scale *= 10
+			if in_frac {
+				scale *= 10
+			}
 		} else {
 			fmt.eprintfln("invalid float: %q", s)
 			os.exit(1)
@@ -484,7 +542,9 @@ _printer_proc :: proc(t: ^thread.Thread) {
 	p := (^Printer)(t.data)
 	for {
 		msg, ok := chan.recv(p.ch)
-		if !ok do return
+		if !ok {
+			return
+		}
 		fmt.print(msg)
 		os.flush(os.stdout)
 		delete(msg)
@@ -512,7 +572,9 @@ _printer_stop :: proc(p: ^Printer) {
 }
 
 _printer_emit :: proc(p: ^Printer, s: string) {
-	if builtin.len(s) == 0 do return
+	if builtin.len(s) == 0 {
+		return
+	}
 	cloned := strings.clone(s)
 	sync.wait_group_add(&p.pending, 1)
 	chan.send(p.ch, cloned)

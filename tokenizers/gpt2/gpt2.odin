@@ -1,11 +1,5 @@
 package gpt2_tokenizer
 
-// Byte-level BPE tokenizer compatible with the HuggingFace `tokenizer.json`
-// produced by SmolLM2 / GPT-2 / Llama-style models that use the
-// `Sequence(Digits{individual_digits=true}, ByteLevel{use_regex=true})`
-// pre-tokenizer. Encode pipeline: text → digit split → GPT-2 regex split →
-// byte-to-unicode remap → BPE merges → vocab IDs.
-
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
@@ -25,7 +19,7 @@ Tokenizer :: struct {
 	byte_to_unicode: [256]rune,
 	unicode_to_byte: map[rune]u8,
 
-	_json_root:      json.Value,
+	_json_root: json.Value,
 }
 
 @(require_results)
@@ -106,10 +100,14 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 		added_array, _ := added.(json.Array)
 		for entry in added_array {
 			entry_object, entry_object_ok := entry.(json.Object)
-			if !entry_object_ok do continue
+			if !entry_object_ok {
+				continue
+			}
 			content_string, content_ok := entry_object["content"].(string)
 			id_int, id_int_ok          := entry_object["id"].(json.Integer)
-			if content_ok && id_int_ok do tok.added_tokens[content_string] = int(id_int)
+			if content_ok && id_int_ok {
+				tok.added_tokens[content_string] = int(id_int)
+			}
 		}
 	}
 
@@ -148,7 +146,9 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) ->
 		clear(&encoded_buffer)
 		for byte_value in transmute([]u8)pretoken {
 			rune_bytes, rune_size := utf8.encode_rune(tok.byte_to_unicode[byte_value])
-			for k in 0 ..< rune_size do append(&encoded_buffer, rune_bytes[k])
+			for k in 0 ..< rune_size {
+				append(&encoded_buffer, rune_bytes[k])
+			}
 		}
 		encoded := string(encoded_buffer[:])
 
@@ -185,7 +185,9 @@ decode :: proc(tok: ^Tokenizer, ids: []int, allocator := context.allocator) -> s
 	output.allocator = allocator
 
 	for id in ids {
-		if id < 0 || id >= len(tok.id_to_piece) do continue
+		if id < 0 || id >= len(tok.id_to_piece) {
+			continue
+		}
 		piece := tok.id_to_piece[id]
 		for offset := 0; offset < len(piece); {
 			rune_value, rune_size := utf8.decode_rune_in_string(piece[offset:])
@@ -193,7 +195,9 @@ decode :: proc(tok: ^Tokenizer, ids: []int, allocator := context.allocator) -> s
 				append(&output, byte_value)
 			} else {
 				rune_bytes, rune_byte_count := utf8.encode_rune(rune_value)
-				for k in 0 ..< rune_byte_count do append(&output, rune_bytes[k])
+				for k in 0 ..< rune_byte_count {
+					append(&output, rune_bytes[k])
+				}
 			}
 			offset += rune_size
 		}
@@ -203,9 +207,15 @@ decode :: proc(tok: ^Tokenizer, ids: []int, allocator := context.allocator) -> s
 
 _init_byte_unicode_maps :: proc(tok: ^Tokenizer) {
 	visible: [256]bool
-	for byte_value in u8('!') ..= u8('~')      do visible[byte_value] = true
-	for byte_value in u8(0xA1) ..= u8(0xAC)    do visible[byte_value] = true
-	for byte_value in u8(0xAE) ..= u8(0xFF)    do visible[byte_value] = true
+	for byte_value in u8('!') ..= u8('~') {
+		visible[byte_value] = true
+	}
+	for byte_value in u8(0xA1) ..= u8(0xAC) {
+		visible[byte_value] = true
+	}
+	for byte_value in u8(0xAE) ..= u8(0xFF) {
+		visible[byte_value] = true
+	}
 
 	next_extra := rune(256)
 	for byte_value in 0 ..< 256 {
@@ -216,7 +226,9 @@ _init_byte_unicode_maps :: proc(tok: ^Tokenizer) {
 			next_extra += 1
 		}
 	}
-	for byte_value in 0 ..< 256 do tok.unicode_to_byte[tok.byte_to_unicode[byte_value]] = u8(byte_value)
+	for byte_value in 0 ..< 256 {
+		tok.unicode_to_byte[tok.byte_to_unicode[byte_value]] = u8(byte_value)
+	}
 }
 
 _pretokenize :: proc(text: string, out: ^[dynamic]string) {
@@ -224,7 +236,9 @@ _pretokenize :: proc(text: string, out: ^[dynamic]string) {
 	for offset := 0; offset < len(text); {
 		rune_value, rune_size := utf8.decode_rune_in_string(text[offset:])
 		if unicode.is_digit(rune_value) {
-			if offset > chunk_start do _gpt2_split(text[chunk_start:offset], out)
+			if offset > chunk_start {
+				_gpt2_split(text[chunk_start:offset], out)
+			}
 			append(out, text[offset:offset + rune_size])
 			offset += rune_size
 			chunk_start = offset
@@ -232,7 +246,9 @@ _pretokenize :: proc(text: string, out: ^[dynamic]string) {
 			offset += rune_size
 		}
 	}
-	if chunk_start < len(text) do _gpt2_split(text[chunk_start:], out)
+	if chunk_start < len(text) {
+		_gpt2_split(text[chunk_start:], out)
+	}
 }
 
 _gpt2_split :: proc(text: string, out: ^[dynamic]string) {
@@ -244,15 +260,14 @@ _gpt2_split :: proc(text: string, out: ^[dynamic]string) {
 	}
 }
 
-// Match one alternative of the GPT-2 byte-level pre-tokenizer regex
-// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
-// at byte position `start`, returning the matched length in bytes.
 _match_one :: proc(text: string, start: int) -> int {
 	first_rune, first_size := utf8.decode_rune_in_string(text[start:])
 
 	if first_rune == '\'' {
 		contraction_length := _match_contraction(text, start)
-		if contraction_length > 0 do return contraction_length
+		if contraction_length > 0 {
+			return contraction_length
+		}
 	}
 
 	if unicode.is_letter(first_rune) {
@@ -265,12 +280,12 @@ _match_one :: proc(text: string, start: int) -> int {
 		return first_size + _consume_run(text, start + first_size, _is_other_rune)
 	}
 
-	// `first_rune` is whitespace. Greedy whitespace run and its successor
-	// determine the alternative.
 	whitespace_end := start + first_size
 	for whitespace_end < len(text) {
 		next_rune, next_size := utf8.decode_rune_in_string(text[whitespace_end:])
-		if !unicode.is_space(next_rune) do break
+		if !unicode.is_space(next_rune) {
+			break
+		}
 		whitespace_end += next_size
 	}
 
@@ -297,7 +312,9 @@ _match_contraction :: proc(text: string, start: int) -> int {
 	rest := text[start:]
 	contractions := [?]string{"'re", "'ve", "'ll", "'s", "'t", "'m", "'d"}
 	for contraction in contractions {
-		if len(rest) >= len(contraction) && rest[:len(contraction)] == contraction do return len(contraction)
+		if len(rest) >= len(contraction) && rest[:len(contraction)] == contraction {
+			return len(contraction)
+		}
 	}
 	return 0
 }
@@ -306,7 +323,9 @@ _consume_run :: proc(text: string, start: int, predicate: proc(rune) -> bool) ->
 	offset := start
 	for offset < len(text) {
 		rune_value, rune_size := utf8.decode_rune_in_string(text[offset:])
-		if !predicate(rune_value) do break
+		if !predicate(rune_value) {
+			break
+		}
 		offset += rune_size
 	}
 	return offset - start
@@ -319,7 +338,9 @@ _is_other_rune  :: proc(r: rune) -> bool {
 }
 
 _apply_bpe :: proc(tok: ^Tokenizer, symbols: ^[dynamic]string, merge_buffer: ^[dynamic]string) {
-	if len(symbols) < 2 do return
+	if len(symbols) < 2 {
+		return
+	}
 
 	for {
 		best_rank  := max(int)
@@ -332,7 +353,9 @@ _apply_bpe :: proc(tok: ^Tokenizer, symbols: ^[dynamic]string, merge_buffer: ^[d
 				}
 			}
 		}
-		if best_index == -1 do break
+		if best_index == -1 {
+			break
+		}
 
 		first_symbol  := symbols[best_index]
 		second_symbol := symbols[best_index + 1]
@@ -351,6 +374,9 @@ _apply_bpe :: proc(tok: ^Tokenizer, symbols: ^[dynamic]string, merge_buffer: ^[d
 
 		clear(symbols)
 		append(symbols, ..merge_buffer[:])
-		if len(symbols) == 1 do break
+
+		if len(symbols) == 1 {
+			break
+		}
 	}
 }

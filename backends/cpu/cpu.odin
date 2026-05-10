@@ -43,14 +43,18 @@ when thread.IS_SUPPORTED {
 
 		for {
 			sync.sema_wait(&w.start_sem)
-			if _shutdown do return
+			if _shutdown {
+				return
+			}
 
 			d := _dispatch
 			if w.id < d.task_count {
 				chunk := (d.job_count + d.task_count - 1) / d.task_count
 				start := w.id * chunk
 				end   := start + chunk
-				if end > d.job_count do end = d.job_count
+				if end > d.job_count {
+					end = d.job_count
+				}
 
 				if start < end {
 					d.chunk_proc(start, end, d.data)
@@ -1510,7 +1514,9 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 
 		for b in 0 ..< count {
 			dout := output_grad_ptr[b * output_size + o]
-			if dout == 0 do continue
+			if dout == 0 {
+				continue
+			}
 			x := input_data_ptr[b * input_size:]
 			_simd_axpy_f32(w_grad, x, dout, input_size)
 		}
@@ -1531,7 +1537,9 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 
 		for o in 0 ..< output_size {
 			dout := dy[o]
-			if dout == 0 do continue
+			if dout == 0 {
+				continue
+			}
 			w_data := weight_data_ptr[o * input_size:]
 			_simd_axpy_f32(dx, w_data, dout, input_size)
 		}
@@ -3383,8 +3391,8 @@ attention_cache_forward :: proc(op: ml.Operation) {
 	cache_pos   := v.cache_position
 	t_capacity  := v.k_cache.shape[0]
 
-	k_new_bytes := transmute([]byte)v.key.buffers     [.Data]
-	v_new_bytes := transmute([]byte)v.value.buffers   [.Data]
+	k_new_bytes   := transmute([]byte)v.key.buffers    [.Data]
+	v_new_bytes   := transmute([]byte)v.value.buffers  [.Data]
 	k_cache_bytes := transmute([]byte)v.k_cache.buffers[.Data]
 	v_cache_bytes := transmute([]byte)v.v_cache.buffers[.Data]
 

@@ -1,12 +1,5 @@
 package gemma_tokenizer
 
-// SentencePiece-style byte-fallback BPE tokenizer compatible with the
-// HuggingFace `tokenizer.json` shipped with Gemma 4. Encode pipeline:
-// text → replace ' ' with '▁' → split into unicode scalars → byte-fallback
-// for scalars not in vocab → BPE merges → vocab IDs. Decode reverses the
-// pipeline, fusing adjacent `<0xHH>` byte tokens into raw bytes before
-// the final ▁→space replacement.
-
 import "base:builtin"
 
 import "core:encoding/json"
@@ -15,7 +8,7 @@ import "core:os"
 import "core:strings"
 import "core:unicode/utf8"
 
-WHITESPACE_PIECE :: "▁" // ▁ (U+2581 LOWER ONE EIGHTH BLOCK)
+WHITESPACE_PIECE :: "▁"
 
 Pair :: struct {
 	a, b: string,
@@ -26,9 +19,9 @@ Tokenizer :: struct {
 	id_to_piece:   []string,
 	merge_rank:    map[Pair]int,
 	added_tokens:  map[string]int,
-	byte_fallback: [256]int, // -1 if missing, else token id of `<0xHH>`
+	byte_fallback: [256]int,
 
-	_json_root:    json.Value,
+	_json_root: json.Value,
 }
 
 @(require_results)
@@ -90,9 +83,6 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 	}
 
 	for merge_value, merge_index in merges_array {
-		// HF Gemma writes merges as `[a, b]` arrays of two strings. Older
-		// HF tokenizers serialised them as `"a b"` space-joined strings;
-		// accept both for forward compatibility.
 		if merge_array, is_array := merge_value.(json.Array); is_array {
 			if len(merge_array) != 2 {
 				fmt.eprintfln("gemma.load: merge[%v] is not a 2-element array", merge_index)
@@ -122,7 +112,9 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 		}
 	}
 
-	for byte_value in 0 ..< 256 do tok.byte_fallback[byte_value] = -1
+	for byte_value in 0 ..< 256 {
+		tok.byte_fallback[byte_value] = -1
+	}
 	byte_token_buffer: [8]u8
 	for byte_value in 0 ..< 256 {
 		byte_token := fmt.bprintf(byte_token_buffer[:], "<0x%02X>", byte_value)
@@ -135,10 +127,14 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 		added_array, _ := added.(json.Array)
 		for entry in added_array {
 			entry_object, entry_object_ok := entry.(json.Object)
-			if !entry_object_ok do continue
+			if !entry_object_ok {
+				continue
+			}
 			content_string, content_ok := entry_object["content"].(string)
 			id_int, id_int_ok          := entry_object["id"].(json.Integer)
-			if content_ok && id_int_ok do tok.added_tokens[content_string] = int(id_int)
+			if content_ok && id_int_ok {
+				tok.added_tokens[content_string] = int(id_int)
+			}
 		}
 	}
 
@@ -158,17 +154,17 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) ->
 	ids: [dynamic]int
 	ids.allocator = allocator
 
-	// Pre-extract added/special tokens (e.g. `<bos>`, `<start_of_turn>`,
-	// `<end_of_turn>`) as single IDs. We scan left-to-right; at each cursor
-	// position we look for the longest matching added-token prefix and emit
-	// its ID directly. Text in the gaps goes through normal BPE.
 	cursor := 0
 	for cursor < len(text) {
 		match_content: string
 		match_id := -1
 		for content, id in tok.added_tokens {
-			if cursor + len(content) > len(text) do continue
-			if text[cursor:cursor + len(content)] != content do continue
+			if cursor + len(content) > len(text) {
+				continue
+			}
+			if text[cursor:cursor + len(content)] != content {
+				continue
+			}
 			if len(content) > len(match_content) {
 				match_content = content
 				match_id      = id
@@ -180,8 +176,10 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) ->
 			continue
 		}
 		next_special := len(text)
-		for content, _ in tok.added_tokens {
-			if len(content) == 0 do continue
+		for content in tok.added_tokens {
+			if len(content) == 0 {
+				continue
+			}
 			idx := strings.index(text[cursor:], content)
 			if idx >= 0 && cursor + idx < next_special {
 				next_special = cursor + idx
@@ -190,11 +188,14 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) ->
 		_encode_text_segment(tok, text[cursor:next_special], &ids)
 		cursor = next_special
 	}
+
 	return ids[:]
 }
 
 _encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) {
-	if len(text) == 0 do return
+	if len(text) == 0 {
+		return
+	}
 
 	normalized, _ := strings.replace_all(text, " ", WHITESPACE_PIECE, context.temp_allocator)
 
@@ -244,7 +245,9 @@ decode :: proc(tok: ^Tokenizer, ids: []int, allocator := context.allocator) -> s
 	output.allocator = allocator
 
 	for id in ids {
-		if id < 0 || id >= len(tok.id_to_piece) do continue
+		if id < 0 || id >= len(tok.id_to_piece) {
+			continue
+		}
 		piece := tok.id_to_piece[id]
 		if byte_value, ok := _parse_byte_fallback_piece(piece); ok {
 			append(&output, byte_value)
@@ -256,20 +259,32 @@ decode :: proc(tok: ^Tokenizer, ids: []int, allocator := context.allocator) -> s
 				append(&output, ' ')
 			} else {
 				rune_bytes, rune_byte_count := utf8.encode_rune(rune_value)
-				for k in 0 ..< rune_byte_count do append(&output, rune_bytes[k])
+				for k in 0 ..< rune_byte_count {
+					append(&output, rune_bytes[k])
+				}
 			}
 			offset += rune_size
 		}
 	}
+
 	return string(output[:])
 }
 
 _parse_byte_fallback_piece :: proc(piece: string) -> (u8, bool) {
-	if len(piece) != 6 do return 0, false
-	if piece[0] != '<' || piece[1] != '0' || piece[2] != 'x' || piece[5] != '>' do return 0, false
+	if len(piece) != 6 {
+		return 0, false
+	}
+	if piece[0] != '<' || piece[1] != '0' || piece[2] != 'x' || piece[5] != '>' {
+		return 0, false
+	}
+
 	high, high_ok := _hex_digit_value(piece[3])
 	low,  low_ok  := _hex_digit_value(piece[4])
-	if !high_ok || !low_ok do return 0, false
+
+	if !high_ok || !low_ok {
+		return 0, false
+	}
+
 	return high * 16 + low, true
 }
 
@@ -283,7 +298,9 @@ _hex_digit_value :: proc(c: u8) -> (u8, bool) {
 }
 
 _apply_bpe :: proc(tok: ^Tokenizer, symbols: ^[dynamic]string, merge_buffer: ^[dynamic]string) {
-	if len(symbols) < 2 do return
+	if len(symbols) < 2 {
+		return
+	}
 
 	for {
 		best_rank  := builtin.max(int)
@@ -296,7 +313,9 @@ _apply_bpe :: proc(tok: ^Tokenizer, symbols: ^[dynamic]string, merge_buffer: ^[d
 				}
 			}
 		}
-		if best_index == -1 do break
+		if best_index == -1 {
+			break
+		}
 
 		first_symbol  := symbols[best_index]
 		second_symbol := symbols[best_index + 1]
@@ -315,6 +334,9 @@ _apply_bpe :: proc(tok: ^Tokenizer, symbols: ^[dynamic]string, merge_buffer: ^[d
 
 		clear(symbols)
 		append(symbols, ..merge_buffer[:])
-		if len(symbols) == 1 do break
+
+		if len(symbols) == 1 {
+			break
+		}
 	}
 }

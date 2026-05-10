@@ -7,33 +7,17 @@ import "core:slice"
 import ml          "../../"
 import safetensors "../../loaders/safetensors"
 
-// Load HuggingFace-format SmolLM2 / Llama weights into a `Llama` allocated
-// at the matching config. Weights ship as BF16 in HF's smollm checkpoints
-// and as F32 in some other Llama dumps; both are converted to the model's
-// stored dtype (today: F32 master weights).
-//
-// HF tensor names (matches `transformers/src/transformers/models/llama/`):
-//   model.embed_tokens.weight
-//   model.layers.{i}.input_layernorm.weight
-//   model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
-//   model.layers.{i}.post_attention_layernorm.weight
-//   model.layers.{i}.mlp.{gate,up,down}_proj.weight
-//   model.norm.weight
-//   lm_head.weight                      (absent when tie_word_embeddings)
 load_safetensors :: proc(model: Llama, path: string) -> bool {
 	loader, load_ok := safetensors.load(path)
-	if !load_ok do return false
+	if !load_ok {
+		return false
+	}
 	defer safetensors.destroy(loader)
 
-	if !_load_named(loader, model.token_embeddings, "model.embed_tokens.weight") do return false
+	if !_load_named(loader, model.token_embeddings, "model.embed_tokens.weight") {
+		return false
+	}
 
-	// Q and K weights need a per-head row permutation: HF stores each head's
-	// `head_size` rows as `[first_half (D/2) | second_half (D/2)]` and applies
-	// `rotate_half`-style RoPE; our `ml.rope` works on interleaved pairs
-	// `(x_{2i}, x_{2i+1})`. Permuting the projection rows so that the i-th
-	// pair lands at positions (2i, 2i+1) lets RoPE produce HF-equivalent
-	// rotated Q/K. V and o_proj need no permutation (V is unrotated, and the
-	// attention output inherits V's HF-native head-dim layout).
 	for layer, i in model.layers {
 		ok := _load_named(loader, layer.input_norm_weight,     fmt.tprintf("model.layers.%v.input_layernorm.weight",          i)) &&
 		      _load_rope_permuted(loader, layer.q_proj_weight, fmt.tprintf("model.layers.%v.self_attn.q_proj.weight",         i), model.config.n_q_heads,  model.config.head_size) &&
@@ -44,16 +28,20 @@ load_safetensors :: proc(model: Llama, path: string) -> bool {
 		      _load_named(loader, layer.gate_proj_weight,      fmt.tprintf("model.layers.%v.mlp.gate_proj.weight",            i)) &&
 		      _load_named(loader, layer.up_proj_weight,        fmt.tprintf("model.layers.%v.mlp.up_proj.weight",              i)) &&
 		      _load_named(loader, layer.down_proj_weight,      fmt.tprintf("model.layers.%v.mlp.down_proj.weight",            i))
-		if !ok do return false
+		if !ok {
+			return false
+		}
 	}
 
-	if !_load_named(loader, model.output_norm_weight, "model.norm.weight") do return false
+	if !_load_named(loader, model.output_norm_weight, "model.norm.weight") {
+		return false
+	}
 
-	// HF saves a separate lm_head only when embeddings are not tied. If the
-	// file has it, prefer it (handles models authored with untied weights).
 	if _, has_lm_head := safetensors.get_info(loader, "lm_head.weight"); has_lm_head {
 		if !model.config.tied_embeddings {
-			if !_load_named(loader, model.lm_head_weight, "lm_head.weight") do return false
+			if !_load_named(loader, model.lm_head_weight, "lm_head.weight") {
+				return false
+			}
 		}
 	}
 
@@ -83,10 +71,14 @@ _load_rope_permuted :: proc(loader: safetensors.Loader, target: ml.Tensor, name:
 	half_size      := head_size / 2
 
 	raw_bytes, bytes_ok := safetensors.get_bytes(loader, name)
-	if !bytes_ok do return false
+	if !bytes_ok {
+		return false
+	}
 
 	source_floats := builtin.make([]f32, ml.len(target), context.temp_allocator)
-	if !_decode_dtype_bytes(info, raw_bytes, source_floats) do return false
+	if !_decode_dtype_bytes(info, raw_bytes, source_floats) {
+		return false
+	}
 
 	permuted := builtin.make([]f32, ml.len(target), context.temp_allocator)
 	for h in 0 ..< head_count {
@@ -120,7 +112,9 @@ _decode_dtype_bytes :: proc(info: safetensors.Tensor_Info, raw_bytes: []byte, ds
 			return false
 		}
 		bf := slice.from_ptr((^ml.Bf16)(raw_data(raw_bytes)), count)
-		for value, index in bf do dst[index] = ml.bf16_to_f32(value)
+		for value, index in bf {
+			dst[index] = ml.bf16_to_f32(value)
+		}
 	case:
 		fmt.eprintfln("llama.load_safetensors: unsupported dtype %q (only F32 and BF16 implemented)", info.dtype)
 		return false
@@ -144,10 +138,14 @@ _load_named :: proc(loader: safetensors.Loader, target: ml.Tensor, name: string)
 	}
 
 	raw_bytes, bytes_ok := safetensors.get_bytes(loader, name)
-	if !bytes_ok do return false
+	if !bytes_ok {
+		return false
+	}
 
 	floats := builtin.make([]f32, ml.len(target), context.temp_allocator)
-	if !_decode_dtype_bytes(info, raw_bytes, floats) do return false
+	if !_decode_dtype_bytes(info, raw_bytes, floats) {
+		return false
+	}
 	ml.set_data(target, floats)
 	return true
 }

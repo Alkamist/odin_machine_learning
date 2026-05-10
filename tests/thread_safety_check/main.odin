@@ -32,8 +32,12 @@ run_workload :: proc() -> (data_sum, grad_sum: f32) {
 	output := ml.linear(input, weight)
 	ml.backward()
 
-	for v in cpu.data(output)     do data_sum += v
-	for g in cpu.gradient(weight) do grad_sum += g
+	for v in cpu.data(output) {
+		data_sum += v
+	}
+	for g in cpu.gradient(weight) {
+		grad_sum += g
+	}
 	return
 }
 
@@ -65,10 +69,14 @@ main :: proc() {
 		thread.start(threads[i])
 	}
 
-	for t in threads do thread.join(t)
-	for t in threads do thread.destroy(t)
+	for t in threads {
+		thread.join(t)
+	}
+	for t in threads {
+		thread.destroy(t)
+	}
 
-	GRAD_TOL :: f32(0.01)
+	GRAD_TOL :: 0.01
 
 	all_ok := true
 	for r in results {
@@ -77,13 +85,19 @@ main :: proc() {
 		grad_ok  := grad_rel < GRAD_TOL
 
 		status := "OK"
-		if !fwd_ok       do status = "FWD MISMATCH"
-		else if !grad_ok do status = "GRAD DRIFT"
+		if !fwd_ok {
+			status = "FWD MISMATCH"
+		}
+		else if !grad_ok {
+			status = "GRAD DRIFT"
+		}
 
 		fmt.printfln("thread %v: data_sum=%.6f  grad_sum=%.6f  rel=%.2e  %v",
 			r.id, r.data_sum, r.grad_sum, grad_rel, status)
 
-		if !fwd_ok || !grad_ok do all_ok = false
+		if !fwd_ok || !grad_ok {
+			all_ok = false
+		}
 	}
 
 	if all_ok {

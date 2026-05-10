@@ -110,11 +110,15 @@ _fatal :: proc(msg: string) -> []int {
 
 load_token_ids :: proc(path: string) -> ([]int, bool) {
 	bytes, err := os.read_entire_file_from_path(path, context.allocator)
-	if err != nil do return nil, false
+	if err != nil {
+		return nil, false
+	}
 	defer delete(bytes)
 
 	count := int((^u32le)(raw_data(bytes))^)
-	if 4 + count * 4 > builtin.len(bytes) do return nil, false
+	if 4 + count * 4 > builtin.len(bytes) {
+		return nil, false
+	}
 
 	out := make([]int, count)
 	for i in 0 ..< count {

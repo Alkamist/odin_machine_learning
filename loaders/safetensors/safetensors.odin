@@ -72,7 +72,9 @@ load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, o
 
 	tensors: map[string]Tensor_Info
 	for name, entry in root_object {
-		if name == "__metadata__" do continue
+		if name == "__metadata__" {
+			continue
+		}
 
 		entry_object, entry_ok := entry.(json.Object)
 		if !entry_ok {
@@ -149,6 +151,7 @@ load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, o
 	loader.data_start = 8 + header_len
 	loader.tensors    = tensors
 	loader._json_root = root
+
 	return loader, true
 }
 
@@ -171,7 +174,9 @@ get_info :: proc(loader: Loader, name: string) -> (info: Tensor_Info, ok: bool) 
 @(require_results)
 get_bytes :: proc(loader: Loader, name: string) -> ([]byte, bool) {
 	info, ok := loader.tensors[name]
-	if !ok do return nil, false
+	if !ok {
+		return nil, false
+	}
 	return loader.bytes[loader.data_start + info.data_offsets[0] : loader.data_start + info.data_offsets[1]], true
 }
 

@@ -8,57 +8,29 @@ import "core:slice"
 import ml          "../../"
 import safetensors "../../loaders/safetensors"
 
-// Load HuggingFace-format Gemma 4 text-only weights into a `Gemma` allocated
-// at the matching config. The vision and audio towers are skipped.
-//
-// HF tensor naming convention (`model.language_model.*` for the text tower,
-// shared with the multimodal Gemma4ForConditionalGeneration container):
-//
-//   model.language_model.embed_tokens.weight
-//   model.language_model.embed_tokens_per_layer.weight
-//   model.language_model.per_layer_model_projection.weight
-//   model.language_model.per_layer_projection_norm.weight
-//   model.language_model.norm.weight
-//   model.language_model.layers.{i}.input_layernorm.weight
-//   model.language_model.layers.{i}.self_attn.{q,k,v}_proj.weight
-//   model.language_model.layers.{i}.self_attn.{q,k}_norm.weight
-//   model.language_model.layers.{i}.self_attn.o_proj.weight
-//   model.language_model.layers.{i}.post_attention_layernorm.weight
-//   model.language_model.layers.{i}.pre_feedforward_layernorm.weight
-//   model.language_model.layers.{i}.post_feedforward_layernorm.weight
-//   model.language_model.layers.{i}.mlp.{gate,up,down}_proj.weight
-//   model.language_model.layers.{i}.per_layer_input_gate.weight
-//   model.language_model.layers.{i}.per_layer_projection.weight
-//   model.language_model.layers.{i}.post_per_layer_input_norm.weight
-//   model.language_model.layers.{i}.layer_scalar
-//   lm_head.weight (only present when not tied)
-//
-// Two load-time transforms vs straight copy:
-//
-//  - Q and K projection ROWS are permuted from HF's `[first_half | second_half]`
-//    interleaving (which `rotate_half` consumes) to our `(x_{2i}, x_{2i+1})`
-//    interleaved-pair layout, the same trick `networks/llama/loader.odin` uses.
-//    Since q_norm and k_norm operate on the per-head dim AFTER the projection
-//    but BEFORE RoPE, the corresponding norm weight rows must be permuted with
-//    the same indexing — applied here as `_load_per_head_dim_permuted`.
-//
-//  - The `q_norm.weight` is additionally pre-multiplied by `sqrt(head_dim)`.
-//    Gemma 4's HF code uses `attention_scaling = 1.0` (no `1/sqrt(head_dim)`
-//    factor on the attention scores, because q/k_norm pre-normalise Q and K).
-//    Our `ml.attention` always applies `1/sqrt(head_size)` internally; baking
-//    the inverse into q_norm absorbs the scale through the rest of the
-//    pipeline (RoPE preserves magnitude) and exactly cancels.
 @(require_results)
 load_safetensors :: proc(model: Gemma, path: string) -> bool {
 	loader, load_ok := safetensors.load(path)
-	if !load_ok do return false
+	if !load_ok {
+		return false
+	}
 	defer safetensors.destroy(loader)
 
-	if !_load_named(loader, model.embed_tokens_weight, "model.language_model.embed_tokens.weight") do return false
-	if !_load_named(loader, model.output_norm_weight,  "model.language_model.norm.weight")          do return false
-	if !_load_per_layer_embedding_host(loader, model)                                               do return false
-	if !_load_named(loader, model.per_layer_model_projection_weight, "model.language_model.per_layer_model_projection.weight") do return false
-	if !_load_named(loader, model.per_layer_projection_norm_weight,  "model.language_model.per_layer_projection_norm.weight")  do return false
+	if !_load_named(loader, model.embed_tokens_weight, "model.language_model.embed_tokens.weight") {
+		return false
+	}
+	if !_load_named(loader, model.output_norm_weight,  "model.language_model.norm.weight") {
+		return false
+	}
+	if !_load_per_layer_embedding_host(loader, model) {
+		return false
+	}
+	if !_load_named(loader, model.per_layer_model_projection_weight, "model.language_model.per_layer_model_projection.weight") {
+		return false
+	}
+	if !_load_named(loader, model.per_layer_projection_norm_weight,  "model.language_model.per_layer_projection_norm.weight") {
+		return false
+	}
 
 	cfg := model.config
 	for layer, layer_idx in model.layers {
@@ -79,30 +51,29 @@ load_safetensors :: proc(model: Gemma, path: string) -> bool {
 		      _load_named         (loader, layer.per_layer_projection_weight,      fmt.tprintf("%v.per_layer_projection.weight",       prefix)) &&
 		      _load_named         (loader, layer.post_per_layer_input_norm_weight, fmt.tprintf("%v.post_per_layer_input_norm.weight",  prefix)) &&
 		      _load_named         (loader, layer.layer_scalar,                     fmt.tprintf("%v.layer_scalar",                      prefix))
-		if !ok do return false
+		if !ok {
+			return false
+		}
 
-		// K/V projection + K-norm only exist for non-shared layers in our model.
-		// HF stores k/v_proj weights for every layer in the safetensors but ignores
-		// them at runtime for shared layers — we do the same by skipping the load.
 		if !is_kv_shared_layer(cfg, layer_idx) {
-			ok2 := _load_rope_permuted (loader, layer.k_proj_weight, fmt.tprintf("%v.self_attn.k_proj.weight", prefix), cfg.num_key_value_heads, head_dim) &&
-			       _load_named         (loader, layer.v_proj_weight, fmt.tprintf("%v.self_attn.v_proj.weight", prefix)) &&
+			ok2 := _load_rope_permuted(loader, layer.k_proj_weight, fmt.tprintf("%v.self_attn.k_proj.weight", prefix), cfg.num_key_value_heads, head_dim) &&
+			       _load_named        (loader, layer.v_proj_weight, fmt.tprintf("%v.self_attn.v_proj.weight", prefix)) &&
 			       _load_per_head_dim_permuted(loader, layer.k_norm_weight, fmt.tprintf("%v.self_attn.k_norm.weight", prefix), head_dim, 1.0)
-			if !ok2 do return false
+			if !ok2 {
+				return false
+			}
 		}
 	}
 
-	// HF stores a separate lm_head only when embeddings are not tied.
 	if !cfg.tie_word_embeddings {
-		if !_load_named(loader, model.lm_head_weight, "lm_head.weight") do return false
+		if !_load_named(loader, model.lm_head_weight, "lm_head.weight") {
+			return false
+		}
 	}
 
 	return true
 }
 
-// `embed_tokens_per_layer` is too big for a single Vulkan buffer (>2 GiB).
-// Decode the safetensors blob directly into the model's host-side byte
-// buffer; lookups happen per-forward in `_per_layer_inputs`.
 _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma) -> bool {
 	name := "model.language_model.embed_tokens_per_layer.weight"
 	info, info_ok := safetensors.get_info(loader, name)
@@ -118,7 +89,9 @@ _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma)
 	}
 
 	raw_bytes, bytes_ok := safetensors.get_bytes(loader, name)
-	if !bytes_ok do return false
+	if !bytes_ok {
+		return false
+	}
 
 	count := cfg.vocab_size * cfg.num_hidden_layers * cfg.hidden_size_per_layer_input
 	#partial switch model.dtype {
@@ -137,7 +110,9 @@ _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma)
 			}
 			src := slice.from_ptr((^f32)(raw_data(raw_bytes)), count)
 			dst := ([^]ml.Bf16)(raw_data(model.embed_tokens_per_layer_bytes))
-			for v, i in src do dst[i] = ml.bf16_from_f32(v)
+			for v, i in src {
+				dst[i] = ml.bf16_from_f32(v)
+			}
 		case:
 			fmt.eprintfln("gemma.load: %q unsupported source dtype %q", name, info.dtype)
 			return false
@@ -157,7 +132,9 @@ _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma)
 			}
 			src := slice.from_ptr((^ml.Bf16)(raw_data(raw_bytes)), count)
 			dst := ([^]f32)(raw_data(model.embed_tokens_per_layer_bytes))
-			for v, i in src do dst[i] = ml.bf16_to_f32(v)
+			for v, i in src {
+				dst[i] = ml.bf16_to_f32(v)
+			}
 		case:
 			fmt.eprintfln("gemma.load: %q unsupported source dtype %q", name, info.dtype)
 			return false
@@ -181,18 +158,20 @@ _load_named :: proc(loader: safetensors.Loader, target: ml.Tensor, name: string)
 	}
 
 	raw_bytes, bytes_ok := safetensors.get_bytes(loader, name)
-	if !bytes_ok do return false
+	if !bytes_ok {
+		return false
+	}
 	return _write_target(target, info, raw_bytes, name)
 }
 
-// Decode raw safetensors bytes (F32 or BF16) into the target tensor's dtype
-// and write. Bf16-source-Bf16-target is a direct byte copy.
 _write_target :: proc(target: ml.Tensor, info: safetensors.Tensor_Info, raw_bytes: []byte, name: string) -> bool {
 	count := ml.len(target)
 	#partial switch target.type {
 	case .F32:
 		floats := builtin.make([]f32, count, context.temp_allocator)
-		if !_decode_dtype_bytes(info, raw_bytes, floats) do return false
+		if !_decode_dtype_bytes(info, raw_bytes, floats) {
+			return false
+		}
 		ml.set_data(target, floats)
 	case .Bf16:
 		bytes := builtin.make([]byte, count * 2, context.temp_allocator)
@@ -210,7 +189,9 @@ _write_target :: proc(target: ml.Tensor, info: safetensors.Tensor_Info, raw_byte
 				return false
 			}
 			src := slice.from_ptr((^f32)(raw_data(raw_bytes)), count)
-			for v, i in src do bf[i] = ml.bf16_from_f32(v)
+			for v, i in src {
+				bf[i] = ml.bf16_from_f32(v)
+			}
 		case:
 			fmt.eprintfln("gemma.load: %q unsupported source dtype %q for Bf16 target", name, info.dtype)
 			return false
@@ -242,10 +223,14 @@ _load_rope_permuted :: proc(loader: safetensors.Loader, target: ml.Tensor, name:
 	half_size      := head_size / 2
 
 	raw_bytes, bytes_ok := safetensors.get_bytes(loader, name)
-	if !bytes_ok do return false
+	if !bytes_ok {
+		return false
+	}
 
 	source_floats := builtin.make([]f32, ml.len(target), context.temp_allocator)
-	if !_decode_dtype_bytes(info, raw_bytes, source_floats) do return false
+	if !_decode_dtype_bytes(info, raw_bytes, source_floats) {
+		return false
+	}
 
 	permuted := builtin.make([]f32, ml.len(target), context.temp_allocator)
 	for h in 0 ..< head_count {
@@ -264,7 +249,6 @@ _load_rope_permuted :: proc(loader: safetensors.Loader, target: ml.Tensor, name:
 	return true
 }
 
-// Convert a buffer of F32 values to the target tensor's dtype and write.
 _write_floats_to_target :: proc(target: ml.Tensor, src: []f32, name: string) {
 	count := ml.len(target)
 	assert(builtin.len(src) == count, name)
@@ -274,15 +258,13 @@ _write_floats_to_target :: proc(target: ml.Tensor, src: []f32, name: string) {
 	case .Bf16:
 		bytes := builtin.make([]byte, count * 2, context.temp_allocator)
 		bf    := ([^]ml.Bf16)(raw_data(bytes))
-		for v, i in src do bf[i] = ml.bf16_from_f32(v)
+		for v, i in src {
+			bf[i] = ml.bf16_from_f32(v)
+		}
 		ml.set_data_bytes(target, bytes)
 	}
 }
 
-// Apply the same `(first_half | second_half) -> interleaved pairs` permutation
-// to a 1-D `[head_dim]` weight (q_norm or k_norm), then scale by `extra_scale`.
-// The scale is `sqrt(head_dim)` for q_norm (to absorb the `1/sqrt(head_dim)`
-// that `ml.attention` builds into its scoring) and `1.0` for k_norm.
 _load_per_head_dim_permuted :: proc(loader: safetensors.Loader, target: ml.Tensor, name: string, head_size: int, extra_scale: f32) -> bool {
 	info, info_ok := safetensors.get_info(loader, name)
 	if !info_ok {
@@ -299,10 +281,14 @@ _load_per_head_dim_permuted :: proc(loader: safetensors.Loader, target: ml.Tenso
 	}
 
 	raw_bytes, bytes_ok := safetensors.get_bytes(loader, name)
-	if !bytes_ok do return false
+	if !bytes_ok {
+		return false
+	}
 
 	source := builtin.make([]f32, head_size, context.temp_allocator)
-	if !_decode_dtype_bytes(info, raw_bytes, source) do return false
+	if !_decode_dtype_bytes(info, raw_bytes, source) {
+		return false
+	}
 
 	permuted := builtin.make([]f32, head_size, context.temp_allocator)
 	half_size := head_size / 2
@@ -330,7 +316,9 @@ _decode_dtype_bytes :: proc(info: safetensors.Tensor_Info, raw_bytes: []byte, ds
 			return false
 		}
 		bf := slice.from_ptr((^ml.Bf16)(raw_data(raw_bytes)), count)
-		for value, index in bf do dst[index] = ml.bf16_to_f32(value)
+		for value, index in bf {
+			dst[index] = ml.bf16_to_f32(value)
+		}
 	case:
 		fmt.eprintfln("gemma.load_safetensors: unsupported dtype %q (only F32 and BF16 implemented)", info.dtype)
 		return false

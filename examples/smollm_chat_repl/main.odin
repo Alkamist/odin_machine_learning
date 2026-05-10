@@ -23,9 +23,9 @@ DEFAULT_MODEL_PATH   :: DATA_DIR + "/model.safetensors"
 TOKENIZER_PATH       :: DATA_DIR + "/tokenizer.json"
 
 DEFAULT_MAX_TOKENS  :: 512
-DEFAULT_TEMPERATURE :: f32(0.8)
+DEFAULT_TEMPERATURE :: 0.8
 DEFAULT_TOP_K       :: 40
-DEFAULT_TOP_P       :: f32(0.95)
+DEFAULT_TOP_P       :: 0.95
 DEFAULT_T_MAX       :: 4096
 DEFAULT_THREADS     :: 8
 DEFAULT_CPU_ARENA   :: 1 * 1024 * 1024 * 1024
@@ -38,9 +38,9 @@ EOT_TEXT       :: "<|endoftext|>"
 
 main :: proc() {
 	max_new_tokens := DEFAULT_MAX_TOKENS
-	temperature    := DEFAULT_TEMPERATURE
+	temperature: f32 = DEFAULT_TEMPERATURE
 	top_k          := DEFAULT_TOP_K
-	top_p          := DEFAULT_TOP_P
+	top_p:       f32 = DEFAULT_TOP_P
 	t_max          := DEFAULT_T_MAX
 	use_cpu        := false
 	cpu_arena      := DEFAULT_CPU_ARENA
@@ -126,7 +126,9 @@ main :: proc() {
 			break
 		}
 		line = strings.trim_space(line)
-		if builtin.len(line) == 0 do continue
+		if builtin.len(line) == 0 {
+			continue
+		}
 
 		switch line {
 		case ":quit", ":exit", ":q":
@@ -201,7 +203,9 @@ main :: proc() {
 				previous_decoded_length = builtin.len(reply_so_far)
 			}
 
-			if step == max_new_tokens - 1 do break
+			if step == max_new_tokens - 1 {
+				break
+			}
 
 			ml.clear({.No_Gradients})
 			single := [1]int{next_id}
@@ -264,34 +268,48 @@ read_line :: proc(buffer: []byte) -> (line: string, ok: bool) {
 	for cursor < builtin.len(buffer) {
 		n, err := os.read(os.stdin, one[:])
 		if err != nil || n == 0 {
-			if cursor == 0 do return "", false
+			if cursor == 0 {
+				return "", false
+			}
 			break
 		}
 		c := one[0]
-		if c == '\n' do break
+		if c == '\n' {
+			break
+		}
 		buffer[cursor] = c
 		cursor += 1
 	}
-	if cursor > 0 && buffer[cursor - 1] == '\r' do cursor -= 1
+	if cursor > 0 && buffer[cursor - 1] == '\r' {
+		cursor -= 1
+	}
 	return string(buffer[:cursor]), true
 }
 
 sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> int {
 	if temperature <= 0 || top_k == 1 {
 		best := 0
-		for i in 1 ..< builtin.len(logits) do if logits[i] > logits[best] do best = i
+		for i in 1 ..< builtin.len(logits) {
+			if logits[i] > logits[best] {
+				best = i
+			}
+		}
 		return best
 	}
 
 	candidate_count := top_k > 0 ? min(top_k, builtin.len(logits)) : builtin.len(logits)
 
 	indices := make([]int, builtin.len(logits), context.temp_allocator)
-	for i in 0 ..< builtin.len(logits) do indices[i] = i
+	for i in 0 ..< builtin.len(logits) {
+		indices[i] = i
+	}
 
 	for slot in 0 ..< candidate_count {
 		best := slot
 		for i in slot + 1 ..< builtin.len(indices) {
-			if logits[indices[i]] > logits[indices[best]] do best = i
+			if logits[indices[i]] > logits[indices[best]] {
+				best = i
+			}
 		}
 		indices[slot], indices[best] = indices[best], indices[slot]
 	}
@@ -303,7 +321,9 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 		probabilities[slot] = math.exp_f32((logits[indices[slot]] - max_logit) / temperature)
 		sum += probabilities[slot]
 	}
-	for slot in 0 ..< candidate_count do probabilities[slot] /= sum
+	for slot in 0 ..< candidate_count {
+		probabilities[slot] /= sum
+	}
 
 	keep := candidate_count
 	if top_p > 0 && top_p < 1 {
@@ -316,9 +336,13 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 			}
 		}
 		new_sum: f32
-		for slot in 0 ..< keep do new_sum += probabilities[slot]
+		for slot in 0 ..< keep {
+			new_sum += probabilities[slot]
+		}
 		if new_sum > 0 {
-			for slot in 0 ..< keep do probabilities[slot] /= new_sum
+			for slot in 0 ..< keep {
+				probabilities[slot] /= new_sum
+			}
 		}
 	}
 
@@ -326,7 +350,9 @@ sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> 
 	cumulative: f32
 	for slot in 0 ..< keep {
 		cumulative += probabilities[slot]
-		if r <= cumulative do return indices[slot]
+		if r <= cumulative {
+			return indices[slot]
+		}
 	}
 	return indices[keep - 1]
 }
@@ -338,42 +364,60 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 		arg := args[i]
 		switch arg {
 		case "--max-tokens":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			max_new_tokens^ = _parse_int(args[i + 1])
 			i += 2
 		case "--temperature":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			temperature^ = f32(_parse_float(args[i + 1]))
 			i += 2
 		case "--top-k":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			top_k^ = _parse_int(args[i + 1])
 			i += 2
 		case "--top-p":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			top_p^ = f32(_parse_float(args[i + 1]))
 			i += 2
 		case "--t-max":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			t_max^ = _parse_int(args[i + 1])
 			i += 2
 		case "--cpu":
 			use_cpu^ = true
 			i += 1
 		case "--cpu-arena":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			cpu_arena^ = _parse_int(args[i + 1])
 			i += 2
 		case "--threads":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			threads^ = _parse_int(args[i + 1])
 			i += 2
 		case "--system":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			system_prompt^ = args[i + 1]
 			i += 2
 		case "--model":
-			if i + 1 >= builtin.len(args) do _usage_exit()
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
 			model_path^ = args[i + 1]
 			i += 2
 		case "--help", "-h":
@@ -426,7 +470,9 @@ _parse_float :: proc(s: string) -> f64 {
 			in_frac = true
 		} else if c >= '0' && c <= '9' {
 			value = value * 10 + f64(c - '0')
-			if in_frac do scale *= 10
+			if in_frac {
+				scale *= 10
+			}
 		} else {
 			fmt.eprintfln("invalid float: %q", s)
 			os.exit(1)

@@ -62,7 +62,9 @@ main :: proc() {
 		bf := make([]ml.Bf16, logit_count)
 		defer delete(bf)
 		ml.get_data_bytes(logits, slice.bytes_from_ptr(raw_data(bf), logit_count * 2))
-		for v, i in bf do floats[i] = ml.bf16_to_f32(v)
+		for v, i in bf {
+			floats[i] = ml.bf16_to_f32(v)
+		}
 	} else {
 		fmt.eprintfln("unexpected logits dtype %v", logits.type)
 		os.exit(1)
@@ -77,8 +79,12 @@ main :: proc() {
 	for v in final {
 		if math.is_nan(v) { nan_count += 1 } else if math.is_inf(v) { inf_count += 1 } else {
 			a := v
-			if a < 0 do a = -a
-			if a > max_abs do max_abs = a
+			if a < 0 {
+				a = -a
+			}
+			if a > max_abs {
+				max_abs = a
+			}
 		}
 	}
 	fmt.printfln("logits: vocab=%v finite_max_abs=%.4f nan=%v inf=%v", vocab, max_abs, nan_count, inf_count)
@@ -96,7 +102,9 @@ main :: proc() {
 	Pair :: struct { id: int, score: f32 }
 	pairs := make([]Pair, vocab)
 	defer delete(pairs)
-	for v, i in final do pairs[i] = {id = i, score = v}
+	for v, i in final {
+		pairs[i] = {id = i, score = v}
+	}
 	slice.sort_by(pairs, proc(a, b: Pair) -> bool { return a.score > b.score })
 
 	fmt.println("top-5 next-token ids after BOS:")

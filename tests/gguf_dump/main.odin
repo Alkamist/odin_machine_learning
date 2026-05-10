@@ -32,7 +32,9 @@ main :: proc() {
 	fmt.println("KV (sorted):")
 	keys := make([dynamic]string, 0, len(loader.kv))
 	defer delete(keys)
-	for key, _ in loader.kv do append(&keys, key)
+	for key, _ in loader.kv {
+		append(&keys, key)
+	}
 	slice.sort(keys[:])
 	for key in keys {
 		entry := loader.kv[key]
@@ -42,7 +44,9 @@ main :: proc() {
 		case .String:
 			s, _ := gguf.get_str(loader, key)
 			s_disp := s
-			if len(s_disp) > 80 do s_disp = strings.concatenate({s_disp[:80], "…"}, context.temp_allocator)
+			if len(s_disp) > 80 {
+				s_disp = strings.concatenate({s_disp[:80], "…"}, context.temp_allocator)
+			}
 			fmt.printfln("  %-50s %-8v %q", key, entry.type, s_disp)
 		case .Array:
 			fmt.printfln("  %-50s %-8v elem=%v count=%v", key, entry.type, entry.array_type, entry.array_count)
@@ -53,7 +57,9 @@ main :: proc() {
 	fmt.println("Tensors (sorted):")
 	tnames := make([dynamic]string, 0, len(loader.tensors))
 	defer delete(tnames)
-	for name, _ in loader.tensors do append(&tnames, name)
+	for name, _ in loader.tensors {
+		append(&tnames, name)
+	}
 	slice.sort(tnames[:])
 	for name in tnames {
 		info := loader.tensors[name]
@@ -63,7 +69,9 @@ main :: proc() {
 	// Type histogram.
 	type_counts: map[gguf.Tensor_Type]int
 	defer delete(type_counts)
-	for _, info in loader.tensors do type_counts[info.type] += 1
+	for _, info in loader.tensors {
+		type_counts[info.type] += 1
+	}
 	fmt.println()
 	fmt.println("Tensor type histogram:")
 	for ty, count in type_counts {

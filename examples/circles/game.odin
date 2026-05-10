@@ -30,10 +30,18 @@ window_should_close :: proc() -> bool {
 }
 
 human_action :: proc(previous: Action) -> (res: Action) {
-    if rl.IsKeyDown(.A) do res = .Left
-    if rl.IsKeyDown(.D) do res = .Right
-    if rl.IsKeyDown(.S) do res = .Down
-    if rl.IsKeyDown(.W) do res = .Up
+    if rl.IsKeyDown(.A) {
+    	res = .Left
+    }
+    if rl.IsKeyDown(.D) {
+    	res = .Right
+    }
+    if rl.IsKeyDown(.S) {
+    	res = .Down
+    }
+    if rl.IsKeyDown(.W) {
+    	res = .Up
+    }
     return
 }
 

@@ -11,12 +11,10 @@ import "bindings/cublas"
 
 import ml "../../"
 
-// Per-process CUDA device state. One per backend; shared across all Contexts.
 Gpu_Device :: struct {
 	dev:       cuda.Device,
 	ctx:       cuda.Context,
 
-	// Device properties we cache for kernel tuning.
 	cc_major, cc_minor: i32,
 	sm_count:           i32,
 	warp_size:          i32,
@@ -24,11 +22,8 @@ Gpu_Device :: struct {
 	max_smem_per_block: i32,
 	max_smem_optin:     i32,
 
-	device_name:        string,
+	device_name: string,
 
-	// Pipelines are owned by the device (CUmodule + CUfunction live in the
-	// driver, not the user's Context) so they can be reused across multiple
-	// Contexts and torn down once at device_destroy.
 	pipelines: [dynamic]^Pipeline,
 }
 
@@ -38,76 +33,34 @@ Context :: struct {
 	stream:        cuda.Stream,
 	cublas_handle: cublas.Handle,
 
-	// Activation buffers (persist=false) are tracked here so `clear()` can
-	// recycle them. Slots are reused by index across forward passes, mirroring
-	// the vulkan backend's activation pool. On size mismatch the slot is freed
-	// and re-allocated.
 	activation_pool:   [dynamic]Activation_Slot,
 	activation_cursor: int,
 
-	// Persistent buffers (model weights, optimizer state) live until
-	// context_destroy. We track them so we don't leak on teardown.
 	persistent: [dynamic]cuda.DevicePtr,
 
-	// Optional per-dispatch GPU timing. Populated by `enable_timing`.
 	timing_enabled: bool,
 	timing_totals:  map[^Pipeline]Timing_Stat,
 	timing_pool:    [dynamic]Timing_Slot,
 	timing_cursor:  int,
 
-	// CUDA graph state. While capturing, every kernel/memcpy launched on
-	// `stream` is recorded into `graph` instead of executing. After capture,
-	// `replay_graph` launches the captured sequence in one driver call.
 	graph_capturing: bool,
 	graph_exec:      cuda.GraphExec,
 	graph_handle:    cuda.Graph,
 
-	// Auto-graph mode (set via `enable_decode_graph`). Each forward is
-	// captured into its own throwaway Graph; if the topology matches the
-	// previous capture, `cuGraphExecUpdate` swaps params into `auto_exec`
-	// in-place; otherwise we re-instantiate. Driven implicitly by `clear`
-	// (begin) and `buffer_get` (end+launch). Does not interact with the
-	// explicit `begin_graph_capture` / `replay_graph` API.
 	auto_graph_enabled: bool,
 	auto_capturing:     bool,
-	auto_warmup_done:   bool,        // first forward runs direct (cuBLAS algo selection isn't capturable cold)
+	auto_warmup_done:   bool,
 	auto_exec:          cuda.GraphExec,
 
-	// Per-forward cache of q8_1-quantized inputs keyed by source device
-	// pointer. Lets multiple Q4_K matmuls that share an input (q/k/v from
-	// the same rmsnorm; gate/up from the same pre_ff_norm) reuse a single
-	// quantize_q8_1 dispatch. Cleared on every `clear()`.
 	q8_1_cache: map[cuda.DevicePtr]cuda.DevicePtr,
 
-	// Per-forward sets of K and V caches whose `cache_write` (and shift, for
-	// sliding) has already been emitted this forward. Gemma's KV-shared layers
-	// point at the source layer's k_cache/v_cache; without dedup, each shared
-	// layer would re-shift and re-write the cache. Split into K and V so the
-	// fused `rmsnorm_rope_write_cache` op (which writes only K) can mark the K
-	// side as done without affecting V. Both cleared every `clear()`.
 	k_cache_written_this_forward: map[cuda.DevicePtr]bool,
 	v_cache_written_this_forward: map[cuda.DevicePtr]bool,
 
-	// Decode-position upload state. Position-bearing kernels (rmsnorm_rope,
-	// rope, attention_cache) read `cache_position` from `position_dev` instead
-	// of taking it as a scalar kernel arg. The first position-bearing dispatch
-	// of each forward writes the value into the pinned host buffer and emits
-	// a single HtoDAsync into `position_dev`; the captured graph references
-	// stable pointers (pinned host → fixed device buffer) so re-captures of
-	// the same topology produce bit-identical kernel-arg buffers across
-	// decode steps. Without this, every step's captured graph differed by
-	// 4 bytes per position-bearing node, forcing `cuGraphExecUpdate` to
-	// patch each one. Mirrors how ggml keeps step-varying state in tensors.
-	position_pinned:                rawptr,         // pinned 4-byte host buffer
-	position_dev:                   cuda.DevicePtr, // 4-byte device buffer
+	position_pinned:                rawptr,
+	position_dev:                   cuda.DevicePtr,
 	position_written_this_forward:  bool,
 
-	// Shift scratch for sliding K/V cache layers. The cache is laid out
-	// linearly (slot 0 is oldest, slot cap-1 is newest); on every cache_write
-	// we shift contents back by n_rows before writing the new rows at slot
-	// [cap-n_rows..cap). The shift goes through this scratch buffer (two
-	// cuMemcpyDtoDAsync per K/V) since cuMemcpy doesn't support overlapping
-	// dst/src. Sized lazily to the max (cap-1)*kv_size bytes seen.
 	shift_scratch_dev:  cuda.DevicePtr,
 	shift_scratch_size: u64,
 }
@@ -122,8 +75,6 @@ Timing_Stat :: struct {
 	count:    int,
 }
 
-// Reusable pair of CUevents (start/end) for per-dispatch timing. Allocated on
-// demand and recycled across batches.
 Timing_Slot :: struct {
 	pipeline: ^Pipeline,
 	start:    cuda.Event,
@@ -139,13 +90,15 @@ _gctx :: #force_inline proc(loc := #caller_location) -> ^Context {
 }
 
 device_init :: proc() {
-	sync.mutex_lock(&_gpu_mutex)
-	defer sync.mutex_unlock(&_gpu_mutex)
+	sync.lock(&_gpu_mutex)
+	defer sync.unlock(&_gpu_mutex)
 	_device_init_locked()
 }
 
 _device_init_locked :: proc() {
-	if _gpu.ctx != nil { return }
+	if _gpu.ctx != nil {
+		return
+	}
 
 	cuda.check(cuda.Init(0))
 
@@ -158,7 +111,12 @@ _device_init_locked :: proc() {
 	name_buf: [128]u8
 	cuda.check(cuda.DeviceGetName(raw_data(name_buf[:]), i32(builtin.len(name_buf)), _gpu.dev))
 	name_len := 0
-	for c, i in name_buf { if c == 0 { name_len = i; break } }
+	for c, i in name_buf {
+		if c == 0 {
+			name_len = i
+			break
+		}
+	}
 	owned := builtin.make([]u8, name_len)
 	builtin.copy(owned, name_buf[:name_len])
 	_gpu.device_name = builtin.string(owned)
@@ -173,13 +131,12 @@ _device_init_locked :: proc() {
 
 	cuda.check(cuda.CtxCreate(&_gpu.ctx, cuda.CTX_SCHED_BLOCKING_SYNC, _gpu.dev))
 
-	fmt.printfln("cuda: %s  cc=%d.%d  SMs=%d  warp=%d",
-		_gpu.device_name, _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
+	fmt.printfln("cuda: %s  cc=%d.%d  SMs=%d  warp=%d", _gpu.device_name, _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
 }
 
 device_destroy :: proc() {
-	sync.mutex_lock(&_gpu_mutex)
-	defer sync.mutex_unlock(&_gpu_mutex)
+	sync.lock(&_gpu_mutex)
+	defer sync.unlock(&_gpu_mutex)
 
 	for p in _gpu.pipelines {
 		_destroy_pipeline(p)
@@ -203,8 +160,8 @@ device_name :: proc() -> string {
 
 @(require_results)
 context_create :: proc(allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
-	sync.mutex_lock(&_gpu_mutex)
-	defer sync.mutex_unlock(&_gpu_mutex)
+	sync.lock(&_gpu_mutex)
+	defer sync.unlock(&_gpu_mutex)
 
 	_device_init_locked()
 
@@ -237,12 +194,11 @@ context_create :: proc(allocator := context.allocator, loc := #caller_location) 
 }
 
 context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc := #caller_location) {
-	sync.mutex_lock(&_gpu_mutex)
-	defer sync.mutex_unlock(&_gpu_mutex)
+	sync.lock(&_gpu_mutex)
+	defer sync.unlock(&_gpu_mutex)
 
 	gctx := cast(^Context)ctx
 
-	// Drain anything still in flight before tearing down.
 	if gctx.stream != nil {
 		cuda.check(cuda.StreamSynchronize(gctx.stream))
 	}
@@ -309,21 +265,15 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 }
 
 clear :: proc(loc: runtime.Source_Code_Location) {
-	sync.mutex_lock(&_gpu_mutex)
-	defer sync.mutex_unlock(&_gpu_mutex)
+	sync.lock(&_gpu_mutex)
+	defer sync.unlock(&_gpu_mutex)
 
 	gctx := _gctx(loc)
 
-	// If a previous forward never reached `buffer_get` (e.g. a prefill chunk
-	// that doesn't read logits), an auto-graph capture is still open. Finish
-	// it and launch on the stream so the captured work actually executes
-	// before we start a new capture for this forward.
 	if gctx.auto_capturing {
 		_auto_graph_finish(gctx, loc)
 	}
 
-	// Wait for any in-flight work, fold per-dispatch timing readings into
-	// totals, and rewind the timing slot cursor for the next forward pass.
 	if gctx.stream != nil {
 		cuda.check(cuda.StreamSynchronize(gctx.stream))
 	}
@@ -340,27 +290,15 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 		gctx.timing_cursor = 0
 	}
 
-	// Activation pool rewinds for the next forward pass. Buffers stay alive
-	// and are handed back to ml.alloc in the same order they were requested.
 	gctx.activation_cursor = 0
 
-	// Drop q8_1 reuse cache: keyed by activation-pool pointers, which are
-	// stable across forwards but the *contents* are stale once we rewind.
 	builtin.clear(&gctx.q8_1_cache)
 
-	// Reset KV-cache shift/write dedup set. New forward = new shift cycle.
 	builtin.clear(&gctx.k_cache_written_this_forward)
 	builtin.clear(&gctx.v_cache_written_this_forward)
 
-	// Position upload happens lazily on the first position-bearing dispatch
-	// of the new forward (see `_emit_position_upload` in ops.odin).
 	gctx.position_written_this_forward = false
 
-	// Auto-graph mode: enter capture for the upcoming forward. The forward's
-	// kernel/memcpy launches will be recorded into a Graph instead of running.
-	// `buffer_get` (= `ml.get_data`) ends the capture and launches the graph.
-	// We skip capture on the very first forward after enable so cuBLAS can
-	// do its first-call algorithm selection on a real launch (not capturable).
 	if gctx.auto_graph_enabled && gctx.auto_warmup_done && !gctx.auto_capturing && !gctx.graph_capturing && !gctx.timing_enabled {
 		cuda.check(cuda.StreamBeginCapture_v2(gctx.stream, .Relaxed), loc=loc)
 		gctx.auto_capturing = true
@@ -370,27 +308,15 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 	}
 }
 
-// Opt into transparent CUDA graph capture/replay. When enabled, every forward
-// is captured into a per-call Graph; if the topology matches the previous
-// forward we update the existing GraphExec in place via `cuGraphExecUpdate`,
-// otherwise we re-instantiate. Replay happens implicitly inside `buffer_get`,
-// so callers don't need to change their decode loop.
-//
-// Mutually exclusive with `enable_timing` (timing uses cuEventRecord, which
-// is not stream-capturable) and with the explicit `begin_graph_capture` API.
 enable_decode_graph :: proc(enabled: bool, loc := #caller_location) {
 	gctx := _gctx(loc)
 	if enabled {
-		fmt.assertf(!gctx.timing_enabled,
-			"enable_decode_graph: cannot combine with enable_timing", loc=loc)
-		fmt.assertf(!gctx.graph_capturing,
-			"enable_decode_graph: explicit graph capture in progress", loc=loc)
+		fmt.assertf(!gctx.timing_enabled, "enable_decode_graph: cannot combine with enable_timing", loc=loc)
+		fmt.assertf(!gctx.graph_capturing, "enable_decode_graph: explicit graph capture in progress", loc=loc)
 	}
 	gctx.auto_graph_enabled = enabled
 }
 
-// Optional GPU timing. Once enabled, every _dispatch records start/end events
-// and `clear` folds the deltas into `timing_totals` keyed by Pipeline pointer.
 enable_timing :: proc(enabled: bool) {
 	gctx := _gctx()
 	gctx.timing_enabled = enabled
@@ -402,15 +328,13 @@ Timing_Entry :: struct {
 	count:    int,
 }
 
-// Snapshot the current per-pipeline timing totals into a sorted (descending by
-// total_ns) slice, allocated on `allocator`. Caller frees with `delete`.
 @(require_results)
 timing_snapshot :: proc(allocator := context.allocator) -> []Timing_Entry {
 	gctx := _gctx()
 	entries := builtin.make([]Timing_Entry, builtin.len(gctx.timing_totals), allocator)
 	i := 0
 	for p, stat in gctx.timing_totals {
-		entries[i] = Timing_Entry{ name = p.name, total_ns = stat.total_ns, count = stat.count }
+		entries[i] = {name=p.name, total_ns=stat.total_ns, count=stat.count}
 		i += 1
 	}
 	for outer in 1 ..< builtin.len(entries) {
@@ -428,25 +352,16 @@ reset_timing :: proc() {
 	builtin.clear(&gctx.timing_totals)
 }
 
-// Begin capturing every subsequent kernel/memcpy on this Context's stream
-// into a CUDA graph. The user runs their forward as usual; nothing actually
-// executes on the GPU during capture, the ops are just recorded.
-//
-// `enable_timing` must be off during capture (cuEventRecord is not
-// capturable on the same stream).
 begin_graph_capture :: proc(loc := #caller_location) {
 	gctx := _gctx(loc)
 	fmt.assertf(!gctx.graph_capturing, "begin_graph_capture: capture already in progress", loc=loc)
 	fmt.assertf(!gctx.timing_enabled, "begin_graph_capture: disable timing first (cuEventRecord is uncapturable)", loc=loc)
 
-	// Drain any in-flight work; capture starts from a clean stream state.
 	cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)
 	cuda.check(cuda.StreamBeginCapture_v2(gctx.stream, .Relaxed), loc=loc)
 	gctx.graph_capturing = true
 }
 
-// End capture and instantiate the executable graph. After this returns,
-// `replay_graph` will launch the captured sequence.
 end_graph_capture :: proc(loc := #caller_location) {
 	gctx := _gctx(loc)
 	fmt.assertf(gctx.graph_capturing, "end_graph_capture: no capture in progress", loc=loc)
@@ -465,16 +380,12 @@ end_graph_capture :: proc(loc := #caller_location) {
 	gctx.graph_capturing = false
 }
 
-// Launch the captured graph on this Context's stream. Caller is responsible
-// for ensuring the graph's inputs (whatever device buffers the captured
-// kernels read from) hold the desired values before the call.
 replay_graph :: proc(loc := #caller_location) {
 	gctx := _gctx(loc)
 	fmt.assertf(gctx.graph_exec != nil, "replay_graph: no captured graph (call end_graph_capture first)", loc=loc)
 	cuda.check(cuda.GraphLaunch(gctx.graph_exec, gctx.stream), loc=loc)
 }
 
-// Op routing lives in ops.odin.
-forward  :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) { _forward (op,  loc) }
-backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) { _backward(op,  loc) }
+forward  :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)                { _forward (op, loc)   }
+backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)                { _backward(op, loc)   }
 update   :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) { _update(opt, t, loc) }
