@@ -43,8 +43,8 @@ path.
 - `rmsnorm/rmsnorm.cu` (rewritten: takes f32 weight, writes per-row
   `rstd` for backward) + `rmsnorm_back_f32.cu`
 - `attention/attention_train_f32.cu` — non-flash, materialises
-  softmax_outputs to `Attention.softmax_outputs`. Caps T at 1024 due
-  to `d_p_row[1024]` shared memory in backward.
+  softmax_outputs to `Attention.softmax_outputs`. Caps T at 2048 due
+  to `d_p_row[2048]` shared memory in backward.
 - `attention/attention_train_back_f32.cu` — uses materialised softmax;
   one block per (kv_head, q_head_in_group, t_q).
 
@@ -201,6 +201,13 @@ What landed:
   adapters on attention projections, train on a tokenized text
   corpus. Saves adapter weights as a simple binary at the end
   (LORA0001 magic, per-layer (rank, in, out, A bytes, B bytes)).
+  Accepts `--tokens PATH` (pre-tokenized binary) or `--corpus PATH`
+  (raw text, capped at 32 KB because the runtime tokenizer is slow).
+- **`tools/tokenize`** — Odin tool that takes a UTF-8 text file
+  and produces the trainer's binary token format (u32 LE count +
+  i32 ids). Chunks at newline boundaries (default 4 KB chunks)
+  to keep the O(N^2) BPE merge loop linear in practice. ~50K tok/s
+  on Shakespeare with the gemma tokenizer (1.1 MB → 7.4 s).
 
 Memory budget on a 3090 Ti for E4B QLoRA:
 - Q4_K base weights: ~2 GB (kept in 4-bit)

@@ -54,7 +54,7 @@ void attention_train_back_f32(const float* __restrict__ q,        // [T, n_q_hea
 	// First, accumulate dV[k] += p[k] * d_o, and per-k compute d_p[k] = dot(d_o, V[k]).
 	// We loop over k cooperatively so each thread handles a subset.
 	// d_p stored in shared so all threads can compute the row reduction.
-	__shared__ float d_p_row[1024];  // assumes T <= 1024
+	__shared__ float d_p_row[2048];  // assumes T <= 2048
 
 	for (int t_k = tid; t_k < T; t_k += 256) {
 		if (t_k >= t_k_min && t_k < t_k_max) {

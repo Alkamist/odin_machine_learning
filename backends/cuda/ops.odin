@@ -75,6 +75,7 @@ _adam_f32_pipeline:  ^Pipeline
 _adam_bf16_pipeline: ^Pipeline
 
 _silu_f32_pipeline:       ^Pipeline
+_silu_bf16_pipeline:      ^Pipeline
 _silu_back_f32_pipeline:  ^Pipeline
 _silu_back_bf16_pipeline: ^Pipeline
 
@@ -1136,7 +1137,7 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 		gctx := _gctx(loc)
 		training := !(.No_Gradients in gctx.clear_flags)
 		if training {
-			fmt.assertf(token_count <= 1024, "cuda attention_train_bf16 caps token_count at 1024 (got %v)", token_count, loc=loc)
+			fmt.assertf(token_count <= 2048, "cuda attention_train_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
 			if _attention_train_bf16_pipeline == nil {
 				_attention_train_bf16_pipeline = _compile_pipeline(ATTENTION_TRAIN_BF16_SRC, "attention_train_bf16.cu", "attention_train_bf16")
 			}
@@ -1159,7 +1160,7 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 		}
 
 	case .F32:
-		fmt.assertf(token_count <= 1024, "cuda attention_train_f32 caps token_count at 1024 (got %v)", token_count, loc=loc)
+		fmt.assertf(token_count <= 2048, "cuda attention_train_f32 caps token_count at 2048 (got %v)", token_count, loc=loc)
 		if _attention_train_f32_pipeline == nil {
 			_attention_train_f32_pipeline = _compile_pipeline(ATTENTION_TRAIN_F32_SRC, "attention_train_f32.cu", "attention_train_f32")
 		}
@@ -1369,16 +1370,28 @@ _slice_trailing_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 _silu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
-	fmt.assertf(x.type == .F32, "cuda silu requires F32 (got %v)", x.type, loc=loc)
-
-	if _silu_f32_pipeline == nil {
-		_silu_f32_pipeline = _compile_pipeline(SILU_F32_SRC, "silu_f32.cu", "silu_f32")
-	}
 
 	xp := data(x).ptr; yp := data(y).ptr
 	n  := i32(ml.len(x))
-	args := [?]rawptr{&xp, &yp, &n}
-	_dispatch(_silu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+
+	#partial switch x.type {
+	case .F32:
+		if _silu_f32_pipeline == nil {
+			_silu_f32_pipeline = _compile_pipeline(SILU_F32_SRC, "silu_f32.cu", "silu_f32")
+		}
+		args := [?]rawptr{&xp, &yp, &n}
+		_dispatch(_silu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .Bf16:
+		if _silu_bf16_pipeline == nil {
+			_silu_bf16_pipeline = _compile_pipeline(SILU_BF16_SRC, "silu_bf16.cu", "silu_bf16")
+		}
+		pair_count := (ml.len(x) + 1) / 2
+		pc := i32(pair_count)
+		args := [?]rawptr{&xp, &yp, &n, &pc}
+		_dispatch(_silu_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("cuda silu: unsupported dtype %v", x.type, loc=loc)
+	}
 }
 
 _gelu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -1771,7 +1784,7 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 			0, args[:], loc,
 		)
 	case .Bf16:
-		fmt.assertf(token_count <= 1024, "cuda attention_train_back_bf16 caps token_count at 1024 (got %v)", token_count, loc=loc)
+		fmt.assertf(token_count <= 2048, "cuda attention_train_back_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
 		fmt.assertf(head_size % 2 == 0, "cuda attention backward bf16 requires even head_size (got %v)", head_size, loc=loc)
 		if _attention_train_back_bf16_pipeline == nil {
 			_attention_train_back_bf16_pipeline = _compile_pipeline(ATTENTION_TRAIN_BACK_BF16_SRC, "attention_train_back_bf16.cu", "attention_train_back_bf16")

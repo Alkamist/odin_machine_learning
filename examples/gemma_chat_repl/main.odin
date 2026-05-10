@@ -17,6 +17,7 @@ import ml    "../.."
 import cpu   "../../backends/cpu"
 import gpu   "../../backends/cuda"
 import gemma "../../networks/gemma"
+import lora  "../../networks/lora"
 import tok   "../../tokenizers/gemma"
 
 DATA_DIR       :: "gemma_data"
@@ -31,6 +32,7 @@ DEFAULT_TOP_P       :: 0.95
 DEFAULT_T_MAX       :: 4096
 DEFAULT_CPU_ARENA   :: 2 * 1024 * 1024 * 1024
 DEFAULT_THREADS     :: 8
+DEFAULT_LORA_ALPHA  :: f32(32) // training-time default in examples/reascript_qlora
 
 EOS_TOKEN_ID     :: 1
 END_OF_TURN_TEXT :: "<turn|>"
@@ -46,9 +48,11 @@ main :: proc() {
 	cpu_arena      := DEFAULT_CPU_ARENA
 	threads        := DEFAULT_THREADS
 	gguf_path      := ""
+	adapters_path  := ""
+	lora_alpha:    f32 = DEFAULT_LORA_ALPHA
 	timing         := false
 
-	parse_args(&max_new_tokens, &temperature, &top_k, &top_p, &t_max, &use_cpu, &cpu_arena, &threads, &gguf_path, &timing)
+	parse_args(&max_new_tokens, &temperature, &top_k, &top_p, &t_max, &use_cpu, &cpu_arena, &threads, &gguf_path, &adapters_path, &lora_alpha, &timing)
 
 	cpu.set_thread_count(threads)
 
@@ -79,10 +83,43 @@ main :: proc() {
 
 	use_gguf := builtin.len(gguf_path) > 0 || os.exists(GGUF_PATH)
 	weights_label := "Q4_K_M GGUF" if use_gguf else "bf16 safetensors"
+
+	// If --adapters is given, scan the file first so we can size LoRA correctly
+	// before allocating the model. Targets and rank are derived from non-zero
+	// slots in the file; alpha defaults to the training-time value.
+	adapter_file: lora.File
+	have_adapters := builtin.len(adapters_path) > 0
+	lora_cfg_opt: Maybe(gemma.LoRA_Config)
+	if have_adapters {
+		ok: bool
+		adapter_file, ok = lora.file_open(adapters_path)
+		if !ok {
+			os.exit(1)
+		}
+
+		targets: gemma.LoRA_Targets
+		rank := 0
+		for layer_idx in 0 ..< adapter_file.layer_count {
+			h := lora.file_slot(adapter_file, layer_idx, .Q   ); if h.rank > 0 { targets += {.Q   }; rank = h.rank }
+			h  = lora.file_slot(adapter_file, layer_idx, .K   ); if h.rank > 0 { targets += {.K   }; rank = h.rank }
+			h  = lora.file_slot(adapter_file, layer_idx, .V   ); if h.rank > 0 { targets += {.V   }; rank = h.rank }
+			h  = lora.file_slot(adapter_file, layer_idx, .O   ); if h.rank > 0 { targets += {.O   }; rank = h.rank }
+			h  = lora.file_slot(adapter_file, layer_idx, .Gate); if h.rank > 0 { targets += {.Gate}; rank = h.rank }
+			h  = lora.file_slot(adapter_file, layer_idx, .Up  ); if h.rank > 0 { targets += {.Up  }; rank = h.rank }
+			h  = lora.file_slot(adapter_file, layer_idx, .Down); if h.rank > 0 { targets += {.Down}; rank = h.rank }
+		}
+		if rank == 0 || card(targets) == 0 {
+			fmt.eprintfln("FAIL: %v has no non-empty adapter slots", adapters_path)
+			os.exit(1)
+		}
+		lora_cfg_opt = gemma.LoRA_Config{rank = rank, alpha = lora_alpha, targets = targets}
+		fmt.printfln("Adapters: %v   rank=%v   alpha=%.1f   targets=%v", adapters_path, rank, f64(lora_alpha), targets)
+	}
+
 	fmt.printfln("Allocating Gemma 4 E4B (%v, %v) ...", weights_label, "CPU" if use_cpu else "GPU")
 	cfg := gemma.make_e4b_config()
 	defer gemma.config_destroy(cfg)
-	model := gemma.make(cfg, .Bf16)
+	model := gemma.make(cfg, .Bf16, lora_cfg = lora_cfg_opt)
 	defer gemma.destroy(model)
 
 	fmt.println("Loading weights ...")
@@ -106,6 +143,25 @@ main :: proc() {
 		}
 	}
 	fmt.printfln("  loaded in %.1f s", f64(time.duration_seconds(time.tick_since(t_load))))
+
+	if have_adapters {
+		fmt.println("Loading LoRA adapter weights ...")
+		for layer_idx in 0 ..< builtin.len(model.layers) {
+			lay := model.layers[layer_idx]
+			ok := lora.load_into(adapter_file, layer_idx, .Q,    lay.q_lora) &&
+			      lora.load_into(adapter_file, layer_idx, .K,    lay.k_lora) &&
+			      lora.load_into(adapter_file, layer_idx, .V,    lay.v_lora) &&
+			      lora.load_into(adapter_file, layer_idx, .O,    lay.o_lora) &&
+			      lora.load_into(adapter_file, layer_idx, .Gate, lay.gate_lora) &&
+			      lora.load_into(adapter_file, layer_idx, .Up,   lay.up_lora) &&
+			      lora.load_into(adapter_file, layer_idx, .Down, lay.down_lora)
+			if !ok {
+				fmt.eprintln("FAIL: adapter load failed.")
+				os.exit(1)
+			}
+		}
+		lora.file_destroy(adapter_file)
+	}
 
 	cache := gemma.cache_make(model, t_max)
 	defer gemma.cache_destroy(cache)
@@ -404,7 +460,7 @@ _sift_down_min_logit :: proc(indices: []int, logits: []f32, start, n: int) {
 	}
 }
 
-parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, threads: ^int, gguf_path: ^string, timing: ^bool) {
+parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: ^f32, t_max: ^int, use_cpu: ^bool, cpu_arena: ^int, threads: ^int, gguf_path: ^string, adapters_path: ^string, lora_alpha: ^f32, timing: ^bool) {
 	args := os.args[1:]
 	i := 0
 	for i < builtin.len(args) {
@@ -461,6 +517,18 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 			}
 			gguf_path^ = args[i + 1]
 			i += 2
+		case "--adapters":
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
+			adapters_path^ = args[i + 1]
+			i += 2
+		case "--lora-alpha":
+			if i + 1 >= builtin.len(args) {
+				_usage_exit()
+			}
+			lora_alpha^ = f32(_parse_float(args[i + 1]))
+			i += 2
 		case "--timing":
 			timing^ = true
 			i += 1
@@ -474,7 +542,7 @@ parse_args :: proc(max_new_tokens: ^int, temperature: ^f32, top_k: ^int, top_p: 
 }
 
 _usage_exit :: proc() {
-	fmt.eprintln("usage: gemma_chat_repl [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N] [--gguf PATH] [--timing]")
+	fmt.eprintln("usage: gemma_chat_repl [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--t-max N] [--cpu] [--cpu-arena BYTES] [--threads N] [--gguf PATH] [--adapters PATH] [--lora-alpha F] [--timing]")
 	os.exit(1)
 }
 

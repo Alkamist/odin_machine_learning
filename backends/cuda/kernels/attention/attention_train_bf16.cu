@@ -1,7 +1,7 @@
 // Bf16 attention forward for training. Port of attention_train_f32.cu:
 // reads/writes bf16 for Q/K/V/out, materialises softmax_outputs as f32
 // (backward needs the row probabilities), accumulates internally in fp32.
-// One block per (head, q_token), 256 threads. Caps T at 1024 (smem-bound
+// One block per (head, q_token), 256 threads. Caps T at 2048 (smem-bound
 // in backward, mirrored for symmetry).
 #include <cuda_bf16.h>
 

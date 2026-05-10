@@ -55,6 +55,7 @@ main :: proc() {
 	gguf_path      := DEFAULT_GGUF
 	tokenizer_path := DEFAULT_TOKEN
 	corpus_path    := DEFAULT_CORPUS
+	tokens_path    := ""
 	rank           := DEFAULT_RANK
 	alpha          := DEFAULT_ALPHA
 	seq_len        := DEFAULT_SEQ_LEN
@@ -63,45 +64,54 @@ main :: proc() {
 	lr             := DEFAULT_LR
 	log_every      := DEFAULT_LOG_EVERY
 
-	parse_args(&gguf_path, &tokenizer_path, &corpus_path, &rank, &alpha, &seq_len, &steps, &accum, &lr, &log_every)
+	parse_args(&gguf_path, &tokenizer_path, &corpus_path, &tokens_path, &rank, &alpha, &seq_len, &steps, &accum, &lr, &log_every)
 
 	rand.reset(DEFAULT_SEED)
 
-	fmt.println("Loading tokenizer ...")
-	tokenizer, tokenizer_ok := tok.load(tokenizer_path)
-	if !tokenizer_ok {
-		fmt.eprintfln("FAIL: could not load tokenizer at %v", tokenizer_path)
-		os.exit(1)
-	}
-	defer tok.destroy(tokenizer)
-
-	fmt.println("Reading corpus ...")
-	corpus_bytes, corpus_err := os.read_entire_file_from_path(corpus_path, context.allocator)
-	if corpus_err != nil {
-		fmt.eprintfln("FAIL: could not read corpus at %v: %v", corpus_path, corpus_err)
-		os.exit(1)
-	}
-	defer delete(corpus_bytes)
-
-	// The gemma tokenizer's `encode` does an O(N * num_added_tokens) scan
-	// for each special-token occurrence and is unworkably slow on large
-	// corpora (megabytes take many minutes). Cap the corpus we actually
-	// tokenize. For real fine-tunes, pre-tokenize your dataset instead.
-	corpus_cap := MAX_CORPUS_BYTES
-	if builtin.len(corpus_bytes) > corpus_cap {
-		fmt.printfln("Corpus is %v bytes; capping at %v for runtime tokenization.", builtin.len(corpus_bytes), corpus_cap)
+	corpus_tokens: []int
+	if tokens_path != "" {
+		// Pre-tokenized binary path. Skips the slow runtime tokenization.
+		// Format matches tools/tokenize: u32 LE count + count * i32 ids.
+		fmt.printfln("Loading pre-tokenized corpus from %v ...", tokens_path)
+		corpus_tokens = load_token_file(tokens_path)
+		fmt.printfln("  %v tokens", builtin.len(corpus_tokens))
 	} else {
-		corpus_cap = builtin.len(corpus_bytes)
-	}
+		fmt.println("Loading tokenizer ...")
+		tokenizer, tokenizer_ok := tok.load(tokenizer_path)
+		if !tokenizer_ok {
+			fmt.eprintfln("FAIL: could not load tokenizer at %v", tokenizer_path)
+			os.exit(1)
+		}
+		defer tok.destroy(tokenizer)
 
-	fmt.println("Tokenizing corpus (this can be slow) ...")
-	t_tok := time.tick_now()
-	corpus_text := string(corpus_bytes[:corpus_cap])
-	corpus_tokens := tok.encode(&tokenizer, corpus_text)
+		fmt.println("Reading corpus ...")
+		corpus_bytes, corpus_err := os.read_entire_file_from_path(corpus_path, context.allocator)
+		if corpus_err != nil {
+			fmt.eprintfln("FAIL: could not read corpus at %v: %v", corpus_path, corpus_err)
+			os.exit(1)
+		}
+		defer delete(corpus_bytes)
+
+		// The gemma tokenizer's `encode` is unworkably slow on big corpora.
+		// Cap the runtime path; for real fine-tunes, pre-tokenize via
+		// `tools/tokenize` and pass the binary via --tokens.
+		corpus_cap := MAX_CORPUS_BYTES
+		if builtin.len(corpus_bytes) > corpus_cap {
+			fmt.printfln("Corpus is %v bytes; capping at %v for runtime tokenization.", builtin.len(corpus_bytes), corpus_cap)
+			fmt.println("(Pre-tokenize with tools/tokenize and pass --tokens PATH for the full corpus.)")
+		} else {
+			corpus_cap = builtin.len(corpus_bytes)
+		}
+
+		fmt.println("Tokenizing corpus (this can be slow) ...")
+		t_tok := time.tick_now()
+		corpus_text := string(corpus_bytes[:corpus_cap])
+		corpus_tokens = tok.encode(&tokenizer, corpus_text)
+		fmt.printfln("  corpus = %v bytes -> %v tokens (%.1f s)",
+			corpus_cap, builtin.len(corpus_tokens),
+			f64(time.duration_seconds(time.tick_since(t_tok))))
+	}
 	defer delete(corpus_tokens)
-	fmt.printfln("  corpus = %v bytes -> %v tokens (%.1f s)",
-		corpus_cap, builtin.len(corpus_tokens),
-		f64(time.duration_seconds(time.tick_since(t_tok))))
 
 	if builtin.len(corpus_tokens) <= seq_len + 1 {
 		fmt.eprintfln("FAIL: corpus too short for seq_len %v", seq_len)
@@ -301,7 +311,7 @@ _save_adapter :: proc(buf: ^[dynamic]byte, adapter: lora.Adapter) {
 	append(buf, ..b_bytes)
 }
 
-parse_args :: proc(gguf, tokenizer, corpus: ^string, rank: ^int, alpha: ^f32, seq_len, steps, accum: ^int, lr: ^f32, log_every: ^int) {
+parse_args :: proc(gguf, tokenizer, corpus, tokens: ^string, rank: ^int, alpha: ^f32, seq_len, steps, accum: ^int, lr: ^f32, log_every: ^int) {
 	args := os.args[1:]
 	i := 0
 	for i < builtin.len(args) {
@@ -310,6 +320,7 @@ parse_args :: proc(gguf, tokenizer, corpus: ^string, rank: ^int, alpha: ^f32, se
 		case "--gguf":      i += 1; gguf^      = args[i]; i += 1
 		case "--tokenizer": i += 1; tokenizer^ = args[i]; i += 1
 		case "--corpus":    i += 1; corpus^    = args[i]; i += 1
+		case "--tokens":    i += 1; tokens^    = args[i]; i += 1
 		case "--rank":      i += 1; rank^      = _parse_int(args[i]); i += 1
 		case "--alpha":     i += 1; alpha^     = f32(_parse_float(args[i])); i += 1
 		case "--seq-len":   i += 1; seq_len^   = _parse_int(args[i]); i += 1
@@ -318,13 +329,42 @@ parse_args :: proc(gguf, tokenizer, corpus: ^string, rank: ^int, alpha: ^f32, se
 		case "--lr":        i += 1; lr^        = f32(_parse_float(args[i])); i += 1
 		case "--log-every": i += 1; log_every^ = _parse_int(args[i]); i += 1
 		case "--help", "-h":
-			fmt.println("usage: gemma_qlora [--gguf PATH] [--tokenizer PATH] [--corpus PATH] [--rank N] [--alpha F] [--seq-len N] [--steps N] [--accum N] [--lr F] [--log-every N]")
+			fmt.println("usage: gemma_qlora [--gguf PATH] [--tokenizer PATH] [--corpus PATH] [--tokens PATH] [--rank N] [--alpha F] [--seq-len N] [--steps N] [--accum N] [--lr F] [--log-every N]")
+			fmt.println("  --tokens PATH   pre-tokenized binary (u32 LE count + i32 ids); skips runtime tokenization")
+			fmt.println("  --corpus PATH   raw text; tokenized at runtime (slow on >32 KB)")
 			os.exit(0)
 		case:
 			fmt.eprintfln("unknown argument: %v", arg)
 			os.exit(1)
 		}
 	}
+}
+
+load_token_file :: proc(path: string) -> []int {
+	bytes, err := os.read_entire_file_from_path(path, context.allocator)
+	if err != nil {
+		fmt.eprintfln("FAIL: could not read tokens file %v: %v", path, err)
+		os.exit(1)
+	}
+	defer delete(bytes)
+
+	if builtin.len(bytes) < 4 {
+		fmt.eprintfln("FAIL: %v is too short to be a tokens file", path)
+		os.exit(1)
+	}
+
+	count := int((^u32le)(raw_data(bytes))^)
+	expected := 4 + count * 4
+	if builtin.len(bytes) < expected {
+		fmt.eprintfln("FAIL: %v claims %v tokens but file has %v bytes", path, count, builtin.len(bytes))
+		os.exit(1)
+	}
+
+	out := builtin.make([]int, count)
+	for i in 0 ..< count {
+		out[i] = int((^i32)(&bytes[4 + i * 4])^)
+	}
+	return out
 }
 
 _parse_int :: proc(s: string) -> int {
@@ -401,4 +441,3 @@ _parse_float :: proc(s: string) -> f64 {
 	}
 	return -out if negative else out
 }
-

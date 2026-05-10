@@ -10,11 +10,14 @@ import "core:math"
 import "core:math/rand"
 import "core:os"
 import "core:strings"
+import "core:sync"
+import "core:sync/chan"
+import "core:thread"
 import "core:time"
 
 import ml    "../.."
 import cpu   "../../backends/cpu"
-import gpu   "../../backends/vulkan"
+import gpu   "../../backends/cuda"
 import llama "../../networks/llama"
 import gpt2  "../../tokenizers/gpt2"
 
@@ -79,17 +82,24 @@ main :: proc() {
 		os.exit(1)
 	}
 
-	fmt.printfln("Allocating SmolLM2-135M (%v) ...", "CPU" if use_cpu else "GPU")
-	model := llama.make(llama.SMOLLM2_135M_CONFIG)
+	fmt.printfln("Allocating SmolLM2-135M (bf16, %v) ...", "CPU" if use_cpu else "GPU")
+	model := llama.make(llama.SMOLLM2_135M_CONFIG, .Bf16)
 	defer llama.destroy(model)
 
 	fmt.printfln("Loading weights from %v ...", model_path)
 	t_load := time.tick_now()
 	{
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		if !llama.load_safetensors(model, model_path) {
-			fmt.eprintln("FAIL: weight loading failed.")
-			os.exit(1)
+		if is_smlw_file(model_path) {
+			if !llama.load_smlw(model, model_path) {
+				fmt.eprintln("FAIL: SMLW weight loading failed.")
+				os.exit(1)
+			}
+		} else {
+			if !llama.load_safetensors(model, model_path) {
+				fmt.eprintln("FAIL: weight loading failed.")
+				os.exit(1)
+			}
 		}
 	}
 	fmt.printfln("  loaded in %.1f s", f64(time.duration_seconds(time.tick_since(t_load))))
@@ -113,6 +123,10 @@ main :: proc() {
 		f64(temperature), top_k, f64(top_p), t_max, max_new_tokens)
 	fmt.println("Type your message and press Enter. Commands: :quit, :reset")
 	fmt.println()
+
+	printer: Printer
+	_printer_start(&printer)
+	defer _printer_stop(&printer)
 
 	first_turn := true
 	input_buffer: [4096]byte
@@ -182,6 +196,7 @@ main :: proc() {
 
 		for step in 0 ..< max_new_tokens {
 			if cache.length + 1 > t_max {
+				_printer_drain(&printer)
 				fmt.println()
 				fmt.println("(stopped: reached t_max)")
 				break
@@ -198,8 +213,7 @@ main :: proc() {
 			reply_so_far := gpt2.decode(&tokenizer, all_tokens[reply_start:])
 			defer delete(reply_so_far)
 			if builtin.len(reply_so_far) > previous_decoded_length {
-				fmt.print(reply_so_far[previous_decoded_length:])
-				os.flush(os.stdout)
+				_printer_emit(&printer, reply_so_far[previous_decoded_length:])
 				previous_decoded_length = builtin.len(reply_so_far)
 			}
 
@@ -221,6 +235,7 @@ main :: proc() {
 		newline_ids := gpt2.encode(&tokenizer, "\n", context.temp_allocator)
 		append(&all_tokens, ..newline_ids)
 
+		_printer_drain(&printer)
 		fmt.println()
 		decode_elapsed := f64(time.duration_seconds(time.tick_since(t_generate)))
 		prefill_rate := f64(builtin.len(new_tokens)) / prefill_elapsed if prefill_elapsed > 0 else 0
@@ -260,6 +275,17 @@ encode_chatml_prefix :: proc(tok: ^gpt2.Tokenizer, role: string, im_start_id: in
 	append(&out, ..header_ids)
 
 	return out[:]
+}
+
+is_smlw_file :: proc(path: string) -> bool {
+	f, err := os.open(path, os.O_RDONLY)
+	if err != nil {
+		return false
+	}
+	defer os.close(f)
+	header: [8]byte
+	n, _ := os.read(f, header[:])
+	return n == 8 && string(header[:]) == "SMLW0001"
 }
 
 read_line :: proc(buffer: []byte) -> (line: string, ok: bool) {
@@ -481,4 +507,61 @@ _parse_float :: proc(s: string) -> f64 {
 	}
 	out := value / scale
 	return -out if negative else out
+}
+
+// Drains stdout writes onto a worker thread so the decode loop never blocks
+// on os.flush. clear() at the start of each forward synchronises the GPU
+// stream, so a per-token flush stall directly idles the GPU.
+PRINTER_QUEUE_CAPACITY :: 256
+
+Printer :: struct {
+	ch:      chan.Chan(string),
+	pending: sync.Wait_Group,
+	thread:  ^thread.Thread,
+}
+
+_printer_proc :: proc(t: ^thread.Thread) {
+	p := (^Printer)(t.data)
+	for {
+		msg, ok := chan.recv(p.ch)
+		if !ok {
+			return
+		}
+		fmt.print(msg)
+		os.flush(os.stdout)
+		delete(msg)
+		sync.wait_group_done(&p.pending)
+	}
+}
+
+_printer_start :: proc(p: ^Printer) {
+	ch_err: runtime.Allocator_Error
+	p.ch, ch_err = chan.create(chan.Chan(string), PRINTER_QUEUE_CAPACITY, context.allocator)
+	if ch_err != .None {
+		fmt.eprintln("FAIL: could not create printer channel.")
+		os.exit(1)
+	}
+	p.thread = thread.create(_printer_proc)
+	p.thread.data = p
+	thread.start(p.thread)
+}
+
+_printer_stop :: proc(p: ^Printer) {
+	chan.close(p.ch)
+	thread.join(p.thread)
+	thread.destroy(p.thread)
+	chan.destroy(p.ch)
+}
+
+_printer_emit :: proc(p: ^Printer, s: string) {
+	if builtin.len(s) == 0 {
+		return
+	}
+	cloned := strings.clone(s)
+	sync.wait_group_add(&p.pending, 1)
+	chan.send(p.ch, cloned)
+}
+
+_printer_drain :: proc(p: ^Printer) {
+	sync.wait_group_wait(&p.pending)
 }

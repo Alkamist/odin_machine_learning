@@ -1404,7 +1404,7 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
 	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
 
-	training := !(.No_Gradients in _current_ctx.clear_flags)
+	training := .No_Gradients not_in _current_ctx.clear_flags
 	if input.type == .F32 || training {
 		view   := reshape(input, []int{input.shape[0] * head_count, head_size}, loc=loc)
 		normed := rmsnorm(view, weight, eps, loc=loc)
@@ -1501,7 +1501,7 @@ add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc :=
 		assert(a.shape[d] == b.shape[d], "add_rmsnorm a/b shape must match", loc=loc)
 	}
 
-	training := !(.No_Gradients in _current_ctx.clear_flags)
+	training := .No_Gradients not_in _current_ctx.clear_flags
 	if a.type == .F32 || training {
 		residual_new = add(a, b, loc=loc)
 		normed       = rmsnorm(residual_new, weight, eps, loc=loc)

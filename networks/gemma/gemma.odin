@@ -690,6 +690,9 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 		hidden := ml.rmsnorm(residual, layer.input_norm_weight, cfg.rms_norm_eps)
 
 		q := _linear(hidden, layer.q_proj_weight)
+		if layer.q_lora.rank > 0 {
+			q = lora.apply(hidden, q, layer.q_lora)
+		}
 		q  = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
 
 		cache_layer_idx := layer_idx if !is_kv_shared_layer(cfg, layer_idx) else kv_source_layer_idx(cfg, layer_idx)
@@ -703,23 +706,52 @@ forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logit
 			v = step_kvs[source].v
 		} else {
 			k = _linear(hidden, layer.k_proj_weight)
+			if layer.k_lora.rank > 0 {
+				k = lora.apply(hidden, k, layer.k_lora)
+			}
 			k = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction, k_cache, k_cache.shape[0])
 
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
 			v = _linear(hidden, layer.v_proj_weight)
+			if layer.v_lora.rank > 0 {
+				v = lora.apply(hidden, v, layer.v_lora)
+			}
 			v = _qkv_norm(model, v, v_norm_ones, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
 
 			step_kvs[layer_idx] = Step_KV{k = k, v = v}
 		}
 
 		attn := ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window)
-		attn  = _linear(attn, layer.o_proj_weight)
+		attn_pre_o := attn
+		attn  = _linear(attn_pre_o, layer.o_proj_weight)
+		if layer.o_lora.rank > 0 {
+			attn = lora.apply(attn_pre_o, attn, layer.o_lora)
+		}
 		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
-	
+
 		mlp_in: ml.Tensor
 		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
 
-		mlp := _linear(_gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight), layer.down_proj_weight)
+		// When gate/up adapters are present, break the fused gate_up_geglu so
+		// each linear's adapter contribution can land on its own output.
+		mlp_act: ml.Tensor
+		if layer.gate_lora.rank > 0 || layer.up_lora.rank > 0 {
+			gate := _linear(mlp_in, layer.gate_proj_weight)
+			if layer.gate_lora.rank > 0 {
+				gate = lora.apply(mlp_in, gate, layer.gate_lora)
+			}
+			up := _linear(mlp_in, layer.up_proj_weight)
+			if layer.up_lora.rank > 0 {
+				up = lora.apply(mlp_in, up, layer.up_lora)
+			}
+			mlp_act = ml.gelu_mul(gate, up)
+		} else {
+			mlp_act = _gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight)
+		}
+		mlp := _linear(mlp_act, layer.down_proj_weight)
+		if layer.down_lora.rank > 0 {
+			mlp = lora.apply(mlp_act, mlp, layer.down_lora)
+		}
 		mlp  = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
 
 		residual = ml.add(residual, mlp)

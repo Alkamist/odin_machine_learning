@@ -30,3 +30,5 @@ examples/data/mnist_flow_samples
 
 smollm_data/
 gemma_data/
+
+reascript/

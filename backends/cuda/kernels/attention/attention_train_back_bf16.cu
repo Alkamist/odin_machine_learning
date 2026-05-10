@@ -45,7 +45,7 @@ void attention_train_back_bf16(const unsigned int* __restrict__ q,
 	int sm_offset = h * T * T + t_q * T;
 
 	__shared__ float reduction[BWG];
-	__shared__ float d_p_row[1024];
+	__shared__ float d_p_row[2048];  // assumes T <= 2048
 
 	for (int t_k = tid; t_k < T; t_k += BWG) {
 		if (t_k >= t_k_min && t_k < t_k_max) {

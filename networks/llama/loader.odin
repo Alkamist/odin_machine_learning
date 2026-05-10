@@ -2,6 +2,7 @@ package machine_learning_network_llama
 
 import "base:builtin"
 import "core:fmt"
+import "core:os"
 import "core:slice"
 
 import ml          "../../"
@@ -93,7 +94,7 @@ _load_rope_permuted :: proc(loader: safetensors.Loader, target: ml.Tensor, name:
 		}
 	}
 
-	ml.set_data(target, permuted)
+	_set_target_from_floats(target, permuted)
 	return true
 }
 
@@ -146,6 +147,169 @@ _load_named :: proc(loader: safetensors.Loader, target: ml.Tensor, name: string)
 	if !_decode_dtype_bytes(info, raw_bytes, floats) {
 		return false
 	}
-	ml.set_data(target, floats)
+	_set_target_from_floats(target, floats)
+	return true
+}
+
+// Writes f32 source values into the target tensor regardless of its dtype.
+// For Bf16 targets, converts element-wise via bf16_from_f32.
+_set_target_from_floats :: proc(target: ml.Tensor, floats: []f32, loc := #caller_location) {
+	switch target.type {
+	case .F32:
+		ml.set_data(target, floats)
+	case .Bf16:
+		count := builtin.len(floats)
+		byte_buf := builtin.make([]byte, count * 2, context.temp_allocator)
+		bf := ([^]ml.Bf16)(raw_data(byte_buf))[:count]
+		for i in 0 ..< count {
+			bf[i] = ml.bf16_from_f32(floats[i])
+		}
+		ml.set_data_bytes(target, byte_buf)
+	case .Q4_K, .Q6_K:
+		fmt.panicf("llama loader: target dtype %v not supported", target.type, loc=loc)
+	}
+}
+
+// Loads weights saved by examples/reascript_smollm in the SMLW0001 format.
+//
+// File layout (LE):
+//   magic "SMLW0001" (8 bytes)
+//   tensor_count (i32)
+//   per tensor:
+//     i32 name_len + name bytes
+//     i32 dtype (0=F32, 1=BF16)
+//     i32 rank + rank * i32 shape
+//     payload (count * dtype_bytes)
+//
+// Tensor names follow the same scheme as load_safetensors. Q/K bytes are
+// already in the model's pair-interleaved order (saved straight from the
+// trained tensors), so no rope-permutation is applied here.
+load_smlw :: proc(model: Llama, path: string) -> bool {
+	bytes, err := os.read_entire_file_from_path(path, context.allocator)
+	if err != nil {
+		fmt.eprintfln("llama.load_smlw: could not read %v: %v", path, err)
+		return false
+	}
+	defer delete(bytes)
+
+	if builtin.len(bytes) < 12 || string(bytes[:8]) != "SMLW0001" {
+		fmt.eprintfln("llama.load_smlw: %v is not an SMLW0001 file", path)
+		return false
+	}
+
+	tensor_count := int((^i32)(&bytes[8])^)
+	cursor := 12
+
+	tensors_by_name: map[string][]byte
+	tensors_by_name.allocator = context.temp_allocator
+	tensor_dtypes:    map[string]i32
+	tensor_dtypes.allocator   = context.temp_allocator
+
+	for i in 0 ..< tensor_count {
+		if cursor + 4 > builtin.len(bytes) {
+			fmt.eprintfln("llama.load_smlw: truncated at tensor %v name_len", i)
+			return false
+		}
+		name_len := int((^i32)(&bytes[cursor])^)
+		cursor += 4
+		if cursor + name_len > builtin.len(bytes) {
+			fmt.eprintfln("llama.load_smlw: truncated at tensor %v name", i)
+			return false
+		}
+		name := string(bytes[cursor : cursor + name_len])
+		cursor += name_len
+
+		if cursor + 8 > builtin.len(bytes) {
+			fmt.eprintfln("llama.load_smlw: truncated at tensor %q dtype/rank", name)
+			return false
+		}
+		dtype := (^i32)(&bytes[cursor])^
+		cursor += 4
+		rank := int((^i32)(&bytes[cursor])^)
+		cursor += 4
+
+		if cursor + rank * 4 > builtin.len(bytes) {
+			fmt.eprintfln("llama.load_smlw: truncated at tensor %q shape", name)
+			return false
+		}
+		count := 1
+		for d in 0 ..< rank {
+			dim := int((^i32)(&bytes[cursor])^)
+			count *= dim
+			cursor += 4
+		}
+
+		bytes_per_elem := 4 if dtype == 0 else 2
+		payload_bytes  := count * bytes_per_elem
+		if cursor + payload_bytes > builtin.len(bytes) {
+			fmt.eprintfln("llama.load_smlw: truncated at tensor %q payload", name)
+			return false
+		}
+		tensors_by_name[name] = bytes[cursor : cursor + payload_bytes]
+		tensor_dtypes[name]   = dtype
+		cursor += payload_bytes
+	}
+
+	apply :: proc(tensors: map[string][]byte, dtypes: map[string]i32, target: ml.Tensor, name: string) -> bool {
+		raw, ok := tensors[name]
+		if !ok {
+			fmt.eprintfln("llama.load_smlw: missing tensor %q", name)
+			return false
+		}
+		dtype := dtypes[name]
+		count := ml.len(target)
+		floats := builtin.make([]f32, count, context.temp_allocator)
+		switch dtype {
+		case 0:
+			if builtin.len(raw) != count * 4 {
+				fmt.eprintfln("llama.load_smlw: %q F32 byte count mismatch", name)
+				return false
+			}
+			builtin.copy(floats, slice.from_ptr((^f32)(raw_data(raw)), count))
+		case 1:
+			if builtin.len(raw) != count * 2 {
+				fmt.eprintfln("llama.load_smlw: %q BF16 byte count mismatch", name)
+				return false
+			}
+			bf := slice.from_ptr((^ml.Bf16)(raw_data(raw)), count)
+			for v, idx in bf {
+				floats[idx] = ml.bf16_to_f32(v)
+			}
+		case:
+			fmt.eprintfln("llama.load_smlw: %q unsupported dtype %v", name, dtype)
+			return false
+		}
+		_set_target_from_floats(target, floats)
+		return true
+	}
+
+	if !apply(tensors_by_name, tensor_dtypes, model.token_embeddings, "model.embed_tokens.weight") {
+		return false
+	}
+	for layer, i in model.layers {
+		ok := apply(tensors_by_name, tensor_dtypes, layer.input_norm_weight,     fmt.tprintf("model.layers.%v.input_layernorm.weight",          i)) &&
+		      apply(tensors_by_name, tensor_dtypes, layer.q_proj_weight,         fmt.tprintf("model.layers.%v.self_attn.q_proj.weight",         i)) &&
+		      apply(tensors_by_name, tensor_dtypes, layer.k_proj_weight,         fmt.tprintf("model.layers.%v.self_attn.k_proj.weight",         i)) &&
+		      apply(tensors_by_name, tensor_dtypes, layer.v_proj_weight,         fmt.tprintf("model.layers.%v.self_attn.v_proj.weight",         i)) &&
+		      apply(tensors_by_name, tensor_dtypes, layer.o_proj_weight,         fmt.tprintf("model.layers.%v.self_attn.o_proj.weight",         i)) &&
+		      apply(tensors_by_name, tensor_dtypes, layer.post_attn_norm_weight, fmt.tprintf("model.layers.%v.post_attention_layernorm.weight", i)) &&
+		      apply(tensors_by_name, tensor_dtypes, layer.gate_proj_weight,      fmt.tprintf("model.layers.%v.mlp.gate_proj.weight",            i)) &&
+		      apply(tensors_by_name, tensor_dtypes, layer.up_proj_weight,        fmt.tprintf("model.layers.%v.mlp.up_proj.weight",              i)) &&
+		      apply(tensors_by_name, tensor_dtypes, layer.down_proj_weight,      fmt.tprintf("model.layers.%v.mlp.down_proj.weight",            i))
+		if !ok {
+			return false
+		}
+	}
+	if !apply(tensors_by_name, tensor_dtypes, model.output_norm_weight, "model.norm.weight") {
+		return false
+	}
+	if !model.config.tied_embeddings {
+		if _, has := tensors_by_name["lm_head.weight"]; has {
+			if !apply(tensors_by_name, tensor_dtypes, model.lm_head_weight, "lm_head.weight") {
+				return false
+			}
+		}
+	}
+
 	return true
 }

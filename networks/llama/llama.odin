@@ -55,35 +55,35 @@ Llama :: struct {
 	lm_head_weight:     ml.Tensor, // [vocabulary_size, embedding_size]; aliases token_embeddings when tied.
 }
 
-make :: proc(config: Config, allocator := context.allocator) -> (model: Llama) {
+make :: proc(config: Config, dtype: ml.Data_Type = .F32, allocator := context.allocator) -> (model: Llama) {
 	q_size  := config.n_q_heads  * config.head_size
 	kv_size := config.n_kv_heads * config.head_size
 
 	model.config           = config
 	model.layers           = builtin.make([]Layer, config.layer_count)
-	model.token_embeddings = ml.make(.F32, {config.vocabulary_size, config.embedding_size})
+	model.token_embeddings = ml.make(dtype, {config.vocabulary_size, config.embedding_size})
 
 	for &layer in model.layers {
-		layer.input_norm_weight     = ml.make(.F32, {config.embedding_size})
-		layer.q_proj_weight         = ml.make(.F32, {q_size,  config.embedding_size})
-		layer.k_proj_weight         = ml.make(.F32, {kv_size, config.embedding_size})
-		layer.v_proj_weight         = ml.make(.F32, {kv_size, config.embedding_size})
-		layer.o_proj_weight         = ml.make(.F32, {config.embedding_size, q_size})
+		layer.input_norm_weight     = ml.make(dtype, {config.embedding_size})
+		layer.q_proj_weight         = ml.make(dtype, {q_size,  config.embedding_size})
+		layer.k_proj_weight         = ml.make(dtype, {kv_size, config.embedding_size})
+		layer.v_proj_weight         = ml.make(dtype, {kv_size, config.embedding_size})
+		layer.o_proj_weight         = ml.make(dtype, {config.embedding_size, q_size})
 		if config.use_qk_norm {
-			layer.q_norm_weight = ml.make(.F32, {config.head_size})
-			layer.k_norm_weight = ml.make(.F32, {config.head_size})
+			layer.q_norm_weight = ml.make(dtype, {config.head_size})
+			layer.k_norm_weight = ml.make(dtype, {config.head_size})
 		}
-		layer.post_attn_norm_weight = ml.make(.F32, {config.embedding_size})
-		layer.gate_proj_weight      = ml.make(.F32, {config.intermediate_size, config.embedding_size})
-		layer.up_proj_weight        = ml.make(.F32, {config.intermediate_size, config.embedding_size})
-		layer.down_proj_weight      = ml.make(.F32, {config.embedding_size,    config.intermediate_size})
+		layer.post_attn_norm_weight = ml.make(dtype, {config.embedding_size})
+		layer.gate_proj_weight      = ml.make(dtype, {config.intermediate_size, config.embedding_size})
+		layer.up_proj_weight        = ml.make(dtype, {config.intermediate_size, config.embedding_size})
+		layer.down_proj_weight      = ml.make(dtype, {config.embedding_size,    config.intermediate_size})
 	}
 
-	model.output_norm_weight = ml.make(.F32, {config.embedding_size})
+	model.output_norm_weight = ml.make(dtype, {config.embedding_size})
 	if config.tied_embeddings {
 		model.lm_head_weight = model.token_embeddings
 	} else {
-		model.lm_head_weight = ml.make(.F32, {config.vocabulary_size, config.embedding_size})
+		model.lm_head_weight = ml.make(dtype, {config.vocabulary_size, config.embedding_size})
 	}
 
 	randomize(model)
@@ -182,16 +182,19 @@ Cache :: struct {
 	layers: []Layer_Cache,
 }
 
-cache_make :: proc(model: Llama, t_max: int, type: ml.Data_Type = .F32, allocator := context.allocator) -> (cache: Cache) {
+// Cache dtype tracks the model's weight dtype: K/V projections produce values
+// in that dtype, so storing them otherwise would cost a per-token cast.
+cache_make :: proc(model: Llama, t_max: int, allocator := context.allocator) -> (cache: Cache) {
 	kv_size := model.config.n_kv_heads * model.config.head_size
+	cache_type := model.token_embeddings.type
 
 	cache.t_max  = t_max
 	cache.length = 0
 	cache.layers = builtin.make([]Layer_Cache, len(model.layers), allocator)
 
 	for &layer_cache in cache.layers {
-		layer_cache.k = ml.alloc(type, {t_max, kv_size}, persistent=true, buffers={.Data})
-		layer_cache.v = ml.alloc(type, {t_max, kv_size}, persistent=true, buffers={.Data})
+		layer_cache.k = ml.alloc(cache_type, {t_max, kv_size}, persistent=true, buffers={.Data})
+		layer_cache.v = ml.alloc(cache_type, {t_max, kv_size}, persistent=true, buffers={.Data})
 	}
 
 	return
@@ -268,6 +271,9 @@ forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int) -> (outpu
 
 	output = ml.rmsnorm(residual, model.output_norm_weight)
 	output = ml.linear(output, model.lm_head_weight)
+	if output.type != .F32 {
+		output = ml.cast_to(output, .F32)
+	}
 
 	cache.length += token_count
 
@@ -311,6 +317,9 @@ forward :: proc(model: Llama, tokens: []int) -> (output: ml.Tensor) {
 
 	output = ml.rmsnorm(residual, model.output_norm_weight)
 	output = ml.linear(output, model.lm_head_weight)
+	if output.type != .F32 {
+		output = ml.cast_to(output, .F32)
+	}
 	return
 }
 
