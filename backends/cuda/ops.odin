@@ -198,6 +198,25 @@ _update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer
 	}
 }
 
+_sq_sum_accumulate :: proc(buffer: ml.Backend_Buffer, count: int, accumulator: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
+	b := transmute(Gpu_Buffer)buffer
+	a := transmute(Gpu_Buffer)accumulator
+	bp := b.ptr; ap := a.ptr; n := i32(count)
+	args := [?]rawptr{&bp, &ap, &n}
+
+	pipeline := _compile_pipeline(SQ_SUM_F32_SRC, "sq_sum_f32.cu", "sq_sum_f32")
+	_dispatch(pipeline, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_scale :: proc(buffer: ml.Backend_Buffer, count: int, scale: f32, loc: runtime.Source_Code_Location) {
+	b := transmute(Gpu_Buffer)buffer
+	bp := b.ptr; n := i32(count); s := scale
+	args := [?]rawptr{&bp, &n, &s}
+
+	pipeline := _compile_pipeline(SCALE_F32_SRC, "scale_f32.cu", "scale_f32")
+	_dispatch(pipeline, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
 _linear_dtype :: proc(t: ml.Data_Type, loc: runtime.Source_Code_Location) -> cublas.DataType {
 	#partial switch t {
 	case .Bf16: return .R_16BF

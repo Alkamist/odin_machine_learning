@@ -185,9 +185,77 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 	_adam_compare(t, "moment_m", adam_cpu_m[:],  adam_cuda_m[:])
 	_adam_compare(t, "moment_v", adam_cpu_v[:],  adam_cuda_v[:])
 
+	clip_cpu_grad  := make([]f32, CLIP_TOTAL)
+	clip_cuda_grad := make([]f32, CLIP_TOTAL)
+	defer delete(clip_cpu_grad)
+	defer delete(clip_cuda_grad)
+	clip_cpu_norm, clip_cuda_norm: f32
+
+	ml.context_begin(cpu_ctx)
+	clip_cpu_norm = _run_clip(clip_cpu_grad)
+	ml.context_end()
+
+	ml.context_begin(cuda_ctx)
+	clip_cuda_norm = _run_clip(clip_cuda_grad)
+	ml.context_end()
+
+	_adam_compare(t, "clip_grad", clip_cpu_grad, clip_cuda_grad)
+	{
+		a := f64(clip_cpu_norm)
+		b := f64(clip_cuda_norm)
+		denom := max(max(abs(a), abs(b)), REL_FLOOR)
+		rel   := abs(a - b) / denom
+		testing.expectf(t, rel <= PARITY_TOL,
+			"clip norm cpu=%.7g cuda=%.7g rel_err=%.4g (tol=%.3g)", a, b, rel, PARITY_TOL)
+	}
+
 	cpu.context_destroy(cpu_ctx)
 	cuda.context_destroy(cuda_ctx)
 	cuda.device_destroy()
+}
+
+CLIP_MAX_NORM :: f32(1.0)
+CLIP_TOTAL    :: 288
+
+_clip_grad :: proc(index: int) -> f32 {
+	return (f32((index * 13 + 7) % 23) - 11) * 0.05
+}
+
+_run_clip :: proc(grads_out: []f32, loc := #caller_location) -> f32 {
+	sizes := [3]int{64, 128, 96}
+	n := len(sizes)
+
+	tensors := make([]ml.Tensor, n)
+	params  := make([]ml.Parameter, n)
+	defer delete(tensors)
+	defer delete(params)
+
+	offset := 0
+	for size, i in sizes {
+		shape := [1]int{size}
+		tensors[i] = ml.make(.F32, shape[:])
+		grad := make([]f32, size)
+		for j in 0 ..< size {
+			grad[j] = _clip_grad(offset + j)
+		}
+		ml.set_bytes(tensors[i], .Gradient, mem.slice_to_bytes(grad))
+		delete(grad)
+		params[i] = ml.Parameter{name = "", tensor = tensors[i]}
+		offset += size
+	}
+
+	norm := ml.clip_gradient_norm(params[:], CLIP_MAX_NORM)
+
+	offset = 0
+	for size, i in sizes {
+		ml.get_gradient(tensors[i], grads_out[offset:offset + size])
+		offset += size
+	}
+
+	for tensor in tensors {
+		ml.destroy(tensor)
+	}
+	return norm
 }
 
 @(test)

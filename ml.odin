@@ -95,6 +95,9 @@ Backend :: struct #all_or_none {
 	buffer_set:   proc(buffer: Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location),
 	buffer_copy:  proc(dst, src: Backend_Buffer, loc: runtime.Source_Code_Location),
 
+	buffer_sq_sum_accumulate: proc(buffer: Backend_Buffer, count: int, accumulator: Backend_Buffer, loc: runtime.Source_Code_Location),
+	buffer_scale:             proc(buffer: Backend_Buffer, count: int, scale: f32, loc: runtime.Source_Code_Location),
+
 	forward_ops:  Operation_Set,
 	backward_ops: Operation_Set,
 }
@@ -109,6 +112,8 @@ Context :: struct {
 	operations:      [MAX_OPERATIONS]Operation,
 
 	training: bool,
+
+	grad_norm_accumulator: Backend_Buffer,
 
 	previous_ctx: ^Context,
 }
@@ -579,35 +584,37 @@ update :: proc(opt: ^Optimizer, t: Tensor, loc := #caller_location) {
 }
 
 clip_gradient_norm :: proc(params: []Parameter, max_norm: f32, loc := #caller_location) -> (norm: f32) {
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-
-	widest := 0
-	for p in params {
-		widest = builtin.max(widest, p.tensor.count)
+	if builtin.len(params) == 0 {
+		return
 	}
-	scratch := builtin.make([]f32, widest, allocator=context.temp_allocator)
 
-	total_sq := f64(0)
-	for p in params {
-		grad := scratch[:p.tensor.count]
-		get_gradient(p.tensor, grad, loc=loc)
-		for g in grad {
-			total_sq += f64(g) * f64(g)
-		}
+	ctx     := current_context(loc=loc)
+	backend := ctx.backend
+
+	if ctx.grad_norm_accumulator == (Backend_Buffer{}) {
+		ctx.grad_norm_accumulator = backend.buffer_alloc(size_of(f64), .Gradient, true, loc)
 	}
-	norm = f32(math.sqrt(total_sq))
+	accumulator := ctx.grad_norm_accumulator
+
+	zero_bytes: [size_of(f64)]byte
+	backend.buffer_set(accumulator, zero_bytes[:], loc)
+
+	for p in params {
+		assert(p.tensor.buffers[.Gradient] != Backend_Buffer{}, "clip_gradient_norm requires parameters with a gradient buffer", loc=loc)
+		backend.buffer_sq_sum_accumulate(p.tensor.buffers[.Gradient], p.tensor.count, accumulator, loc)
+	}
+
+	total_sq: [1]f64
+	backend.buffer_get(accumulator, mem.slice_to_bytes(total_sq[:]), loc)
+
+	norm = f32(math.sqrt(total_sq[0]))
 	if norm <= max_norm || norm == 0 {
 		return
 	}
 
 	scale := max_norm / norm
 	for p in params {
-		grad := scratch[:p.tensor.count]
-		get_gradient(p.tensor, grad, loc=loc)
-		for &g in grad {
-			g *= scale
-		}
-		p.tensor.backend.buffer_set(p.tensor.buffers[.Gradient], mem.slice_to_bytes(grad), loc)
+		backend.buffer_scale(p.tensor.buffers[.Gradient], p.tensor.count, scale, loc)
 	}
 	return
 }

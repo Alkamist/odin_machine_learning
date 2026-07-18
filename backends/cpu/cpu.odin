@@ -341,6 +341,9 @@ _backend := ml.Backend{
 	buffer_set   = buffer_set,
 	buffer_copy  = buffer_copy,
 
+	buffer_sq_sum_accumulate = buffer_sq_sum_accumulate,
+	buffer_scale             = buffer_scale,
+
 	forward_ops  = ml.OPERATION_SET_ALL - {.Linear_Q4_K_Gate_Up_Geglu, .Rmsnorm_Rope_Write_Cache},
 	backward_ops = ml.OPERATION_SET_ALL - {
 		.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
@@ -370,6 +373,10 @@ context_create :: proc(size: int, allocator := context.allocator, loc := #caller
 context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc := #caller_location) {
 	ctx := cast(^Context)ctx
 	ml._context_destroy(ctx, loc)
+	accumulator_bytes := transmute([]byte)ctx.grad_norm_accumulator
+	if raw_data(accumulator_bytes) != nil {
+		builtin.delete(accumulator_bytes, loc=loc)
+	}
 	builtin.delete(ctx.arena.data, loc=loc)
 	builtin.delete(ctx.persistent)
 	builtin.free(ctx, allocator=allocator, loc=loc)
@@ -454,6 +461,24 @@ buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_C
 
 buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
 	builtin.copy(transmute([]byte)dst, transmute([]byte)src)
+}
+
+buffer_sq_sum_accumulate :: proc(buffer: ml.Backend_Buffer, count: int, accumulator: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
+	g   := ([^]f32)(raw_data(transmute([]byte)buffer))[:count]
+	acc := (^f64)(raw_data(transmute([]byte)accumulator))
+
+	total := f64(0)
+	for i in 0 ..< count {
+		total += f64(g[i]) * f64(g[i])
+	}
+	acc^ += total
+}
+
+buffer_scale :: proc(buffer: ml.Backend_Buffer, count: int, scale: f32, loc: runtime.Source_Code_Location) {
+	g := ([^]f32)(raw_data(transmute([]byte)buffer))[:count]
+	for i in 0 ..< count {
+		g[i] *= scale
+	}
 }
 
 update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {

@@ -183,6 +183,9 @@ _backend := ml.Backend{
 	buffer_set   = buffer_set,
 	buffer_copy  = buffer_copy,
 
+	buffer_sq_sum_accumulate = buffer_sq_sum_accumulate,
+	buffer_scale             = buffer_scale,
+
 	forward_ops = {
 		.Add, .Mul, .Gelu_Mul, .Gelu, .Silu, .Tanh, .Cast, .Linear,
 		.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
@@ -447,3 +450,6 @@ forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 }
 backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)                { _backward(op, loc)   }
 update   :: proc(opt: ml.Optimizer, t: ml.Tensor, m, v: ml.Backend_Buffer, loc: runtime.Source_Code_Location) { _update(opt, t, m, v, loc) }
+
+buffer_sq_sum_accumulate :: proc(buffer: ml.Backend_Buffer, count: int, accumulator: ml.Backend_Buffer, loc: runtime.Source_Code_Location) { _sq_sum_accumulate(buffer, count, accumulator, loc) }
+buffer_scale             :: proc(buffer: ml.Backend_Buffer, count: int, scale: f32, loc: runtime.Source_Code_Location)                    { _scale(buffer, count, scale, loc) }
