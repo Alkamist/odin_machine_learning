@@ -12,6 +12,10 @@
 
 - DON'T WRITE ANY COMMENTS.
 
+## Sub-Agents
+
+- When doing large edit arcs, spawn an instance of Opus as a sub-agent to do it, then check and critique its work in an adversarial way. The goal is to arrive at the best possible code you can agree on.
+
 ## Style
 
 - Use descriptive variable names.
