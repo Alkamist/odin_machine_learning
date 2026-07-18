@@ -138,7 +138,9 @@ when thread.IS_SUPPORTED {
 		_cleanup_thread_pool()
 	}
 
-	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data)) {
+	PARALLELIZE_MIN_WORK :: 24 * 1024
+
+	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data), work := max(int)) {
 		Thunk_Data :: struct {
 			data: Data,
 			job:  proc(index: int, data: Data),
@@ -153,6 +155,13 @@ when thread.IS_SUPPORTED {
 
 		if job_count <= 1 {
 			job(0, data)
+			return
+		}
+
+		if work < PARALLELIZE_MIN_WORK {
+			for i in 0 ..< job_count {
+				job(i, data)
+			}
 			return
 		}
 
@@ -208,7 +217,7 @@ when thread.IS_SUPPORTED {
 	set_thread_count :: proc(count: int, loc := #caller_location) {
 	}
 
-	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data)) {
+	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data), work := max(int)) {
 		for i in 0 ..< job_count {
 			job(i, data)
 		}
@@ -698,12 +707,18 @@ add_forward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
+	width := ml.len(b)
+
 	#partial switch a.type {
 	case .F32:
-		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
-				data(output)[o] = data(a)[o] + data(b)[j]
+		a_f32 := data(a)
+		b_f32 := data(b)
+		o_f32 := data(output)
+		#no_bounds_check for i in 0 ..< stride {
+			row_a := a_f32[i * width:]
+			row_o := o_f32[i * width:]
+			for j in 0 ..< width {
+				row_o[j] = row_a[j] + b_f32[j]
 			}
 		}
 	case .Bf16:
@@ -711,8 +726,8 @@ add_forward :: proc(op: ml.Operation) {
 		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
 		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) + ml.bf16_to_f32(b_bf[j]))
 			}
 		}
@@ -725,11 +740,13 @@ add_backward :: proc(op: ml.Operation) {
 	stride := ml.len(a) / ml.len(b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
-	for i in 0 ..< stride {
-		for j in 0 ..< ml.len(b) {
-			o := i * ml.len(b) + j
-			da[o] += dy[o]
-			db[j] += dy[o]
+	width := ml.len(b)
+	#no_bounds_check for i in 0 ..< stride {
+		row_da := da[i * width:]
+		row_dy := dy[i * width:]
+		for j in 0 ..< width {
+			row_da[j] += row_dy[j]
+			db[j]     += row_dy[j]
 		}
 	}
 }
@@ -1295,13 +1312,38 @@ linear_forward :: proc(op: ml.Operation) {
 linear_forward_f32 :: proc(op: ml.Operation) {
 	weight      := op.variant.(ml.Linear).weight
 	output_size := weight.shape[0]
-	count       := ml.len(op.input) / weight.shape[1]
+	input_size  := weight.shape[1]
+	count       := ml.len(op.input) / input_size
 
 	Job_Data :: struct {
 		op:    ml.Operation,
 		count: int,
 	}
 	jd := Job_Data{op = op, count = count}
+
+	work := count * output_size * input_size
+
+	if count >= output_size {
+		parallelize(count, count, jd, proc(c: int, jd: Job_Data) {
+			op := jd.op
+			input, output := op.input, op.output
+			weight      := op.variant.(ml.Linear).weight
+			output_size := weight.shape[0]
+			input_size  := weight.shape[1]
+
+			input_ptr  := ([^]f32)(raw_data(data(input)))
+			output_ptr := ([^]f32)(raw_data(data(output)))
+			weight_ptr := ([^]f32)(raw_data(data(weight)))
+
+			x := input_ptr[c * input_size:]
+			y := output_ptr[c * output_size:]
+
+			for o in 0 ..< output_size {
+				y[o] = _simd_dot_f32(weight_ptr[o * input_size:], x, input_size)
+			}
+		}, work=work)
+		return
+	}
 
 	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
 		op := jd.op
@@ -1319,7 +1361,7 @@ linear_forward_f32 :: proc(op: ml.Operation) {
 			x := input_ptr[c * input_size:]
 			output_ptr[c * output_size + o] = _simd_dot_f32(w_row, x, input_size)
 		}
-	})
+	}, work=work)
 }
 
 linear_forward_bf16 :: proc(op: ml.Operation) {
@@ -1491,6 +1533,8 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 	input_size  := weight.shape[1]
 	count       := ml.len(op.input) / input_size
 
+	work := count * output_size * input_size
+
 	parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
 		input, output := op.input, op.output
 		weight      := op.variant.(ml.Linear).weight
@@ -1512,7 +1556,7 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 			x := input_data_ptr[b * input_size:]
 			_simd_axpy_f32(w_grad, x, dout, input_size)
 		}
-	})
+	}, work=work)
 
 	parallelize(count, count, op, proc(b: int, op: ml.Operation) {
 		input, output := op.input, op.output
@@ -1535,7 +1579,7 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 			w_data := weight_data_ptr[o * input_size:]
 			_simd_axpy_f32(dx, w_data, dout, input_size)
 		}
-	})
+	}, work=work)
 }
 
 rope_forward :: proc(op: ml.Operation) {
@@ -2560,8 +2604,10 @@ _unary_forward_dispatch :: proc(op: ml.Operation, fwd_f32: proc(x: f32) -> f32) 
 	input, output := op.input, op.output
 	#partial switch input.type {
 	case .F32:
-		for i in 0 ..< ml.len(input) {
-			data(output)[i] = fwd_f32(data(input)[i])
+		x := data(input)
+		y := data(output)
+		#no_bounds_check for i in 0 ..< ml.len(input) {
+			y[i] = fwd_f32(x[i])
 		}
 	case .Bf16:
 		x_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
@@ -2576,8 +2622,11 @@ _unary_backward_dispatch :: proc(op: ml.Operation, local_grad_from_input: proc(x
 	input, output := op.input, op.output
 	#partial switch input.type {
 	case .F32:
-		for i in 0 ..< ml.len(input) {
-			gradient(input)[i] += gradient(output)[i] * local_grad_from_input(data(input)[i])
+		x  := data(input)
+		dx := gradient(input)
+		dy := gradient(output)
+		#no_bounds_check for i in 0 ..< ml.len(input) {
+			dx[i] += dy[i] * local_grad_from_input(x[i])
 		}
 	case .Bf16:
 		x_bf := data_bf16(input)
@@ -2591,11 +2640,30 @@ _unary_backward_dispatch :: proc(op: ml.Operation, local_grad_from_input: proc(x
 }
 
 relu_forward :: proc(op: ml.Operation) {
-	_unary_forward_dispatch(op, proc(x: f32) -> f32 { return x < 0 ? 0 : x })
+	if op.input.type != .F32 {
+		_unary_forward_dispatch(op, proc(x: f32) -> f32 { return x < 0 ? 0 : x })
+		return
+	}
+
+	x := data(op.input)
+	y := data(op.output)
+	#no_bounds_check for i in 0 ..< ml.len(op.input) {
+		y[i] = x[i] < 0 ? 0 : x[i]
+	}
 }
 
 relu_backward :: proc(op: ml.Operation) {
-	_unary_backward_dispatch(op, proc(x: f32) -> f32 { return x > 0 ? 1 : 0 })
+	if op.input.type != .F32 {
+		_unary_backward_dispatch(op, proc(x: f32) -> f32 { return x > 0 ? 1 : 0 })
+		return
+	}
+
+	x  := data(op.input)
+	dx := gradient(op.input)
+	dy := gradient(op.output)
+	#no_bounds_check for i in 0 ..< ml.len(op.input) {
+		dx[i] += x[i] > 0 ? dy[i] : 0
+	}
 }
 
 sigmoid_forward :: proc(op: ml.Operation) {

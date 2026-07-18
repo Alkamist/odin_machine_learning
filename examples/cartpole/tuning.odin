@@ -23,6 +23,9 @@ Tuning :: struct {
 	barrier_weight:  f32,
 	spin_weight:     f32,
 	discount:        f32,
+	threads:         int,
+	train_batch:     int,
+	hidden:          int,
 }
 
 tuning := Tuning {
@@ -40,6 +43,9 @@ tuning := Tuning {
 	barrier_weight = 20,
 	spin_weight    = 2,
 	discount       = 0.98,
+	threads        = 4,
+	train_batch    = 64,
+	hidden         = HIDDEN_SIZE,
 }
 
 tuning_parse :: proc(arguments: []string) {
@@ -73,6 +79,9 @@ tuning_parse :: proc(arguments: []string) {
 		case "barrier_weight": tuning.barrier_weight = f32(number)
 		case "spin_weight":    tuning.spin_weight    = f32(number)
 		case "discount":       tuning.discount       = f32(number)
+		case "threads":        tuning.threads        = int(number)
+		case "train_batch":    tuning.train_batch    = int(number)
+		case "hidden":         tuning.hidden         = int(number)
 		case:
 			fmt.eprintln("unknown tuning key:", key)
 			os.exit(1)
@@ -82,4 +91,5 @@ tuning_parse :: proc(arguments: []string) {
 	assert(tuning.plan_samples <= PLAN_SAMPLES, "plan_samples exceeds its compiled maximum")
 	assert(tuning.plan_horizon <= PLAN_HORIZON, "plan_horizon exceeds its compiled maximum")
 	assert(tuning.plan_elites  <= tuning.plan_samples)
+	assert(tuning.train_batch  <= TRAIN_BATCH_SIZE, "train_batch exceeds its compiled maximum")
 }

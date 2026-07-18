@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:math"
 import "core:math/rand"
 import "core:os"
+import "core:time"
 
 import ml  "../../"
 import cpu "../../backends/cpu"
@@ -13,18 +14,26 @@ FIXED_DELTA :: 1.0 / 60.0
 PIXELS_PER_METER :: 24
 
 main :: proc() {
-	cpu.set_thread_count(4)
+	tuning_parse(os.args[1:])
+
+	cpu.set_thread_count(tuning.threads)
 
 	ctx := cpu.context_create(1024 * 1024 * 256)
 	defer cpu.context_destroy(ctx)
 
 	ml.context_scope(ctx)
 
-	tuning_parse(os.args[1:])
-
 	for argument in os.args[1:] {
 		if argument == "-headless" {
 			headless()
+			return
+		}
+		if argument == "-profile" {
+			profile()
+			return
+		}
+		if argument == "-bench" {
+			bench()
 			return
 		}
 	}
@@ -66,13 +75,19 @@ interactive :: proc() {
 			mouse_end(&game_state)
 		}
 
+		agent_spent: time.Duration
+		steps:       f32
+
 		for fixed_timestep(&timestep, FIXED_DELTA) {
 			if human {
 				action = human_action(action)
 			}
 			else {
-				action = agent_step(&agent, game_state)
+				start  := time.tick_now()
+				action  = agent_step(&agent, game_state)
+				agent_spent += time.tick_since(start)
 			}
+			steps += 1
 
 			if step(&game_state, action, FIXED_DELTA) {
 				reset(&game_state)
@@ -81,10 +96,50 @@ interactive :: proc() {
 		}
 
 		draw(game_state, timestep.interpolation)
-		draw_status(human, agent.decisions)
+		draw_status(human, agent.decisions, f32(time.duration_milliseconds(agent_spent)), steps)
 
 		frame_end()
 	}
+}
+
+// Where the frame time actually goes. Runs only a few hundred frames on one
+// seed so it stays cheap to run.
+profile :: proc() {
+	rand.reset(0)
+
+	game_state: State
+	init(&game_state)
+	defer destroy(&game_state)
+
+	agent := agent_make()
+	defer agent_destroy(agent)
+
+	FRAMES :: 400
+
+	worst: time.Duration
+	total: time.Duration
+
+	for _ in 1 ..= FRAMES {
+		defer free_all(context.temp_allocator)
+
+		start  := time.tick_now()
+		action := agent_step(&agent, game_state)
+		spent  := time.tick_since(start)
+
+		total += spent
+		worst  = max(worst, spent)
+
+		if step(&game_state, action, FIXED_DELTA) {
+			reset(&game_state)
+			agent_forget_episode(&agent)
+		}
+	}
+
+	budget := time.Duration(FIXED_DELTA * f32(time.Second))
+
+	fmt.printfln("mean  %8.3f ms/frame  (%.0f%% of a 60Hz frame)", time.duration_milliseconds(total) / FRAMES, 100 * f64(total / FRAMES) / f64(budget))
+	fmt.printfln("worst %8.3f ms/frame  (%.0f%% of a 60Hz frame)", time.duration_milliseconds(worst),          100 * f64(worst)         / f64(budget))
+	fmt.printfln("agent train %6.3f ms  plan %6.3f ms  per decision", time.duration_milliseconds(agent_train_time) / (FRAMES / ACTION_REPEAT), time.duration_milliseconds(agent_plan_time) / (FRAMES / ACTION_REPEAT))
 }
 
 HEADLESS_SEEDS  :: 6

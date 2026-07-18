@@ -1,6 +1,7 @@
 package main
 
 import "core:math"
+import "core:time"
 import "core:math/rand"
 import "core:slice"
 
@@ -21,7 +22,7 @@ import    "../../networks/mlp"
 ACTION_COUNT :: len(Action)
 OBS_SIZE     :: 5
 MODEL_INPUT  :: OBS_SIZE + ACTION_COUNT
-HIDDEN_SIZE  :: 96
+HIDDEN_SIZE  :: 32
 
 // The agent commits to an action for this many physics frames. Holding actions
 // shrinks the search space and makes the sampled sequences coherent enough to
@@ -35,9 +36,9 @@ PLAN_ELITES  :: 8
 PLAN_ITERS   :: 3
 
 BUFFER_CAPACITY  :: 4096
-TRAIN_BATCH_SIZE :: 64
+TRAIN_BATCH_SIZE :: 512 // compiled maximum; see tuning.train_batch
 TRAIN_MINIMUM    :: 8
-TRAIN_STEPS      :: 32
+TRAIN_STEPS      :: 24
 LEARNING_RATE    :: 3e-3
 
 // Decisions of uniformly random actions before planning takes over. The model
@@ -84,13 +85,14 @@ Agent :: struct {
 
 	action:       Action,
 	hold:         int,
+	train_credit: f32,
 	previous:     Observation,
 	has_previous: bool,
 	decisions:    int,
 }
 
 agent_make :: proc(allocator := context.allocator) -> (agent: Agent) {
-	agent.model = mlp.make(MODEL_INPUT, HIDDEN_SIZE, OBS_SIZE, allocator=allocator)
+	agent.model = mlp.make(MODEL_INPUT, tuning.hidden, OBS_SIZE, allocator=allocator)
 	agent_forget_episode(&agent)
 	return
 }
@@ -115,6 +117,15 @@ agent_forget_episode :: proc(agent: ^Agent) {
 // Drives one physics frame: records the transition that just completed, trains
 // on it, and re-plans, but only on frames where the held action expires.
 agent_step :: proc(agent: ^Agent, state: State) -> Action {
+	// Training is spread across every frame rather than landing entirely on the
+	// frames where a decision is made. It is the same total work, but a third of
+	// the spike, and the spike is what was blowing the frame budget.
+	agent.train_credit += f32(tuning.train_steps) / f32(ACTION_REPEAT)
+
+	steps := int(agent.train_credit)
+	agent.train_credit -= f32(steps)
+	agent_train(agent, steps)
+
 	if agent.hold > 0 {
 		agent.hold -= 1
 		return agent.action
@@ -132,8 +143,6 @@ agent_step :: proc(agent: ^Agent, state: State) -> Action {
 		}
 		agent_remember(agent, transition)
 	}
-
-	agent_train(agent)
 
 	if agent.decisions < tuning.warmup {
 		agent.action = Action(rand.int_max(ACTION_COUNT))
@@ -212,7 +221,14 @@ encode :: proc(observation: Observation, action: Action, dst: []f32) {
 	dst[OBS_SIZE + int(action)] = 1
 }
 
-agent_train :: proc(agent: ^Agent) {
+// Profiling counters, read by the -profile mode.
+agent_train_time: time.Duration
+agent_plan_time:  time.Duration
+
+agent_train :: proc(agent: ^Agent, steps: int) {
+	start := time.tick_now()
+	defer agent_train_time += time.tick_since(start)
+
 	// Sampling with replacement, so training starts as soon as there is
 	// anything at all to train on rather than idling until a full batch has
 	// accumulated. Those first few dozen frames are a large slice of the
@@ -221,13 +237,13 @@ agent_train :: proc(agent: ^Agent) {
 		return
 	}
 
-	inputs  := make([]f32, TRAIN_BATCH_SIZE * MODEL_INPUT, context.temp_allocator)
-	targets := make([]f32, TRAIN_BATCH_SIZE * OBS_SIZE,    context.temp_allocator)
+	inputs  := make([]f32, tuning.train_batch * MODEL_INPUT, context.temp_allocator)
+	targets := make([]f32, tuning.train_batch * OBS_SIZE,    context.temp_allocator)
 
-	for _ in 0 ..< tuning.train_steps {
+	for _ in 0 ..< steps {
 		ml.clear(training=true)
 
-		for b in 0 ..< TRAIN_BATCH_SIZE {
+		for b in 0 ..< tuning.train_batch {
 			transition := agent.buffer[agent_sample_index(agent)]
 
 			encode(transition.observation, transition.action, inputs[b * MODEL_INPUT:][:MODEL_INPUT])
@@ -237,8 +253,8 @@ agent_train :: proc(agent: ^Agent) {
 			}
 		}
 
-		x          := ml.reshape(ml.tensor(inputs),  {TRAIN_BATCH_SIZE, MODEL_INPUT})
-		y          := ml.reshape(ml.tensor(targets), {TRAIN_BATCH_SIZE, OBS_SIZE})
+		x          := ml.reshape(ml.tensor(inputs),  {tuning.train_batch, MODEL_INPUT})
+		y          := ml.reshape(ml.tensor(targets), {tuning.train_batch, OBS_SIZE})
 		prediction := mlp.forward(agent.model, x)
 		loss       := ml.mean(ml.mean_squared_error(prediction, y))
 
@@ -255,6 +271,9 @@ agent_train :: proc(agent: ^Agent) {
 // the best few, and refit the distribution toward them.
 @(require_results)
 agent_plan :: proc(agent: ^Agent, observation: Observation) -> Action {
+	start := time.tick_now()
+	defer agent_plan_time += time.tick_since(start)
+
 	sequences := make([][PLAN_HORIZON]Action, tuning.plan_samples, context.temp_allocator)
 	returns   := make([]f32,                  tuning.plan_samples, context.temp_allocator)
 	order     := make([]int,                  tuning.plan_samples, context.temp_allocator)

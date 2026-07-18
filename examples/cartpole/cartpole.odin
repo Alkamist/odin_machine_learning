@@ -184,6 +184,7 @@ State :: struct {
 	mouse_shape:  b2.ShapeId,
 	mouse_active: bool,
 	mouse_target: [2]f32,
+	mouse_position_: [2]f32, // previous position for visual interpolation
 }
 
 // A kinematic disc the mouse drives around to shove the pole with. Kinematic so
@@ -208,6 +209,8 @@ mouse_begin :: proc(state: ^State, world: [2]f32) {
 	b2.Body_SetTransform(state.mouse_body, world, b2.MakeRot(0))
 	b2.Body_SetLinearVelocity(state.mouse_body, {0, 0})
 	b2.Body_Enable(state.mouse_body)
+
+	state.mouse_position_ = world
 }
 
 mouse_end :: proc(state: ^State) {
@@ -367,6 +370,8 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (done: bool) {
 	b2.Body_ApplyForceToCenter(state.cart.body, {force, 0}, true)
 
 	// Update interpolation values
+	state.mouse_position_ = b2.Body_GetPosition(state.mouse_body)
+
 	box_update(&state.left_wall)
 	box_update(&state.right_wall)
 
@@ -425,7 +430,7 @@ draw :: proc(state: State, interpolation: f32) {
 	box_draw(state.pole, rl.GREEN,    interpolation)
 
 	if state.mouse_active {
-		position := b2.Body_GetPosition(state.mouse_body)
+		position := math.lerp(state.mouse_position_, b2.Body_GetPosition(state.mouse_body), interpolation)
 		rl.DrawCircleV({position.x, -position.y}, MOUSE_RADIUS, rl.YELLOW)
 	}
 
@@ -438,13 +443,18 @@ draw :: proc(state: State, interpolation: f32) {
 	rl.EndMode2D()
 }
 
-draw_status :: proc(human: bool, decisions: int) {
+draw_status :: proc(human: bool, decisions: int, agent_ms, steps: f32) {
 	if human {
 		rl.DrawText("Human (TAB to hand back to the agent) - A/D to move", 20, 20, 20, rl.WHITE)
 	}
 	else {
 		rl.DrawText(rl.TextFormat("Agent, %d decisions learned (TAB to take over)", decisions), 20, 20, 20, rl.WHITE)
 	}
+
+	// Frame budget at 60Hz is 16.7ms. If the agent figure is small and the frame
+	// figure is not, the time is going somewhere other than the agent.
+	rl.DrawText(rl.TextFormat("%d FPS | frame %.1f ms | agent %.2f ms over %.1f steps",
+		rl.GetFPS(), 1000 * rl.GetFrameTime(), agent_ms, steps), 20, 44, 20, rl.LIGHTGRAY)
 }
 
 draw_text :: proc(text: cstring, font_size: int, x, y: f32, color: rl.Color) {
