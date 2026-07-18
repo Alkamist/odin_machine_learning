@@ -1,7 +1,7 @@
 ## Rules
 
 - Don't edit this file.
-- Commit as you go, but only with a single-line message, no co-author, and no session pin.
+- Don't git commit without asking. Instead, if you reach a good spot to commit, give me a one-line message to commit with and I'll do it. If I ask you to, commit with a single-line message, no co-author, and no session pin.
 - Prioritize code correctness, clarity, and maintainability for humans.
 - Minimize cross-cutting concerns and dependencies when possible.
 - Don't leave old cruft if it is never going to be useful later.
