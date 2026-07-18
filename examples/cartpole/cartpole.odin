@@ -8,6 +8,7 @@ import b2 "vendor:box2d"
 window_open :: proc() {
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 	rl.InitWindow(1280, 720, "CartPole")
+	rl.SetTargetFPS(240)
 }
 
 window_close :: proc() {
@@ -31,8 +32,6 @@ toggle_pressed :: proc() -> bool {
 	return rl.IsKeyPressed(.TAB)
 }
 
-// The world is drawn with {0, 0} at the middle of the window and y pointing up,
-// so screen coordinates have to be recentered and flipped to match.
 @(require_results)
 mouse_position :: proc() -> [2]f32 {
 	position := rl.GetMousePosition()
@@ -187,10 +186,6 @@ State :: struct {
 	mouse_position_: [2]f32, // previous position for visual interpolation
 }
 
-// A kinematic disc the mouse drives around to shove the pole with. Kinematic so
-// the pole cannot push back on it, and driven by velocity rather than by
-// teleporting its transform, because a body that jumps between positions has no
-// velocity for the solver to transfer into whatever it lands on.
 MOUSE_RADIUS :: 20.0
 
 mouse_destroy :: proc(state: State) {
@@ -277,10 +272,8 @@ reset :: proc(state: ^State) {
 	state.time     = 0
 	state.score    = 0
 
-	// The disc is recreated below along with everything else.
 	state.mouse_active = false
 
-	// Create static anchor body for the prismatic joint
 	anchor_def         := b2.DefaultBodyDef()
 	anchor_def.type     = .staticBody
 	anchor_def.position = {0, 0}
@@ -289,8 +282,6 @@ reset :: proc(state: ^State) {
 	state.cart = box_make(state^, .dynamicBody, {0, 0}, CART_SIZE, 5)
 	state.pole = box_make(state^, .dynamicBody, {0, -POLE_SIZE.y * 0.5}, POLE_SIZE, 2, category={.Pole}, mask={.Mouse})
 
-	// The disc the mouse pushes the pole with. It only ever interacts with the
-	// pole, and stays disabled until the left button is actually held.
 	mouse_def         := b2.DefaultBodyDef()
 	mouse_def.type     = .kinematicBody
 	mouse_def.position = {0, 0}
@@ -306,20 +297,17 @@ reset :: proc(state: ^State) {
 	b2.Shape_SetFriction(state.mouse_shape, 0)
 	b2.Body_Disable(state.mouse_body)
 
-	// Create walls
 	state.left_wall  = box_make(state^, .staticBody, {-CART_LIMIT, 0}, WALL_SIZE, 0)
 	state.right_wall = box_make(state^, .staticBody, { CART_LIMIT, 0}, WALL_SIZE, 0)
 
-	// Create prismatic joint to constrain cart movement
 	prismatic_def                 := b2.DefaultPrismaticJointDef()
 	prismatic_def.bodyIdA          = state.anchor_body
 	prismatic_def.bodyIdB          = state.cart.body
 	prismatic_def.localAnchorA     = {0, 0}
 	prismatic_def.localAnchorB     = {0, 0}
-	prismatic_def.localAxisA       = {1, 0} // allow movement along x-axis
+	prismatic_def.localAxisA       = {1, 0}
 	state.prismatic_joint          = b2.CreatePrismaticJoint(state.world, prismatic_def)
 
-	// Create revolute joint between cart and pole
 	revolute_def             := b2.DefaultRevoluteJointDef()
 	revolute_def.bodyIdA      = state.cart.body
 	revolute_def.bodyIdB      = state.pole.body
@@ -327,9 +315,6 @@ reset :: proc(state: ^State) {
 	revolute_def.localAnchorB = {0, POLE_SIZE.y / 2.0}
 	state.revolute_joint      = b2.CreateRevoluteJoint(state.world, revolute_def)
 }
-
-// The four numbers that fully describe the system, for whoever is playing it.
-// The pole hangs straight down at angle 0 and stands upright at +/-pi.
 
 @(require_results)
 cart_position :: proc(state: State) -> f32 {
@@ -356,7 +341,6 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (done: bool) {
 
 	mouse_apply(state, delta)
 
-	// Apply a force to the cart based on action
 	target_speed: f32
 	switch action {
 	case .None:
@@ -369,7 +353,6 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (done: bool) {
 
 	b2.Body_ApplyForceToCenter(state.cart.body, {force, 0}, true)
 
-	// Update interpolation values
 	state.mouse_position_ = b2.Body_GetPosition(state.mouse_body)
 
 	box_update(&state.left_wall)
@@ -378,15 +361,12 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (done: bool) {
 	box_update(&state.cart)
 	box_update(&state.pole)
 
-	// Step physics
 	b2.World_Step(state.world, delta, 4)
 
-	// Accumulate score. The further the pole is flipped up, the faster it climbs
 	pole_angle := b2.Rot_GetAngle(b2.Body_GetRotation(state.pole.body))
 
 	state.score += abs(pole_angle) * delta
 
-	// Check for wall collisions
 	contact_events := b2.World_GetContactEvents(state.world)
 	wall_hit       := false
 
@@ -402,7 +382,6 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (done: bool) {
 		}
 	}
 
-	// Game-ending conditions
 	if wall_hit || state.time > TIME_LIMIT {
 		if state.score > state.high_score {
 			state.high_score = state.score
@@ -414,7 +393,6 @@ step :: proc(state: ^State, action: Action, delta: f32) -> (done: bool) {
 }
 
 draw :: proc(state: State, interpolation: f32) {
-	// Offset the camera so that {0, 0} is in the middle of the window
 	camera: rl.Camera2D
 	camera.offset = {
 		f32(rl.GetScreenWidth())  / 2.0,
@@ -437,13 +415,13 @@ draw :: proc(state: State, interpolation: f32) {
 	position := math.lerp(state.cart.position_, b2.Body_GetPosition(state.cart.body), interpolation)
 	draw_text_centered(rl.TextFormat("%.2f", state.score), 10, position.x, position.y + 50, rl.WHITE)
 
-	draw_text(rl.TextFormat("High Score: %.2f", state.high_score),        20, 20 - CART_LIMIT, 340, rl.WHITE)
-	draw_text(rl.TextFormat("Time: %.2f",       TIME_LIMIT - state.time), 20, 0,               340, rl.WHITE)
-
 	rl.EndMode2D()
+
+	rl.DrawText(rl.TextFormat("High Score: %.2f", state.high_score),        20, 68, 20, rl.WHITE)
+	rl.DrawText(rl.TextFormat("Time: %.2f",       TIME_LIMIT - state.time), 20, 92, 20, rl.WHITE)
 }
 
-draw_status :: proc(human: bool, decisions: int, agent_ms, steps: f32) {
+draw_status :: proc(human: bool, decisions: int) {
 	if human {
 		rl.DrawText("Human (TAB to hand back to the agent) - A/D to move", 20, 20, 20, rl.WHITE)
 	}
@@ -451,10 +429,7 @@ draw_status :: proc(human: bool, decisions: int, agent_ms, steps: f32) {
 		rl.DrawText(rl.TextFormat("Agent, %d decisions learned (TAB to take over)", decisions), 20, 20, 20, rl.WHITE)
 	}
 
-	// Frame budget at 60Hz is 16.7ms. If the agent figure is small and the frame
-	// figure is not, the time is going somewhere other than the agent.
-	rl.DrawText(rl.TextFormat("%d FPS | frame %.1f ms | agent %.2f ms over %.1f steps",
-		rl.GetFPS(), 1000 * rl.GetFrameTime(), agent_ms, steps), 20, 44, 20, rl.LIGHTGRAY)
+	rl.DrawText(rl.TextFormat("%d FPS", rl.GetFPS()), 20, 44, 20, rl.LIGHTGRAY)
 }
 
 draw_text :: proc(text: cstring, font_size: int, x, y: f32, color: rl.Color) {
