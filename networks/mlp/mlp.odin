@@ -1,6 +1,8 @@
-package machine_learning_network_mlp
+package mlp
 
 import "base:builtin"
+
+import "core:fmt"
 
 import ml "../../"
 
@@ -32,6 +34,13 @@ destroy :: proc(mlp: Mlp) {
 		ml.destroy(layer.bias)
 	}
 	delete(mlp.layers)
+}
+
+parameters :: proc(mlp: Mlp, prefix: string, list: ^[dynamic]ml.Parameter) {
+	for layer, i in mlp.layers {
+		ml.parameter_append(list, prefix, fmt.tprintf("%d.weight", i), layer.weight)
+		ml.parameter_append(list, prefix, fmt.tprintf("%d.bias",   i), layer.bias)
+	}
 }
 
 copy :: proc(dst, src: Mlp) {

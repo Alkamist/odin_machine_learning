@@ -1,10 +1,4 @@
-package gguf
-
-import "core:fmt"
-import "core:os"
-import "core:slice"
-
-// GGUF v3 reader. The on-disk layout per llama.cpp/ggml/include/gguf.h:
+// GGUF v3 reader
 //
 //   magic        u32 = 'GGUF'
 //   version      u32
@@ -22,6 +16,11 @@ import "core:slice"
 //     offset    u64 (relative to data_start, aligned to general.alignment)
 //   pad to alignment
 //   tensor data blob
+package gguf
+
+import "core:log"
+import "core:os"
+import "core:slice"
 
 GGUF_MAGIC             :: 0x4655_4747 // 'GGUF' little-endian
 GGUF_DEFAULT_ALIGNMENT :: 32
@@ -42,9 +41,6 @@ Value_Type :: enum u32 {
 	F64    = 12,
 }
 
-// ggml_type values from llama.cpp/ggml/include/ggml.h. Only the entries we
-// expect to see in real model files are named; an unknown id stays as its
-// raw u32 cast and `_byte_count` rejects it.
 Tensor_Type :: enum u32 {
 	F32  = 0,
 	F16  = 1,
@@ -71,9 +67,6 @@ Tensor_Info :: struct {
 	byte_count:  int,
 }
 
-// Pre-parsed KV pair. For scalars/strings we stash the byte range so the
-// typed accessors can decode on demand. For arrays we keep the element type
-// and count so the accessor can stride into the payload.
 KV :: struct {
 	key:          string,
 	type:         Value_Type,
@@ -93,10 +86,12 @@ Loader :: struct {
 }
 
 @(require_results)
-load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, ok: bool) {
+load :: proc(path: string, allocator := context.allocator, loc := #caller_location) -> (loader: Loader, ok: bool) {
+	context.allocator = allocator
+
 	file_bytes, read_err := os.read_entire_file_from_path(path, allocator)
 	if read_err != nil {
-		fmt.eprintfln("gguf.load: failed to read %v: %v", path, read_err)
+		log.errorf("failed to read %v: %v", path, read_err, location=loc)
 		return {}, false
 	}
 
@@ -104,14 +99,14 @@ load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, o
 
 	magic, magic_ok := _read_u32(&r)
 	if !magic_ok || magic != GGUF_MAGIC {
-		fmt.eprintfln("gguf.load: %v: bad magic 0x%08x (expected 'GGUF')", path, magic)
+		log.errorf("%v: bad magic 0x%08x (expected 'GGUF')", path, magic, location=loc)
 		delete(file_bytes)
 		return {}, false
 	}
 
 	version, version_ok := _read_u32(&r)
 	if !version_ok || version != 3 {
-		fmt.eprintfln("gguf.load: %v: unsupported GGUF version %v (only 3 implemented)", path, version)
+		log.errorf("%v: unsupported GGUF version %v (only 3 implemented)", path, version, location=loc)
 		delete(file_bytes)
 		return {}, false
 	}
@@ -119,7 +114,7 @@ load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, o
 	tensor_count, tensor_count_ok := _read_u64(&r)
 	kv_count,     kv_count_ok     := _read_u64(&r)
 	if !tensor_count_ok || !kv_count_ok {
-		fmt.eprintfln("gguf.load: %v: short read in header counts", path)
+		log.errorf("%v: short read in header counts", path, location=loc)
 		delete(file_bytes)
 		return {}, false
 	}
@@ -151,13 +146,13 @@ load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, o
 			entry.array_type  = Value_Type(arr_ty_raw)
 			entry.array_count = int(arr_count)
 			if !_skip_array_payload(&r, entry.array_type, entry.array_count) {
-				fmt.eprintfln("gguf.load: array payload overrun at key %q", key)
+				log.errorf("array payload overrun at key %q", key, location=loc)
 				_destroy_partial(file_bytes, kv, nil)
 				return {}, false
 			}
 		} else {
 			if !_skip_scalar_payload(&r, ty) {
-				fmt.eprintfln("gguf.load: scalar payload overrun at key %q (type %v)", key, ty)
+				log.errorf("scalar payload overrun at key %q (type %v)", key, ty, location=loc)
 				_destroy_partial(file_bytes, kv, nil)
 				return {}, false
 			}
@@ -206,7 +201,7 @@ load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, o
 		ty := Tensor_Type(ty_raw)
 		bc, bc_ok := _byte_count(ty, element_count)
 		if !bc_ok {
-			fmt.eprintfln("gguf.load: tensor %q has unsupported type id %v", name, ty_raw)
+			log.errorf("tensor %q has unsupported type id %v", name, ty_raw, location=loc)
 			delete(shape)
 			_destroy_partial(file_bytes, kv, tensors)
 			return {}, false
@@ -225,13 +220,28 @@ load :: proc(path: string, allocator := context.allocator) -> (loader: Loader, o
 	if entry, found := kv["general.alignment"]; found && entry.type == .U32 {
 		alignment = int((^u32le)(raw_data(file_bytes[entry.value_offset:]))^)
 	}
+	if alignment <= 0 {
+		log.errorf("%v: invalid general.alignment %v", path, alignment, location=loc)
+		_destroy_partial(file_bytes, kv, tensors)
+		return {}, false
+	}
 
 	pad := (alignment - (r.offset % alignment)) % alignment
 	data_start := r.offset + pad
 	if data_start > len(file_bytes) {
-		fmt.eprintfln("gguf.load: %v: data_start %v overruns file size %v", path, data_start, len(file_bytes))
+		log.errorf("%v: data_start %v overruns file size %v", path, data_start, len(file_bytes), location=loc)
 		_destroy_partial(file_bytes, kv, tensors)
 		return {}, false
+	}
+
+	for name, info in tensors {
+		if info.data_offset < 0 || info.byte_count < 0 ||
+		   info.data_offset > len(file_bytes) - data_start ||
+		   info.byte_count  > len(file_bytes) - data_start - info.data_offset {
+			log.errorf("%v: tensor %q byte range [%v, +%v) overruns file", path, name, info.data_offset, info.byte_count, location=loc)
+			_destroy_partial(file_bytes, kv, tensors)
+			return {}, false
+		}
 	}
 
 	loader.bytes      = file_bytes
@@ -274,8 +284,6 @@ get_bytes :: proc(loader: Loader, name: string) -> ([]byte, bool) {
 shapes_match :: proc(a, b: []int) -> bool {
 	return slice.equal(a, b)
 }
-
-// --- KV accessors ----------------------------------------------------------
 
 @(require_results)
 get_u32 :: proc(loader: Loader, key: string) -> (u32, bool) {
@@ -331,7 +339,6 @@ get_bool :: proc(loader: Loader, key: string) -> (bool, bool) {
 	return loader.bytes[entry.value_offset] != 0, true
 }
 
-// Returns a slice into the loader's bytes; valid for the lifetime of the loader.
 @(require_results)
 get_str :: proc(loader: Loader, key: string) -> (string, bool) {
 	entry, found := loader.kv[key]
@@ -341,8 +348,6 @@ get_str :: proc(loader: Loader, key: string) -> (string, bool) {
 	return _peek_str(loader.bytes, entry.value_offset)
 }
 
-// Read array metadata. Use the returned `payload_offset` plus elem_type
-// stride to walk the elements yourself, or use a helper accessor.
 @(require_results)
 get_array_meta :: proc(loader: Loader, key: string) -> (elem_type: Value_Type, count: int, payload_offset: int, ok: bool) {
 	entry, found := loader.kv[key]
@@ -352,8 +357,6 @@ get_array_meta :: proc(loader: Loader, key: string) -> (elem_type: Value_Type, c
 	return entry.array_type, entry.array_count, entry.value_offset + 12, true
 }
 
-// Look up the i-th string in a string array. O(i) — scans from the start
-// each time. Use sparingly or cache results in the caller.
 @(require_results)
 get_array_str :: proc(loader: Loader, key: string, index: int) -> (string, bool) {
 	elem_type, count, base, ok := get_array_meta(loader, key)
@@ -370,8 +373,6 @@ get_array_str :: proc(loader: Loader, key: string, index: int) -> (string, bool)
 	}
 	return _peek_str(loader.bytes, off)
 }
-
-// --- internals -------------------------------------------------------------
 
 Reader :: struct {
 	bytes:  []byte,
@@ -398,17 +399,16 @@ _read_u64 :: proc(r: ^Reader) -> (u64, bool) {
 	return u64(v), true
 }
 
-// Returns a slice that aliases the file bytes (no copy).
 @(require_results)
 _read_str :: proc(r: ^Reader, file_bytes: []byte) -> (string, bool) {
 	n, n_ok := _read_u64(r)
 	if !n_ok {
 		return "", false
 	}
-	end := r.offset + int(n)
-	if end > len(r.bytes) {
+	if n > u64(len(r.bytes) - r.offset) {
 		return "", false
 	}
+	end := r.offset + int(n)
 	s := string(file_bytes[r.offset:end])
 	r.offset = end
 	return s, true
@@ -419,11 +419,11 @@ _peek_str :: proc(bytes: []byte, off: int) -> (string, bool) {
 	if off + 8 > len(bytes) {
 		return "", false
 	}
-	n := int((^u64le)(raw_data(bytes[off:]))^)
-	if off + 8 + n > len(bytes) {
+	n := (^u64le)(raw_data(bytes[off:]))^
+	if u64(n) > u64(len(bytes) - (off + 8)) {
 		return "", false
 	}
-	return string(bytes[off + 8 : off + 8 + n]), true
+	return string(bytes[off + 8 : off + 8 + int(n)]), true
 }
 
 @(require_results)

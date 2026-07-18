@@ -1,1 +1,0 @@
-ALWAYS read AGENTS.md first.

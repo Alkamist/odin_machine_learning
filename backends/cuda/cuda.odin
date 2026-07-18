@@ -1,15 +1,17 @@
-﻿package machine_learning_backend_cuda
+package machine_learning_backend_cuda
 
 import "base:builtin"
 import "base:runtime"
 
 import "core:fmt"
+import "core:log"
 import "core:sync"
 
 import "bindings/cuda"
 import "bindings/cublas"
 
-import ml "../../"
+import ml   "../.."
+import pool "../activation_pool"
 
 Gpu_Device :: struct {
 	dev:       cuda.Device,
@@ -33,8 +35,7 @@ Context :: struct {
 	stream:        cuda.Stream,
 	cublas_handle: cublas.Handle,
 
-	activation_pool:   [dynamic]Activation_Slot,
-	activation_cursor: int,
+	activation_pool: pool.Pool(cuda.DevicePtr),
 
 	persistent: [dynamic]cuda.DevicePtr,
 
@@ -66,9 +67,18 @@ Context :: struct {
 	shift_scratch_size: u64,
 }
 
-Activation_Slot :: struct {
-	ptr:  cuda.DevicePtr,
-	size: u64,
+_activation_pool_ops :: proc(gctx: ^Context) -> pool.Ops(cuda.DevicePtr) {
+	return {user = gctx, alloc = _activation_pool_alloc, free = _activation_pool_free}
+}
+
+_activation_pool_alloc :: proc(user: rawptr, size: u64, loc: runtime.Source_Code_Location) -> cuda.DevicePtr {
+	ptr: cuda.DevicePtr
+	cuda.check(cuda.MemAlloc(&ptr, uint(size)), loc=loc)
+	return ptr
+}
+
+_activation_pool_free :: proc(user: rawptr, handle: cuda.DevicePtr, loc: runtime.Source_Code_Location) {
+	cuda.check(cuda.MemFree(handle), loc=loc)
 }
 
 Timing_Stat :: struct {
@@ -132,7 +142,7 @@ _device_init_locked :: proc() {
 
 	cuda.check(cuda.CtxCreate(&_gpu.ctx, cuda.CTX_SCHED_BLOCKING_SYNC, _gpu.dev))
 
-	fmt.printfln("cuda: %s  cc=%d.%d  SMs=%d  warp=%d", _gpu.device_name, _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
+	log.infof("%s  cc=%d.%d  SMs=%d  warp=%d", _gpu.device_name, _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
 }
 
 device_destroy :: proc() {
@@ -160,7 +170,11 @@ device_name :: proc() -> string {
 }
 
 @(require_results)
-context_create :: proc(allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
+// decode_graph arms CUDA auto-graph capture: after a warmup step, single-token
+// decode replays a captured graph instead of re-issuing every kernel launch, so
+// pass true for inference. Leave false for training or when using enable_timing
+// (graph capture cannot coexist with cuEventRecord).
+context_create :: proc(decode_graph := false, allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
 	sync.lock(&_gpu_mutex)
 	defer sync.unlock(&_gpu_mutex)
 
@@ -168,6 +182,8 @@ context_create :: proc(allocator := context.allocator, loc := #caller_location) 
 
 	gctx, err := builtin.new(Context, allocator=allocator, loc=loc)
 	fmt.assertf(err == nil, "Failed to allocate Context: %v", err, loc=loc)
+
+	gctx.auto_graph_enabled = decode_graph
 
 	cuda.check(cuda.StreamCreate(&gctx.stream, cuda.STREAM_NON_BLOCKING))
 	cublas.check(cublas.Create_v2(&gctx.cublas_handle))
@@ -188,7 +204,19 @@ context_create :: proc(allocator := context.allocator, loc := #caller_location) 
 		buffer_get   = buffer_get,
 		buffer_set   = buffer_set,
 		buffer_copy  = buffer_copy,
-		capabilities = { .Linear_Q4_K_Gate_Up_Geglu, .Rmsnorm_Rope_Write_Cache },
+
+		forward_ops = {
+			.Add, .Mul, .Gelu_Mul, .Gelu, .Silu, .Tanh, .Cast, .Linear,
+			.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
+			.Rmsnorm, .Add_Rmsnorm, .Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache,
+			.Rope, .Attention, .Attention_Cache, .Cross_Entropy,
+			.Select, .Slice_Trailing, .Exp, .Clamp, .Min, .Softmax, .Entropy,
+		},
+		backward_ops = {
+			.Add, .Mul, .Linear, .Linear_Q4_K, .Linear_Q6_K, .Silu, .Gelu,
+			.Tanh, .Select, .Slice_Trailing, .Rmsnorm, .Rope, .Attention,
+			.Cross_Entropy, .Cast, .Exp, .Clamp, .Min, .Softmax, .Entropy,
+		},
 	}, allocator, loc)
 
 	return gctx
@@ -204,10 +232,7 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 		cuda.check(cuda.StreamSynchronize(gctx.stream))
 	}
 
-	for slot in gctx.activation_pool {
-		cuda.MemFree(slot.ptr)
-	}
-	builtin.delete(gctx.activation_pool)
+	pool.destroy(&gctx.activation_pool, _activation_pool_ops(gctx))
 
 	for ptr in gctx.persistent {
 		cuda.MemFree(ptr)
@@ -292,7 +317,7 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 		gctx.timing_cursor = 0
 	}
 
-	gctx.activation_cursor = 0
+	pool.reset(&gctx.activation_pool)
 
 	builtin.clear(&gctx.q8_1_cache)
 	builtin.clear(&gctx.dequant_cache)
@@ -314,8 +339,8 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 enable_decode_graph :: proc(enabled: bool, loc := #caller_location) {
 	gctx := _gctx(loc)
 	if enabled {
-		fmt.assertf(!gctx.timing_enabled, "enable_decode_graph: cannot combine with enable_timing", loc=loc)
-		fmt.assertf(!gctx.graph_capturing, "enable_decode_graph: explicit graph capture in progress", loc=loc)
+		fmt.assertf(!gctx.timing_enabled, "cannot combine with enable_timing", loc=loc)
+		fmt.assertf(!gctx.graph_capturing, "explicit graph capture in progress", loc=loc)
 	}
 	gctx.auto_graph_enabled = enabled
 }
@@ -357,8 +382,8 @@ reset_timing :: proc() {
 
 begin_graph_capture :: proc(loc := #caller_location) {
 	gctx := _gctx(loc)
-	fmt.assertf(!gctx.graph_capturing, "begin_graph_capture: capture already in progress", loc=loc)
-	fmt.assertf(!gctx.timing_enabled, "begin_graph_capture: disable timing first (cuEventRecord is uncapturable)", loc=loc)
+	fmt.assertf(!gctx.graph_capturing, "capture already in progress", loc=loc)
+	fmt.assertf(!gctx.timing_enabled, "disable timing first (cuEventRecord is uncapturable)", loc=loc)
 
 	cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)
 	cuda.check(cuda.StreamBeginCapture_v2(gctx.stream, .Relaxed), loc=loc)
@@ -367,7 +392,7 @@ begin_graph_capture :: proc(loc := #caller_location) {
 
 end_graph_capture :: proc(loc := #caller_location) {
 	gctx := _gctx(loc)
-	fmt.assertf(gctx.graph_capturing, "end_graph_capture: no capture in progress", loc=loc)
+	fmt.assertf(gctx.graph_capturing, "no capture in progress", loc=loc)
 
 	if gctx.graph_exec != nil {
 		cuda.GraphExecDestroy(gctx.graph_exec)
@@ -385,10 +410,33 @@ end_graph_capture :: proc(loc := #caller_location) {
 
 replay_graph :: proc(loc := #caller_location) {
 	gctx := _gctx(loc)
-	fmt.assertf(gctx.graph_exec != nil, "replay_graph: no captured graph (call end_graph_capture first)", loc=loc)
+	fmt.assertf(gctx.graph_exec != nil, "no captured graph (call end_graph_capture first)", loc=loc)
 	cuda.check(cuda.GraphLaunch(gctx.graph_exec, gctx.stream), loc=loc)
 }
 
-forward  :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)                { _forward (op, loc)   }
+// Fills the variant's scratch tensors with what this backend's kernels need.
+_alloc_scratch :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
+	#partial switch &v in op.variant {
+	case ml.Attention:
+		token_count := op.input.shape[0]
+		if op.input.type == .Bf16 && !ml.is_training(loc=loc) {
+			// The flash inference kernel keeps only per-row log-sum-exp.
+			v.lse = ml.scratch(.F32, {v.n_q_heads, token_count}, loc=loc)
+		} else {
+			v.softmax_outputs = ml.scratch(.F32, {v.n_q_heads, token_count, token_count}, loc=loc)
+		}
+	case ml.Rmsnorm:
+		count := ml.len(op.input) / op.input.shape[op.input.rank - 1]
+		v.rstd = ml.scratch(.F32, {count}, loc=loc)
+	case ml.Cross_Entropy:
+		shape := op.input.shape
+		v.probabilities = ml.scratch(op.input.type, shape[:op.input.rank], loc=loc)
+	}
+}
+
+forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
+	_alloc_scratch(op, loc)
+	_forward(op^, loc)
+}
 backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)                { _backward(op, loc)   }
 update   :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) { _update(opt, t, loc) }

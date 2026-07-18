@@ -1,4 +1,4 @@
-﻿package machine_learning_backend_cuda
+package machine_learning_backend_cuda
 
 import "base:builtin"
 import "base:runtime"
@@ -8,7 +8,8 @@ import "core:sync"
 
 import "bindings/cuda"
 
-import ml "../../"
+import ml   "../.."
+import pool "../activation_pool"
 
 Gpu_Buffer :: struct {
 	ptr:  cuda.DevicePtr,
@@ -46,25 +47,7 @@ buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: 
 }
 
 _activation_alloc :: proc(gctx: ^Context, size: u64, loc: runtime.Source_Code_Location) -> cuda.DevicePtr {
-	if gctx.activation_cursor < builtin.len(gctx.activation_pool) {
-		slot := &gctx.activation_pool[gctx.activation_cursor]
-		if slot.size == size {
-			gctx.activation_cursor += 1
-			return slot.ptr
-		}
-		cuda.check(cuda.MemFree(slot.ptr), loc=loc)
-		for i in gctx.activation_cursor + 1 ..< builtin.len(gctx.activation_pool) {
-			cuda.check(cuda.MemFree(gctx.activation_pool[i].ptr), loc=loc)
-		}
-		builtin.resize(&gctx.activation_pool, gctx.activation_cursor)
-	}
-
-	new_ptr: cuda.DevicePtr
-	cuda.check(cuda.MemAlloc(&new_ptr, uint(size)), loc=loc)
-	builtin.append(&gctx.activation_pool, Activation_Slot{ptr=new_ptr, size=size})
-	gctx.activation_cursor += 1
-
-	return new_ptr
+	return pool.take(&gctx.activation_pool, size, _activation_pool_ops(gctx), loc)
 }
 
 buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
@@ -96,7 +79,7 @@ buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_C
 	if gb.ptr == 0 || builtin.len(dst) == 0 {
 		return
 	}
-	fmt.assertf(u64(builtin.len(dst)) <= gb.size, "buffer_get: dst (%d) larger than buffer (%d)", builtin.len(dst), gb.size, loc=loc)
+	fmt.assertf(u64(builtin.len(dst)) <= gb.size, "dst (%d) larger than buffer (%d)", builtin.len(dst), gb.size, loc=loc)
 
 	gctx := _gctx(loc)
 
@@ -116,7 +99,7 @@ buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_C
 	if gb.ptr == 0 || builtin.len(src) == 0 {
 		return
 	}
-	fmt.assertf(u64(builtin.len(src)) <= gb.size, "buffer_set: src (%d) larger than buffer (%d)", builtin.len(src), gb.size, loc=loc)
+	fmt.assertf(u64(builtin.len(src)) <= gb.size, "src (%d) larger than buffer (%d)", builtin.len(src), gb.size, loc=loc)
 
 	gctx := _gctx(loc)
 	cuda.check(cuda.MemcpyHtoDAsync(gb.ptr, raw_data(src), uint(builtin.len(src)), gctx.stream), loc=loc)

@@ -1,4 +1,4 @@
-package machine_learning_network_llama
+package llama
 
 import "base:builtin"
 import "core:math"

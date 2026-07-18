@@ -1,5 +1,3 @@
-package cublas
-
 // cuBLAS bindings, scoped to what we need for BF16 / F32 GEMM and the
 // dispatch helpers used in the linear forward/backward path. Mirrors the
 // llama.cpp/ggml-cuda use of `cublasGemmEx` rather than the more verbose
@@ -10,12 +8,17 @@ package cublas
 //
 // Naming follows the Odin vendor convention: PascalCase mirroring the C
 // names with the `cublas` prefix stripped via `link_prefix`.
+package cublas
 
 import "core:fmt"
 
 import cu "../cuda"
 
-foreign import lib "../lib/cublas.lib"
+when ODIN_OS == .Windows {
+	foreign import lib "../lib/cublas.lib"
+} else {
+	foreign import lib "system:cublas" // libcublas.so; -L supplies its location
+}
 
 Handle :: distinct rawptr
 

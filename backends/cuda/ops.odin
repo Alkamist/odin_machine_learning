@@ -1,4 +1,4 @@
-﻿package machine_learning_backend_cuda
+package machine_learning_backend_cuda
 
 import "base:builtin"
 import "base:runtime"
@@ -8,7 +8,7 @@ import "core:fmt"
 import "bindings/cuda"
 import "bindings/cublas"
 
-import ml "../../"
+import ml "../.."
 
 _add_pipeline:             ^Pipeline
 _add_bf16_pipeline:        ^Pipeline
@@ -39,6 +39,19 @@ _tanh_pipeline:           ^Pipeline
 _tanh_bf16_pipeline:      ^Pipeline
 _tanh_back_f32_pipeline:  ^Pipeline
 _tanh_back_bf16_pipeline: ^Pipeline
+
+_exp_pipeline:            ^Pipeline
+_exp_back_f32_pipeline:   ^Pipeline
+_clamp_pipeline:          ^Pipeline
+_clamp_back_f32_pipeline: ^Pipeline
+_min_pipeline:            ^Pipeline
+_min_back_a_f32_pipeline: ^Pipeline
+_min_back_b_f32_pipeline: ^Pipeline
+
+_softmax_pipeline:          ^Pipeline
+_softmax_back_f32_pipeline: ^Pipeline
+_entropy_pipeline:          ^Pipeline
+_entropy_back_f32_pipeline: ^Pipeline
 
 _cast_bf16_to_f32_pipeline: ^Pipeline
 _cast_f32_to_bf16_pipeline: ^Pipeline
@@ -115,8 +128,13 @@ _div_up :: #force_inline proc(a, b: int) -> u32 {
 	return u32((a + b - 1) / b)
 }
 
+// CUDA caps grid dimensions Y and Z at 65535 (only X reaches 2^31-1). A kernel that maps a
+// batch-sized count onto grid.y must clamp it here and grid-stride the rest inside the kernel, or
+// the launch is rejected with INVALID_VALUE the moment the count crosses this line.
+MAX_GRID_DIM_YZ :: 65535
+
 _dispatch_cache_write :: proc(src_type: ml.Data_Type, grid: u32, args: []rawptr, loc: runtime.Source_Code_Location) {
-	fmt.assertf(src_type == .Bf16, "cache_write: unsupported src dtype %v", src_type, loc=loc)
+	fmt.assertf(src_type == .Bf16, "unsupported src dtype %v", src_type, loc=loc)
 	if _cache_write_bf16_pipeline == nil {
 		_cache_write_bf16_pipeline = _compile_pipeline(CACHE_WRITE_BF16_SRC, "cache_write_bf16.cu", "cache_write_bf16")
 	}
@@ -125,7 +143,7 @@ _dispatch_cache_write :: proc(src_type: ml.Data_Type, grid: u32, args: []rawptr,
 
 _emit_quantize_q8_1 :: proc(gctx: ^Context, xp: cuda.DevicePtr, input_size: int, input_type: ml.Data_Type, loc: runtime.Source_Code_Location) -> cuda.DevicePtr {
 	xp := xp
-	fmt.assertf(input_type == .Bf16, "quantize_q8_1: unsupported input dtype %v", input_type, loc=loc)
+	fmt.assertf(input_type == .Bf16, "unsupported input dtype %v", input_type, loc=loc)
 	q8_block_count := input_size / Q8_1_BLOCK_ELEMS
 	q8_byte_count  := q8_block_count * Q8_1_BLOCK_BYTES
 	q8 := _activation_alloc(gctx, u64(q8_byte_count), loc)
@@ -170,6 +188,11 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Gelu:         _gelu_forward(op, loc)
 	case ml.Silu:         _silu_forward(op, loc)
 	case ml.Tanh:         _tanh_forward(op, loc)
+	case ml.Exp:          _exp_forward(op, loc)
+	case ml.Clamp:        _clamp_forward(op, loc)
+	case ml.Min:          _min_forward(op, loc)
+	case ml.Softmax:      _softmax_forward(op, loc)
+	case ml.Entropy:      _entropy_forward(op, loc)
 	case ml.Cast:         _cast_forward(op, loc)
 	case ml.Linear:       _linear_forward(op, loc)
 	case ml.Linear_Q4_K:               _linear_q4_k_forward(op, loc)
@@ -185,7 +208,7 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Cross_Entropy:   _cross_entropy_forward(op, loc)
 	case ml.Select:          _select_forward(op, loc)
 	case ml.Slice_Trailing:  _slice_trailing_forward(op, loc)
-	case: fmt.panicf("cuda backend: forward not implemented for op variant %T", op.variant, loc=loc)
+	case: fmt.panicf("forward not implemented for op variant %T", op.variant, loc=loc)
 	}
 }
 
@@ -199,6 +222,11 @@ _backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Silu:           _silu_backward(op, loc)
 	case ml.Gelu:           _gelu_backward(op, loc)
 	case ml.Tanh:           _tanh_backward(op, loc)
+	case ml.Exp:            _exp_backward(op, loc)
+	case ml.Clamp:          _clamp_backward(op, loc)
+	case ml.Min:            _min_backward(op, loc)
+	case ml.Softmax:        _softmax_backward(op, loc)
+	case ml.Entropy:        _entropy_backward(op, loc)
 	case ml.Select:         _select_backward(op, loc)
 	case ml.Slice_Trailing: _slice_trailing_backward(op, loc)
 	case ml.Rmsnorm:        _rmsnorm_backward(op, loc)
@@ -206,7 +234,7 @@ _backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Attention:      _attention_backward(op, loc)
 	case ml.Cross_Entropy:  _cross_entropy_backward(op, loc)
 	case ml.Cast:           _cast_backward(op, loc)
-	case:                   fmt.panicf("cuda backend: backward not implemented for op variant %T", op.variant, loc=loc)
+	case:                   fmt.panicf("backward not implemented for op variant %T", op.variant, loc=loc)
 	}
 }
 
@@ -233,8 +261,8 @@ _update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Locati
 	g := gradient(t).ptr
 	m := transmute(Gpu_Buffer)t.buffers[.Adam_M]
 	v := transmute(Gpu_Buffer)t.buffers[.Adam_V]
-	fmt.assertf(m.ptr != 0, "cuda update: tensor missing Adam_M buffer", loc=loc)
-	fmt.assertf(v.ptr != 0, "cuda update: tensor missing Adam_V buffer", loc=loc)
+	fmt.assertf(m.ptr != 0, "tensor missing Adam_M buffer", loc=loc)
+	fmt.assertf(v.ptr != 0, "tensor missing Adam_V buffer", loc=loc)
 	mp := m.ptr; vp := v.ptr
 
 	n  := i32(t.count)
@@ -256,7 +284,7 @@ _update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Locati
 		}
 		_dispatch(_adam_bf16_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda update: unsupported dtype %v", t.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", t.type, loc=loc)
 	}
 }
 
@@ -264,7 +292,7 @@ _linear_dtype :: proc(t: ml.Data_Type, loc: runtime.Source_Code_Location) -> cub
 	#partial switch t {
 	case .Bf16: return .R_16BF
 	case .F32:  return .R_32F
-	case:       fmt.panicf("linear: unsupported dtype %v", t, loc=loc)
+	case:       fmt.panicf("unsupported dtype %v", t, loc=loc)
 	}
 	return .R_32F
 }
@@ -391,8 +419,8 @@ _linear_q4_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	input_size  := weight.shape[1]
 	count       := ml.len(input) / input_size
 
-	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q4_k: K must be a multiple of 256, got %v", input_size, loc=loc)
-	fmt.assertf(output.type == .Bf16, "cuda linear_q4_k requires Bf16 output (got %v)", output.type, loc=loc)
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "K must be a multiple of 256, got %v", input_size, loc=loc)
+	fmt.assertf(output.type == .Bf16, "linear_q4_k requires Bf16 output (got %v)", output.type, loc=loc)
 
 	if count == 1 {
 		// Decode-time fast path: per-element fused dequant+matmul.
@@ -461,7 +489,7 @@ _linear_q4_k_forward_mmvq :: proc(op: ml.Operation, loc: runtime.Source_Code_Loc
 }
 
 // Backward for Linear_Q4_K: only computes dx (Q4_K weight is frozen by
-// design — that's the QLoRA recipe). Dequantizes W to bf16 scratch,
+// design - that's the QLoRA recipe). Dequantizes W to bf16 scratch,
 // casts f32 dy to bf16 scratch, runs a Tensor-Core bf16 GEMM with f32
 // output for dx.
 _linear_q4_k_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -528,7 +556,7 @@ _dequantize_q4_k :: proc(gctx: ^Context, src: cuda.DevicePtr, output_size, input
 	}
 	src := src
 	count := output_size * input_size
-	fmt.assertf(count % ml.K_QUANT_BLOCK_SIZE == 0, "_dequantize_q4_k: count %v not divisible by 256", count, loc=loc)
+	fmt.assertf(count % ml.K_QUANT_BLOCK_SIZE == 0, "count %v not divisible by 256", count, loc=loc)
 	num_blocks := count / ml.K_QUANT_BLOCK_SIZE
 
 	dst := _activation_alloc(gctx, u64(count) * 2, loc)
@@ -554,9 +582,9 @@ _linear_q4_k_gate_up_geglu_forward :: proc(op: ml.Operation, loc: runtime.Source
 	input_size  := w_gate.shape[1]
 	count       := ml.len(input) / input_size
 
-	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q4_k_gate_up_geglu: K must be a multiple of 256, got %v", input_size, loc=loc)
-	fmt.assertf(count == 1, "cuda linear_q4_k_gate_up_geglu requires M=1 (decode); got M=%v", count, loc=loc)
-	fmt.assertf(output.type == .Bf16, "cuda linear_q4_k_gate_up_geglu requires Bf16 output (got %v)", output.type, loc=loc)
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "K must be a multiple of 256, got %v", input_size, loc=loc)
+	fmt.assertf(count == 1, "linear_q4_k_gate_up_geglu requires M=1 (decode); got M=%v", count, loc=loc)
+	fmt.assertf(output.type == .Bf16, "linear_q4_k_gate_up_geglu requires Bf16 output (got %v)", output.type, loc=loc)
 
 	if _linear_q4_k_gate_up_geglu_bf16_pipeline == nil {
 		_linear_q4_k_gate_up_geglu_bf16_pipeline = _compile_pipeline(LINEAR_Q4_K_GATE_UP_GEGLU_BF16_SRC, "linear_q4_k_gate_up_geglu_bf16.cu", "linear_q4_k_gate_up_geglu_bf16")
@@ -620,7 +648,7 @@ _add_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		_dispatch(_add_bf16_pipeline, grid, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args[:], loc)
 
 	case:
-		fmt.panicf("add: unsupported dtype %v", a.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
 	}
 }
 
@@ -672,7 +700,7 @@ _add_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		_dispatch(_add_back_b_bf16_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
 
 	case:
-		fmt.panicf("add backward: unsupported dtype %v", a.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
 	}
 }
 
@@ -700,7 +728,7 @@ _mul_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b, &pc}
 		_dispatch(_mul_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("mul: unsupported dtype %v", a.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
 	}
 }
 
@@ -728,7 +756,7 @@ _gelu_mul_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b}
 		_dispatch(_gelu_mul_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("gelu_mul: unsupported dtype %v", a.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
 	}
 }
 
@@ -755,7 +783,227 @@ _tanh_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		args := [?]rawptr{&xp, &yp, &n, &pc}
 		_dispatch(_tanh_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("tanh: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_exp_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+
+	#partial switch x.type {
+	case .F32:
+		if _exp_pipeline == nil {
+			_exp_pipeline = _compile_pipeline(EXP_F32_SRC, "exp.cu", "exp_f32")
+		}
+		xp := data(x).ptr; yp := data(y).ptr
+		n := i32(ml.len(x))
+		args := [?]rawptr{&xp, &yp, &n}
+		_dispatch(_exp_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_exp_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+
+	yp  := data(y).ptr
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	n   := i32(ml.len(x))
+	args := [?]rawptr{&yp, &dyp, &dxp, &n}
+
+	#partial switch x.type {
+	case .F32:
+		if _exp_back_f32_pipeline == nil {
+			_exp_back_f32_pipeline = _compile_pipeline(EXP_BACK_F32_SRC, "exp_back_f32.cu", "exp_back_f32")
+		}
+		_dispatch(_exp_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_clamp_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Clamp)
+	lo := v.min_val; hi := v.max_val
+
+	#partial switch x.type {
+	case .F32:
+		if _clamp_pipeline == nil {
+			_clamp_pipeline = _compile_pipeline(CLAMP_F32_SRC, "clamp.cu", "clamp_f32")
+		}
+		xp := data(x).ptr; yp := data(y).ptr
+		n := i32(ml.len(x))
+		args := [?]rawptr{&xp, &yp, &lo, &hi, &n}
+		_dispatch(_clamp_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_clamp_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Clamp)
+	lo := v.min_val; hi := v.max_val
+
+	xp  := data(x).ptr
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	n   := i32(ml.len(x))
+	args := [?]rawptr{&xp, &dyp, &dxp, &lo, &hi, &n}
+
+	#partial switch x.type {
+	case .F32:
+		if _clamp_back_f32_pipeline == nil {
+			_clamp_back_f32_pipeline = _compile_pipeline(CLAMP_BACK_F32_SRC, "clamp_back_f32.cu", "clamp_back_f32")
+		}
+		_dispatch(_clamp_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_min_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a := op.input
+	b := op.variant.(ml.Min).b
+	c := op.output
+
+	#partial switch a.type {
+	case .F32:
+		if _min_pipeline == nil {
+			_min_pipeline = _compile_pipeline(MIN_F32_SRC, "min.cu", "min_f32")
+		}
+		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
+		n := i32(ml.len(a))
+		args := [?]rawptr{&ap, &bp, &cp, &n}
+		_dispatch(_min_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
+	}
+}
+
+_min_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a := op.input
+	b := op.variant.(ml.Min).b
+	c := op.output
+
+	ap  := data(a).ptr
+	bp  := data(b).ptr
+	dyp := gradient(c).ptr
+	dap := gradient(a).ptr
+	dbp := gradient(b).ptr
+	n   := i32(ml.len(a))
+
+	have_a_grad := dap != 0
+	have_b_grad := dbp != 0
+
+	args_a := [?]rawptr{&ap, &bp, &dyp, &dap, &n}
+	args_b := [?]rawptr{&ap, &bp, &dyp, &dbp, &n}
+
+	#partial switch a.type {
+	case .F32:
+		if have_a_grad {
+			if _min_back_a_f32_pipeline == nil {
+				_min_back_a_f32_pipeline = _compile_pipeline(MIN_BACK_A_F32_SRC, "min_back_a_f32.cu", "min_back_a_f32")
+			}
+			_dispatch(_min_back_a_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
+		}
+		if have_b_grad {
+			if _min_back_b_f32_pipeline == nil {
+				_min_back_b_f32_pipeline = _compile_pipeline(MIN_BACK_B_F32_SRC, "min_back_b_f32.cu", "min_back_b_f32")
+			}
+			_dispatch(_min_back_b_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
+		}
+	case:
+		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
+	}
+}
+
+_softmax_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	cols := x.shape[x.rank - 1]
+	rows := ml.len(x) / cols
+
+	#partial switch x.type {
+	case .F32:
+		if _softmax_pipeline == nil {
+			_softmax_pipeline = _compile_pipeline(SOFTMAX_F32_SRC, "softmax.cu", "softmax_f32")
+		}
+		xp := data(x).ptr; yp := data(y).ptr
+		rr := i32(rows); cc := i32(cols)
+		args := [?]rawptr{&xp, &yp, &rr, &cc}
+		_dispatch(_softmax_pipeline, _div_up(rows, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_softmax_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	cols := x.shape[x.rank - 1]
+	rows := ml.len(x) / cols
+
+	yp := data(y).ptr; dyp := gradient(y).ptr; dxp := gradient(x).ptr
+	rr := i32(rows); cc := i32(cols)
+	args := [?]rawptr{&yp, &dyp, &dxp, &rr, &cc}
+
+	#partial switch x.type {
+	case .F32:
+		if _softmax_back_f32_pipeline == nil {
+			_softmax_back_f32_pipeline = _compile_pipeline(SOFTMAX_BACK_F32_SRC, "softmax_back_f32.cu", "softmax_back_f32")
+		}
+		_dispatch(_softmax_back_f32_pipeline, _div_up(rows, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+}
+
+_entropy_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	p := op.input
+	h := op.output
+	cols := p.shape[p.rank - 1]
+	rows := ml.len(p) / cols
+
+	#partial switch p.type {
+	case .F32:
+		if _entropy_pipeline == nil {
+			_entropy_pipeline = _compile_pipeline(ENTROPY_F32_SRC, "entropy.cu", "entropy_f32")
+		}
+		pp := data(p).ptr; hp := data(h).ptr
+		rr := i32(rows); cc := i32(cols)
+		args := [?]rawptr{&pp, &hp, &rr, &cc}
+		_dispatch(_entropy_pipeline, _div_up(rows, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", p.type, loc=loc)
+	}
+}
+
+_entropy_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	p := op.input
+	h := op.output
+	cols := p.shape[p.rank - 1]
+	rows := ml.len(p) / cols
+
+	pp := data(p).ptr; dyp := gradient(h).ptr; dpp := gradient(p).ptr
+	rr := i32(rows); cc := i32(cols)
+	args := [?]rawptr{&pp, &dyp, &dpp, &rr, &cc}
+
+	#partial switch p.type {
+	case .F32:
+		if _entropy_back_f32_pipeline == nil {
+			_entropy_back_f32_pipeline = _compile_pipeline(ENTROPY_BACK_F32_SRC, "entropy_back_f32.cu", "entropy_back_f32")
+		}
+		_dispatch(_entropy_back_f32_pipeline, _div_up(rows, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case:
+		fmt.panicf("unsupported dtype %v", p.type, loc=loc)
 	}
 }
 
@@ -788,7 +1036,7 @@ _cast_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		args := [?]rawptr{&xp, &yp, &n, &pc}
 		_dispatch(_cast_f32_to_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cast: unsupported (%v -> %v)", x.type, y.type, loc=loc)
+		fmt.panicf("unsupported (%v -> %v)", x.type, y.type, loc=loc)
 	}
 }
 
@@ -820,7 +1068,7 @@ _rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		args := [?]rawptr{&xp, &wp, &yp, &rstd_p, &c, &s, &eps}
 		_dispatch(_rmsnorm_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("rmsnorm: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -853,7 +1101,7 @@ _add_rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 		}
 		_dispatch(_add_rmsnorm_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("add_rmsnorm: unsupported dtype %v", a.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
 	}
 }
 
@@ -887,7 +1135,7 @@ _rmsnorm_rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locatio
 		}
 		_dispatch(_rmsnorm_rope_f32_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("rmsnorm_rope: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -927,7 +1175,7 @@ _rmsnorm_rope_write_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_
 	cap    := i32(v.cache_capacity)
 	args := [?]rawptr{&xp, &wp, &cp, &tc, &hc, &hs, &eps, &base, &pos_dev, &rpc, &cap}
 
-	fmt.assertf(x.type == .Bf16, "rmsnorm_rope_write_cache: unsupported input dtype %v", x.type, loc=loc)
+	fmt.assertf(x.type == .Bf16, "unsupported input dtype %v", x.type, loc=loc)
 	if _rmsnorm_rope_cache_bf16_pipeline == nil {
 		_rmsnorm_rope_cache_bf16_pipeline = _compile_pipeline(RMSNORM_ROPE_CACHE_BF16_SRC, "rmsnorm_rope_cache_bf16.cu", "rmsnorm_rope_cache_bf16")
 	}
@@ -965,7 +1213,7 @@ _rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 		_dispatch(_rope_bf16_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("rope: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -977,8 +1225,8 @@ _linear_q6_k_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	input_size  := weight.shape[1]
 	count       := ml.len(input) / input_size
 
-	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "linear_q6_k: K must be a multiple of 256, got %v", input_size, loc=loc)
-	fmt.assertf(output.type == .Bf16, "cuda linear_q6_k requires Bf16 output (got %v)", output.type, loc=loc)
+	fmt.assertf(input_size  % ml.K_QUANT_BLOCK_SIZE == 0, "K must be a multiple of 256, got %v", input_size, loc=loc)
+	fmt.assertf(output.type == .Bf16, "linear_q6_k requires Bf16 output (got %v)", output.type, loc=loc)
 
 	if count == 1 {
 		_linear_q6_k_forward_mmvq(op, loc)
@@ -1048,7 +1296,7 @@ _dequantize_q6_k :: proc(gctx: ^Context, src: cuda.DevicePtr, output_size, input
 	}
 	src := src
 	count := output_size * input_size
-	fmt.assertf(count % ml.K_QUANT_BLOCK_SIZE == 0, "_dequantize_q6_k: count %v not divisible by 256", count, loc=loc)
+	fmt.assertf(count % ml.K_QUANT_BLOCK_SIZE == 0, "count %v not divisible by 256", count, loc=loc)
 	num_blocks := count / ml.K_QUANT_BLOCK_SIZE
 
 	dst := _activation_alloc(gctx, u64(count) * 2, loc)
@@ -1120,8 +1368,8 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 	q_size      := q.shape[1]
 	kv_size     := k.shape[1]
 	head_size   := q_size / v.n_q_heads
-	fmt.assertf(head_size <= 512, "cuda attention caps head_size at 512 (got %v)", head_size, loc=loc)
-	fmt.assertf(v.window == 0 || v.causal, "cuda attention window > 0 requires causal=true", loc=loc)
+	fmt.assertf(head_size <= 512, "attention caps head_size at 512 (got %v)", head_size, loc=loc)
+	fmt.assertf(v.window == 0 || v.causal, "attention window > 0 requires causal=true", loc=loc)
 
 	qp := data(q).ptr; kp := data(k).ptr; vp := data(val).ptr; op_ptr := data(o).ptr
 	n_q_heads  := i32(v.n_q_heads)
@@ -1131,13 +1379,13 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 
 	#partial switch q.type {
 	case .Bf16:
-		fmt.assertf(head_size % 2 == 0, "cuda bf16 attention requires even head_size (got %v)", head_size, loc=loc)
-		// Training mode (no .No_Gradients flag): use the materialising
-		// train kernel so backward has the softmax matrix.
+		fmt.assertf(head_size % 2 == 0, "bf16 attention requires even head_size (got %v)", head_size, loc=loc)
+		// Training mode: use the materialising train kernel so backward has
+		// the softmax matrix. Must match _alloc_scratch's kernel choice.
 		gctx := _gctx(loc)
-		training := !(.No_Gradients in gctx.clear_flags)
+		training := gctx.training
 		if training {
-			fmt.assertf(token_count <= 2048, "cuda attention_train_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
+			fmt.assertf(token_count <= 2048, "attention_train_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
 			if _attention_train_bf16_pipeline == nil {
 				_attention_train_bf16_pipeline = _compile_pipeline(ATTENTION_TRAIN_BF16_SRC, "attention_train_bf16.cu", "attention_train_bf16")
 			}
@@ -1160,7 +1408,7 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 		}
 
 	case .F32:
-		fmt.assertf(token_count <= 2048, "cuda attention_train_f32 caps token_count at 2048 (got %v)", token_count, loc=loc)
+		fmt.assertf(token_count <= 2048, "attention_train_f32 caps token_count at 2048 (got %v)", token_count, loc=loc)
 		if _attention_train_f32_pipeline == nil {
 			_attention_train_f32_pipeline = _compile_pipeline(ATTENTION_TRAIN_F32_SRC, "attention_train_f32.cu", "attention_train_f32")
 		}
@@ -1172,7 +1420,7 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 		_dispatch(_attention_train_f32_pipeline, u32(v.n_q_heads), u32(token_count), 1, 256, 1, 1, 0, args[:], loc)
 
 	case:
-		fmt.panicf("attention: unsupported dtype %v", q.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", q.type, loc=loc)
 	}
 }
 
@@ -1189,16 +1437,16 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	q_size      := q.shape[1]
 	kv_size     := k.shape[1]
 	head_size   := q_size / v.n_q_heads
-	fmt.assertf(head_size <= 512, "cuda attention_with_cache caps head_size at 512 (got %v)", head_size, loc=loc)
-	fmt.assertf(q.type == .Bf16, "cuda attention_with_cache requires Bf16 Q (got %v)", q.type, loc=loc)
-	fmt.assertf(k_cache.type == .Bf16, "cuda attention_with_cache requires Bf16 K cache (got %v)", k_cache.type, loc=loc)
-	fmt.assertf(head_size % 2 == 0, "cuda attention_with_cache requires even head_size (got %v)", head_size, loc=loc)
+	fmt.assertf(head_size <= 512, "attention_with_cache caps head_size at 512 (got %v)", head_size, loc=loc)
+	fmt.assertf(q.type == .Bf16, "attention_with_cache requires Bf16 Q (got %v)", q.type, loc=loc)
+	fmt.assertf(k_cache.type == .Bf16, "attention_with_cache requires Bf16 K cache (got %v)", k_cache.type, loc=loc)
+	fmt.assertf(head_size % 2 == 0, "attention_with_cache requires even head_size (got %v)", head_size, loc=loc)
 
 	gctx := _gctx(loc)
 
 	capacity := k_cache.shape[0]
 
-	fmt.assertf(token_count <= capacity, "cuda attention_with_cache: q_token_count (%v) cannot exceed cache capacity (%v); chunk multi-token prefill if needed", token_count, capacity, loc=loc)
+	fmt.assertf(token_count <= capacity, "q_token_count (%v) cannot exceed cache capacity (%v); chunk multi-token prefill if needed", token_count, capacity, loc=loc)
 
 	k_cache_ptr := data(k_cache).ptr
 	v_cache_ptr := data(v_cache).ptr
@@ -1317,21 +1565,21 @@ _select_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .Bf16:
-		fmt.assertf(size % 2 == 0, "cuda bf16 select requires even row size (got %v)", size, loc=loc)
+		fmt.assertf(size % 2 == 0, "bf16 select requires even row size (got %v)", size, loc=loc)
 		if _select_bf16_pipeline == nil {
 			_select_bf16_pipeline = _compile_pipeline(SELECT_BF16_SRC, "select_bf16.cu", "select_bf16")
 		}
 		pair_count := size / 2
 		args := [?]rawptr{&xp, &idx_ptr, &yp, &n_idx, &s}
-		_dispatch(_select_bf16_pipeline, _div_up(pair_count, 256), u32(builtin.len(indices)), 1, 256, 1, 1, 0, args[:], loc)
+		_dispatch(_select_bf16_pipeline, _div_up(pair_count, 256), u32(min(builtin.len(indices), MAX_GRID_DIM_YZ)), 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
 		if _select_f32_pipeline == nil {
 			_select_f32_pipeline = _compile_pipeline(SELECT_F32_SRC, "select.cu", "select_f32")
 		}
 		args := [?]rawptr{&xp, &idx_ptr, &yp, &n_idx, &s}
-		_dispatch(_select_f32_pipeline, _div_up(size, 256), u32(builtin.len(indices)), 1, 256, 1, 1, 0, args[:], loc)
+		_dispatch(_select_f32_pipeline, _div_up(size, 256), u32(min(builtin.len(indices), MAX_GRID_DIM_YZ)), 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("select: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1363,7 +1611,7 @@ _slice_trailing_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 		args := [?]rawptr{&xp, &yp, &ld, &tr, &nt, &st}
 		_dispatch(_slice_trailing_f32_pipeline, _div_up(leading * new_trailing, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("slice_trailing: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1390,7 +1638,7 @@ _silu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		args := [?]rawptr{&xp, &yp, &n, &pc}
 		_dispatch(_silu_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda silu: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1417,7 +1665,7 @@ _gelu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		args := [?]rawptr{&xp, &yp, &n, &pc}
 		_dispatch(_gelu_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda gelu: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1443,7 +1691,7 @@ _gelu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 		_dispatch(_gelu_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda gelu backward: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1469,7 +1717,7 @@ _tanh_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 		_dispatch(_tanh_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda tanh backward: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1501,7 +1749,7 @@ _slice_trailing_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 		}
 		_dispatch(_slice_trailing_back_bf16_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda slice_trailing backward: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1527,7 +1775,7 @@ _silu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 		_dispatch(_silu_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda silu backward: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1535,7 +1783,7 @@ _cross_entropy_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locati
 	x := op.input
 	y := op.output
 	v := op.variant.(ml.Cross_Entropy)
-	fmt.assertf(x.type == .F32, "cuda cross_entropy requires F32 (got %v)", x.type, loc=loc)
+	fmt.assertf(x.type == .F32, "cross_entropy requires F32 (got %v)", x.type, loc=loc)
 
 	if _cross_entropy_f32_pipeline == nil {
 		_cross_entropy_f32_pipeline = _compile_pipeline(CROSS_ENTROPY_F32_SRC, "cross_entropy_f32.cu", "cross_entropy_f32")
@@ -1627,7 +1875,7 @@ _mul_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 			_dispatch(_mul_back_b_bf16_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
 		}
 	case:
-		fmt.panicf("cuda mul backward: unsupported dtype %v", a.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
 	}
 }
 
@@ -1666,7 +1914,7 @@ _select_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 		_dispatch(_select_back_bf16_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda select backward: unsupported dtype %v", w.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", w.type, loc=loc)
 	}
 }
 
@@ -1674,7 +1922,7 @@ _rmsnorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
 	v := op.variant.(ml.Rmsnorm)
-	fmt.assertf(v.weight.type == x.type, "cuda rmsnorm backward requires weight dtype to match input (x=%v, w=%v)", x.type, v.weight.type, loc=loc)
+	fmt.assertf(v.weight.type == x.type, "rmsnorm backward requires weight dtype to match input (x=%v, w=%v)", x.type, v.weight.type, loc=loc)
 
 	size  := x.shape[x.rank - 1]
 	count := ml.len(x) / size
@@ -1696,13 +1944,13 @@ _rmsnorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 		_dispatch(_rmsnorm_back_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		fmt.assertf(size % 2 == 0, "cuda rmsnorm backward bf16 requires even trailing dim (got %v)", size, loc=loc)
+		fmt.assertf(size % 2 == 0, "rmsnorm backward bf16 requires even trailing dim (got %v)", size, loc=loc)
 		if _rmsnorm_back_bf16_pipeline == nil {
 			_rmsnorm_back_bf16_pipeline = _compile_pipeline(RMSNORM_BACK_BF16_SRC, "rmsnorm_back_bf16.cu", "rmsnorm_back_bf16")
 		}
 		_dispatch(_rmsnorm_back_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda rmsnorm backward: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1731,13 +1979,13 @@ _rope_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 		_dispatch(_rope_back_f32_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		fmt.assertf(head_size % 2 == 0, "cuda rope backward bf16 requires even head_size (got %v)", head_size, loc=loc)
+		fmt.assertf(head_size % 2 == 0, "rope backward bf16 requires even head_size (got %v)", head_size, loc=loc)
 		if _rope_back_bf16_pipeline == nil {
 			_rope_back_bf16_pipeline = _compile_pipeline(ROPE_BACK_BF16_SRC, "rope_back_bf16.cu", "rope_back_bf16")
 		}
 		_dispatch(_rope_back_bf16_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
-		fmt.panicf("cuda rope backward: unsupported dtype %v", x.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
@@ -1784,8 +2032,8 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 			0, args[:], loc,
 		)
 	case .Bf16:
-		fmt.assertf(token_count <= 2048, "cuda attention_train_back_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
-		fmt.assertf(head_size % 2 == 0, "cuda attention backward bf16 requires even head_size (got %v)", head_size, loc=loc)
+		fmt.assertf(token_count <= 2048, "attention_train_back_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
+		fmt.assertf(head_size % 2 == 0, "attention backward bf16 requires even head_size (got %v)", head_size, loc=loc)
 		if _attention_train_back_bf16_pipeline == nil {
 			_attention_train_back_bf16_pipeline = _compile_pipeline(ATTENTION_TRAIN_BACK_BF16_SRC, "attention_train_back_bf16.cu", "attention_train_back_bf16")
 		}
@@ -1795,6 +2043,6 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 			0, args[:], loc,
 		)
 	case:
-		fmt.panicf("cuda attention backward: unsupported dtype %v", q.type, loc=loc)
+		fmt.panicf("unsupported dtype %v", q.type, loc=loc)
 	}
 }

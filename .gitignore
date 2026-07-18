@@ -1,34 +1,72 @@
-ols.json
+# Build artifacts
 *.exe
 *.dll
-*.csv
-*.png
 *.lib
-*.bin
-*.ttf
+*.exp
 *.pdb
-*.log
+*.ilk
+*.o
+*.obj
+*.a
+*.so
+*.dylib
 
+# CUDA compilation output
+*.ptx
+*.cubin
+*.fatbin
+
+# Vendored / external libraries
+backends/cuda/lib/
+backends/cuda/bindings/lib/
 ggml/
 llama.cpp/
 ollama/
 
+# Model weights and checkpoints
+*.safetensors
+*.gguf
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.npy
+*.npz
+*.bin
 models/
+*.part
+
+# Auto-downloaded by examples/llm_chat (see fetch.odin). The tokenizer.json
+# files are not covered by the extension globs above, so match the whole tree.
+examples/llm_chat/data/
+
+# Data and generated assets
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.wav
+*.mp3
+*.ttf
+*.log
 audio_sources/
-
-.claude/
-
-__pycache__
-
-tests/pytorch_parity/artifacts
-
 examples/data/audio_samples
 examples/data/audio_lm.ckpt
 examples/data/mnist_flow_samples
+tests/pytorch_parity/artifacts
 
-*.safetensors
+# Tooling
+ols.json
+.claude/
+__pycache__/
 
-smollm_data/
-gemma_data/
+# Editors
+.vs/
+.vscode/
+.idea/
+*.swp
 
-reascript/
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store

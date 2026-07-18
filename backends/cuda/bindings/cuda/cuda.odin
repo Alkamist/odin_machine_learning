@@ -1,5 +1,3 @@
-package cuda
-
 // CUDA Driver API bindings.
 //
 // Targets the system-installed NVIDIA driver (nvcuda.dll). The import lib is
@@ -11,10 +9,15 @@ package cuda
 // names with the `cu` / `CU` prefix stripped. The strip is done via
 // `link_prefix="cu"` for the common case; entry points whose actual export
 // name has a `_v2` (or similar) suffix are wired with `link_name` overrides.
+package cuda
 
 import "core:fmt"
 
-foreign import lib "../lib/cuda.lib"
+when ODIN_OS == .Windows {
+	foreign import lib "../lib/cuda.lib"
+} else {
+	foreign import lib "system:cuda" // libcuda.so, the NVIDIA driver; -L supplies its location
+}
 
 // Opaque handles. All driver objects are pointers to internal structs.
 Context  :: distinct rawptr
@@ -134,7 +137,7 @@ STREAM_DEFAULT      :: 0x00
 STREAM_NON_BLOCKING :: 0x01
 
 // Stream capture mode (`CUstreamCaptureMode`). `Relaxed` is what graph
-// recording usually wants â€” `Global` enforces strict cross-thread isolation.
+// recording usually wants - `Global` enforces strict cross-thread isolation.
 StreamCaptureMode :: enum i32 {
 	Global       = 0,
 	Thread_Local = 1,

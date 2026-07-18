@@ -1,4 +1,4 @@
-﻿package machine_learning_backend_cuda
+package machine_learning_backend_cuda
 
 import "base:builtin"
 import "base:runtime"
@@ -20,11 +20,16 @@ _resolve_include_arg :: proc() -> cstring {
 
 	candidates: [3]string
 	n := 0
+	include_suffix := ODIN_OS == .Windows ? "\\include" : "/include"
 	if env := os.get_env("CUDA_PATH", context.temp_allocator); env != "" {
-		candidates[n] = strings.concatenate({env, "\\include"}, context.temp_allocator); n += 1
+		candidates[n] = strings.concatenate({env, include_suffix}, context.temp_allocator); n += 1
 	}
-	candidates[n] = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6\\include"; n += 1
-	candidates[n] = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.5\\include"; n += 1
+	when ODIN_OS == .Windows {
+		candidates[n] = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6\\include"; n += 1
+		candidates[n] = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.5\\include"; n += 1
+	} else {
+		candidates[n] = "/usr/local/cuda/include"; n += 1
+	}
 
 	for i in 0..<n {
 		path := candidates[i]

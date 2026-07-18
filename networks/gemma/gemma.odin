@@ -1,4 +1,4 @@
-package machine_learning_network_gemma
+package gemma
 
 import "base:builtin"
 
@@ -8,7 +8,7 @@ import "core:math/rand"
 import "core:mem"
 
 import ml   "../../"
-import lora "../lora"
+import lora "../../networks/lora"
 
 Layer_Type :: enum u8 {
 	Sliding,
@@ -324,7 +324,7 @@ _make_const_scalar :: proc(dtype: ml.Data_Type, value: f32, buffers: ml.Buffer_S
 		src := [1]ml.Bf16{ml.bf16_from_f32(value)}
 		ml.set_data_bytes(t, mem.slice_to_bytes(src[:]))
 	case .Q4_K, .Q6_K:
-		fmt.panicf("_make_const_scalar: unsupported dtype %v", dtype)
+		fmt.panicf("unsupported dtype %v", dtype)
 	}
 	return t
 }
@@ -457,7 +457,7 @@ _fill_per_layer_bytes_normal :: proc(model: Gemma, std: f32) {
 			f[i] = ml.bf16_from_f32(rand.float32_normal(0, std))
 		}
 	case .Q4_K, .Q6_K:
-		fmt.panicf("randomize: unsupported dtype %v", model.dtype)
+		fmt.panicf("unsupported dtype %v", model.dtype)
 	}
 }
 
@@ -572,8 +572,8 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 		src := model.embed_tokens_per_layer_bytes[tok * row_bytes : (tok + 1) * row_bytes]
 		copy(lookup_buf[t * row_bytes : (t + 1) * row_bytes], src)
 	}
-	// `zeros` allocates the gradient buffer too (unless No_Gradients is set),
-	// which the training backward pass needs.
+	// `zeros` allocates the gradient buffer too (unless the pass was cleared
+	// with training=false), which the training backward pass needs.
 	token_identity := ml.zeros(model.dtype, {token_count, ple_total})
 	ml.set_data_bytes(token_identity, lookup_buf)
 	token_identity = ml.mul(token_identity, model.ple_token_scale)

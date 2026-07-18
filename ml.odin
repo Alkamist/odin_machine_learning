@@ -1,20 +1,22 @@
 package machine_learning
 
 import "base:builtin"
+import "base:intrinsics"
 import "base:runtime"
 
 import "core:fmt"
 import "core:mem"
 import "core:math"
 import "core:math/rand"
+import "core:strings"
 
-MAX_OPERATIONS          :: 4096
-MAX_TENSOR_RANK         :: 6
-BACKEND_BUFFER_MAX_SIZE :: 16
-OP_ARENA_DEFAULT_SIZE   :: 1 * 1024 * 1024
-K_QUANT_BLOCK_SIZE      :: 256
-Q4_K_BLOCK_BYTES        :: 144
-Q6_K_BLOCK_BYTES        :: 210
+MAX_OPERATIONS               :: 16384
+MAX_TENSOR_RANK              :: 6
+BACKEND_BUFFER_MAX_SIZE      :: 16
+OPERATION_ARENA_DEFAULT_SIZE :: 16 * 1024 * 1024
+K_QUANT_BLOCK_SIZE           :: 256
+Q4_K_BLOCK_BYTES             :: 144
+Q6_K_BLOCK_BYTES             :: 210
 
 Data_Type :: enum u8 {
 	Bf16,
@@ -72,11 +74,6 @@ Buffer_Kind :: enum u8 {
 }
 Buffer_Set :: bit_set[Buffer_Kind; u8]
 
-Clear_Flag :: enum u8 {
-	No_Gradients,
-}
-Clear_Flags :: bit_set[Clear_Flag; u8]
-
 Backend_Buffer :: [BACKEND_BUFFER_MAX_SIZE]byte
 
 Tensor :: struct {
@@ -88,15 +85,9 @@ Tensor :: struct {
 	count:   int,
 }
 
-Backend_Capability :: enum {
-	Linear_Q4_K_Gate_Up_Geglu,
-	Rmsnorm_Rope_Write_Cache,
-}
-Backend_Capabilities :: bit_set[Backend_Capability]
-
 Backend :: struct #all_or_none {
 	clear:    proc(loc: runtime.Source_Code_Location),
-	forward:  proc(op: Operation, loc: runtime.Source_Code_Location),
+	forward:  proc(op: ^Operation, loc: runtime.Source_Code_Location),
 	backward: proc(op: Operation, loc: runtime.Source_Code_Location),
 	update:   proc(opt: Optimizer, t: Tensor, loc: runtime.Source_Code_Location),
 
@@ -106,7 +97,8 @@ Backend :: struct #all_or_none {
 	buffer_set:   proc(buffer: Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location),
 	buffer_copy:  proc(dst, src: Backend_Buffer, loc: runtime.Source_Code_Location),
 
-	capabilities: Backend_Capabilities,
+	forward_ops:  Operation_Set,
+	backward_ops: Operation_Set,
 }
 
 Context :: struct {
@@ -118,7 +110,7 @@ Context :: struct {
 	operation_count: int,
 	operations:      [MAX_OPERATIONS]Operation,
 
-	clear_flags: Clear_Flags,
+	training: bool,
 
 	previous_ctx: ^Context,
 }
@@ -127,9 +119,10 @@ Context :: struct {
 _current_ctx: ^Context
 
 _context_init :: proc(ctx: ^Context, backend: Backend, allocator: mem.Allocator, loc: runtime.Source_Code_Location) {
-	ctx.backend = backend
+	ctx.backend  = backend
+	ctx.training = true
 
-	op_arena_buf, op_arena_err := builtin.make([]byte, OP_ARENA_DEFAULT_SIZE, allocator=allocator, loc=loc)
+	op_arena_buf, op_arena_err := builtin.make([]byte, OPERATION_ARENA_DEFAULT_SIZE, allocator=allocator, loc=loc)
 	assert(op_arena_err == nil, "Failed to allocate op-metadata arena", loc=loc)
 	ctx._op_arena_buf = op_arena_buf
 	mem.arena_init(&ctx.op_arena, op_arena_buf)
@@ -161,18 +154,33 @@ current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
 	return _current_ctx
 }
 
-clear :: proc(flags: Clear_Flags = {}, loc := #caller_location) {
+clear :: proc(training := false, loc := #caller_location) {
 	assert(_current_ctx != nil, "Did you forget to call context_create or context_scope?", loc=loc)
 
-	_current_ctx.clear_flags = flags
+	_current_ctx.training = training
 	_current_ctx.backend.clear(loc)
 
 	mem.arena_free_all(&_current_ctx.op_arena)
 	_current_ctx.operation_count = 0
 }
 
+@(require_results)
+is_training :: #force_inline proc(loc := #caller_location) -> bool {
+	assert(_current_ctx != nil, "Called is_training with no active context", loc=loc)
+	return _current_ctx.training
+}
+
 op_arena_allocator :: proc() -> mem.Allocator {
 	return mem.arena_allocator(&_current_ctx.op_arena)
+}
+
+@(require_results)
+_op_arena_make :: proc($T: typeid, count: int, loc := #caller_location) -> []T {
+	slice, err := builtin.make([]T, count, allocator=op_arena_allocator(), loc=loc)
+	fmt.assertf(err == nil && builtin.len(slice) == count,
+		"op arena exhausted allocating %d x %v (%d bytes) - raise OP_ARENA_DEFAULT_SIZE",
+		count, typeid_of(T), count * size_of(T), loc=loc)
+	return slice
 }
 
 @(require_results)
@@ -192,11 +200,6 @@ shape_element_count :: proc(shape: []int) -> int {
 DEFAULT_ACTIVATION_BUFFERS :: Buffer_Set{.Data, .Gradient}
 DEFAULT_PARAMETER_BUFFERS  :: Buffer_Set{.Data, .Gradient, .Adam_M, .Adam_V}
 
-// Mixed-precision rule: only the .Data buffer follows the tensor's primary
-// dtype. Gradient and Adam moments are always F32 — keeps gradient
-// accumulation precise (no bf16 += across many threads losing ULPs) and
-// lets backward kernels use native atomicAdd instead of CAS-based bf16
-// emulation, which was ~25x slower on the previous all-bf16 path.
 @(require_results)
 buffer_dtype :: #force_inline proc(tensor_type: Data_Type, kind: Buffer_Kind) -> Data_Type {
 	if kind == .Data {
@@ -239,7 +242,7 @@ alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_S
 @(require_results)
 zeros :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> (t: Tensor) {
 	buffers := DEFAULT_ACTIVATION_BUFFERS
-	if _current_ctx != nil && .No_Gradients in _current_ctx.clear_flags {
+	if _current_ctx != nil && !_current_ctx.training {
 		buffers = Buffer_Set{.Data}
 	}
 	return alloc(type, shape, persistent=false, buffers=buffers, loc=loc)
@@ -249,6 +252,11 @@ zeros :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> (t: Ten
 zeros_like :: proc(src: Tensor, loc := #caller_location) -> Tensor {
 	shape := src.shape
 	return zeros(src.type, shape[:src.rank], loc=loc)
+}
+
+@(require_results)
+scratch :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> Tensor {
+	return alloc(type, shape, persistent=false, buffers={.Data}, loc=loc)
 }
 
 @(require_results)
@@ -354,12 +362,71 @@ get_gradient :: proc(t: Tensor, data: []f32, loc := #caller_location) {
 	t.backend.buffer_get(t.buffers[.Gradient], mem.slice_to_bytes(data), loc)
 }
 
+get_bytes :: proc(t: Tensor, kind: Buffer_Kind, dst: []byte, loc := #caller_location) {
+	t.backend.buffer_get(t.buffers[kind], dst, loc)
+}
+
+set_bytes :: proc(t: Tensor, kind: Buffer_Kind, src: []byte, loc := #caller_location) {
+	t.backend.buffer_set(t.buffers[kind], src, loc)
+}
+
 get_data_bytes :: proc(t: Tensor, dst: []byte, loc := #caller_location) {
-	t.backend.buffer_get(t.buffers[.Data], dst, loc)
+	get_bytes(t, .Data, dst, loc)
 }
 
 set_data_bytes :: proc(t: Tensor, src: []byte, loc := #caller_location) {
-	t.backend.buffer_set(t.buffers[.Data], src, loc)
+	set_bytes(t, .Data, src, loc)
+}
+
+@(require_results)
+has_buffer :: #force_inline proc(t: Tensor, kind: Buffer_Kind) -> bool {
+	return t.buffers[kind] != Backend_Buffer{}
+}
+
+@(require_results)
+buffer_byte_count :: proc(t: Tensor, kind: Buffer_Kind) -> int {
+	return _data_byte_count(buffer_dtype(t.type, kind), t.count)
+}
+
+Parameter :: struct {
+	name:   string,
+	tensor: Tensor,
+}
+
+parameter_append :: proc(list: ^[dynamic]Parameter, prefix, name: string, tensor: Tensor) {
+	full: string
+	if prefix == "" {
+		full = strings.clone(name, allocator=list.allocator)
+	} else {
+		full = fmt.aprintf("%s.%s", prefix, name, allocator=list.allocator)
+	}
+	append(list, Parameter{name=full, tensor=tensor})
+}
+
+@(require_results)
+parameters_len :: proc(params: []Parameter) -> (total: int) {
+	for p in params {
+		total += p.tensor.count
+	}
+	return
+}
+
+parameters_read :: proc(params: []Parameter, dst: []f32, loc := #caller_location) {
+	assert(builtin.len(dst) == parameters_len(params), "dst length must equal parameters_len", loc=loc)
+	index := 0
+	for p in params {
+		get_data(p.tensor, dst[index:index + p.tensor.count], loc=loc)
+		index += p.tensor.count
+	}
+}
+
+parameters_write :: proc(params: []Parameter, src: []f32, loc := #caller_location) {
+	assert(builtin.len(src) == parameters_len(params), "src length must equal parameters_len", loc=loc)
+	index := 0
+	for p in params {
+		set_data(p.tensor, src[index:index + p.tensor.count], loc=loc)
+		index += p.tensor.count
+	}
 }
 
 fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
@@ -426,7 +493,7 @@ Optimizer :: struct {
 }
 
 @(require_results)
-optimize :: proc(
+optimizer_step :: proc(
 	opt:           ^Optimizer,
 	period:        int = 128,
 	learning_rate: f32 = 0.001,
@@ -459,12 +526,68 @@ update :: proc(opt: Optimizer, t: Tensor, loc := #caller_location) {
 	t.backend.update(opt, t, loc)
 }
 
+clip_gradient_norm :: proc(params: []Parameter, max_norm: f32, loc := #caller_location) -> (norm: f32) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+
+	widest := 0
+	for p in params {
+		widest = builtin.max(widest, p.tensor.count)
+	}
+	scratch := builtin.make([]f32, widest, allocator=context.temp_allocator)
+
+	total_sq := f64(0)
+	for p in params {
+		grad := scratch[:p.tensor.count]
+		get_gradient(p.tensor, grad, loc=loc)
+		for g in grad {
+			total_sq += f64(g) * f64(g)
+		}
+	}
+	norm = f32(math.sqrt(total_sq))
+	if norm <= max_norm || norm == 0 {
+		return
+	}
+
+	scale := max_norm / norm
+	for p in params {
+		grad := scratch[:p.tensor.count]
+		get_gradient(p.tensor, grad, loc=loc)
+		for &g in grad {
+			g *= scale
+		}
+		p.tensor.backend.buffer_set(p.tensor.buffers[.Gradient], mem.slice_to_bytes(grad), loc)
+	}
+	return
+}
+
+@(require_results)
+linear_schedule :: proc(step, total_steps: int, start_value, end_value: f32) -> f32 {
+	if total_steps <= 0 {
+		return end_value
+	}
+	t := builtin.clamp(f32(step) / f32(total_steps), 0, 1)
+	return start_value + (end_value - start_value) * t
+}
+
+@(require_results)
+warmup_cosine_schedule :: proc(step, total_steps, warmup_steps: int, peak_value, final_value: f32) -> f32 {
+	if warmup_steps > 0 && step < warmup_steps {
+		return peak_value * f32(step) / f32(warmup_steps)
+	}
+	if total_steps <= warmup_steps {
+		return final_value
+	}
+	t := builtin.clamp(f32(step - warmup_steps) / f32(total_steps - warmup_steps), 0, 1)
+	return final_value + (peak_value - final_value) * 0.5 * (1 + math.cos(math.PI * t))
+}
+
 Operation_Variant :: union {
 	Add,
 	Sub,
 	Mul,
 	Div,
 	Exp,
+	Sqrt,
 	Clamp,
 	Min,
 	Max,
@@ -488,6 +611,7 @@ Operation_Variant :: union {
 	Entropy,
 	Log_Softmax,
 	Mean_Squared_Error,
+	Smooth_L1,
 	Cross_Entropy,
 	Relu,
 	Sigmoid,
@@ -505,6 +629,126 @@ Operation_Variant :: union {
 	Accumulate_Mean,
 }
 
+Operation_Kind :: enum {
+	Add,
+	Sub,
+	Mul,
+	Div,
+	Exp,
+	Sqrt,
+	Clamp,
+	Min,
+	Max,
+	Mean,
+	Transpose,
+	Select,
+	Slice,
+	Slice_Trailing,
+	Concat,
+	Linear,
+	Linear_Q4_K,
+	Linear_Q4_K_Gate_Up_Geglu,
+	Linear_Q6_K,
+	Rope,
+	Layernorm,
+	Rmsnorm,
+	Rmsnorm_Rope,
+	Rmsnorm_Rope_Write_Cache,
+	Add_Rmsnorm,
+	Softmax,
+	Entropy,
+	Log_Softmax,
+	Mean_Squared_Error,
+	Smooth_L1,
+	Cross_Entropy,
+	Relu,
+	Sigmoid,
+	Gelu,
+	Gelu_Mul,
+	Silu,
+	Tanh,
+	Batched_Matmul,
+	Permute,
+	Causal_Mask,
+	Attention,
+	Attention_Cache,
+	Cast,
+	Lerp_Assign,
+	Accumulate_Mean,
+}
+Operation_Set :: bit_set[Operation_Kind]
+
+OPERATION_SET_ALL :: Operation_Set{
+	.Add, .Sub, .Mul, .Div, .Exp, .Sqrt, .Clamp, .Min, .Max, .Mean,
+	.Transpose, .Select, .Slice, .Slice_Trailing, .Concat, .Linear,
+	.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K, .Rope,
+	.Layernorm, .Rmsnorm, .Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache,
+	.Add_Rmsnorm, .Softmax, .Entropy, .Log_Softmax, .Mean_Squared_Error,
+	.Smooth_L1, .Cross_Entropy, .Relu, .Sigmoid, .Gelu, .Gelu_Mul,
+	.Silu, .Tanh, .Batched_Matmul, .Permute, .Causal_Mask, .Attention,
+	.Attention_Cache, .Cast, .Lerp_Assign, .Accumulate_Mean,
+}
+
+#assert(builtin.len(Operation_Kind) == intrinsics.type_union_variant_count(Operation_Variant))
+
+@(require_results)
+operation_kind :: proc(variant: Operation_Variant) -> Operation_Kind {
+	switch _ in variant {
+	case Add:                        return .Add
+	case Sub:                        return .Sub
+	case Mul:                        return .Mul
+	case Div:                        return .Div
+	case Exp:                        return .Exp
+	case Sqrt:                       return .Sqrt
+	case Clamp:                      return .Clamp
+	case Min:                        return .Min
+	case Max:                        return .Max
+	case Mean:                       return .Mean
+	case Transpose:                  return .Transpose
+	case Select:                     return .Select
+	case Slice:                      return .Slice
+	case Slice_Trailing:             return .Slice_Trailing
+	case Concat:                     return .Concat
+	case Linear:                     return .Linear
+	case Linear_Q4_K:                return .Linear_Q4_K
+	case Linear_Q4_K_Gate_Up_Geglu:  return .Linear_Q4_K_Gate_Up_Geglu
+	case Linear_Q6_K:                return .Linear_Q6_K
+	case Rope:                       return .Rope
+	case Layernorm:                  return .Layernorm
+	case Rmsnorm:                    return .Rmsnorm
+	case Rmsnorm_Rope:               return .Rmsnorm_Rope
+	case Rmsnorm_Rope_Write_Cache:   return .Rmsnorm_Rope_Write_Cache
+	case Add_Rmsnorm:                return .Add_Rmsnorm
+	case Softmax:                    return .Softmax
+	case Entropy:                    return .Entropy
+	case Log_Softmax:                return .Log_Softmax
+	case Mean_Squared_Error:         return .Mean_Squared_Error
+	case Smooth_L1:                  return .Smooth_L1
+	case Cross_Entropy:              return .Cross_Entropy
+	case Relu:                       return .Relu
+	case Sigmoid:                    return .Sigmoid
+	case Gelu:                       return .Gelu
+	case Gelu_Mul:                   return .Gelu_Mul
+	case Silu:                       return .Silu
+	case Tanh:                       return .Tanh
+	case Batched_Matmul:             return .Batched_Matmul
+	case Permute:                    return .Permute
+	case Causal_Mask:                return .Causal_Mask
+	case Attention:                  return .Attention
+	case Attention_Cache:            return .Attention_Cache
+	case Cast:                       return .Cast
+	case Lerp_Assign:                return .Lerp_Assign
+	case Accumulate_Mean:            return .Accumulate_Mean
+	}
+	panic("nil or unknown Operation_Variant")
+}
+
+_run_forward :: proc(op: ^Operation, loc: runtime.Source_Code_Location) {
+	kind := operation_kind(op.variant)
+	fmt.assertf(kind in _current_ctx.backend.forward_ops, "backend does not support %v in forward_ops", kind, loc=loc)
+	_current_ctx.backend.forward(op, loc)
+}
+
 Operation :: struct {
 	input:   Tensor,
 	output:  Tensor,
@@ -517,7 +761,7 @@ append_operation :: proc(op: Operation, loc := #caller_location) {
 	_current_ctx.operation_count += 1
 }
 
-backward :: proc(loc := #caller_location) {
+backward :: proc(loss: Tensor, loc := #caller_location) {
 	if _current_ctx == nil || _current_ctx.operation_count <= 0 {
 		return
 	}
@@ -526,15 +770,25 @@ backward :: proc(loc := #caller_location) {
 
 	backend := _current_ctx.backend
 
-	final_op := &_current_ctx.operations[_current_ctx.operation_count - 1]
+	assert(_current_ctx.training, "backward called on an inference pass (did you forget clear(training=true)?)", loc=loc)
+	assert(loss.backend == &_current_ctx.backend, "loss tensor is not from the active context", loc=loc)
+	assert(loss.type == .F32, "backward requires an F32 loss tensor", loc=loc)
+	assert(loss.buffers[.Gradient] != Backend_Buffer{}, "loss tensor has no gradient buffer", loc=loc)
 
-	assert(final_op.output.type == .F32, "backward currently requires an F32 loss tensor", loc=loc)
+	unsupported: Operation_Set
+	for i in 0 ..< _current_ctx.operation_count {
+		kind := operation_kind(_current_ctx.operations[i].variant)
+		if kind not_in backend.backward_ops {
+			unsupported += {kind}
+		}
+	}
+	fmt.assertf(unsupported == {}, "this backend cannot differentiate %v", unsupported, loc=loc)
 
-	ones := builtin.make([]f32, final_op.output.count, allocator=context.temp_allocator)
+	ones := builtin.make([]f32, loss.count, allocator=context.temp_allocator)
 	for &v in ones {
 		v = 1
 	}
-	backend.buffer_set(final_op.output.buffers[.Gradient], mem.slice_to_bytes(ones), loc)
+	backend.buffer_set(loss.buffers[.Gradient], mem.slice_to_bytes(ones), loc)
 
 	for i := _current_ctx.operation_count - 1; i >= 0; i -= 1 {
 		backend.backward(_current_ctx.operations[i], loc)
@@ -549,7 +803,7 @@ Lerp_Assign :: struct {
 }
 
 lerp_assign :: proc(dst, source: Tensor, alpha: f32, loc := #caller_location) {
-	assert(len(dst) == len(source), "lerp_assign: dst and source must have the same length", loc=loc)
+	assert(len(dst) == len(source), "dst and source must have the same length", loc=loc)
 	assert(dst.type == .F32 && source.type == .F32, "lerp_assign requires F32 tensors", loc=loc)
 
 	op := Operation{
@@ -557,13 +811,13 @@ lerp_assign :: proc(dst, source: Tensor, alpha: f32, loc := #caller_location) {
 		output  = dst,
 		variant = Lerp_Assign{source = source, alpha = alpha},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 }
 
 Accumulate_Mean :: struct {}
 
 accumulate_mean :: proc(dst, source: Tensor, loc := #caller_location) {
-	assert(len(dst) == 1, "accumulate_mean: dst must be a length-1 scalar", loc=loc)
+	assert(len(dst) == 1, "dst must be a length-1 scalar", loc=loc)
 	assert(dst.type == .F32 && source.type == .F32, "accumulate_mean requires F32 tensors", loc=loc)
 
 	op := Operation{
@@ -571,7 +825,7 @@ accumulate_mean :: proc(dst, source: Tensor, loc := #caller_location) {
 		output  = dst,
 		variant = Accumulate_Mean{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 }
 
 @(require_results)
@@ -584,23 +838,23 @@ cast_to :: proc(input: Tensor, target_type: Data_Type, loc := #caller_location) 
 		output  = output,
 		variant = Cast{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
 }
 
 Attention :: struct {
-	n_q_heads:       int,
-	n_kv_heads:      int,
-	causal:          bool,
-	window:          int,
-	key:             Tensor,
-	value:           Tensor,
+	n_q_heads:  int,
+	n_kv_heads: int,
+	causal:     bool,
+	window:     int,
+	key:        Tensor,
+	value:      Tensor,
+
 	softmax_outputs: Tensor,
-	d_p_scratch:     Tensor,
 	lse:             Tensor,
-	d_acc:           Tensor,
+	d_p_scratch:     Tensor,
 }
 
 @(require_results)
@@ -639,29 +893,21 @@ attention :: proc(
 	assert(window >= 0, "attention window must be non-negative (0 means full attention)", loc=loc)
 	assert(window == 0 || causal, "attention window > 0 requires causal=true", loc=loc)
 
-	output           = zeros(query.type, {token_count, q_size}, loc=loc)
-	softmax_outputs := zeros(.F32, {n_q_heads, token_count, token_count}, loc=loc)
-	d_p_scratch     := zeros(.F32, {n_q_heads, token_count}, loc=loc)
-	lse             := zeros(.F32, {n_q_heads, token_count}, loc=loc)
-	d_acc           := zeros(.F32, {n_q_heads, token_count}, loc=loc)
+	output = zeros(query.type, {token_count, q_size}, loc=loc)
 
 	op := Operation{
 		input   = query,
 		output  = output,
 		variant = Attention{
-			n_q_heads       = n_q_heads,
-			n_kv_heads      = kv_heads,
-			causal          = causal,
-			window          = window,
-			key             = key,
-			value           = value,
-			softmax_outputs = softmax_outputs,
-			d_p_scratch     = d_p_scratch,
-			lse             = lse,
-			d_acc           = d_acc,
+			n_q_heads  = n_q_heads,
+			n_kv_heads = kv_heads,
+			causal     = causal,
+			window     = window,
+			key        = key,
+			value      = value,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -726,8 +972,8 @@ attention_with_cache :: proc(
 	if window == 0 {
 		assert(cache_position + token_count <= t_capacity, "cache overflow: cache_position + token_count > t_max", loc=loc)
 	} else {
-		assert(t_capacity >= window, "attention_with_cache: sliding cache capacity must be >= window", loc=loc)
-		assert(token_count <= t_capacity, "attention_with_cache: token_count exceeds ring capacity", loc=loc)
+		assert(t_capacity >= window, "sliding cache capacity must be >= window", loc=loc)
+		assert(token_count <= t_capacity, "token_count exceeds ring capacity", loc=loc)
 	}
 
 	output = zeros(query.type, {token_count, q_size}, loc=loc)
@@ -746,10 +992,29 @@ attention_with_cache :: proc(
 			v_cache        = v_cache,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
+}
+
+_assert_broadcastable :: proc(a, b: Tensor, loc: runtime.Source_Code_Location) {
+	assert(a.type == b.type, "Broadcast inputs must have the same dtype", loc=loc)
+	if b.count == 1 {
+		return
+	}
+	assert(b.rank <= a.rank, "Broadcast: b's rank must not exceed a's", loc=loc)
+	for d in 0 ..< b.rank {
+		assert(b.shape[b.rank - 1 - d] == a.shape[a.rank - 1 - d], "Broadcast: b's shape must equal a's trailing shape", loc=loc)
+	}
+}
+
+_assert_same_shape :: proc(a, b: Tensor, loc: runtime.Source_Code_Location) {
+	assert(a.type == b.type, "Inputs must have the same dtype", loc=loc)
+	assert(a.rank == b.rank, "Inputs must have the same rank", loc=loc)
+	for d in 0 ..< a.rank {
+		assert(a.shape[d] == b.shape[d], "Inputs must have the same shape", loc=loc)
+	}
 }
 
 Add :: struct {
@@ -758,8 +1023,7 @@ Add :: struct {
 
 @(require_results)
 add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
-	assert(a.type == b.type, "add inputs must have the same dtype", loc=loc)
+	_assert_broadcastable(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -768,7 +1032,7 @@ add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Add{b=b},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -780,8 +1044,7 @@ Sub :: struct {
 
 @(require_results)
 sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
-	assert(a.type == b.type, "sub inputs must have the same dtype", loc=loc)
+	_assert_broadcastable(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -790,7 +1053,7 @@ sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Sub{b=b},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -802,8 +1065,7 @@ Mul :: struct {
 
 @(require_results)
 mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
-	assert(a.type == b.type, "mul inputs must have the same dtype", loc=loc)
+	_assert_broadcastable(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -812,7 +1074,7 @@ mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Mul{b=b},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -824,13 +1086,9 @@ Gelu_Mul :: struct {
 
 @(require_results)
 gelu_mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(len(a) % len(b) == 0, "gelu_mul: A length must be divisible by B length", loc=loc)
-	assert(a.type == b.type, "gelu_mul inputs must have the same dtype", loc=loc)
+	_assert_broadcastable(a, b, loc)
 
-	// Decompose for training (any dtype) so backward can route through
-	// gelu and mul individually. Fused gelu_mul has no backward kernel.
-	training := !(.No_Gradients in _current_ctx.clear_flags)
-	if a.type == .F32 || training {
+	if a.type == .F32 || _current_ctx.training || .Gelu_Mul not_in _current_ctx.backend.forward_ops {
 		return mul(gelu(a, loc=loc), b, loc=loc)
 	}
 
@@ -841,7 +1099,7 @@ gelu_mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Gelu_Mul{b=b},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -853,8 +1111,7 @@ Div :: struct {
 
 @(require_results)
 div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(len(a) % len(b) == 0, "A length must be divisible by B length", loc=loc)
-	assert(a.type == b.type, "div inputs must have the same dtype", loc=loc)
+	_assert_broadcastable(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -863,7 +1120,7 @@ div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Div{b=b},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -881,7 +1138,25 @@ exp :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Exp{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
+	append_operation(op, loc=loc)
+
+	return
+}
+
+Sqrt :: struct {
+}
+
+@(require_results)
+sqrt :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	output = zeros_like(input, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Sqrt{},
+	}
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -906,7 +1181,7 @@ clamp :: proc(input: Tensor, min_val, max_val: f32, loc := #caller_location) -> 
 			max_val = max_val,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -918,7 +1193,7 @@ Min :: struct {
 
 @(require_results)
 min :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(len(a) == len(b), "Requires inputs of equal length", loc=loc)
+	_assert_same_shape(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -929,7 +1204,7 @@ min :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			b = b,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -941,7 +1216,7 @@ Max :: struct {
 
 @(require_results)
 max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(len(a) == len(b), "Requires inputs of equal length", loc=loc)
+	_assert_same_shape(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -952,7 +1227,7 @@ max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			b = b,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -969,7 +1244,7 @@ mean :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Mean{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -980,6 +1255,7 @@ Transpose :: struct {}
 @(require_results)
 transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank == 2, "transpose requires a 2-D tensor", loc=loc)
+	assert(input.type == .F32, "transpose is F32-only", loc=loc)
 
 	rows    := input.shape[0]
 	columns := input.shape[1]
@@ -991,7 +1267,7 @@ transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Transpose{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1005,7 +1281,7 @@ Select :: struct {
 select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 1, "select input must have rank >= 1", loc=loc)
 
-	indices_copy := builtin.make([]int, builtin.len(indices), allocator=op_arena_allocator())
+	indices_copy := _op_arena_make(int, builtin.len(indices), loc=loc)
 	for i in 0 ..< builtin.len(indices) {
 		indices_copy[i] = indices[i]
 	}
@@ -1021,7 +1297,7 @@ select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (outpu
 			indices = indices_copy,
 		}
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1046,7 +1322,7 @@ slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (outpu
 			end   = end,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1073,7 +1349,7 @@ slice_trailing :: proc(input: Tensor, start, end: int, loc := #caller_location) 
 			end   = end,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1097,7 +1373,7 @@ concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 		trailing_sum += inputs[i].shape[inputs[i].rank - 1]
 	}
 
-	inputs_copy := builtin.make([]Tensor, builtin.len(inputs), allocator=op_arena_allocator())
+	inputs_copy := _op_arena_make(Tensor, builtin.len(inputs), loc=loc)
 	for input, i in inputs {
 		inputs_copy[i] = input
 	}
@@ -1111,7 +1387,7 @@ concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 			inputs = inputs_copy,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1141,7 +1417,7 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 			weight = weight,
 		}
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1172,7 +1448,7 @@ linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 		output  = output,
 		variant = Linear_Q4_K{weight=weight},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1198,7 +1474,7 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "input dim must be a multiple of 256", loc=loc)
 	assert(input.shape[input.rank - 1] == input_size, "input trailing dim must equal weight's input dim", loc=loc)
 
-	if _leading_count(input) == 1 && .Linear_Q4_K_Gate_Up_Geglu in _current_ctx.backend.capabilities {
+	if _leading_count(input) == 1 && !_current_ctx.training && .Linear_Q4_K_Gate_Up_Geglu in _current_ctx.backend.forward_ops {
 		new_shape: [MAX_TENSOR_RANK]int = input.shape
 		new_shape[input.rank - 1] = output_size
 		output = zeros(.Bf16, new_shape[:input.rank], loc=loc)
@@ -1207,7 +1483,7 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 			output  = output,
 			variant = Linear_Q4_K_Gate_Up_Geglu{w_gate=w_gate, w_up=w_up},
 		}
-		_current_ctx.backend.forward(op, loc)
+		_run_forward(&op, loc)
 		append_operation(op, loc=loc)
 		return
 	}
@@ -1244,7 +1520,7 @@ linear_q6_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 		output  = output,
 		variant = Linear_Q6_K{weight=weight},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1265,8 +1541,7 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset:
 	assert(input.rank >= 2, "rope requires rank >= 2", loc=loc)
 	assert(rope_fraction > 0 && rope_fraction <= 1, "rope_fraction must be in (0, 1]", loc=loc)
 
-	token_count := input.shape[0]
-	input_size  := input.shape[input.rank - 1]
+	input_size := input.shape[input.rank - 1]
 	assert(input_size % head_count == 0, "Trailing dim must be divisible by head count", loc=loc)
 
 	head_size := input_size / head_count
@@ -1278,9 +1553,6 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset:
 
 	output = zeros_like(input, loc=loc)
 
-	cos_cache := zeros(.F32, {token_count * half_head}, loc=loc)
-	sin_cache := zeros(.F32, {token_count * half_head}, loc=loc)
-
 	op := Operation{
 		input   = input,
 		output  = output,
@@ -1289,11 +1561,9 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset:
 			base              = base,
 			position_offset   = position_offset,
 			rotate_pair_count = rotate_pair_count,
-			cos_cache         = cos_cache,
-			sin_cache         = sin_cache,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1301,19 +1571,16 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset:
 
 Layernorm :: struct {
 	weight: Tensor,
-	mean:   Tensor,
-	rstd:   Tensor,
+
+	// Backend-filled scratch: per-row statistics kept from forward for backward.
+	mean: Tensor,
+	rstd: Tensor,
 }
 
 @(require_results)
 layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(weight.rank == 1, "layernorm weight must be 1-D", loc=loc)
 	assert(weight.shape[0] == input.shape[input.rank - 1], "layernorm weight length must equal input's trailing dim", loc=loc)
-
-	count := _leading_count(input)
-
-	mean := zeros(.F32, {count}, loc=loc)
-	rstd := zeros(.F32, {count}, loc=loc)
 
 	output = zeros_like(input, loc=loc)
 
@@ -1322,11 +1589,9 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 		output  = output,
 		variant = Layernorm{
 			weight = weight,
-			mean   = mean,
-			rstd   = rstd,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1334,8 +1599,9 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 
 Rmsnorm :: struct {
 	weight: Tensor,
-	rstd:   Tensor,
 	eps:    f32,
+
+	rstd: Tensor,
 }
 
 RMSNORM_DEFAULT_EPS :: 1e-5
@@ -1346,10 +1612,6 @@ rmsnorm :: proc(input, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #c
 	assert(weight.shape[0] == input.shape[input.rank - 1], "rmsnorm weight length must equal input's trailing dim", loc=loc)
 	assert(eps > 0, "rmsnorm eps must be positive", loc=loc)
 
-	count := _leading_count(input)
-
-	rstd := zeros(.F32, {count}, loc=loc)
-
 	output = zeros_like(input, loc=loc)
 
 	op := Operation{
@@ -1357,11 +1619,10 @@ rmsnorm :: proc(input, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #c
 		output  = output,
 		variant = Rmsnorm{
 			weight = weight,
-			rstd   = rstd,
 			eps    = eps,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1404,8 +1665,7 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
 	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
 
-	training := .No_Gradients not_in _current_ctx.clear_flags
-	if input.type == .F32 || training {
+	if input.type == .F32 || _current_ctx.training || .Rmsnorm_Rope not_in _current_ctx.backend.forward_ops {
 		view   := reshape(input, []int{input.shape[0] * head_count, head_size}, loc=loc)
 		normed := rmsnorm(view, weight, eps, loc=loc)
 		normed  = reshape(normed, []int{input.shape[0], head_count * head_size}, loc=loc)
@@ -1426,7 +1686,7 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 			rotate_pair_count = rotate_pair_count,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1458,7 +1718,7 @@ rmsnorm_rope_write_cache :: proc(
 	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
 	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
 
-	if .Rmsnorm_Rope_Write_Cache in _current_ctx.backend.capabilities {
+	if !_current_ctx.training && .Rmsnorm_Rope_Write_Cache in _current_ctx.backend.forward_ops {
 		output = zeros_like(input, loc=loc)
 		op := Operation{
 			input   = input,
@@ -1474,7 +1734,7 @@ rmsnorm_rope_write_cache :: proc(
 				cache_capacity    = cache_capacity,
 			},
 		}
-		_current_ctx.backend.forward(op, loc)
+		_run_forward(&op, loc)
 		append_operation(op, loc=loc)
 		return
 	}
@@ -1501,8 +1761,7 @@ add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc :=
 		assert(a.shape[d] == b.shape[d], "add_rmsnorm a/b shape must match", loc=loc)
 	}
 
-	training := .No_Gradients not_in _current_ctx.clear_flags
-	if a.type == .F32 || training {
+	if a.type == .F32 || _current_ctx.training || .Add_Rmsnorm not_in _current_ctx.backend.forward_ops {
 		residual_new = add(a, b, loc=loc)
 		normed       = rmsnorm(residual_new, weight, eps, loc=loc)
 		return
@@ -1521,7 +1780,7 @@ add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc :=
 			residual_out = residual_new,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1538,7 +1797,7 @@ softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Softmax{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1555,7 +1814,7 @@ log_softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 		output  = output,
 		variant = Log_Softmax{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1572,7 +1831,7 @@ entropy :: proc(probabilities: Tensor, loc := #caller_location) -> (output: Tens
 		output  = output,
 		variant = Entropy{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1595,15 +1854,42 @@ mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location
 			targets = targets,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
+	append_operation(op, loc=loc)
+
+	return
+}
+
+Smooth_L1 :: struct {
+	targets: Tensor,
+	beta:    f32,
+}
+
+@(require_results)
+smooth_l1 :: proc(predictions, targets: Tensor, beta: f32 = 1.0, loc := #caller_location) -> (output: Tensor) {
+	assert(len(predictions) == len(targets), "Predictions and targets must have same length", loc=loc)
+	assert(beta > 0, "smooth_l1 beta must be positive", loc=loc)
+
+	output = _zeros_drop_last(predictions, loc=loc)
+
+	op := Operation{
+		input   = predictions,
+		output  = output,
+		variant = Smooth_L1{
+			targets = targets,
+			beta    = beta,
+		},
+	}
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
 }
 
 Cross_Entropy :: struct {
+	targets: []int,
+
 	probabilities: Tensor,
-	targets:       []int,
 }
 
 @(require_results)
@@ -1615,24 +1901,22 @@ cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) ->
 
 	class_size := input.shape[input.rank - 1]
 
-	targets_copy := builtin.make([]int, sample_count, allocator=op_arena_allocator())
+	targets_copy := _op_arena_make(int, sample_count, loc=loc)
 	for target, i in targets {
 		assert(target >= 0 && target < class_size, "Target is out of bounds", loc=loc)
 		targets_copy[i] = target
 	}
 
-	probabilities := zeros_like(input, loc=loc)
-	output         = _zeros_drop_last(input, loc=loc)
+	output = _zeros_drop_last(input, loc=loc)
 
 	op := Operation{
 		input   = input,
 		output  = output,
 		variant = Cross_Entropy{
-			probabilities = probabilities,
-			targets       = targets_copy,
+			targets = targets_copy,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1650,7 +1934,7 @@ relu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Relu{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1668,7 +1952,7 @@ sigmoid :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Sigmoid{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1686,7 +1970,7 @@ gelu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Gelu{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1704,7 +1988,7 @@ silu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Silu{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1722,7 +2006,7 @@ tanh :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Tanh{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1752,7 +2036,7 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 			b=b,
 		},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1784,7 +2068,7 @@ permute :: proc(input: Tensor, axes: [3]int, loc := #caller_location) -> (output
 		output  = output,
 		variant = Permute{axes=axes},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return
@@ -1805,7 +2089,7 @@ causal_mask :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 		output  = output,
 		variant = Causal_Mask{},
 	}
-	_current_ctx.backend.forward(op, loc)
+	_run_forward(&op, loc)
 	append_operation(op, loc=loc)
 
 	return

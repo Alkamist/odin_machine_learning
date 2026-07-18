@@ -1,5 +1,3 @@
-package nvrtc
-
 // NVRTC bindings (runtime CUDA compilation).
 //
 // Compiles `.cu` source to PTX or cubin in-process so kernels can be embedded
@@ -11,10 +9,15 @@ package nvrtc
 //
 // Naming follows the Odin vendor convention: PascalCase mirroring the C
 // names with the `nvrtc` prefix stripped via `link_prefix`.
+package nvrtc
 
 import "core:fmt"
 
-foreign import lib "../lib/nvrtc.lib"
+when ODIN_OS == .Windows {
+	foreign import lib "../lib/nvrtc.lib"
+} else {
+	foreign import lib "system:nvrtc" // libnvrtc.so; -L supplies its location
+}
 
 Program :: distinct rawptr
 

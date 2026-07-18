@@ -1,4 +1,4 @@
-package machine_learning_backend_cpu
+package cpu
 
 import "base:builtin"
 import "base:runtime"
@@ -11,8 +11,7 @@ import "core:simd"
 import "core:sync"
 import "core:thread"
 
-import ml "../../"
-import "../../loaders/gguf"
+import ml "../.."
 
 when thread.IS_SUPPORTED {
 	_thread_pool_context: runtime.Context
@@ -40,6 +39,7 @@ when thread.IS_SUPPORTED {
 
 	_worker_proc :: proc(t: ^thread.Thread) {
 		w := cast(^Worker)t.data
+		_enable_flush_to_zero()
 
 		for {
 			sync.sema_wait(&w.start_sem)
@@ -314,17 +314,25 @@ when intrinsics.has_target_feature("avx") {
 
 Context :: struct {
 	using _: ml.Context,
-	arena:   mem.Arena,
+
+	arena:      mem.Arena,
+	persistent: map[rawptr]bool,
 }
+
+POISON_TRANSIENT :: #config(ML_CPU_POISON, false)
 
 @(require_results)
 context_create :: proc(size: int, allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
+	_enable_flush_to_zero()
+
 	ctx, ctx_err := builtin.new(Context, allocator=allocator, loc=loc)
 	assert(ctx_err == nil, "Failed to allocate Context", loc=loc)
 
 	arena_buf, arena_buf_err := builtin.make([]byte, size, allocator=context.allocator, loc=loc)
 	assert(arena_buf_err == nil, "Failed to allocate CPU backend arena data", loc=loc)
 	mem.arena_init(&ctx.arena, arena_buf)
+
+	ctx.persistent = builtin.make(map[rawptr]bool, allocator=allocator)
 
 	ml._context_init(ctx, {
 		clear        = clear,
@@ -336,7 +344,13 @@ context_create :: proc(size: int, allocator := context.allocator, loc := #caller
 		buffer_get   = buffer_get,
 		buffer_set   = buffer_set,
 		buffer_copy  = buffer_copy,
-		capabilities = {},
+
+		forward_ops  = ml.OPERATION_SET_ALL - {.Linear_Q4_K_Gate_Up_Geglu, .Rmsnorm_Rope_Write_Cache},
+		backward_ops = ml.OPERATION_SET_ALL - {
+			.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
+			.Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache, .Add_Rmsnorm,
+			.Gelu_Mul, .Lerp_Assign, .Accumulate_Mean,
+		},
 	}, allocator, loc)
 
 	return ctx
@@ -346,6 +360,7 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	ctx := cast(^Context)ctx
 	ml._context_destroy(ctx, loc)
 	builtin.delete(ctx.arena.data, loc=loc)
+	builtin.delete(ctx.persistent)
 	builtin.free(ctx, allocator=allocator, loc=loc)
 }
 
@@ -372,6 +387,12 @@ gradient :: #force_inline proc(t: ml.Tensor) -> []f32 {
 }
 
 @(require_results)
+data_bf16 :: #force_inline proc(t: ml.Tensor) -> []ml.Bf16 {
+	bytes := transmute([]byte)t.buffers[.Data]
+	return ([^]ml.Bf16)(raw_data(bytes))[:t.count]
+}
+
+@(require_results)
 adam_m :: #force_inline proc(t: ml.Tensor) -> []f32 {
 	bytes := transmute([]byte)t.buffers[.Adam_M]
 	return ([^]f32)(raw_data(bytes))[:t.count]
@@ -384,18 +405,38 @@ adam_v :: #force_inline proc(t: ml.Tensor) -> []f32 {
 }
 
 buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
-	_ = kind  // CPU backend uses `builtin.make` which always zero-fills; the kind hint is consumed by GPU backends.
 	ctx       := cast(^Context)ml.current_context(loc=loc)
 	allocator := persist ? context.allocator : mem.arena_allocator(&ctx.arena)
 
 	bytes, err := builtin.make([]byte, byte_count, allocator=allocator, loc=loc)
 	fmt.assertf(err == nil, "Failed to allocate CPU buffer: %v", err, loc=loc)
 
+	if persist {
+		ctx.persistent[rawptr(raw_data(bytes))] = true
+	} else {
+		when POISON_TRANSIENT {
+			if kind == .Data {
+				for &word in mem.slice_data_cast([]u32, bytes) {
+					word = 0x7fc0_0000 // quiet NaN
+				}
+			}
+		}
+	}
+
 	return transmute([ml.BACKEND_BUFFER_MAX_SIZE]byte)bytes
 }
 
 buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
-	builtin.delete(transmute([]byte)buffer, loc=loc)
+	bytes := transmute([]byte)buffer
+	if raw_data(bytes) == nil {
+		return
+	}
+	ctx := cast(^Context)ml.current_context(loc=loc)
+	if rawptr(raw_data(bytes)) not_in ctx.persistent {
+		return
+	}
+	builtin.delete_key(&ctx.persistent, rawptr(raw_data(bytes)))
+	builtin.delete(bytes, loc=loc)
 }
 
 buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location) {
@@ -411,17 +452,23 @@ buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Locati
 }
 
 update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) {
-	d := data(t)
 	g := gradient(t)
 	m := adam_m(t)
 	v := adam_v(t)
 
-	assert(d != nil, "Tensor Data is nil", loc=loc)
 	assert(g != nil, "Tensor Gradient is nil", loc=loc)
 	assert(m != nil, "Tensor Adam_M is nil", loc=loc)
 	assert(v != nil, "Tensor Adam_V is nil", loc=loc)
 
-	for i in 0 ..< builtin.len(d) {
+	d_bf: [^]ml.Bf16
+	d_f32: []f32
+	#partial switch t.type {
+	case .F32:  d_f32 = data(t)
+	case .Bf16: d_bf  = ([^]ml.Bf16)(raw_data(transmute([]byte)t.buffers[.Data]))
+	case:       panic("only F32 and Bf16 parameters are trainable", loc)
+	}
+
+	for i in 0 ..< t.count {
 		grad := g[i]
 
 		m[i] = opt.beta1 * m[i] + (1 - opt.beta1) * grad
@@ -430,18 +477,55 @@ update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Locatio
 		m_hat := m[i] / opt.bias_correction1
 		v_hat := v[i] / opt.bias_correction2
 
-		d[i] = d[i] * (1 - opt.learning_rate * opt.weight_decay) - opt.learning_rate * m_hat / (math.sqrt(v_hat) + opt.epsilon)
+		weight := t.type == .Bf16 ? ml.bf16_to_f32(d_bf[i]) : d_f32[i]
+		weight = weight * (1 - opt.learning_rate * opt.weight_decay) - opt.learning_rate * m_hat / (math.sqrt(v_hat) + opt.epsilon)
+		if t.type == .Bf16 {
+			d_bf[i] = ml.bf16_from_f32(weight)
+		} else {
+			d_f32[i] = weight
+		}
+
 		g[i] = 0
 	}
 }
 
-forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+_alloc_scratch :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
+	#partial switch &v in op.variant {
+	case ml.Attention:
+		token_count := op.input.shape[0]
+		v.softmax_outputs = ml.scratch(.F32, {v.n_q_heads, token_count, token_count}, loc=loc)
+		if ml.is_training(loc=loc) {
+			v.d_p_scratch = ml.scratch(.F32, {v.n_q_heads, token_count}, loc=loc)
+		}
+	case ml.Rope:
+		token_count := op.input.shape[0]
+		input_size  := op.input.shape[op.input.rank - 1]
+		half_head   := (input_size / v.head_count) / 2
+		v.cos_cache = ml.scratch(.F32, {token_count * half_head}, loc=loc)
+		v.sin_cache = ml.scratch(.F32, {token_count * half_head}, loc=loc)
+	case ml.Layernorm:
+		count := ml.len(op.input) / op.input.shape[op.input.rank - 1]
+		v.mean = ml.scratch(.F32, {count}, loc=loc)
+		v.rstd = ml.scratch(.F32, {count}, loc=loc)
+	case ml.Rmsnorm:
+		count := ml.len(op.input) / op.input.shape[op.input.rank - 1]
+		v.rstd = ml.scratch(.F32, {count}, loc=loc)
+	case ml.Cross_Entropy:
+		shape := op.input.shape
+		v.probabilities = ml.scratch(op.input.type, shape[:op.input.rank], loc=loc)
+	}
+}
+
+forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
+	_alloc_scratch(op, loc)
+	op := op^
 	switch _ in op.variant {
 	case ml.Add:                add_forward                (op)
 	case ml.Sub:                sub_forward                (op)
 	case ml.Mul:                mul_forward                (op)
 	case ml.Div:                div_forward                (op)
 	case ml.Exp:                exp_forward                (op)
+	case ml.Sqrt:               sqrt_forward               (op)
 	case ml.Clamp:              clamp_forward              (op)
 	case ml.Min:                min_forward                (op)
 	case ml.Max:                max_forward                (op)
@@ -453,18 +537,19 @@ forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
 	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
-	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("cpu backend: Linear_Q4_K_Gate_Up_Geglu unreachable (proc decomposes when capability is absent)")
+	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu unreachable (proc decomposes when capability is absent)")
 	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
 	case ml.Rmsnorm_Rope:       rmsnorm_rope_forward       (op)
-	case ml.Rmsnorm_Rope_Write_Cache: panic("CPU rmsnorm_rope_write_cache_forward: backend does not advertise Rmsnorm_Rope_Write_Cache capability")
+	case ml.Rmsnorm_Rope_Write_Cache: panic("backend does not advertise Rmsnorm_Rope_Write_Cache capability")
 	case ml.Add_Rmsnorm:        add_rmsnorm_forward        (op)
 	case ml.Softmax:            softmax_forward            (op)
 	case ml.Entropy:            entropy_forward            (op)
 	case ml.Log_Softmax:        log_softmax_forward        (op)
 	case ml.Mean_Squared_Error: mean_squared_error_forward (op)
+	case ml.Smooth_L1:          smooth_l1_forward          (op)
 	case ml.Cross_Entropy:      cross_entropy_forward      (op)
 	case ml.Relu:               relu_forward               (op)
 	case ml.Sigmoid:            sigmoid_forward            (op)
@@ -490,6 +575,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Mul:                mul_backward               (op)
 	case ml.Div:                div_backward               (op)
 	case ml.Exp:                exp_backward               (op)
+	case ml.Sqrt:               sqrt_backward              (op)
 	case ml.Clamp:              clamp_backward             (op)
 	case ml.Min:                min_backward               (op)
 	case ml.Max:                max_backward               (op)
@@ -500,24 +586,25 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
-	case ml.Linear_Q4_K:        panic("CPU linear_q4_k_backward: linear_q4_k is forward-only")
-	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("CPU linear_q4_k_gate_up_geglu_backward: forward-only")
-	case ml.Linear_Q6_K:        panic("CPU linear_q6_k_backward: linear_q6_k is forward-only")
+	case ml.Linear_Q4_K:        panic("linear_q4_k is forward-only")
+	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("forward-only")
+	case ml.Linear_Q6_K:        panic("linear_q6_k is forward-only")
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
-	case ml.Rmsnorm_Rope:       panic("CPU rmsnorm_rope_backward: fused rmsnorm+rope is forward-only")
-	case ml.Rmsnorm_Rope_Write_Cache: panic("CPU rmsnorm_rope_write_cache_backward: forward-only fused op")
-	case ml.Add_Rmsnorm:        panic("CPU add_rmsnorm_backward: fused add+rmsnorm is forward-only")
+	case ml.Rmsnorm_Rope:       panic("fused rmsnorm+rope is forward-only")
+	case ml.Rmsnorm_Rope_Write_Cache: panic("forward-only fused op")
+	case ml.Add_Rmsnorm:        panic("fused add+rmsnorm is forward-only")
 	case ml.Softmax:            softmax_backward           (op)
 	case ml.Entropy:            entropy_backward           (op)
 	case ml.Log_Softmax:        log_softmax_backward       (op)
 	case ml.Mean_Squared_Error: mean_squared_error_backward(op)
+	case ml.Smooth_L1:          smooth_l1_backward         (op)
 	case ml.Cross_Entropy:      cross_entropy_backward     (op)
 	case ml.Relu:               relu_backward              (op)
 	case ml.Sigmoid:            sigmoid_backward           (op)
 	case ml.Gelu:               gelu_backward              (op)
-	case ml.Gelu_Mul:           panic("CPU gelu_mul_backward: fused gelu*mul is forward-only")
+	case ml.Gelu_Mul:           panic("fused gelu*mul is forward-only")
 	case ml.Silu:               silu_backward              (op)
 	case ml.Tanh:               tanh_backward              (op)
 	case ml.Batched_Matmul:     batched_matmul_backward    (op)
@@ -526,8 +613,8 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Attention:          attention_backward         (op)
 	case ml.Attention_Cache:    attention_cache_backward   (op)
 	case ml.Cast:               cast_backward              (op)
-	case ml.Lerp_Assign:        panic("CPU lerp_assign_backward: lerp_assign is a forward-only utility op")
-	case ml.Accumulate_Mean:    panic("CPU accumulate_mean_backward: accumulate_mean is a forward-only utility op")
+	case ml.Lerp_Assign:        panic("lerp_assign is a forward-only utility op")
+	case ml.Accumulate_Mean:    panic("accumulate_mean is a forward-only utility op")
 	}
 }
 
@@ -558,9 +645,11 @@ cast_forward :: proc(op: ml.Operation) {
 }
 
 cast_backward :: proc(op: ml.Operation) {
-	dst_grad := transmute([]byte)op.output.buffers[.Gradient]
-	src_grad := transmute([]byte)op.input.buffers[.Gradient]
-	_cast_bytes_accumulate(dst_grad, op.output.type, src_grad, op.input.type, op.input.count)
+	src_grad := gradient(op.output)
+	dst_grad := gradient(op.input)
+	for i in 0 ..< op.input.count {
+		dst_grad[i] += src_grad[i]
+	}
 }
 
 _cast_bytes :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: ml.Data_Type, count: int) {
@@ -635,26 +724,12 @@ add_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
-	#partial switch a.type {
-	case .F32:
-		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
-				gradient(a)[o] += gradient(output)[o]
-				gradient(b)[j] += gradient(output)[o]
-			}
-		}
-	case .Bf16:
-		da_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
-		db_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Gradient]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
-				dy := ml.bf16_to_f32(dy_bf[o])
-				da_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(da_bf[o]) + dy)
-				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) + dy)
-			}
+	da, db, dy := gradient(a), gradient(b), gradient(output)
+	for i in 0 ..< stride {
+		for j in 0 ..< ml.len(b) {
+			o := i * ml.len(b) + j
+			da[o] += dy[o]
+			db[j] += dy[o]
 		}
 	}
 }
@@ -691,26 +766,12 @@ sub_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Sub).b
 	stride := ml.len(a) / ml.len(b)
 
-	#partial switch a.type {
-	case .F32:
-		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
-				gradient(a)[o] += gradient(output)[o]
-				gradient(b)[j] -= gradient(output)[o]
-			}
-		}
-	case .Bf16:
-		da_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
-		db_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Gradient]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
-				dy := ml.bf16_to_f32(dy_bf[o])
-				da_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(da_bf[o]) + dy)
-				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) - dy)
-			}
+	da, db, dy := gradient(a), gradient(b), gradient(output)
+	for i in 0 ..< stride {
+		for j in 0 ..< ml.len(b) {
+			o := i * ml.len(b) + j
+			da[o] += dy[o]
+			db[j] -= dy[o]
 		}
 	}
 }
@@ -747,29 +808,24 @@ mul_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Mul).b
 	stride := ml.len(a) / ml.len(b)
 
+	da, db, dy := gradient(a), gradient(b), gradient(output)
 	#partial switch a.type {
 	case .F32:
+		av, bv := data(a), data(b)
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
 				o := i * ml.len(b) + j
-				gradient(a)[o] += gradient(output)[o] * data(b)[j]
-				gradient(b)[j] += gradient(output)[o] * data(a)[o]
+				da[o] += dy[o] * bv[j]
+				db[j] += dy[o] * av[o]
 			}
 		}
 	case .Bf16:
-		a_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Data]))
-		b_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
-		da_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
-		db_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Gradient]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+		av, bv := data_bf16(a), data_bf16(b)
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
 				o := i * ml.len(b) + j
-				dy   := ml.bf16_to_f32(dy_bf[o])
-				a_v  := ml.bf16_to_f32(a_bf [o])
-				b_v  := ml.bf16_to_f32(b_bf [j])
-				da_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(da_bf[o]) + dy * b_v)
-				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) + dy * a_v)
+				da[o] += dy[o] * ml.bf16_to_f32(bv[j])
+				db[j] += dy[o] * ml.bf16_to_f32(av[o])
 			}
 		}
 	}
@@ -807,29 +863,26 @@ div_backward :: proc(op: ml.Operation) {
 	b      := op.variant.(ml.Div).b
 	stride := ml.len(a) / ml.len(b)
 
+	da, db, dy := gradient(a), gradient(b), gradient(output)
 	#partial switch a.type {
 	case .F32:
+		av, bv := data(a), data(b)
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
 				o := i * ml.len(b) + j
-				gradient(a)[o] += gradient(output)[o] / data(b)[j]
-				gradient(b)[j] += gradient(output)[o] * (-data(a)[o] / (data(b)[j] * data(b)[j]))
+				da[o] += dy[o] / bv[j]
+				db[j] += dy[o] * (-av[o] / (bv[j] * bv[j]))
 			}
 		}
 	case .Bf16:
-		a_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Data]))
-		b_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
-		da_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
-		db_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Gradient]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+		av, bv := data_bf16(a), data_bf16(b)
 		for i in 0 ..< stride {
 			for j in 0 ..< ml.len(b) {
 				o := i * ml.len(b) + j
-				dy   := ml.bf16_to_f32(dy_bf[o])
-				a_v  := ml.bf16_to_f32(a_bf [o])
-				b_v  := ml.bf16_to_f32(b_bf [j])
-				da_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(da_bf[o]) + dy / b_v)
-				db_bf[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_bf[j]) + dy * (-a_v / (b_v * b_v)))
+				a_v := ml.bf16_to_f32(av[o])
+				b_v := ml.bf16_to_f32(bv[j])
+				da[o] += dy[o] / b_v
+				db[j] += dy[o] * (-a_v / (b_v * b_v))
 			}
 		}
 	}
@@ -856,18 +909,40 @@ exp_forward :: proc(op: ml.Operation) {
 exp_backward :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
+	dx, dy := gradient(input), gradient(output)
 	#partial switch input.type {
 	case .F32:
+		y := data(output)
 		for i in 0 ..< ml.len(input) {
-			gradient(input)[i] += data(output)[i] * gradient(output)[i]
+			dx[i] += y[i] * dy[i]
 		}
 	case .Bf16:
-		y_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
+		y := data_bf16(output)
 		for i in 0 ..< ml.len(input) {
-			dx_bf[i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[i]) +
-				ml.bf16_to_f32(y_bf[i]) * ml.bf16_to_f32(dy_bf[i]))
+			dx[i] += ml.bf16_to_f32(y[i]) * dy[i]
+		}
+	}
+}
+
+sqrt_forward :: proc(op: ml.Operation) {
+	input  := op.input
+	output := op.output
+
+	assert(input.type == .F32, "sqrt is F32-only")
+
+	for i in 0 ..< ml.len(input) {
+		data(output)[i] = math.sqrt(data(input)[i])
+	}
+}
+
+sqrt_backward :: proc(op: ml.Operation) {
+	input, output := op.input, op.output
+
+	dx, dy := gradient(input), gradient(output)
+	y := data(output)
+	for i in 0 ..< ml.len(input) {
+		if y[i] > 0 {
+			dx[i] += 0.5 / y[i] * dy[i]
 		}
 	}
 }
@@ -992,41 +1067,16 @@ mean_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 mean_backward :: proc(op: ml.Operation) {
-	#partial switch op.input.type {
-	case .F32:  mean_backward_f32 (op)
-	case .Bf16: mean_backward_bf16(op)
-	}
-}
-
-mean_backward_f32 :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 	count := ml.len(output)
 	size  := ml.len(input) / count
 
+	dx, dy := gradient(input), gradient(output)
 	for sample in 0 ..< count {
-		gradient_per_element := gradient(output)[sample] / f32(size)
+		gradient_per_element := dy[sample] / f32(size)
 
 		for i in 0 ..< size {
-			input_index := sample * size + i
-			gradient(input)[input_index] += gradient_per_element
-		}
-	}
-}
-
-mean_backward_bf16 :: proc(op: ml.Operation) {
-	input, output := op.input, op.output
-	count := ml.len(output)
-	size  := ml.len(input) / count
-
-	dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
-	dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-
-	for sample in 0 ..< count {
-		gradient_per_element := ml.bf16_to_f32(dy_bf[sample]) / f32(size)
-
-		for i in 0 ..< size {
-			idx := sample * size + i
-			dx_bf[idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[idx]) + gradient_per_element)
+			dx[sample * size + i] += gradient_per_element
 		}
 	}
 }
@@ -1079,22 +1129,10 @@ select_backward :: proc(op: ml.Operation) {
 	indices := op.variant.(ml.Select).indices
 	size    := ml.len(output) / builtin.len(indices)
 
-	#partial switch weight.type {
-	case .F32:
-		for i in 0 ..< builtin.len(indices) {
-			for j in 0 ..< size {
-				gradient(weight)[indices[i] * size + j] += gradient(output)[i * size + j]
-			}
-		}
-	case .Bf16:
-		dw := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Gradient]))
-		dy := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		for i in 0 ..< builtin.len(indices) {
-			for j in 0 ..< size {
-				dst_idx := indices[i] * size + j
-				src_idx := i * size + j
-				dw[dst_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dw[dst_idx]) + ml.bf16_to_f32(dy[src_idx]))
-			}
+	dw, dy := gradient(weight), gradient(output)
+	for i in 0 ..< builtin.len(indices) {
+		for j in 0 ..< size {
+			dw[indices[i] * size + j] += dy[i * size + j]
 		}
 	}
 }
@@ -1124,18 +1162,9 @@ slice_backward :: proc(op: ml.Operation) {
 	variant := op.variant.(ml.Slice)
 	start   := variant.start
 
-	#partial switch input.type {
-	case .F32:
-		for i in 0 ..< ml.len(output) {
-			gradient(input)[start + i] += gradient(output)[i]
-		}
-	case .Bf16:
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		for i in 0 ..< ml.len(output) {
-			idx := start + i
-			dx_bf[idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[idx]) + ml.bf16_to_f32(dy_bf[i]))
-		}
+	dx, dy := gradient(input), gradient(output)
+	for i in 0 ..< ml.len(output) {
+		dx[start + i] += dy[i]
 	}
 }
 
@@ -1181,25 +1210,12 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 	new_trailing := output.shape[output.rank - 1]
 	leading      := ml._leading_count(input)
 
-	#partial switch input.type {
-	case .F32:
-		for r in 0 ..< leading {
-			in_off  := r * trailing + start
-			out_off := r * new_trailing
-			for i in 0 ..< new_trailing {
-				gradient(input)[in_off + i] += gradient(output)[out_off + i]
-			}
-		}
-	case .Bf16:
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		for r in 0 ..< leading {
-			in_off  := r * trailing + start
-			out_off := r * new_trailing
-			for i in 0 ..< new_trailing {
-				idx := in_off + i
-				dx_bf[idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[idx]) + ml.bf16_to_f32(dy_bf[out_off + i]))
-			}
+	dx, dy := gradient(input), gradient(output)
+	for r in 0 ..< leading {
+		in_off  := r * trailing + start
+		out_off := r * new_trailing
+		for i in 0 ..< new_trailing {
+			dx[in_off + i] += dy[out_off + i]
 		}
 	}
 }
@@ -1253,36 +1269,19 @@ concat_backward :: proc(op: ml.Operation) {
 	leading      := ml._leading_count(inputs[0])
 	out_trailing := output.shape[output.rank - 1]
 
-	#partial switch output.type {
-	case .F32:
-		src_col := 0
-		for input in inputs {
-			in_trailing := input.shape[input.rank - 1]
-			for r in 0 ..< leading {
-				out_off := r * out_trailing + src_col
-				in_off  := r * in_trailing
-				for i in 0 ..< in_trailing {
-					gradient(input)[in_off + i] += gradient(output)[out_off + i]
-				}
+	dy := gradient(output)
+	src_col := 0
+	for input in inputs {
+		dx          := gradient(input)
+		in_trailing := input.shape[input.rank - 1]
+		for r in 0 ..< leading {
+			out_off := r * out_trailing + src_col
+			in_off  := r * in_trailing
+			for i in 0 ..< in_trailing {
+				dx[in_off + i] += dy[out_off + i]
 			}
-			src_col += in_trailing
 		}
-	case .Bf16:
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		src_col := 0
-		for input in inputs {
-			dx_bf       := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers[.Gradient]))
-			in_trailing := input.shape[input.rank - 1]
-			for r in 0 ..< leading {
-				out_off := r * out_trailing + src_col
-				in_off  := r * in_trailing
-				for i in 0 ..< in_trailing {
-					idx := in_off + i
-					dx_bf[idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[idx]) + ml.bf16_to_f32(dy_bf[out_off + i]))
-				}
-			}
-			src_col += in_trailing
-		}
+		src_col += in_trailing
 	}
 }
 
@@ -1353,10 +1352,6 @@ linear_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-// Reference CPU forward for the GGUF Q4_K linear op: dequantize the weight
-// row block-by-block and accumulate the dot product against the bf16
-// activation. This is slow and intended as the parity baseline for the 
-// GPU shader, not for production decode.
 linear_q4_k_forward :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Linear_Q4_K)
 	output_size := v.weight.shape[0]
@@ -1384,7 +1379,7 @@ linear_q4_k_forward :: proc(op: ml.Operation) {
 		w_row   := w_pk[o * row_bytes : (o + 1) * row_bytes]
 		dequant := make([]f32, input_size)
 		defer delete(dequant)
-		gguf.dequantize_q4_k(w_row, dequant)
+		ml.dequantize_q4_k(w_row, dequant)
 
 		for c in 0 ..< jd.count {
 			x_row := x_bf[c * input_size:]
@@ -1397,7 +1392,6 @@ linear_q4_k_forward :: proc(op: ml.Operation) {
 	})
 }
 
-// Reference CPU forward for the GGUF Q6_K linear op. Same structure as Q4_K.
 linear_q6_k_forward :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Linear_Q6_K)
 	output_size := v.weight.shape[0]
@@ -1425,7 +1419,7 @@ linear_q6_k_forward :: proc(op: ml.Operation) {
 		w_row   := w_pk[o * row_bytes : (o + 1) * row_bytes]
 		dequant := make([]f32, input_size)
 		defer delete(dequant)
-		gguf.dequantize_q6_k(w_row, dequant)
+		ml.dequantize_q6_k(w_row, dequant)
 
 		for c in 0 ..< jd.count {
 			x_row := x_bf[c * input_size:]
@@ -1456,18 +1450,17 @@ linear_backward_bf16 :: proc(op: ml.Operation) {
 		output_size := weight.shape[0]
 		count       := ml.len(op.input) / input_size
 
-		x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Data]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
-		dw_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers   [.Gradient]))
+		x_bf := data_bf16(op.input)
+		dy   := gradient(op.output)
+		dw   := gradient(weight)
 
-		dw_row := dw_bf[o * input_size:]
+		dw_row := dw[o * input_size:]
 		for k in 0 ..< input_size {
 			acc: f32
 			for c in 0 ..< count {
-				acc += ml.bf16_to_f32(x_bf[c * input_size + k]) *
-				       ml.bf16_to_f32(dy_bf[c * output_size + o])
+				acc += ml.bf16_to_f32(x_bf[c * input_size + k]) * dy[c * output_size + o]
 			}
-			dw_row[k] = ml.bf16_from_f32(ml.bf16_to_f32(dw_row[k]) + acc)
+			dw_row[k] += acc
 		}
 	})
 
@@ -1476,19 +1469,18 @@ linear_backward_bf16 :: proc(op: ml.Operation) {
 		input_size  := weight.shape[1]
 		output_size := weight.shape[0]
 
-		w_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers   [.Data]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Gradient]))
+		w_bf := data_bf16(weight)
+		dy   := gradient(op.output)
+		dx   := gradient(op.input)
 
-		dx_row := dx_bf[c * input_size:]
-		dy_row := dy_bf[c * output_size:]
+		dx_row := dx[c * input_size:]
+		dy_row := dy[c * output_size:]
 		for k in 0 ..< input_size {
 			acc: f32
 			for o in 0 ..< output_size {
-				acc += ml.bf16_to_f32(w_bf[o * input_size + k]) *
-				       ml.bf16_to_f32(dy_row[o])
+				acc += ml.bf16_to_f32(w_bf[o * input_size + k]) * dy_row[o]
 			}
-			dx_row[k] = ml.bf16_from_f32(ml.bf16_to_f32(dx_row[k]) + acc)
+			dx_row[k] += acc
 		}
 	})
 }
@@ -1649,13 +1641,6 @@ rope_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 rope_backward :: proc(op: ml.Operation) {
-	#partial switch op.input.type {
-	case .F32:  rope_backward_f32 (op)
-	case .Bf16: rope_backward_bf16(op)
-	}
-}
-
-rope_backward_f32 :: proc(op: ml.Operation) {
 	input, output := op.input, op.output
 
 	variant           := op.variant.(ml.Rope)
@@ -1685,48 +1670,6 @@ rope_backward_f32 :: proc(op: ml.Operation) {
 			for i in rotate_pair_count ..< half_head {
 				gradient(input)[head_offset + i * 2]     += gradient(output)[head_offset + i * 2]
 				gradient(input)[head_offset + i * 2 + 1] += gradient(output)[head_offset + i * 2 + 1]
-			}
-		}
-	}
-}
-
-rope_backward_bf16 :: proc(op: ml.Operation) {
-	input, output := op.input, op.output
-
-	variant           := op.variant.(ml.Rope)
-	head_count        := variant.head_count
-	rotate_pair_count := variant.rotate_pair_count
-	cos_cache         := variant.cos_cache
-	sin_cache         := variant.sin_cache
-	token_count       := input.shape[0]
-	head_size         := input.shape[input.rank - 1] / head_count
-	half_head         := head_size / 2
-
-	dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
-	dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-
-	for t in 0 ..< token_count {
-		for h in 0 ..< head_count {
-			head_offset := t * head_count * head_size + h * head_size
-
-			for i in 0 ..< rotate_pair_count {
-				cache_idx := t * half_head + i
-				cos_val := data(cos_cache)[cache_idx]
-				sin_val := data(sin_cache)[cache_idx]
-
-				grad_x := ml.bf16_to_f32(dy_bf[head_offset + i * 2])
-				grad_y := ml.bf16_to_f32(dy_bf[head_offset + i * 2 + 1])
-
-				lo_idx := head_offset + i * 2
-				hi_idx := lo_idx + 1
-				dx_bf[lo_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[lo_idx]) +  grad_x * cos_val + grad_y * sin_val)
-				dx_bf[hi_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[hi_idx]) + -grad_x * sin_val + grad_y * cos_val)
-			}
-			for i in rotate_pair_count ..< half_head {
-				lo_idx := head_offset + i * 2
-				hi_idx := lo_idx + 1
-				dx_bf[lo_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[lo_idx]) + ml.bf16_to_f32(dy_bf[lo_idx]))
-				dx_bf[hi_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[hi_idx]) + ml.bf16_to_f32(dy_bf[hi_idx]))
 			}
 		}
 	}
@@ -1878,11 +1821,11 @@ layernorm_backward_bf16 :: proc(op: ml.Operation) {
 	size    := input.shape[input.rank - 1]
 	count   := ml.len(input) / size
 
-	x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
-	w_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
-	dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
-	dw_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Gradient]))
-	dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+	x_bf := data_bf16(input)
+	w_bf := data_bf16(weight)
+	dx   := gradient(input)
+	dw   := gradient(weight)
+	dy   := gradient(output)
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1893,7 +1836,7 @@ layernorm_backward_bf16 :: proc(op: ml.Operation) {
 		dnorm_norm_mean: f32
 		for i in 0 ..< size {
 			norm  := (ml.bf16_to_f32(x_bf[offset + i]) - mean_c) * rstd_c
-			dnorm := ml.bf16_to_f32(w_bf[i]) * ml.bf16_to_f32(dy_bf[offset + i])
+			dnorm := ml.bf16_to_f32(w_bf[i]) * dy[offset + i]
 			dnorm_mean      += dnorm
 			dnorm_norm_mean += dnorm * norm
 		}
@@ -1902,17 +1845,17 @@ layernorm_backward_bf16 :: proc(op: ml.Operation) {
 
 		for i in 0 ..< size {
 			x_v   := ml.bf16_to_f32(x_bf[offset + i])
-			dy_v  := ml.bf16_to_f32(dy_bf[offset + i])
+			dy_v  := dy[offset + i]
 			w_v   := ml.bf16_to_f32(w_bf[i])
 			norm  := (x_v - mean_c) * rstd_c
 			dnorm := w_v * dy_v
 
-			dw_bf[i] = ml.bf16_from_f32(ml.bf16_to_f32(dw_bf[i]) + norm * dy_v)
+			dw[i] += norm * dy_v
 
 			grad := dnorm - dnorm_mean - norm * dnorm_norm_mean
 			grad *= rstd_c
 
-			dx_bf[offset + i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[offset + i]) + grad)
+			dx[offset + i] += grad
 		}
 	}
 }
@@ -2188,11 +2131,11 @@ rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 	size    := input.shape[input.rank - 1]
 	count   := ml.len(input) / size
 
-	x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
-	w_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Data]))
-	dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
-	dw_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)weight.buffers[.Gradient]))
-	dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
+	x_bf := data_bf16(input)
+	w_bf := data_bf16(weight)
+	dx   := gradient(input)
+	dw   := gradient(weight)
+	dy   := gradient(output)
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -2201,22 +2144,22 @@ rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 		dnorm_norm_mean: f32
 		for i in 0 ..< size {
 			norm  := ml.bf16_to_f32(x_bf[offset + i]) * rstd_c
-			dnorm := ml.bf16_to_f32(w_bf[i]) * ml.bf16_to_f32(dy_bf[offset + i])
+			dnorm := ml.bf16_to_f32(w_bf[i]) * dy[offset + i]
 			dnorm_norm_mean += dnorm * norm
 		}
 		dnorm_norm_mean /= f32(size)
 
 		for i in 0 ..< size {
 			x_v   := ml.bf16_to_f32(x_bf[offset + i])
-			dy_v  := ml.bf16_to_f32(dy_bf[offset + i])
+			dy_v  := dy[offset + i]
 			w_v   := ml.bf16_to_f32(w_bf[i])
 			norm  := x_v * rstd_c
 			dnorm := w_v * dy_v
 
-			dw_bf[i] = ml.bf16_from_f32(ml.bf16_to_f32(dw_bf[i]) + norm * dy_v)
+			dw[i] += norm * dy_v
 
 			grad := (dnorm - norm * dnorm_norm_mean) * rstd_c
-			dx_bf[offset + i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[offset + i]) + grad)
+			dx[offset + i] += grad
 		}
 	}
 }
@@ -2298,19 +2241,18 @@ softmax_backward :: proc(op: ml.Operation) {
 			}
 		})
 	case .Bf16:
-		y_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Data]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Gradient]))
+		y_bf := data_bf16(op.output)
+		dy   := gradient(op.output)
+		dx   := gradient(op.input)
 		for sample in 0 ..< count {
 			base := sample * size
 			dot:  f32
 			for i in 0 ..< size {
-				dot += ml.bf16_to_f32(dy_bf[base + i]) * ml.bf16_to_f32(y_bf[base + i])
+				dot += dy[base + i] * ml.bf16_to_f32(y_bf[base + i])
 			}
 			for i in 0 ..< size {
-				y_v  := ml.bf16_to_f32(y_bf [base + i])
-				dy_v := ml.bf16_to_f32(dy_bf[base + i])
-				dx_bf[base + i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[base + i]) + y_v * (dy_v - dot))
+				y_v := ml.bf16_to_f32(y_bf[base + i])
+				dx[base + i] += y_v * (dy[base + i] - dot)
 			}
 		}
 	}
@@ -2382,19 +2324,18 @@ log_softmax_backward :: proc(op: ml.Operation) {
 			}
 		}
 	case .Bf16:
-		y_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
+		y_bf := data_bf16(output)
+		dy   := gradient(output)
+		dx   := gradient(input)
 		for sample in 0 ..< count {
 			base := sample * size
 			grad_sum: f32
 			for i in 0 ..< size {
-				grad_sum += ml.bf16_to_f32(dy_bf[base + i])
+				grad_sum += dy[base + i]
 			}
 			for i in 0 ..< size {
-				dy_v := ml.bf16_to_f32(dy_bf[base + i])
-				y_v  := ml.bf16_to_f32(y_bf [base + i])
-				dx_bf[base + i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[base + i]) + dy_v - math.exp(y_v) * grad_sum)
+				y_v := ml.bf16_to_f32(y_bf[base + i])
+				dx[base + i] += dy[base + i] - math.exp(y_v) * grad_sum
 			}
 		}
 	}
@@ -2451,17 +2392,17 @@ entropy_backward :: proc(op: ml.Operation) {
 			}
 		}
 	case .Bf16:
-		p_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)probabilities.buffers[.Data]))
-		dp_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)probabilities.buffers[.Gradient]))
-		do_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers       [.Gradient]))
+		p_bf := data_bf16(probabilities)
+		dp   := gradient(probabilities)
+		d_out := gradient(output)
 		for sample in 0 ..< count {
-			base    := sample * size
-			dout_v  := ml.bf16_to_f32(do_bf[sample])
+			base   := sample * size
+			dout_v := d_out[sample]
 			for i in 0 ..< size {
 				p      := ml.bf16_to_f32(p_bf[base + i])
 				p_safe := math.max(p, f32(1e-8))
 				grad   := -(math.ln(p_safe) + 1.0)
-				dp_bf[base + i] = ml.bf16_from_f32(ml.bf16_to_f32(dp_bf[base + i]) + dout_v * grad)
+				dp[base + i] += dout_v * grad
 			}
 		}
 	}
@@ -2501,6 +2442,54 @@ mean_squared_error_backward :: proc(op: ml.Operation) {
 		for i in 0 ..< sample_size {
 			index := sample * sample_size + i
 			grad := scale * (data(predictions)[index] - data(targets)[index])
+			gradient(predictions)[index] += grad * upstream_gradient
+		}
+	}
+}
+
+smooth_l1_forward :: proc(op: ml.Operation) {
+	predictions := op.input
+	output      := op.output
+	variant     := op.variant.(ml.Smooth_L1)
+	targets     := variant.targets
+	beta        := variant.beta
+	count       := ml.len(output)
+	sample_size := ml.len(predictions) / count
+
+	for sample in 0 ..< count {
+		sum: f32
+
+		for i in 0 ..< sample_size {
+			index := sample * sample_size + i
+			diff  := data(predictions)[index] - data(targets)[index]
+			if abs(diff) < beta {
+				sum += 0.5 * diff * diff / beta
+			} else {
+				sum += abs(diff) - 0.5 * beta
+			}
+		}
+
+		data(output)[sample] = sum / f32(sample_size)
+	}
+}
+
+smooth_l1_backward :: proc(op: ml.Operation) {
+	predictions, output := op.input, op.output
+	variant     := op.variant.(ml.Smooth_L1)
+	targets     := variant.targets
+	beta        := variant.beta
+	count       := ml.len(output)
+	sample_size := ml.len(predictions) / count
+
+	for sample in 0 ..< count {
+		scale := 1.0 / f32(sample_size)
+
+		upstream_gradient := gradient(output)[sample]
+
+		for i in 0 ..< sample_size {
+			index := sample * sample_size + i
+			diff  := data(predictions)[index] - data(targets)[index]
+			grad  := math.clamp(diff / beta, -1, 1) * scale
 			gradient(predictions)[index] += grad * upstream_gradient
 		}
 	}
@@ -2591,13 +2580,12 @@ _unary_backward_dispatch :: proc(op: ml.Operation, local_grad_from_input: proc(x
 			gradient(input)[i] += gradient(output)[i] * local_grad_from_input(data(input)[i])
 		}
 	case .Bf16:
-		x_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
+		x_bf := data_bf16(input)
+		dy   := gradient(output)
+		dx   := gradient(input)
 		for i in 0 ..< ml.len(input) {
 			x_v := ml.bf16_to_f32(x_bf[i])
-			dx_bf[i] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[i]) +
-				ml.bf16_to_f32(dy_bf[i]) * local_grad_from_input(x_v))
+			dx[i] += dy[i] * local_grad_from_input(x_v)
 		}
 	}
 }
@@ -2794,20 +2782,19 @@ batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 		bi := idx / m
 		i  := idx % m
 
-		b_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)bt.buffers    [.Data]))
-		dc_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		da_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Gradient]))
+		b_bf := data_bf16(bt)
+		dc   := gradient(output)
+		da   := gradient(a)
 
-		dc_row := dc_bf[bi * m * n + i * n:]
-		da_row := da_bf[bi * m * k_count + i * k_count:]
+		dc_row := dc[bi * m * n + i * n:]
+		da_row := da[bi * m * k_count + i * k_count:]
 
 		for kk in 0 ..< k_count {
 			acc: f32
 			for j in 0 ..< n {
-				acc += ml.bf16_to_f32(dc_row[j]) *
-				       ml.bf16_to_f32(b_bf[bi * k_count * n + kk * n + j])
+				acc += dc_row[j] * ml.bf16_to_f32(b_bf[bi * k_count * n + kk * n + j])
 			}
-			da_row[kk] = ml.bf16_from_f32(ml.bf16_to_f32(da_row[kk]) + acc)
+			da_row[kk] += acc
 		}
 	})
 
@@ -2822,18 +2809,18 @@ batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 		bi := idx / k_count
 		kk := idx % k_count
 
-		a_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)a.buffers     [.Data]))
-		dc_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		db_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)bt.buffers    [.Gradient]))
+		a_bf := data_bf16(a)
+		dc   := gradient(output)
+		db   := gradient(bt)
 
-		db_row := db_bf[bi * k_count * n + kk * n:]
+		db_row := db[bi * k_count * n + kk * n:]
 		for j in 0 ..< n {
 			acc: f32
 			for ii in 0 ..< m {
 				acc += ml.bf16_to_f32(a_bf[bi * m * k_count + ii * k_count + kk]) *
-				       ml.bf16_to_f32(dc_bf[bi * m * n + ii * n + j])
+				       dc[bi * m * n + ii * n + j]
 			}
-			db_row[j] = ml.bf16_from_f32(ml.bf16_to_f32(db_row[j]) + acc)
+			db_row[j] += acc
 		}
 	})
 }
@@ -2951,39 +2938,19 @@ permute_backward :: proc(op: ml.Operation) {
 	out_shape  := [3]int{output.shape[0],           output.shape[1], output.shape[2]}
 	in_strides := [3]int{in_shape[1] * in_shape[2], in_shape[2],     1              }
 
-	#partial switch input.type {
-	case .F32:
-		for i0 in 0 ..< out_shape[0] {
-			for i1 in 0 ..< out_shape[1] {
-				for i2 in 0 ..< out_shape[2] {
-					src: [3]int
-					src[axes[0]] = i0
-					src[axes[1]] = i1
-					src[axes[2]] = i2
+	dx, dy := gradient(input), gradient(output)
+	for i0 in 0 ..< out_shape[0] {
+		for i1 in 0 ..< out_shape[1] {
+			for i2 in 0 ..< out_shape[2] {
+				src: [3]int
+				src[axes[0]] = i0
+				src[axes[1]] = i1
+				src[axes[2]] = i2
 
-					src_idx := src[0] * in_strides[0] + src[1] * in_strides[1] + src[2] * in_strides[2]
-					dst_idx := (i0 * out_shape[1] + i1) * out_shape[2] + i2
+				src_idx := src[0] * in_strides[0] + src[1] * in_strides[1] + src[2] * in_strides[2]
+				dst_idx := (i0 * out_shape[1] + i1) * out_shape[2] + i2
 
-					gradient(input)[src_idx] += gradient(output)[dst_idx]
-				}
-			}
-		}
-	case .Bf16:
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		for i0 in 0 ..< out_shape[0] {
-			for i1 in 0 ..< out_shape[1] {
-				for i2 in 0 ..< out_shape[2] {
-					src: [3]int
-					src[axes[0]] = i0
-					src[axes[1]] = i1
-					src[axes[2]] = i2
-
-					src_idx := src[0] * in_strides[0] + src[1] * in_strides[1] + src[2] * in_strides[2]
-					dst_idx := (i0 * out_shape[1] + i1) * out_shape[2] + i2
-
-					dx_bf[src_idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[src_idx]) + ml.bf16_to_f32(dy_bf[dst_idx]))
-				}
+				dx[src_idx] += dy[dst_idx]
 			}
 		}
 	}
@@ -3040,27 +3007,13 @@ causal_mask_backward :: proc(op: ml.Operation) {
 	block_size := T * T
 	n_blocks   := ml.len(input) / block_size
 
-	#partial switch input.type {
-	case .F32:
-		for blk in 0 ..< n_blocks {
-			offset := blk * block_size
-			for t1 in 0 ..< T {
-				for t2 in 0 ..= t1 {
-					idx := offset + t1 * T + t2
-					gradient(input)[idx] += gradient(output)[idx]
-				}
-			}
-		}
-	case .Bf16:
-		dx_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Gradient]))
-		dy_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Gradient]))
-		for blk in 0 ..< n_blocks {
-			offset := blk * block_size
-			for t1 in 0 ..< T {
-				for t2 in 0 ..= t1 {
-					idx := offset + t1 * T + t2
-					dx_bf[idx] = ml.bf16_from_f32(ml.bf16_to_f32(dx_bf[idx]) + ml.bf16_to_f32(dy_bf[idx]))
-				}
+	dx, dy := gradient(input), gradient(output)
+	for blk in 0 ..< n_blocks {
+		offset := blk * block_size
+		for t1 in 0 ..< T {
+			for t2 in 0 ..= t1 {
+				idx := offset + t1 * T + t2
+				dx[idx] += dy[idx]
 			}
 		}
 	}
@@ -3312,13 +3265,13 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 		window      := v.window
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		q_data   := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Data]))
-		q_grad   := ([^]ml.Bf16)(raw_data(transmute([]byte)op.input.buffers [.Gradient]))
-		k_data   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.key.buffers    [.Data]))
-		k_grad   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.key.buffers    [.Gradient]))
-		v_data   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.value.buffers  [.Data]))
-		v_grad   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.value.buffers  [.Gradient]))
-		out_grad := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Gradient]))
+		q_data   := data_bf16(op.input)
+		q_grad   := gradient(op.input)
+		k_data   := data_bf16(v.key)
+		k_grad   := gradient(v.key)
+		v_data   := data_bf16(v.value)
+		v_grad   := gradient(v.value)
+		out_grad := gradient(op.output)
 		sm_ptr   := ([^]f32)(raw_data(data(v.softmax_outputs)))
 		dp_ptr   := ([^]f32)(raw_data(data(v.d_p_scratch)))
 
@@ -3342,16 +3295,13 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 					v_offset := t_k * kv_size + kv_h * head_size
 					dot: f32
 					for d in 0 ..< head_size {
-						d_out_d := ml.bf16_to_f32(out_grad[d_out_offset + d])
-						dot += d_out_d * ml.bf16_to_f32(v_data[v_offset + d])
+						dot += out_grad[d_out_offset + d] * ml.bf16_to_f32(v_data[v_offset + d])
 					}
 					d_p[t_k] = dot
 
 					p_val := sm_row[t_k]
 					for d in 0 ..< head_size {
-						existing := ml.bf16_to_f32(v_grad[v_offset + d])
-						contrib  := ml.bf16_to_f32(out_grad[d_out_offset + d]) * p_val
-						v_grad[v_offset + d] = ml.bf16_from_f32(existing + contrib)
+						v_grad[v_offset + d] += out_grad[d_out_offset + d] * p_val
 					}
 				}
 
@@ -3369,12 +3319,10 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 					k_offset := t_k * kv_size + kv_h * head_size
 					scale    := d_p[t_k]
 					for d in 0 ..< head_size {
-						q_d  := ml.bf16_to_f32(q_data[q_offset + d])
-						k_d  := ml.bf16_to_f32(k_data[k_offset + d])
-						dq_d := ml.bf16_to_f32(q_grad[q_offset + d])
-						dk_d := ml.bf16_to_f32(k_grad[k_offset + d])
-						q_grad[q_offset + d] = ml.bf16_from_f32(dq_d + scale * k_d)
-						k_grad[k_offset + d] = ml.bf16_from_f32(dk_d + scale * q_d)
+						q_d := ml.bf16_to_f32(q_data[q_offset + d])
+						k_d := ml.bf16_to_f32(k_data[k_offset + d])
+						q_grad[q_offset + d] += scale * k_d
+						k_grad[k_offset + d] += scale * q_d
 					}
 				}
 			}

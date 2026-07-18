@@ -30,6 +30,21 @@ TANH_BF16_SRC      :: #load("kernels/tanh/tanh_bf16.cu",      []u8)
 TANH_BACK_F32_SRC  :: #load("kernels/tanh/tanh_back_f32.cu",  []u8)
 TANH_BACK_BF16_SRC :: #load("kernels/tanh/tanh_back_bf16.cu", []u8)
 
+// Elementwise ops added for the RL losses (F32 only - the losses run in F32).
+EXP_F32_SRC        :: #load("kernels/exp/exp.cu",               []u8)
+EXP_BACK_F32_SRC   :: #load("kernels/exp/exp_back_f32.cu",      []u8)
+CLAMP_F32_SRC      :: #load("kernels/clamp/clamp.cu",           []u8)
+CLAMP_BACK_F32_SRC :: #load("kernels/clamp/clamp_back_f32.cu",  []u8)
+MIN_F32_SRC        :: #load("kernels/min/min.cu",               []u8)
+MIN_BACK_A_F32_SRC :: #load("kernels/min/min_back_a_f32.cu",    []u8)
+MIN_BACK_B_F32_SRC :: #load("kernels/min/min_back_b_f32.cu",    []u8)
+
+// Row-wise softmax and entropy over a head's logits (F32 only).
+SOFTMAX_F32_SRC      :: #load("kernels/softmax/softmax.cu",          []u8)
+SOFTMAX_BACK_F32_SRC :: #load("kernels/softmax/softmax_back_f32.cu", []u8)
+ENTROPY_F32_SRC      :: #load("kernels/entropy/entropy.cu",          []u8)
+ENTROPY_BACK_F32_SRC :: #load("kernels/entropy/entropy_back_f32.cu", []u8)
+
 CAST_BF16_TO_F32_SRC :: #load("kernels/cast/cast_bf16_to_f32.cu", []u8)
 CAST_F32_TO_BF16_SRC :: #load("kernels/cast/cast_f32_to_bf16.cu", []u8)
 CAST_BACK_F32_SRC    :: #load("kernels/cast/cast_back_f32.cu",    []u8)

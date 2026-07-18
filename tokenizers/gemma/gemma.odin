@@ -4,6 +4,7 @@ import "base:builtin"
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:log"
 import "core:os"
 import "core:strings"
 import "core:unicode/utf8"
@@ -30,41 +31,41 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 
 	bytes, read_err := os.read_entire_file_from_path(path, allocator)
 	if read_err != nil {
-		fmt.eprintfln("gemma.load: failed to read %v: %v", path, read_err)
+		log.errorf("failed to read %v: %v", path, read_err)
 		return {}, false
 	}
 	defer delete(bytes)
 
 	root, parse_err := json.parse(bytes, parse_integers = true)
 	if parse_err != .None {
-		fmt.eprintfln("gemma.load: JSON parse error %v in %v", parse_err, path)
+		log.errorf("JSON parse error %v in %v", parse_err, path)
 		return {}, false
 	}
 
 	root_object, root_object_ok := root.(json.Object)
 	if !root_object_ok {
-		fmt.eprintln("gemma.load: tokenizer.json root is not an object")
+		log.error("tokenizer.json root is not an object")
 		json.destroy_value(root)
 		return {}, false
 	}
 
 	model_object, model_object_ok := root_object["model"].(json.Object)
 	if !model_object_ok {
-		fmt.eprintln("gemma.load: missing 'model' object")
+		log.error("missing 'model' object")
 		json.destroy_value(root)
 		return {}, false
 	}
 
 	vocab_object, vocab_object_ok := model_object["vocab"].(json.Object)
 	if !vocab_object_ok {
-		fmt.eprintln("gemma.load: missing 'model.vocab' object")
+		log.error("missing 'model.vocab' object")
 		json.destroy_value(root)
 		return {}, false
 	}
 
 	merges_array, merges_array_ok := model_object["merges"].(json.Array)
 	if !merges_array_ok {
-		fmt.eprintln("gemma.load: missing 'model.merges' array")
+		log.error("missing 'model.merges' array")
 		json.destroy_value(root)
 		return {}, false
 	}
@@ -74,7 +75,7 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 	for piece, id_value in vocab_object {
 		id_int, id_int_ok := id_value.(json.Integer)
 		if !id_int_ok || int(id_int) < 0 || int(id_int) >= len(vocab_object) {
-			fmt.eprintfln("gemma.load: vocab entry %q has invalid id", piece)
+			log.errorf("vocab entry %q has invalid id", piece)
 			destroy(tok)
 			return {}, false
 		}
@@ -85,14 +86,14 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 	for merge_value, merge_index in merges_array {
 		if merge_array, is_array := merge_value.(json.Array); is_array {
 			if len(merge_array) != 2 {
-				fmt.eprintfln("gemma.load: merge[%v] is not a 2-element array", merge_index)
+				log.errorf("merge[%v] is not a 2-element array", merge_index)
 				destroy(tok)
 				return {}, false
 			}
 			a_string, a_string_ok := merge_array[0].(string)
 			b_string, b_string_ok := merge_array[1].(string)
 			if !a_string_ok || !b_string_ok {
-				fmt.eprintfln("gemma.load: merge[%v] contains a non-string", merge_index)
+				log.errorf("merge[%v] contains a non-string", merge_index)
 				destroy(tok)
 				return {}, false
 			}
@@ -100,13 +101,13 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 		} else if merge_string, is_string := merge_value.(string); is_string {
 			space_index := strings.index_byte(merge_string, ' ')
 			if space_index <= 0 || space_index >= len(merge_string) - 1 {
-				fmt.eprintfln("gemma.load: merge[%v] = %q has no space separator", merge_index, merge_string)
+				log.errorf("merge[%v] = %q has no space separator", merge_index, merge_string)
 				destroy(tok)
 				return {}, false
 			}
 			tok.merge_rank[Pair{merge_string[:space_index], merge_string[space_index + 1:]}] = merge_index
 		} else {
-			fmt.eprintfln("gemma.load: merge[%v] has unsupported JSON type", merge_index)
+			log.errorf("merge[%v] has unsupported JSON type", merge_index)
 			destroy(tok)
 			return {}, false
 		}
@@ -219,7 +220,7 @@ _encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) 
 					_ = id
 					append(&symbols, strings.clone(byte_token, context.temp_allocator))
 				} else {
-					fmt.eprintfln("gemma.encode: byte 0x%02X has no fallback token in vocab", normalized[offset + k])
+					log.errorf("byte 0x%02X has no fallback token in vocab", normalized[offset + k])
 					return
 				}
 			}
@@ -232,7 +233,7 @@ _encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) 
 	for symbol in symbols {
 		id, present := tok.vocab[symbol]
 		if !present {
-			fmt.eprintfln("gemma.encode: symbol %q not in vocab", symbol)
+			log.errorf("symbol %q not in vocab", symbol)
 			return
 		}
 		append(ids, id)
