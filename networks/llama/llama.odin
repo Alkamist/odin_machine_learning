@@ -222,11 +222,11 @@ _per_head_rmsnorm :: proc(x: ml.Tensor, weight: ml.Tensor, head_count: int) -> m
 }
 
 @(require_results)
-forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int) -> (output: ml.Tensor) {
+forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int, loc := #caller_location) -> (output: ml.Tensor) {
 	token_count := builtin.len(new_tokens)
-	assert(token_count > 0,                          "forward_cached requires at least one new token")
-	assert(cache.length + token_count <= cache.t_max, "forward_cached would overflow KV cache")
-	assert(len(cache.layers) == len(model.layers),    "cache layer count must match model")
+	assert(token_count > 0,                           "requires at least one new token", loc=loc)
+	assert(cache.length + token_count <= cache.t_max, "would overflow KV cache", loc=loc)
+	assert(len(cache.layers) == len(model.layers),    "cache layer count must match model", loc=loc)
 
 	cache_position := cache.length
 

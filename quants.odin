@@ -4,9 +4,9 @@ import "base:builtin"
 
 import "core:mem"
 
-dequantize_q4_k :: proc(src: []byte, dst: []f32) {
-	assert(builtin.len(dst) % K_QUANT_BLOCK_SIZE == 0, "count must be a multiple of 256")
-	assert(builtin.len(src) == (builtin.len(dst) / K_QUANT_BLOCK_SIZE) * Q4_K_BLOCK_BYTES, "src byte count mismatch")
+dequantize_q4_k :: proc(src: []byte, dst: []f32, loc := #caller_location) {
+	assert(builtin.len(dst) % K_QUANT_BLOCK_SIZE == 0, "count must be a multiple of 256", loc=loc)
+	assert(builtin.len(src) == (builtin.len(dst) / K_QUANT_BLOCK_SIZE) * Q4_K_BLOCK_BYTES, "src byte count mismatch", loc=loc)
 
 	num_blocks := builtin.len(dst) / K_QUANT_BLOCK_SIZE
 
@@ -42,9 +42,9 @@ dequantize_q4_k :: proc(src: []byte, dst: []f32) {
 	}
 }
 
-dequantize_q6_k :: proc(src: []byte, dst: []f32) {
-	assert(builtin.len(dst) % K_QUANT_BLOCK_SIZE == 0, "count must be a multiple of 256")
-	assert(builtin.len(src) == (builtin.len(dst) / K_QUANT_BLOCK_SIZE) * Q6_K_BLOCK_BYTES, "src byte count mismatch")
+dequantize_q6_k :: proc(src: []byte, dst: []f32, loc := #caller_location) {
+	assert(builtin.len(dst) % K_QUANT_BLOCK_SIZE == 0, "count must be a multiple of 256", loc=loc)
+	assert(builtin.len(src) == (builtin.len(dst) / K_QUANT_BLOCK_SIZE) * Q6_K_BLOCK_BYTES, "src byte count mismatch", loc=loc)
 
 	num_blocks := builtin.len(dst) / K_QUANT_BLOCK_SIZE
 

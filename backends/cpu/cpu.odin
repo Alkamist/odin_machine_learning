@@ -525,7 +525,7 @@ forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Mul:                mul_forward                (op)
 	case ml.Div:                div_forward                (op)
 	case ml.Exp:                exp_forward                (op)
-	case ml.Sqrt:               sqrt_forward               (op)
+	case ml.Sqrt:               sqrt_forward               (op, loc)
 	case ml.Clamp:              clamp_forward              (op)
 	case ml.Min:                min_forward                (op)
 	case ml.Max:                max_forward                (op)
@@ -537,13 +537,13 @@ forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
 	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
-	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu unreachable (proc decomposes when capability is absent)")
+	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu is unreachable (the op decomposes when the capability is absent)", loc)
 	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
 	case ml.Rope:               rope_forward               (op)
 	case ml.Layernorm:          layernorm_forward          (op)
 	case ml.Rmsnorm:            rmsnorm_forward            (op)
 	case ml.Rmsnorm_Rope:       rmsnorm_rope_forward       (op)
-	case ml.Rmsnorm_Rope_Write_Cache: panic("backend does not advertise Rmsnorm_Rope_Write_Cache capability")
+	case ml.Rmsnorm_Rope_Write_Cache: panic("backend does not advertise the Rmsnorm_Rope_Write_Cache capability", loc)
 	case ml.Add_Rmsnorm:        add_rmsnorm_forward        (op)
 	case ml.Softmax:            softmax_forward            (op)
 	case ml.Entropy:            entropy_forward            (op)
@@ -586,15 +586,15 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
-	case ml.Linear_Q4_K:        panic("linear_q4_k is forward-only")
-	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("forward-only")
-	case ml.Linear_Q6_K:        panic("linear_q6_k is forward-only")
+	case ml.Linear_Q4_K:        panic("Linear_Q4_K is forward-only", loc)
+	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu is forward-only", loc)
+	case ml.Linear_Q6_K:        panic("Linear_Q6_K is forward-only", loc)
 	case ml.Rope:               rope_backward              (op)
 	case ml.Layernorm:          layernorm_backward         (op)
 	case ml.Rmsnorm:            rmsnorm_backward           (op)
-	case ml.Rmsnorm_Rope:       panic("fused rmsnorm+rope is forward-only")
-	case ml.Rmsnorm_Rope_Write_Cache: panic("forward-only fused op")
-	case ml.Add_Rmsnorm:        panic("fused add+rmsnorm is forward-only")
+	case ml.Rmsnorm_Rope:       panic("Rmsnorm_Rope is forward-only", loc)
+	case ml.Rmsnorm_Rope_Write_Cache: panic("Rmsnorm_Rope_Write_Cache is forward-only", loc)
+	case ml.Add_Rmsnorm:        panic("Add_Rmsnorm is forward-only", loc)
 	case ml.Softmax:            softmax_backward           (op)
 	case ml.Entropy:            entropy_backward           (op)
 	case ml.Log_Softmax:        log_softmax_backward       (op)
@@ -604,17 +604,17 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Relu:               relu_backward              (op)
 	case ml.Sigmoid:            sigmoid_backward           (op)
 	case ml.Gelu:               gelu_backward              (op)
-	case ml.Gelu_Mul:           panic("fused gelu*mul is forward-only")
+	case ml.Gelu_Mul:           panic("Gelu_Mul is forward-only", loc)
 	case ml.Silu:               silu_backward              (op)
 	case ml.Tanh:               tanh_backward              (op)
 	case ml.Batched_Matmul:     batched_matmul_backward    (op)
 	case ml.Permute:            permute_backward           (op)
 	case ml.Causal_Mask:        causal_mask_backward       (op)
 	case ml.Attention:          attention_backward         (op)
-	case ml.Attention_Cache:    attention_cache_backward   (op)
+	case ml.Attention_Cache:    attention_cache_backward   (op, loc)
 	case ml.Cast:               cast_backward              (op)
-	case ml.Lerp_Assign:        panic("lerp_assign is a forward-only utility op")
-	case ml.Accumulate_Mean:    panic("accumulate_mean is a forward-only utility op")
+	case ml.Lerp_Assign:        panic("Lerp_Assign is forward-only", loc)
+	case ml.Accumulate_Mean:    panic("Accumulate_Mean is forward-only", loc)
 	}
 }
 
@@ -924,11 +924,11 @@ exp_backward :: proc(op: ml.Operation) {
 	}
 }
 
-sqrt_forward :: proc(op: ml.Operation) {
+sqrt_forward :: proc(op: ml.Operation, loc := #caller_location) {
 	input  := op.input
 	output := op.output
 
-	assert(input.type == .F32, "sqrt is F32-only")
+	assert(input.type == .F32, "Sqrt is F32-only", loc=loc)
 
 	for i in 0 ..< ml.len(input) {
 		data(output)[i] = math.sqrt(data(input)[i])
@@ -3520,6 +3520,6 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-attention_cache_backward :: proc(op: ml.Operation) {
-	panic("attention_with_cache is forward-only; backward is not implemented")
+attention_cache_backward :: proc(op: ml.Operation, loc := #caller_location) {
+	panic("Attention_Cache is forward-only", loc)
 }

@@ -21,7 +21,7 @@ Adapter :: struct {
 }
 
 @(require_results)
-make :: proc(in_features, out_features, rank: int, alpha: f32, dtype: ml.Data_Type = .Bf16) -> (adapter: Adapter) {
+make :: proc(in_features, out_features, rank: int, alpha: f32, dtype: ml.Data_Type = .Bf16, loc := #caller_location) -> (adapter: Adapter) {
 	adapter.rank         = rank
 	adapter.in_features  = in_features
 	adapter.out_features = out_features
@@ -40,7 +40,7 @@ make :: proc(in_features, out_features, rank: int, alpha: f32, dtype: ml.Data_Ty
 		v := [1]ml.Bf16{ml.bf16_from_f32(alpha / f32(rank))}
 		ml.set_data_bytes(adapter.scale, mem.slice_to_bytes(v[:]))
 	case .Q4_K, .Q6_K:
-		panic("quantized scale dtype not supported")
+		panic("quantized scale dtype not supported", loc)
 	}
 	return
 }

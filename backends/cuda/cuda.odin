@@ -100,13 +100,13 @@ _gctx :: #force_inline proc(loc := #caller_location) -> ^Context {
 	return cast(^Context)ml.current_context(loc=loc)
 }
 
-device_init :: proc() {
+device_init :: proc(loc := #caller_location) {
 	sync.lock(&_gpu_mutex)
 	defer sync.unlock(&_gpu_mutex)
-	_device_init_locked()
+	_device_init_locked(loc)
 }
 
-_device_init_locked :: proc() {
+_device_init_locked :: proc(loc := #caller_location) {
 	if _gpu.ctx != nil {
 		return
 	}
@@ -115,7 +115,7 @@ _device_init_locked :: proc() {
 
 	count: i32
 	cuda.check(cuda.DeviceGetCount(&count))
-	fmt.assertf(count > 0, "no CUDA-capable devices found")
+	assert(count > 0, "no CUDA-capable devices found", loc=loc)
 
 	cuda.check(cuda.DeviceGet(&_gpu.dev, 0))
 

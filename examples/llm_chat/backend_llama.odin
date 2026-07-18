@@ -3,6 +3,7 @@ package example_chat
 import "base:builtin"
 
 import "core:fmt"
+import "core:log"
 import "core:os"
 
 import ml    "../../"
@@ -52,14 +53,14 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 		}
 		path = LLAMA_DEFAULT_MODEL
 	} else if !os.exists(path) {
-		fmt.eprintfln("FAIL: no such file: %v", path)
+		log.errorf("no such file: %v", path)
 		return {}, false
 	}
 
-	fmt.println("Loading tokenizer ...")
+	log.info("loading tokenizer")
 	tokenizer, tokenizer_ok := gpt2.load(LLAMA_TOKENIZER_PATH)
 	if !tokenizer_ok {
-		fmt.eprintfln("FAIL: could not load tokenizer: %v", LLAMA_TOKENIZER_PATH)
+		log.errorf("could not load tokenizer: %v", LLAMA_TOKENIZER_PATH)
 		return {}, false
 	}
 
@@ -67,18 +68,18 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 	im_end_id   := tokenizer.added_tokens[IM_END_TEXT]   if IM_END_TEXT   in tokenizer.added_tokens else -1
 	eot_id      := tokenizer.added_tokens[EOT_TEXT]      if EOT_TEXT      in tokenizer.added_tokens else -1
 	if im_start_id < 0 || im_end_id < 0 {
-		fmt.eprintln("FAIL: tokenizer missing <|im_start|> or <|im_end|>.")
+		log.error("tokenizer missing <|im_start|> or <|im_end|>")
 		gpt2.destroy(tokenizer)
 		return {}, false
 	}
 
-	fmt.printfln("Allocating SmolLM2-135M (bf16, %v) ...", ML_BACKEND)
+	log.infof("allocating SmolLM2-135M (bf16, %v)", ML_BACKEND)
 	model := llama.make(llama.SMOLLM2_135M_CONFIG, dtype = .Bf16)
 
-	fmt.printfln("Loading weights from %v ...", path)
+	log.infof("loading weights from %v", path)
 	load_ok := llama.load_safetensors(model, path)
 	if !load_ok {
-		fmt.eprintfln("FAIL: could not load weights from %v", path)
+		log.errorf("could not load weights from %v", path)
 		llama.destroy(model)
 		gpt2.destroy(tokenizer)
 		return {}, false

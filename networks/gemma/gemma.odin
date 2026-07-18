@@ -657,12 +657,12 @@ forward :: proc(model: Gemma, tokens: []int) -> (logits: ml.Tensor) {
 }
 
 @(require_results)
-forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int) -> (logits: ml.Tensor) {
+forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int, loc := #caller_location) -> (logits: ml.Tensor) {
 	cfg := model.config
 	token_count := builtin.len(new_tokens)
-	assert(token_count > 0, "forward_cached requires at least one new token")
-	assert(cache.length + token_count <= cache.t_max, "forward_cached would overflow KV cache")
-	assert(builtin.len(cache.layers) == cfg.num_hidden_layers, "cache layer count must match model")
+	assert(token_count > 0, "requires at least one new token", loc=loc)
+	assert(cache.length + token_count <= cache.t_max, "would overflow KV cache", loc=loc)
+	assert(builtin.len(cache.layers) == cfg.num_hidden_layers, "cache layer count must match model", loc=loc)
 
 	cache_position := cache.length
 

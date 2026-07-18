@@ -37,13 +37,13 @@ data_type_size :: #force_inline proc(t: Data_Type) -> int {
 }
 
 @(require_results)
-_data_byte_count :: #force_inline proc(t: Data_Type, element_count: int) -> int {
+_data_byte_count :: #force_inline proc(t: Data_Type, element_count: int, loc := #caller_location) -> int {
 	#partial switch t {
 	case .Q4_K:
-		assert(element_count % K_QUANT_BLOCK_SIZE == 0, "Q4_K tensor element count must be a multiple of 256")
+		assert(element_count % K_QUANT_BLOCK_SIZE == 0, "Q4_K tensor element count must be a multiple of 256", loc=loc)
 		return (element_count / K_QUANT_BLOCK_SIZE) * Q4_K_BLOCK_BYTES
 	case .Q6_K:
-		assert(element_count % K_QUANT_BLOCK_SIZE == 0, "Q6_K tensor element count must be a multiple of 256")
+		assert(element_count % K_QUANT_BLOCK_SIZE == 0, "Q6_K tensor element count must be a multiple of 256", loc=loc)
 		return (element_count / K_QUANT_BLOCK_SIZE) * Q6_K_BLOCK_BYTES
 	}
 	return element_count * data_type_size(t)
@@ -129,7 +129,7 @@ _context_init :: proc(ctx: ^Context, backend: Backend, allocator: mem.Allocator,
 }
 
 _context_destroy :: proc(ctx: ^Context, loc: runtime.Source_Code_Location) {
-	assert(_current_ctx != ctx, "context_destroy called on the active context", loc=loc)
+	assert(_current_ctx != ctx, "cannot destroy the active context", loc=loc)
 	builtin.delete(ctx._op_arena_buf, loc=loc)
 }
 
@@ -139,7 +139,7 @@ context_begin :: proc(ctx: ^Context) {
 }
 
 context_end :: proc() {
-	assert(_current_ctx != nil, "context_end called with no active context")
+	assert(_current_ctx != nil, "no active context")
 	_current_ctx = _current_ctx.previous_ctx
 }
 
@@ -150,7 +150,7 @@ context_scope :: proc(ctx: ^Context) {
 
 @(require_results)
 current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
-	assert(_current_ctx != nil, "Called current_context with no active context", loc=loc)
+	assert(_current_ctx != nil, "no active context", loc=loc)
 	return _current_ctx
 }
 
@@ -166,7 +166,7 @@ clear :: proc(training := false, loc := #caller_location) {
 
 @(require_results)
 is_training :: #force_inline proc(loc := #caller_location) -> bool {
-	assert(_current_ctx != nil, "Called is_training with no active context", loc=loc)
+	assert(_current_ctx != nil, "no active context", loc=loc)
 	return _current_ctx.training
 }
 
@@ -692,7 +692,7 @@ OPERATION_SET_ALL :: Operation_Set{
 #assert(builtin.len(Operation_Kind) == intrinsics.type_union_variant_count(Operation_Variant))
 
 @(require_results)
-operation_kind :: proc(variant: Operation_Variant) -> Operation_Kind {
+operation_kind :: proc(variant: Operation_Variant, loc := #caller_location) -> Operation_Kind {
 	switch _ in variant {
 	case Add:                        return .Add
 	case Sub:                        return .Sub
@@ -740,7 +740,7 @@ operation_kind :: proc(variant: Operation_Variant) -> Operation_Kind {
 	case Lerp_Assign:                return .Lerp_Assign
 	case Accumulate_Mean:            return .Accumulate_Mean
 	}
-	panic("nil or unknown Operation_Variant")
+	panic("nil or unknown Operation_Variant", loc)
 }
 
 _run_forward :: proc(op: ^Operation, loc: runtime.Source_Code_Location) {

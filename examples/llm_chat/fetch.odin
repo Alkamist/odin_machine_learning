@@ -15,6 +15,7 @@ import "base:runtime"
 
 import "core:c"
 import "core:fmt"
+import "core:log"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -94,12 +95,12 @@ ensure_assets :: proc(assets: []Asset, model_label: string) -> bool {
 	buf: [16]byte
 	line, line_ok := read_line(buf[:])
 	if !line_ok {
-		fmt.eprintln("Aborted (no input on stdin).")
+		log.error("aborted: no input on stdin")
 		return false
 	}
 	answer := strings.trim_space(line)
 	if answer != "y" && answer != "Y" {
-		fmt.println("Aborted. Download the files listed above manually to continue.")
+		log.warn("aborted: download the files listed above manually to continue")
 		return false
 	}
 
@@ -162,7 +163,7 @@ _download :: proc(asset: Asset) -> bool {
 
 	if dir := filepath.dir(asset.dest); dir != "" {
 		if err := os.make_directory_all(dir); err != nil && !os.exists(dir) {
-			fmt.eprintfln("FAIL: could not create %v: %v", dir, err)
+			log.errorf("could not create %v: %v", dir, err)
 			return false
 		}
 	}
@@ -175,14 +176,14 @@ _download :: proc(asset: Asset) -> bool {
 
 	flags := os.File_Flags{.Write, .Create}
 	if resume_from > 0 {
-		fmt.printfln("  resuming %v at %v", name, _human_size(resume_from))
+		log.infof("resuming %v at %v", name, _human_size(resume_from))
 	} else {
 		flags += {.Trunc}
 	}
 
 	file, open_err := os.open(part, flags)
 	if open_err != nil {
-		fmt.eprintfln("FAIL: could not open %v: %v", part, open_err)
+		log.errorf("could not open %v: %v", part, open_err)
 		return false
 	}
 	// Closed explicitly before the rename below; this only covers early exits.
@@ -191,7 +192,7 @@ _download :: proc(asset: Asset) -> bool {
 
 	if resume_from > 0 {
 		if _, err := os.seek(file, resume_from, .Start); err != nil {
-			fmt.eprintfln("FAIL: could not seek %v: %v", part, err)
+			log.errorf("could not seek %v: %v", part, err)
 			return false
 		}
 	}
@@ -207,7 +208,7 @@ _download :: proc(asset: Asset) -> bool {
 
 	handle := curl.easy_init()
 	if handle == nil {
-		fmt.eprintln("FAIL: curl_easy_init failed.")
+		log.error("curl_easy_init failed")
 		return false
 	}
 	defer curl.easy_cleanup(handle)
@@ -230,10 +231,9 @@ _download :: proc(asset: Asset) -> bool {
 
 	if res != .E_OK {
 		if state.write_err != nil {
-			fmt.eprintfln("FAIL: could not write %v: %v", part, state.write_err)
+			log.errorf("could not write %v: %v", part, state.write_err)
 		} else {
-			fmt.eprintfln("FAIL: download of %v failed: %s", name, curl.easy_strerror(res))
-			fmt.eprintfln("      partial data kept at %v; re-run to resume.", part)
+			log.errorf("download of %v failed: %s (partial data kept at %v; re-run to resume)", name, curl.easy_strerror(res), part)
 		}
 		return false
 	}
@@ -241,12 +241,11 @@ _download :: proc(asset: Asset) -> bool {
 	// Verify before publishing the file under its real name.
 	written, size_err := os.file_size(file)
 	if size_err != nil {
-		fmt.eprintfln("FAIL: could not stat %v: %v", part, size_err)
+		log.errorf("could not stat %v: %v", part, size_err)
 		return false
 	}
 	if written != asset.size {
-		fmt.eprintfln("FAIL: %v is %d bytes, expected %d.", name, written, asset.size)
-		fmt.eprintfln("      partial data kept at %v; re-run to resume.", part)
+		log.errorf("%v is %d bytes, expected %d (partial data kept at %v; re-run to resume)", name, written, asset.size, part)
 		return false
 	}
 
@@ -254,7 +253,7 @@ _download :: proc(asset: Asset) -> bool {
 	file_open = false
 
 	if err := os.rename(part, asset.dest); err != nil {
-		fmt.eprintfln("FAIL: could not rename %v: %v", part, err)
+		log.errorf("could not rename %v: %v", part, err)
 		return false
 	}
 	return true

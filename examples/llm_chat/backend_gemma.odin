@@ -4,6 +4,7 @@ import "base:builtin"
 import "base:runtime"
 
 import "core:fmt"
+import "core:log"
 import "core:os"
 import "core:time"
 
@@ -60,22 +61,22 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 		}
 		weights_path = GEMMA_GGUF_PATH
 	} else if !os.exists(weights_path) {
-		fmt.eprintfln("FAIL: no such file: %v", weights_path)
+		log.errorf("no such file: %v", weights_path)
 		return {}, false
 	}
 
-	fmt.println("Loading tokenizer ...")
+	log.info("loading tokenizer")
 	tokenizer, tokenizer_ok := gemma_tok.load(GEMMA_TOKENIZER_PATH)
 	if !tokenizer_ok {
-		fmt.eprintfln("FAIL: could not load tokenizer: %v", GEMMA_TOKENIZER_PATH)
+		log.errorf("could not load tokenizer: %v", GEMMA_TOKENIZER_PATH)
 		return {}, false
 	}
 
-	fmt.printfln("Allocating Gemma 4 E4B (Q4_K/Q6_K GGUF, %v) ...", ML_BACKEND)
+	log.infof("allocating Gemma 4 E4B (Q4_K/Q6_K GGUF, %v)", ML_BACKEND)
 	config := gemma.make_e4b_config()
 	model  := gemma.make(config, dtype = .Bf16)
 
-	fmt.printfln("Loading weights from %v ...", weights_path)
+	log.infof("loading weights from %v", weights_path)
 	t_load := time.tick_now()
 	load_ok: bool
 	{
@@ -83,13 +84,13 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 		load_ok = gemma.load_gguf(&model, weights_path)
 	}
 	if !load_ok {
-		fmt.eprintfln("FAIL: could not load weights from %v", weights_path)
+		log.errorf("could not load weights from %v", weights_path)
 		gemma.destroy(model)
 		gemma.config_destroy(config)
 		gemma_tok.destroy(tokenizer)
 		return {}, false
 	}
-	fmt.printfln("  loaded in %.1f s", time.duration_seconds(time.tick_since(t_load)))
+	log.infof("loaded in %.1f s", time.duration_seconds(time.tick_since(t_load)))
 
 	backend := new(Gemma_Backend)
 	backend.config         = config

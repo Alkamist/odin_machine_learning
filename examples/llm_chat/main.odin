@@ -42,8 +42,10 @@ DEFAULT_SYSTEM :: "You are a helpful AI assistant named SmolLM, trained by Huggi
 
 main :: proc() {
 	// Without this the loaders' log.errorf calls are discarded, which turns a
-	// missing or malformed weight file into a bare "FAIL" with no explanation.
-	context.logger = log.create_console_logger(.Warning, {.Level, .Terminal_Color})
+	// missing or malformed weight file into a silent exit with no explanation.
+	// .Info so that model load progress is visible; the chat transcript itself
+	// is printed directly to stdout and does not go through the logger.
+	context.logger = log.create_console_logger(.Info, {.Level, .Terminal_Color})
 	defer log.destroy_console_logger(context.logger)
 
 	options := Options{
@@ -72,7 +74,7 @@ main :: proc() {
 	case "gemma":
 		model, ok = gemma_backend_make(options.gguf_path, options.t_max)
 	case:
-		fmt.eprintfln("unknown --arch %q (expected llama or gemma)", options.arch)
+		log.errorf("unknown --arch %q (expected llama or gemma)", options.arch)
 		os.exit(1)
 	}
 	if !ok {
@@ -119,7 +121,7 @@ main :: proc() {
 
 		new_tokens := model.encode_turn(model.data, line)
 		if builtin.len(new_tokens) == 0 {
-			fmt.eprintln("(empty tokenization, skipped)")
+			log.warn("empty tokenization, skipped")
 			continue
 		}
 
@@ -320,7 +322,7 @@ parse_args :: proc(options: ^Options) {
 		case "--system":      options.system_prompt  = take_value(args, i);                    i += 2
 		case "--help", "-h":  _usage_exit()
 		case:
-			fmt.eprintfln("unknown argument: %v", arg)
+			log.errorf("unknown argument: %v", arg)
 			_usage_exit()
 		}
 	}
@@ -342,7 +344,7 @@ _parse_int :: proc(s: string) -> int {
 	for cursor < builtin.len(s) {
 		c := s[cursor]
 		if c < '0' || c > '9' {
-			fmt.eprintfln("invalid integer: %q", s)
+			log.errorf("invalid integer: %q", s)
 			os.exit(1)
 		}
 		value = value * 10 + int(c - '0')
@@ -371,7 +373,7 @@ _parse_float :: proc(s: string) -> f64 {
 				scale *= 10
 			}
 		} else {
-			fmt.eprintfln("invalid float: %q", s)
+			log.errorf("invalid float: %q", s)
 			os.exit(1)
 		}
 		cursor += 1
