@@ -323,7 +323,7 @@ forward :: proc(model: Llama, tokens: []int) -> (output: ml.Tensor) {
 	return
 }
 
-update :: proc(opt: ml.Optimizer, model: Llama) {
+update :: proc(opt: ^ml.Optimizer, model: Llama) {
 	ml.update(opt, model.token_embeddings)
 
 	for layer in model.layers {

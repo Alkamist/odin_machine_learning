@@ -70,7 +70,7 @@ apply :: proc(input, base_output: ml.Tensor, adapter: Adapter) -> ml.Tensor {
 	return ml.add(base_output, scaled)
 }
 
-update :: proc(opt: ml.Optimizer, adapter: Adapter) {
+update :: proc(opt: ^ml.Optimizer, adapter: Adapter) {
 	ml.update(opt, adapter.a)
 	ml.update(opt, adapter.b)
 	// scale is a constant; no update.

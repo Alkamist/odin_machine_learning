@@ -73,7 +73,7 @@ forward :: proc(mlp: Mlp, input: ml.Tensor) -> (output: ml.Tensor) {
 	return
 }
 
-update :: proc(opt: ml.Optimizer, mlp: Mlp) {
+update :: proc(opt: ^ml.Optimizer, mlp: Mlp) {
 	for layer in mlp.layers {
 		ml.update(opt, layer.weight)
 		ml.update(opt, layer.bias)

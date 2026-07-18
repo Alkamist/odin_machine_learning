@@ -96,7 +96,7 @@ decode :: proc(jepa: Jepa, latents: ml.Tensor) -> ml.Tensor {
 	return mlp.forward(jepa.decoder, latents)
 }
 
-update_decoder :: proc(opt: ml.Optimizer, jepa: Jepa) {
+update_decoder :: proc(opt: ^ml.Optimizer, jepa: Jepa) {
 	mlp.update(opt, jepa.decoder)
 }
 
@@ -132,7 +132,7 @@ ema_update :: proc(jepa: Jepa, momentum: f32) {
 	}
 }
 
-update :: proc(opt: ml.Optimizer, jepa: Jepa) {
+update :: proc(opt: ^ml.Optimizer, jepa: Jepa) {
 	mlp.update(opt, jepa.encoder)
 	mlp.update(opt, jepa.predictor)
 }
@@ -277,7 +277,7 @@ decoder_parameters :: proc(jepa: Jepa, list: ^[dynamic]ml.Parameter) {
 	mlp.parameters(jepa.decoder, "decoder", list)
 }
 
-save :: proc(jepa: Jepa, path: string, iteration: u64 = 0, decoder_iteration: u64 = 0, loc := #caller_location) -> bool {
+save :: proc(jepa: Jepa, path: string, opt: ^ml.Optimizer = nil, iteration: u64 = 0, decoder_iteration: u64 = 0, loc := #caller_location) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	params := builtin.make([dynamic]ml.Parameter, allocator=context.temp_allocator)
@@ -292,11 +292,11 @@ save :: proc(jepa: Jepa, path: string, iteration: u64 = 0, decoder_iteration: u6
 	metadata["jepa.hidden_size"]     = fmt.tprintf("%d", jepa.config.hidden_size)
 	metadata["jepa.latent_size"]     = fmt.tprintf("%d", jepa.config.latent_size)
 
-	return ml.checkpoint_save(path, params[:], metadata, loc=loc)
+	return ml.checkpoint_save(path, params[:], opt, metadata, loc=loc)
 }
 
 @(require_results)
-load :: proc(config: Config, path: string, allocator := context.allocator, loc := #caller_location) -> (jepa: Jepa, iteration: u64, decoder_iteration: u64, ok: bool) {
+load :: proc(config: Config, path: string, opt: ^ml.Optimizer = nil, allocator := context.allocator, loc := #caller_location) -> (jepa: Jepa, iteration: u64, decoder_iteration: u64, ok: bool) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	jepa = make(config, allocator=allocator, loc=loc)
@@ -305,7 +305,7 @@ load :: proc(config: Config, path: string, allocator := context.allocator, loc :
 	parameters(jepa, &params)
 	decoder_parameters(jepa, &params)
 
-	metadata, load_ok := ml.checkpoint_load(path, params[:], loc=loc)
+	metadata, load_ok := ml.checkpoint_load(path, params[:], opt, loc=loc)
 	if !load_ok {
 		destroy(jepa)
 		return {}, 0, 0, false

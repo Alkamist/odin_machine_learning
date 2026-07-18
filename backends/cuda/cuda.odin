@@ -443,4 +443,4 @@ forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 	_forward(op^, loc)
 }
 backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)                { _backward(op, loc)   }
-update   :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) { _update(opt, t, loc) }
+update   :: proc(opt: ml.Optimizer, t: ml.Tensor, m, v: ml.Backend_Buffer, loc: runtime.Source_Code_Location) { _update(opt, t, m, v, loc) }

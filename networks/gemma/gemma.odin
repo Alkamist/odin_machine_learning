@@ -203,7 +203,7 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 	// path AND any wasted writes to a frozen scalar.
 	const_buffers := ml.Buffer_Set{.Data}
 
-	// Trainable params get the full {Data, Gradient, Adam_M, Adam_V} set;
+	// Trainable params get the {Data, Gradient} set;
 	// anything else (inference, or "frozen base under LoRA") is .Data only.
 	// Linear backward checks for a missing gradient buffer and skips the
 	// dW GEMM, so frozen weights pay no backward cost.
@@ -461,7 +461,7 @@ _fill_per_layer_bytes_normal :: proc(model: Gemma, std: f32) {
 	}
 }
 
-update :: proc(opt: ml.Optimizer, model: Gemma) {
+update :: proc(opt: ^ml.Optimizer, model: Gemma) {
 	cfg := model.config
 
 	ml.update(opt, model.embed_tokens_weight)
@@ -502,7 +502,7 @@ update :: proc(opt: ml.Optimizer, model: Gemma) {
 
 // QLoRA: only the per-layer adapters are trainable. Skips every base
 // weight, which doesn't have an Adam buffer anyway.
-update_lora :: proc(opt: ml.Optimizer, model: Gemma) {
+update_lora :: proc(opt: ^ml.Optimizer, model: Gemma) {
 	for layer in model.layers {
 		if layer.q_lora.rank    > 0 { lora.update(opt, layer.q_lora) }
 		if layer.k_lora.rank    > 0 { lora.update(opt, layer.k_lora) }

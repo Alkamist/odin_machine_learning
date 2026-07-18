@@ -13,7 +13,7 @@ import st "loaders/safetensors"
 CHECKPOINT_VERSION :: "1"
 
 @(require_results)
-checkpoint_save :: proc(path: string, params: []Parameter, metadata: map[string]string, loc := #caller_location) -> bool {
+checkpoint_save :: proc(path: string, params: []Parameter, opt: ^Optimizer, metadata: map[string]string, loc := #caller_location) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	entries := builtin.make([dynamic]st.Entry, allocator=context.temp_allocator)
@@ -38,12 +38,12 @@ checkpoint_save :: proc(path: string, params: []Parameter, metadata: map[string]
 			bytes = data_bytes,
 		})
 
-		if has_buffer(tensor, .Adam_M) {
-			moment_byte_count := buffer_byte_count(tensor, .Adam_M)
+		if state, present := _optimizer_state_lookup(opt, tensor); present {
+			moment_byte_count := _data_byte_count(.F32, tensor.count)
 			m_bytes := builtin.make([]byte, moment_byte_count, allocator=context.temp_allocator)
 			v_bytes := builtin.make([]byte, moment_byte_count, allocator=context.temp_allocator)
-			get_bytes(tensor, .Adam_M, m_bytes, loc=loc)
-			get_bytes(tensor, .Adam_V, v_bytes, loc=loc)
+			tensor.backend.buffer_get(state.m, m_bytes, loc)
+			tensor.backend.buffer_get(state.v, v_bytes, loc)
 			append(&entries, st.Entry{name=fmt.tprintf("%s.adam_m", parameter.name), dtype="F32", shape=shape, bytes=m_bytes})
 			append(&entries, st.Entry{name=fmt.tprintf("%s.adam_v", parameter.name), dtype="F32", shape=shape, bytes=v_bytes})
 		}
@@ -59,7 +59,7 @@ checkpoint_save :: proc(path: string, params: []Parameter, metadata: map[string]
 }
 
 @(require_results)
-checkpoint_load :: proc(path: string, params: []Parameter, loc := #caller_location) -> (metadata: map[string]string, ok: bool) {
+checkpoint_load :: proc(path: string, params: []Parameter, opt: ^Optimizer, loc := #caller_location) -> (metadata: map[string]string, ok: bool) {
 	loader, load_ok := st.load(path, loc=loc)
 	if !load_ok {
 		return
@@ -90,8 +90,8 @@ checkpoint_load :: proc(path: string, params: []Parameter, loc := #caller_locati
 			return
 		}
 
-		if has_buffer(tensor, .Adam_M) {
-			moment_byte_count := buffer_byte_count(tensor, .Adam_M)
+		if opt != nil {
+			moment_byte_count := _data_byte_count(.F32, tensor.count)
 			for suffix in ([]string{"adam_m", "adam_v"}) {
 				moment_name := fmt.tprintf("%s.%s", parameter.name, suffix)
 				moment_info, moment_present := st.get_info(loader, moment_name)
@@ -116,12 +116,13 @@ checkpoint_load :: proc(path: string, params: []Parameter, loc := #caller_locati
 		file_bytes, _ := st.get_bytes(loader, parameter.name)
 		set_bytes(tensor, .Data, file_bytes, loc=loc)
 
-		if has_buffer(tensor, .Adam_M) {
-			if m_bytes, m_ok := st.get_bytes(loader, fmt.tprintf("%s.adam_m", parameter.name)); m_ok {
-				set_bytes(tensor, .Adam_M, m_bytes, loc=loc)
-			}
-			if v_bytes, v_ok := st.get_bytes(loader, fmt.tprintf("%s.adam_v", parameter.name)); v_ok {
-				set_bytes(tensor, .Adam_V, v_bytes, loc=loc)
+		if opt != nil {
+			m_bytes, m_ok := st.get_bytes(loader, fmt.tprintf("%s.adam_m", parameter.name))
+			v_bytes, v_ok := st.get_bytes(loader, fmt.tprintf("%s.adam_v", parameter.name))
+			if m_ok && v_ok {
+				state := _optimizer_state(opt, tensor, loc)
+				tensor.backend.buffer_set(state.m, m_bytes, loc)
+				tensor.backend.buffer_set(state.v, v_bytes, loc)
 			}
 		}
 	}

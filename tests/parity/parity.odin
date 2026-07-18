@@ -1,6 +1,7 @@
 package ml_parity_tests
 
 import "core:fmt"
+import "core:mem"
 import "core:log"
 import "core:testing"
 import "core:math/rand"
@@ -169,7 +170,85 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 		_run_parity(t, tc, cpu_ctx, cuda_ctx, do_backward)
 	}
 
+	adam_cpu_w,  adam_cpu_m,  adam_cpu_v:  [ADAM_SIZE]f32
+	adam_cuda_w, adam_cuda_m, adam_cuda_v: [ADAM_SIZE]f32
+
+	ml.context_begin(cpu_ctx)
+	_run_adam(adam_cpu_w[:], adam_cpu_m[:], adam_cpu_v[:])
+	ml.context_end()
+
+	ml.context_begin(cuda_ctx)
+	_run_adam(adam_cuda_w[:], adam_cuda_m[:], adam_cuda_v[:])
+	ml.context_end()
+
+	_adam_compare(t, "param",    adam_cpu_w[:],  adam_cuda_w[:])
+	_adam_compare(t, "moment_m", adam_cpu_m[:],  adam_cuda_m[:])
+	_adam_compare(t, "moment_v", adam_cpu_v[:],  adam_cuda_v[:])
+
 	cpu.context_destroy(cpu_ctx)
 	cuda.context_destroy(cuda_ctx)
 	cuda.device_destroy()
+}
+
+ADAM_SIZE  :: 8
+ADAM_STEPS :: 12
+
+_adam_grad :: proc(step, index: int) -> f32 {
+	return (f32((step * 7 + index * 3) % 11) - 5) * 0.03
+}
+
+_run_adam :: proc(w_out, m_out, v_out: []f32, loc := #caller_location) {
+	size  := len(w_out)
+	shape := [1]int{size}
+	param := ml.make(.F32, shape[:])
+
+	init_w := make([]f32, size)
+	defer delete(init_w)
+	for i in 0 ..< size {
+		init_w[i] = f32(i) * 0.1 - 0.35
+	}
+	ml.set_data(param, init_w)
+
+	grad := make([]f32, size)
+	defer delete(grad)
+
+	opt: ml.Optimizer
+	for step in 1 ..= ADAM_STEPS {
+		for i in 0 ..< size {
+			grad[i] = _adam_grad(step, i)
+		}
+		ml.set_bytes(param, .Gradient, mem.slice_to_bytes(grad))
+		if ml.optimizer_step(&opt, period=1, learning_rate=0.01, weight_decay=0.1) {
+			ml.update(&opt, param)
+		}
+	}
+
+	ml.get_data(param, w_out)
+
+	state, ok := ml._optimizer_state_lookup(&opt, param)
+	assert(ok, "optimizer state must exist after updates", loc=loc)
+
+	m_bytes := make([]byte, size * 4)
+	v_bytes := make([]byte, size * 4)
+	defer delete(m_bytes)
+	defer delete(v_bytes)
+	param.backend.buffer_get(state.m, m_bytes, loc)
+	param.backend.buffer_get(state.v, v_bytes, loc)
+	copy(m_out, mem.slice_data_cast([]f32, m_bytes))
+	copy(v_out, mem.slice_data_cast([]f32, v_bytes))
+
+	ml.optimizer_destroy(&opt)
+	ml.destroy(param)
+}
+
+_adam_compare :: proc(t: ^testing.T, label: string, cpu_vals, cuda_vals: []f32) {
+	for i in 0 ..< len(cpu_vals) {
+		a := f64(cpu_vals[i])
+		b := f64(cuda_vals[i])
+		denom := max(max(abs(a), abs(b)), REL_FLOOR)
+		rel   := abs(a - b) / denom
+		testing.expectf(t, rel <= PARITY_TOL,
+			"adam %s elem %d cpu=%.6g cuda=%.6g rel_err=%.4g (tol=%.3g)",
+			label, i, a, b, rel, PARITY_TOL)
+	}
 }

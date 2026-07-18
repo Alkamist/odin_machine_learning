@@ -88,6 +88,8 @@ model_make :: proc(allocator := context.allocator) -> (model: Model) {
 }
 
 model_destroy :: proc(model: Model) {
+	model := model
+	ml.optimizer_destroy(&model.opt)
 	mlp.destroy(model.mlp)
 }
 
@@ -123,7 +125,7 @@ model_learn :: proc(model: ^Model, input: []f32, targets: []int) {
 	ml.backward(loss)
 
 	if ml.optimizer_step(&model.opt, period=1) {
-		mlp.update(model.opt, model.mlp)
+		mlp.update(&model.opt, model.mlp)
 	}
 }
 

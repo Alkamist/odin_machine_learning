@@ -69,8 +69,6 @@ bf16_to_f32 :: #force_inline proc "contextless" (x: Bf16) -> f32 {
 Buffer_Kind :: enum u8 {
 	Data,
 	Gradient,
-	Adam_M,
-	Adam_V,
 }
 Buffer_Set :: bit_set[Buffer_Kind; u8]
 
@@ -89,7 +87,7 @@ Backend :: struct #all_or_none {
 	clear:    proc(loc: runtime.Source_Code_Location),
 	forward:  proc(op: ^Operation, loc: runtime.Source_Code_Location),
 	backward: proc(op: Operation, loc: runtime.Source_Code_Location),
-	update:   proc(opt: Optimizer, t: Tensor, loc: runtime.Source_Code_Location),
+	update:   proc(opt: Optimizer, t: Tensor, m, v: Backend_Buffer, loc: runtime.Source_Code_Location),
 
 	buffer_alloc: proc(byte_count: int, kind: Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> Backend_Buffer,
 	buffer_free:  proc(buffer: Backend_Buffer, loc: runtime.Source_Code_Location),
@@ -198,7 +196,7 @@ shape_element_count :: proc(shape: []int) -> int {
 }
 
 DEFAULT_ACTIVATION_BUFFERS :: Buffer_Set{.Data, .Gradient}
-DEFAULT_PARAMETER_BUFFERS  :: Buffer_Set{.Data, .Gradient, .Adam_M, .Adam_V}
+DEFAULT_PARAMETER_BUFFERS  :: Buffer_Set{.Data, .Gradient}
 
 @(require_results)
 buffer_dtype :: #force_inline proc(tensor_type: Data_Type, kind: Buffer_Kind) -> Data_Type {
@@ -478,6 +476,11 @@ xavier_initialization :: proc(t: Tensor, input_features, output_features: int) {
 	fill_normal(t, 0, math.sqrt(2 / f32(input_features + output_features)))
 }
 
+Optimizer_State :: struct {
+	m: Backend_Buffer,
+	v: Backend_Buffer,
+}
+
 Optimizer :: struct {
 	iteration:      u64,
 	period_counter: int,
@@ -490,6 +493,54 @@ Optimizer :: struct {
 
 	bias_correction1: f32,
 	bias_correction2: f32,
+
+	backend: ^Backend,
+	state:   map[Backend_Buffer]Optimizer_State,
+}
+
+@(require_results)
+_optimizer_state :: proc(opt: ^Optimizer, t: Tensor, loc := #caller_location) -> Optimizer_State {
+	key := t.buffers[.Data]
+	if existing, ok := opt.state[key]; ok {
+		return existing
+	}
+
+	if opt.state == nil {
+		opt.state = builtin.make(map[Backend_Buffer]Optimizer_State)
+	}
+	opt.backend = t.backend
+
+	byte_count := _data_byte_count(.F32, t.count)
+	byte_count = (byte_count + 3) & ~int(3)
+
+	state := Optimizer_State{
+		m = t.backend.buffer_alloc(byte_count, .Gradient, true, loc),
+		v = t.backend.buffer_alloc(byte_count, .Gradient, true, loc),
+	}
+	opt.state[key] = state
+	return state
+}
+
+@(require_results)
+_optimizer_state_lookup :: proc(opt: ^Optimizer, t: Tensor) -> (Optimizer_State, bool) {
+	if opt == nil {
+		return {}, false
+	}
+	state, ok := opt.state[t.buffers[.Data]]
+	return state, ok
+}
+
+optimizer_destroy :: proc(opt: ^Optimizer, loc := #caller_location) {
+	if opt.backend == nil {
+		return
+	}
+	for _, state in opt.state {
+		opt.backend.buffer_free(state.m, loc)
+		opt.backend.buffer_free(state.v, loc)
+	}
+	builtin.delete(opt.state)
+	opt.state   = nil
+	opt.backend = nil
 }
 
 @(require_results)
@@ -522,8 +573,9 @@ optimizer_step :: proc(
 	return true
 }
 
-update :: proc(opt: Optimizer, t: Tensor, loc := #caller_location) {
-	t.backend.update(opt, t, loc)
+update :: proc(opt: ^Optimizer, t: Tensor, loc := #caller_location) {
+	state := _optimizer_state(opt, t, loc)
+	t.backend.update(opt^, t, state.m, state.v, loc)
 }
 
 clip_gradient_norm :: proc(params: []Parameter, max_norm: f32, loc := #caller_location) -> (norm: f32) {

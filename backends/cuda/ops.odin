@@ -170,13 +170,13 @@ _cast_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	_dispatch(_cast_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 }
 
-_update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) {
+_update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
 	d := data(t).ptr
 	g := gradient(t).ptr
-	m := transmute(Gpu_Buffer)t.buffers[.Adam_M]
-	v := transmute(Gpu_Buffer)t.buffers[.Adam_V]
-	fmt.assertf(m.ptr != 0, "tensor missing Adam_M buffer", loc=loc)
-	fmt.assertf(v.ptr != 0, "tensor missing Adam_V buffer", loc=loc)
+	m := transmute(Gpu_Buffer)m_buf
+	v := transmute(Gpu_Buffer)v_buf
+	fmt.assertf(m.ptr != 0, "optimizer moment m is nil", loc=loc)
+	fmt.assertf(v.ptr != 0, "optimizer moment v is nil", loc=loc)
 	mp := m.ptr; vp := v.ptr
 
 	n  := i32(t.count)

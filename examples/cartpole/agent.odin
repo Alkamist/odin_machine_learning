@@ -107,8 +107,10 @@ agent_make :: proc(allocator := context.allocator) -> (agent: ^Agent) {
 
 agent_destroy :: proc(agent: ^Agent, allocator := context.allocator) {
 	for m in 0 ..< ENSEMBLE_SIZE {
+		ml.optimizer_destroy(&agent.opts[m])
 		mlp.destroy(agent.models[m])
 	}
+	ml.optimizer_destroy(&agent.policy_opt)
 	mlp.destroy(agent.policy)
 	free(agent, allocator)
 }
@@ -255,7 +257,7 @@ agent_train_policy :: proc(agent: ^Agent, steps: int) {
 		ml.backward(loss)
 
 		if ml.optimizer_step(&agent.policy_opt, period=1, learning_rate=POLICY_RATE) {
-			mlp.update(agent.policy_opt, agent.policy)
+			mlp.update(&agent.policy_opt, agent.policy)
 		}
 	}
 }
@@ -338,7 +340,7 @@ agent_train :: proc(agent: ^Agent, steps: int) {
 
 		for m in 0 ..< ENSEMBLE_SIZE {
 			if ml.optimizer_step(&agent.opts[m], period=1, learning_rate=LEARNING_RATE) {
-				mlp.update(agent.opts[m], agent.models[m])
+				mlp.update(&agent.opts[m], agent.models[m])
 			}
 		}
 	}

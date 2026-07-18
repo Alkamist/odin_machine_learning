@@ -404,15 +404,9 @@ data_bf16 :: #force_inline proc(t: ml.Tensor) -> []ml.Bf16 {
 }
 
 @(require_results)
-adam_m :: #force_inline proc(t: ml.Tensor) -> []f32 {
-	bytes := transmute([]byte)t.buffers[.Adam_M]
-	return ([^]f32)(raw_data(bytes))[:t.count]
-}
-
-@(require_results)
-adam_v :: #force_inline proc(t: ml.Tensor) -> []f32 {
-	bytes := transmute([]byte)t.buffers[.Adam_V]
-	return ([^]f32)(raw_data(bytes))[:t.count]
+_moment :: #force_inline proc(buffer: ml.Backend_Buffer, count: int) -> []f32 {
+	bytes := transmute([]byte)buffer
+	return ([^]f32)(raw_data(bytes))[:count]
 }
 
 buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
@@ -462,14 +456,14 @@ buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Locati
 	builtin.copy(transmute([]byte)dst, transmute([]byte)src)
 }
 
-update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Location) {
+update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
 	g := gradient(t)
-	m := adam_m(t)
-	v := adam_v(t)
+	m := _moment(m_buf, t.count)
+	v := _moment(v_buf, t.count)
 
 	assert(g != nil, "Tensor Gradient is nil", loc=loc)
-	assert(m != nil, "Tensor Adam_M is nil", loc=loc)
-	assert(v != nil, "Tensor Adam_V is nil", loc=loc)
+	assert(m != nil, "Optimizer moment m is nil", loc=loc)
+	assert(v != nil, "Optimizer moment v is nil", loc=loc)
 
 	d_bf: [^]ml.Bf16
 	d_f32: []f32
