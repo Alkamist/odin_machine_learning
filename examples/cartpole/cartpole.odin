@@ -421,7 +421,7 @@ draw :: proc(state: State, interpolation: f32) {
 	rl.DrawText(rl.TextFormat("Time: %.2f",       TIME_LIMIT - state.time), 20, 92, 20, rl.WHITE)
 }
 
-draw_status :: proc(human: bool, decisions: int) {
+draw_status :: proc(human: bool, decisions: int, agreement: f32) {
 	if human {
 		rl.DrawText("Human (TAB to hand back to the agent) - A/D to move", 20, 20, 20, rl.WHITE)
 	}
@@ -430,6 +430,7 @@ draw_status :: proc(human: bool, decisions: int) {
 	}
 
 	rl.DrawText(rl.TextFormat("%d FPS", rl.GetFPS()), 20, 44, 20, rl.WHITE)
+	rl.DrawText(rl.TextFormat("Reflex agreement: %.0f%%", agreement * 100), 20, 116, 20, rl.WHITE)
 }
 
 draw_text :: proc(text: cstring, font_size: int, x, y: f32, color: rl.Color) {

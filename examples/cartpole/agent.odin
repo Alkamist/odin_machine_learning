@@ -29,6 +29,11 @@ TRAIN_MINIMUM    :: 8
 TRAIN_STEPS      :: 24
 LEARNING_RATE    :: 3e-3
 
+POLICY_CAPACITY   :: 4096
+POLICY_MINIMUM    :: 64
+POLICY_RATE       :: 1e-3
+AGREEMENT_RATE    :: f32(0.01)
+
 WARMUP_DECISIONS :: 24
 
 UPRIGHT_WEIGHT :: f32(3)
@@ -52,13 +57,27 @@ Transition :: struct {
 	delta:       Observation,
 }
 
+Policy_Sample :: struct {
+	observation: Observation,
+	action:      Action,
+}
+
 Agent :: struct {
 	models: [ENSEMBLE_SIZE]mlp.Mlp,
 	opts:   [ENSEMBLE_SIZE]ml.Optimizer,
 
+	policy:     mlp.Mlp,
+	policy_opt: ml.Optimizer,
+
 	buffer:       [BUFFER_CAPACITY]Transition,
 	buffer_count: int,
 	buffer_next:  int,
+
+	policy_buffer:       [POLICY_CAPACITY]Policy_Sample,
+	policy_buffer_count: int,
+	policy_buffer_next:  int,
+
+	agreement: f32,
 
 	delta_mean:     Observation,
 	delta_sq_mean:  Observation,
@@ -74,18 +93,24 @@ Agent :: struct {
 	decisions:    int,
 }
 
-agent_make :: proc(allocator := context.allocator) -> (agent: Agent) {
+agent_make :: proc(allocator := context.allocator) -> (agent: ^Agent) {
+	agent = new(Agent, allocator)
+
 	for m in 0 ..< ENSEMBLE_SIZE {
 		agent.models[m] = mlp.make(MODEL_INPUT, HIDDEN_SIZE, OBS_SIZE, allocator=allocator)
 	}
-	agent_forget_episode(&agent)
+	agent.policy = mlp.make(OBS_SIZE, HIDDEN_SIZE, ACTION_COUNT, allocator=allocator)
+
+	agent_forget_episode(agent)
 	return
 }
 
-agent_destroy :: proc(agent: Agent) {
+agent_destroy :: proc(agent: ^Agent, allocator := context.allocator) {
 	for m in 0 ..< ENSEMBLE_SIZE {
 		mlp.destroy(agent.models[m])
 	}
+	mlp.destroy(agent.policy)
+	free(agent, allocator)
 }
 
 agent_forget_episode :: proc(agent: ^Agent) {
@@ -105,6 +130,7 @@ agent_step :: proc(agent: ^Agent, state: State) -> Action {
 	steps := int(agent.train_credit)
 	agent.train_credit -= f32(steps)
 	agent_train(agent, steps)
+	agent_train_policy(agent, steps)
 
 	if agent.hold > 0 {
 		agent.hold -= 1
@@ -134,6 +160,16 @@ agent_step :: proc(agent: ^Agent, state: State) -> Action {
 		agent_plan_shift(agent)
 		agent_plan_refine(agent, observation)
 		agent.action = agent_plan_action(agent)
+
+		if agent.policy_buffer_count >= POLICY_MINIMUM {
+			match := f32(0)
+			if agent_policy_action(agent, observation) == agent.action {
+				match = 1
+			}
+			agent.agreement += (match - agent.agreement) * AGREEMENT_RATE
+		}
+
+		agent_remember_policy(agent, observation, agent.action)
 	}
 
 	agent.previous     = observation
@@ -157,6 +193,70 @@ agent_remember :: proc(agent: ^Agent, transition: Transition) {
 		d := transition.delta[i]
 		agent.delta_mean[i]    += (d     - agent.delta_mean[i])    * rate
 		agent.delta_sq_mean[i] += (d * d - agent.delta_sq_mean[i]) * rate
+	}
+}
+
+agent_remember_policy :: proc(agent: ^Agent, observation: Observation, action: Action) {
+	agent.policy_buffer[agent.policy_buffer_next] = {observation=observation, action=action}
+	agent.policy_buffer_next = (agent.policy_buffer_next + 1) % POLICY_CAPACITY
+	if agent.policy_buffer_count < POLICY_CAPACITY {
+		agent.policy_buffer_count += 1
+	}
+}
+
+@(require_results)
+agent_policy_action :: proc(agent: ^Agent, observation: Observation) -> Action {
+	input  := make([]f32, OBS_SIZE,     context.temp_allocator)
+	logits := make([]f32, ACTION_COUNT, context.temp_allocator)
+
+	for i in 0 ..< OBS_SIZE {
+		input[i] = observation[i]
+	}
+
+	ml.clear()
+
+	x      := ml.reshape(ml.tensor(input), {1, OBS_SIZE})
+	output := mlp.forward(agent.policy, x)
+	ml.get_data(output, logits)
+
+	best := 0
+	for a in 1 ..< ACTION_COUNT {
+		if logits[a] > logits[best] {
+			best = a
+		}
+	}
+	return Action(best)
+}
+
+agent_train_policy :: proc(agent: ^Agent, steps: int) {
+	if agent.policy_buffer_count < POLICY_MINIMUM {
+		return
+	}
+
+	inputs  := make([]f32, TRAIN_BATCH_SIZE * OBS_SIZE, context.temp_allocator)
+	targets := make([]int, TRAIN_BATCH_SIZE,            context.temp_allocator)
+
+	for _ in 0 ..< steps {
+		ml.clear(training=true)
+
+		for b in 0 ..< TRAIN_BATCH_SIZE {
+			sample := agent.policy_buffer[rand.int_max(agent.policy_buffer_count)]
+
+			for i in 0 ..< OBS_SIZE {
+				inputs[b * OBS_SIZE + i] = sample.observation[i]
+			}
+			targets[b] = int(sample.action)
+		}
+
+		x      := ml.reshape(ml.tensor(inputs), {TRAIN_BATCH_SIZE, OBS_SIZE})
+		logits := mlp.forward(agent.policy, x)
+		loss   := ml.mean(ml.cross_entropy(logits, targets))
+
+		ml.backward(loss)
+
+		if ml.optimizer_step(&agent.policy_opt, period=1, learning_rate=POLICY_RATE) {
+			mlp.update(agent.policy_opt, agent.policy)
+		}
 	}
 }
 

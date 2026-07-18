@@ -59,17 +59,17 @@ main :: proc() {
 
 		for fixed_timestep(&timestep, FIXED_DELTA) {
 			if !human {
-				action = agent_step(&agent, game_state)
+				action = agent_step(agent, game_state)
 			}
 
 			if step(&game_state, action, FIXED_DELTA) {
 				reset(&game_state)
-				agent_forget_episode(&agent)
+				agent_forget_episode(agent)
 			}
 		}
 
 		draw(game_state, timestep.interpolation)
-		draw_status(human, agent.decisions)
+		draw_status(human, agent.decisions, agent.agreement)
 
 		frame_end()
 	}
