@@ -755,10 +755,12 @@ Operation :: struct {
 	variant: Operation_Variant,
 }
 
-append_operation :: proc(op: Operation, loc := #caller_location) {
+_record_forward :: proc(op: Operation, loc := #caller_location) {
 	assert(_current_ctx.operation_count < MAX_OPERATIONS, "Maximum operations exceeded, did you forget to call clear?", loc=loc)
-	_current_ctx.operations[_current_ctx.operation_count] = op
+	slot := &_current_ctx.operations[_current_ctx.operation_count]
+	slot^ = op
 	_current_ctx.operation_count += 1
+	_run_forward(slot, loc)
 }
 
 backward :: proc(loss: Tensor, loc := #caller_location) {
@@ -838,8 +840,7 @@ cast_to :: proc(input: Tensor, target_type: Data_Type, loc := #caller_location) 
 		output  = output,
 		variant = Cast{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -907,8 +908,7 @@ attention :: proc(
 			value      = value,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -992,8 +992,7 @@ attention_with_cache :: proc(
 			v_cache        = v_cache,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1032,8 +1031,7 @@ add :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Add{b=b},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1053,8 +1051,7 @@ sub :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Sub{b=b},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1074,8 +1071,7 @@ mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Mul{b=b},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1099,8 +1095,7 @@ gelu_mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Gelu_Mul{b=b},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1120,8 +1115,7 @@ div :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Div{b=b},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1138,8 +1132,7 @@ exp :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Exp{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1156,8 +1149,7 @@ sqrt :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Sqrt{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1181,8 +1173,7 @@ clamp :: proc(input: Tensor, min_val, max_val: f32, loc := #caller_location) -> 
 			max_val = max_val,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1204,8 +1195,7 @@ min :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			b = b,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1227,8 +1217,7 @@ max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 			b = b,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1244,8 +1233,7 @@ mean :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Mean{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1267,8 +1255,7 @@ transpose :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Transpose{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1297,8 +1284,7 @@ select :: proc(input: Tensor, indices: []int, loc := #caller_location) -> (outpu
 			indices = indices_copy,
 		}
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1322,8 +1308,7 @@ slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (outpu
 			end   = end,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1349,8 +1334,7 @@ slice_trailing :: proc(input: Tensor, start, end: int, loc := #caller_location) 
 			end   = end,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1387,8 +1371,7 @@ concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
 			inputs = inputs_copy,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1417,8 +1400,7 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 			weight = weight,
 		}
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1448,8 +1430,7 @@ linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 		output  = output,
 		variant = Linear_Q4_K{weight=weight},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1483,8 +1464,7 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 			output  = output,
 			variant = Linear_Q4_K_Gate_Up_Geglu{w_gate=w_gate, w_up=w_up},
 		}
-		_run_forward(&op, loc)
-		append_operation(op, loc=loc)
+		_record_forward(op, loc=loc)
 		return
 	}
 
@@ -1520,8 +1500,7 @@ linear_q6_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 		output  = output,
 		variant = Linear_Q6_K{weight=weight},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1563,8 +1542,7 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset:
 			rotate_pair_count = rotate_pair_count,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1591,8 +1569,7 @@ layernorm :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Te
 			weight = weight,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1622,8 +1599,7 @@ rmsnorm :: proc(input, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #c
 			eps    = eps,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1686,8 +1662,7 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 			rotate_pair_count = rotate_pair_count,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1734,8 +1709,7 @@ rmsnorm_rope_write_cache :: proc(
 				cache_capacity    = cache_capacity,
 			},
 		}
-		_run_forward(&op, loc)
-		append_operation(op, loc=loc)
+		_record_forward(op, loc=loc)
 		return
 	}
 
@@ -1780,8 +1754,7 @@ add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc :=
 			residual_out = residual_new,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1797,8 +1770,7 @@ softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Softmax{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1814,8 +1786,7 @@ log_softmax :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 		output  = output,
 		variant = Log_Softmax{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1831,8 +1802,7 @@ entropy :: proc(probabilities: Tensor, loc := #caller_location) -> (output: Tens
 		output  = output,
 		variant = Entropy{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1854,8 +1824,7 @@ mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location
 			targets = targets,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1880,8 +1849,7 @@ smooth_l1 :: proc(predictions, targets: Tensor, beta: f32 = 1.0, loc := #caller_
 			beta    = beta,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1916,8 +1884,7 @@ cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) ->
 			targets = targets_copy,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1934,8 +1901,7 @@ relu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Relu{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1952,8 +1918,7 @@ sigmoid :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Sigmoid{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1970,8 +1935,7 @@ gelu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Gelu{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -1988,8 +1952,7 @@ silu :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Silu{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -2006,8 +1969,7 @@ tanh :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
 		output  = output,
 		variant = Tanh{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -2036,8 +1998,7 @@ batched_matmul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor
 			b=b,
 		},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -2068,8 +2029,7 @@ permute :: proc(input: Tensor, axes: [3]int, loc := #caller_location) -> (output
 		output  = output,
 		variant = Permute{axes=axes},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
@@ -2089,8 +2049,7 @@ causal_mask :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) 
 		output  = output,
 		variant = Causal_Mask{},
 	}
-	_run_forward(&op, loc)
-	append_operation(op, loc=loc)
+	_record_forward(op, loc=loc)
 
 	return
 }
