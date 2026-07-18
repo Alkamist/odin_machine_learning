@@ -18,6 +18,8 @@ Adapter :: struct {
 	rank:        int,
 	in_features:  int,
 	out_features: int,
+
+	params: [dynamic]ml.Parameter_Info,
 }
 
 @(require_results)
@@ -26,29 +28,20 @@ make :: proc(in_features, out_features, rank: int, alpha: f32, dtype: ml.Data_Ty
 	adapter.in_features  = in_features
 	adapter.out_features = out_features
 
-	adapter.a = ml.alloc(dtype, {rank, in_features},  persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
-	adapter.b = ml.alloc(dtype, {out_features, rank}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
+	adapter.a = ml.parameter_make(&adapter.params, "", "lora_A.weight", dtype, {rank, in_features}, init=ml.Init_Normal{mean=0, std=0.02})
+	adapter.b = ml.parameter_make(&adapter.params, "", "lora_B.weight", dtype, {out_features, rank}, init=ml.Init_Value{value=0})
 
 	// scale is a frozen constant: persistent Data buffer only, no gradient.
 	// ml.mul backward skips the b-side when b has no gradient buffer.
-	adapter.scale = ml.alloc(dtype, {1}, persistent=true, buffers={.Data})
-	switch dtype {
-	case .F32:
-		v := [1]f32{alpha / f32(rank)}
-		ml.set_data_bytes(adapter.scale, mem.slice_to_bytes(v[:]))
-	case .Bf16:
-		v := [1]ml.Bf16{ml.bf16_from_f32(alpha / f32(rank))}
-		ml.set_data_bytes(adapter.scale, mem.slice_to_bytes(v[:]))
-	case .Q4_K, .Q6_K:
-		panic("quantized scale dtype not supported", loc)
-	}
+	adapter.scale = ml.const_scalar(dtype, alpha / f32(rank), loc=loc)
+	ml.register(&adapter.params, "", "scale", adapter.scale, init=nil, trainable=false)
+
 	return
 }
 
 destroy :: proc(adapter: Adapter) {
-	ml.destroy(adapter.a)
-	ml.destroy(adapter.b)
-	ml.destroy(adapter.scale)
+	adapter := adapter
+	ml.registry_destroy(&adapter.params)
 }
 
 // Standard QLoRA init: A ~ N(0, sigma) so the input through A is non-zero,
@@ -71,15 +64,13 @@ apply :: proc(input, base_output: ml.Tensor, adapter: Adapter) -> ml.Tensor {
 }
 
 update :: proc(opt: ^ml.Optimizer, adapter: Adapter) {
-	ml.update(opt, adapter.a)
-	ml.update(opt, adapter.b)
-	// scale is a constant; no update.
+	ml.registry_update(opt, adapter.params[:])
 }
 
 // Element count for parameter accounting / progress reporting.
 @(require_results)
 parameter_count :: proc(adapter: Adapter) -> int {
-	return adapter.rank * adapter.in_features + adapter.out_features * adapter.rank
+	return ml.registry_parameter_count(adapter.params[:])
 }
 
 // Enumerates the trainable adapter tensors under PEFT-style names
@@ -87,6 +78,5 @@ parameter_count :: proc(adapter: Adapter) -> int {
 // interoperate with the wider ecosystem. `scale` is a frozen constant
 // recomputed from alpha/rank at make time, so it is not a saved parameter.
 parameters :: proc(adapter: Adapter, prefix: string, list: ^[dynamic]ml.Parameter) {
-	ml.parameter_append(list, prefix, "lora_A.weight", adapter.a)
-	ml.parameter_append(list, prefix, "lora_B.weight", adapter.b)
+	ml.registry_parameters(adapter.params[:], list, prefix=prefix)
 }

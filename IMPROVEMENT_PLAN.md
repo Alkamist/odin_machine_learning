@@ -123,7 +123,25 @@ Acceptance: forward/backward from a thread other than the creator works (or is e
 
 ---
 
-## Phase 2 — Parameter registry (highest-leverage refactor)
+## Phase 2 — Parameter registry — DONE (2026-07-18)
+
+Implemented as designed, with these concrete decisions:
+
+- Registry lives in `parameters.odin` (root package): `Parameter_Info{name, tensor, init, trainable}` with an `Init` union (`Init_He`, `Init_Xavier`, `Init_Normal{mean, std}`, `Init_Value{value}`, nil = never randomized). Generic procs: `register`, `registry_destroy`, `registry_clear` (names only — for loaders that replace tensors), `registry_randomize`, `registry_update`, `registry_copy`, `registry_parameters` (trainable entries only), `registry_parameter_count`. `register` asserts trainable ⇒ has gradient buffer and self-initializes the list allocator.
+- `parameter_make(&list, prefix, name, type, shape, init=…, trainable=…) -> Tensor` allocates AND registers in one call, deriving the buffer set from `trainable` ({Data, Gradient} vs {Data}) — used by mlp/lora/llama so a parameter cannot be created without being registered. gemma deliberately keeps create-then-register: its registration must live solely in `_register_parameters` so the post-`load_gguf` rebuild re-runs the exact same walk; `parameter_make` there would fork registration truth into two drift-prone walks. `ml.make` remains for standalone (non-parameter) persistent tensors, e.g. in tests.
+- `trainable` is explicit at registration, NOT derived from `has_gradient`: jepa's EMA target encoder has gradient buffers but must never be optimizer-updated (weight decay would corrupt it).
+- Each module owns its registry; composition prepends prefixes at `parameters` view time (mlp inside jepa, lora adapters inside gemma). Tied tensors register once; aliases never register.
+- mlp/lora/jepa converted with byte-identical checkpoint names (asserted by `tests/registry_check.odin`, which also leak-checks the full lifecycle). jepa needed zero changes.
+- llama and gemma: five-way walks deleted, both now implement `parameters` (checkpointable for the first time). Names are the HF safetensors names from their loaders. gemma's three LoRA ladders (`update_lora`/`randomize_lora`/`lora_parameter_count`, no external callers) are deleted — the trainable-only registry view makes QLoRA selection automatic in the unified `update`/`randomize`/`parameters`.
+- gemma `load_gguf` rebuilds the registry (`registry_clear` + `_register_parameters`) after loading, because the quant path destroy-and-replaces tensors, which would otherwise leave stale handles in the registry.
+- Forward passes merged: llama `forward`/`forward_cached` → one `_forward(model, tokens, cache=nil)`; gemma `forward_with_hidden`/`forward_cached` → one `_forward` preserving all divergences (notably: fused `_gate_up_geglu` only on the cached path with no gate/up LoRA — the uncached path always used the manual ladder; final-cast behavior differs per path and is kept verbatim).
+- Shared helpers folded into `ml`: `per_head_rmsnorm` (was llama `_per_head_rmsnorm` ≡ gemma `_qkv_norm`, which took an unused model param), `Kv_Cache`/`Kv_Layer_Cache` + `kv_cache_destroy`/`kv_cache_reset` (`llama.Cache` and `gemma.Cache` are aliases; makes stay model-specific for sliding-window/shared-layer capacity logic), and `const_scalar` (was gemma `_make_const_scalar` ≡ lora's inline scale baking).
+- Acceptance test `tests/gemma_lora_check.odin`: tiny gemma with QLoRA runs a real CPU forward/backward/Adam step, asserts the parameters view is exactly the 8 LoRA tensors, round-trips a checkpoint including Adam moments and iteration into a fresh model, and shows zero leaks under `mem.Tracking_Allocator`.
+- Verified: `odin check` clean everywhere, `odin test tests` green (7 tests, also under `ML_CPU_POISON`), `odin test tests\parity` green on GPU.
+
+Original plan kept below for reference.
+
+## Phase 2 (original) — Parameter registry (highest-leverage refactor)
 
 ### Problem
 

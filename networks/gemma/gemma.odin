@@ -188,6 +188,8 @@ Gemma :: struct {
 	ple_combine_scale:   ml.Tensor, // 1 / sqrt(2)
 	softcap_inv:         ml.Tensor, // 1 / final_logit_softcapping (only if > 0)
 	softcap:             ml.Tensor, // final_logit_softcapping     (only if > 0)
+
+	params: [dynamic]ml.Parameter_Info,
 }
 
 @(require_results)
@@ -302,90 +304,89 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 		}
 	}
 
-	model.embed_scale       = _make_const_scalar(dtype, math.sqrt(f32(config.hidden_size)),                          const_buffers)
-	model.ple_token_scale   = _make_const_scalar(dtype, math.sqrt(f32(config.hidden_size_per_layer_input)),          const_buffers)
-	model.ple_ctx_scale     = _make_const_scalar(dtype, 1.0 / math.sqrt(f32(config.hidden_size)),                    const_buffers)
-	model.ple_combine_scale = _make_const_scalar(dtype, 1.0 / math.sqrt(f32(2)),                                     const_buffers)
+	model.embed_scale       = ml.const_scalar(dtype, math.sqrt(f32(config.hidden_size)))
+	model.ple_token_scale   = ml.const_scalar(dtype, math.sqrt(f32(config.hidden_size_per_layer_input)))
+	model.ple_ctx_scale     = ml.const_scalar(dtype, 1.0 / math.sqrt(f32(config.hidden_size)))
+	model.ple_combine_scale = ml.const_scalar(dtype, 1.0 / math.sqrt(f32(2)))
 	if config.final_logit_softcapping > 0 {
-		model.softcap_inv = _make_const_scalar(dtype, 1.0 / config.final_logit_softcapping, const_buffers)
-		model.softcap     = _make_const_scalar(dtype, config.final_logit_softcapping,       const_buffers)
+		model.softcap_inv = ml.const_scalar(dtype, 1.0 / config.final_logit_softcapping)
+		model.softcap     = ml.const_scalar(dtype, config.final_logit_softcapping)
 	}
+
+	reserve(&model.params, 16 * config.num_hidden_layers + 12)
+	_register_parameters(&model)
 
 	return
 }
 
-_make_const_scalar :: proc(dtype: ml.Data_Type, value: f32, buffers: ml.Buffer_Set) -> ml.Tensor {
-	t := ml.alloc(dtype, {1}, persistent=true, buffers=buffers)
-	switch dtype {
-	case .F32:
-		src := [1]f32{value}
-		ml.set_data_bytes(t, mem.slice_to_bytes(src[:]))
-	case .Bf16:
-		src := [1]ml.Bf16{ml.bf16_from_f32(value)}
-		ml.set_data_bytes(t, mem.slice_to_bytes(src[:]))
-	case .Q4_K, .Q6_K:
-		fmt.panicf("unsupported dtype %v", dtype)
+_register_parameters :: proc(model: ^Gemma) {
+	cfg            := model.config
+	residual_scale := f32(0.02 / math.sqrt(f32(2 * cfg.num_hidden_layers)))
+
+	reg :: proc(model: ^Gemma, prefix, name: string, tensor: ml.Tensor, init: ml.Init) {
+		ml.register(&model.params, prefix, name, tensor, init=init, trainable=ml.has_gradient(tensor))
 	}
-	return t
+
+	reg(model, "", "model.language_model.embed_tokens.weight",            model.embed_tokens_weight,               ml.Init_Normal{mean=0, std=0.02})
+	reg(model, "", "model.language_model.norm.weight",                    model.output_norm_weight,                ml.Init_Value{value=1})
+	if !cfg.tie_word_embeddings {
+		reg(model, "", "lm_head.weight", model.lm_head_weight, ml.Init_Normal{mean=0, std=0.02})
+	}
+	reg(model, "", "model.language_model.per_layer_model_projection.weight", model.per_layer_model_projection_weight, ml.Init_Normal{mean=0, std=0.02})
+	reg(model, "", "model.language_model.per_layer_projection_norm.weight",  model.per_layer_projection_norm_weight,  ml.Init_Value{value=1})
+
+	reg(model, "", "v_norm_ones_sliding", model.v_norm_ones_sliding, nil)
+	reg(model, "", "v_norm_ones_full",    model.v_norm_ones_full,    nil)
+	reg(model, "", "embed_scale",         model.embed_scale,         nil)
+	reg(model, "", "ple_token_scale",     model.ple_token_scale,     nil)
+	reg(model, "", "ple_ctx_scale",       model.ple_ctx_scale,       nil)
+	reg(model, "", "ple_combine_scale",   model.ple_combine_scale,   nil)
+	if cfg.final_logit_softcapping > 0 {
+		reg(model, "", "softcap_inv", model.softcap_inv, nil)
+		reg(model, "", "softcap",     model.softcap,     nil)
+	}
+
+	for &layer, layer_idx in model.layers {
+		prefix := fmt.tprintf("model.language_model.layers.%v", layer_idx)
+
+		reg(model, prefix, "input_layernorm.weight",            layer.input_norm_weight,            ml.Init_Value{value=1})
+		reg(model, prefix, "post_attention_layernorm.weight",   layer.post_attention_norm_weight,   ml.Init_Value{value=1})
+		reg(model, prefix, "pre_feedforward_layernorm.weight",  layer.pre_feedforward_norm_weight,  ml.Init_Value{value=1})
+		reg(model, prefix, "post_feedforward_layernorm.weight", layer.post_feedforward_norm_weight, ml.Init_Value{value=1})
+
+		reg(model, prefix, "self_attn.q_proj.weight", layer.q_proj_weight, ml.Init_Normal{mean=0, std=0.02})
+		reg(model, prefix, "self_attn.q_norm.weight", layer.q_norm_weight, ml.Init_Value{value=1})
+		reg(model, prefix, "self_attn.o_proj.weight", layer.o_proj_weight, ml.Init_Normal{mean=0, std=residual_scale})
+
+		if !is_kv_shared_layer(cfg, layer_idx) {
+			reg(model, prefix, "self_attn.k_proj.weight", layer.k_proj_weight, ml.Init_Normal{mean=0, std=0.02})
+			reg(model, prefix, "self_attn.k_norm.weight", layer.k_norm_weight, ml.Init_Value{value=1})
+			reg(model, prefix, "self_attn.v_proj.weight", layer.v_proj_weight, ml.Init_Normal{mean=0, std=0.02})
+		}
+
+		reg(model, prefix, "mlp.gate_proj.weight", layer.gate_proj_weight, ml.Init_Normal{mean=0, std=0.02})
+		reg(model, prefix, "mlp.up_proj.weight",   layer.up_proj_weight,   ml.Init_Normal{mean=0, std=0.02})
+		reg(model, prefix, "mlp.down_proj.weight", layer.down_proj_weight, ml.Init_Normal{mean=0, std=residual_scale})
+
+		reg(model, prefix, "per_layer_input_gate.weight",      layer.per_layer_input_gate_weight,      ml.Init_Normal{mean=0, std=0.02})
+		reg(model, prefix, "per_layer_projection.weight",      layer.per_layer_projection_weight,      ml.Init_Normal{mean=0, std=0.02})
+		reg(model, prefix, "post_per_layer_input_norm.weight", layer.post_per_layer_input_norm_weight, ml.Init_Value{value=1})
+		reg(model, prefix, "layer_scalar",                     layer.layer_scalar,                     ml.Init_Value{value=1})
+	}
 }
 
 destroy :: proc(model: Gemma) {
-	_destroy_if_set :: proc(t: ml.Tensor) {
-		if t.backend != nil {
-			ml.destroy(t)
-		}
-	}
-
-	ml.destroy(model.embed_tokens_weight)
-	if !model.config.tie_word_embeddings {
-		ml.destroy(model.lm_head_weight)
-	}
-	ml.destroy(model.output_norm_weight)
+	model := model
+	ml.registry_destroy(&model.params)
 
 	delete(model.embed_tokens_per_layer_bytes)
-	ml.destroy(model.per_layer_model_projection_weight)
-	ml.destroy(model.per_layer_projection_norm_weight)
 
-	ml.destroy(model.v_norm_ones_sliding)
-	ml.destroy(model.v_norm_ones_full)
-
-	_destroy_if_set(model.embed_scale)
-	_destroy_if_set(model.ple_token_scale)
-	_destroy_if_set(model.ple_ctx_scale)
-	_destroy_if_set(model.ple_combine_scale)
-	_destroy_if_set(model.softcap_inv)
-	_destroy_if_set(model.softcap)
-
-	for layer, layer_idx in model.layers {
-		ml.destroy(layer.input_norm_weight)
-		ml.destroy(layer.post_attention_norm_weight)
-		ml.destroy(layer.pre_feedforward_norm_weight)
-		ml.destroy(layer.post_feedforward_norm_weight)
-
-		ml.destroy(layer.q_proj_weight)
-		ml.destroy(layer.q_norm_weight)
-		ml.destroy(layer.o_proj_weight)
-
-		if !is_kv_shared_layer(model.config, layer_idx) {
-			ml.destroy(layer.k_proj_weight)
-			ml.destroy(layer.k_norm_weight)
-			ml.destroy(layer.v_proj_weight)
+	_destroy_lora :: proc(adapter: lora.Adapter) {
+		if adapter.rank > 0 {
+			lora.destroy(adapter)
 		}
-
-		ml.destroy(layer.gate_proj_weight)
-		ml.destroy(layer.up_proj_weight)
-		ml.destroy(layer.down_proj_weight)
-
-		ml.destroy(layer.per_layer_input_gate_weight)
-		ml.destroy(layer.per_layer_projection_weight)
-		ml.destroy(layer.post_per_layer_input_norm_weight)
-		ml.destroy(layer.layer_scalar)
-
-		_destroy_lora :: proc(adapter: lora.Adapter) {
-			if adapter.rank > 0 {
-				lora.destroy(adapter)
-			}
-		}
+	}
+	for layer in model.layers {
 		_destroy_lora(layer.q_lora)
 		_destroy_lora(layer.k_lora)
 		_destroy_lora(layer.v_lora)
@@ -398,46 +399,18 @@ destroy :: proc(model: Gemma) {
 }
 
 randomize :: proc(model: Gemma) {
-	cfg := model.config
-	residual_scale := f32(0.02 / math.sqrt(f32(2 * cfg.num_hidden_layers)))
+	ml.registry_randomize(model.params[:])
 
-	ml.fill_normal(model.embed_tokens_weight, 0, 0.02)
-	ml.fill_value (model.output_norm_weight,  1)
-	if !cfg.tie_word_embeddings {
-		ml.fill_normal(model.lm_head_weight, 0, 0.02)
-	}
-
-	// Per-layer embedding bytes are a frozen lookup in this implementation
-	// (not exposed as a Tensor). Initialise host-side bytes to a small normal.
 	_fill_per_layer_bytes_normal(model, 0.02)
 
-	ml.fill_normal(model.per_layer_model_projection_weight, 0, 0.02)
-	ml.fill_value (model.per_layer_projection_norm_weight,  1)
-
-	for &layer, layer_idx in model.layers {
-		ml.fill_value (layer.input_norm_weight,             1)
-		ml.fill_value (layer.post_attention_norm_weight,    1)
-		ml.fill_value (layer.pre_feedforward_norm_weight,   1)
-		ml.fill_value (layer.post_feedforward_norm_weight,  1)
-
-		ml.fill_normal(layer.q_proj_weight, 0, 0.02)
-		ml.fill_value (layer.q_norm_weight, 1)
-		ml.fill_normal(layer.o_proj_weight, 0, residual_scale)
-
-		if !is_kv_shared_layer(cfg, layer_idx) {
-			ml.fill_normal(layer.k_proj_weight, 0, 0.02)
-			ml.fill_value (layer.k_norm_weight, 1)
-			ml.fill_normal(layer.v_proj_weight, 0, 0.02)
-		}
-
-		ml.fill_normal(layer.gate_proj_weight, 0, 0.02)
-		ml.fill_normal(layer.up_proj_weight,   0, 0.02)
-		ml.fill_normal(layer.down_proj_weight, 0, residual_scale)
-
-		ml.fill_normal(layer.per_layer_input_gate_weight,      0, 0.02)
-		ml.fill_normal(layer.per_layer_projection_weight,      0, 0.02)
-		ml.fill_value (layer.post_per_layer_input_norm_weight, 1)
-		ml.fill_value (layer.layer_scalar,                     1)
+	for layer in model.layers {
+		if layer.q_lora.rank    > 0 { lora.randomize(layer.q_lora) }
+		if layer.k_lora.rank    > 0 { lora.randomize(layer.k_lora) }
+		if layer.v_lora.rank    > 0 { lora.randomize(layer.v_lora) }
+		if layer.o_lora.rank    > 0 { lora.randomize(layer.o_lora) }
+		if layer.gate_lora.rank > 0 { lora.randomize(layer.gate_lora) }
+		if layer.up_lora.rank   > 0 { lora.randomize(layer.up_lora) }
+		if layer.down_lora.rank > 0 { lora.randomize(layer.down_lora) }
 	}
 }
 
@@ -462,47 +435,8 @@ _fill_per_layer_bytes_normal :: proc(model: Gemma, std: f32) {
 }
 
 update :: proc(opt: ^ml.Optimizer, model: Gemma) {
-	cfg := model.config
+	ml.registry_update(opt, model.params[:])
 
-	ml.update(opt, model.embed_tokens_weight)
-	ml.update(opt, model.output_norm_weight)
-	if !cfg.tie_word_embeddings {
-		ml.update(opt, model.lm_head_weight)
-	}
-
-	ml.update(opt, model.per_layer_model_projection_weight)
-	ml.update(opt, model.per_layer_projection_norm_weight)
-
-	for layer, layer_idx in model.layers {
-		ml.update(opt, layer.input_norm_weight)
-		ml.update(opt, layer.post_attention_norm_weight)
-		ml.update(opt, layer.pre_feedforward_norm_weight)
-		ml.update(opt, layer.post_feedforward_norm_weight)
-
-		ml.update(opt, layer.q_proj_weight)
-		ml.update(opt, layer.q_norm_weight)
-		ml.update(opt, layer.o_proj_weight)
-
-		if !is_kv_shared_layer(cfg, layer_idx) {
-			ml.update(opt, layer.k_proj_weight)
-			ml.update(opt, layer.k_norm_weight)
-			ml.update(opt, layer.v_proj_weight)
-		}
-
-		ml.update(opt, layer.gate_proj_weight)
-		ml.update(opt, layer.up_proj_weight)
-		ml.update(opt, layer.down_proj_weight)
-
-		ml.update(opt, layer.per_layer_input_gate_weight)
-		ml.update(opt, layer.per_layer_projection_weight)
-		ml.update(opt, layer.post_per_layer_input_norm_weight)
-		ml.update(opt, layer.layer_scalar)
-	}
-}
-
-// QLoRA: only the per-layer adapters are trainable. Skips every base
-// weight, which doesn't have an Adam buffer anyway.
-update_lora :: proc(opt: ^ml.Optimizer, model: Gemma) {
 	for layer in model.layers {
 		if layer.q_lora.rank    > 0 { lora.update(opt, layer.q_lora) }
 		if layer.k_lora.rank    > 0 { lora.update(opt, layer.k_lora) }
@@ -514,31 +448,20 @@ update_lora :: proc(opt: ^ml.Optimizer, model: Gemma) {
 	}
 }
 
-randomize_lora :: proc(model: Gemma) {
-	for layer in model.layers {
-		if layer.q_lora.rank    > 0 { lora.randomize(layer.q_lora) }
-		if layer.k_lora.rank    > 0 { lora.randomize(layer.k_lora) }
-		if layer.v_lora.rank    > 0 { lora.randomize(layer.v_lora) }
-		if layer.o_lora.rank    > 0 { lora.randomize(layer.o_lora) }
-		if layer.gate_lora.rank > 0 { lora.randomize(layer.gate_lora) }
-		if layer.up_lora.rank   > 0 { lora.randomize(layer.up_lora) }
-		if layer.down_lora.rank > 0 { lora.randomize(layer.down_lora) }
-	}
-}
+parameters :: proc(model: Gemma, list: ^[dynamic]ml.Parameter) {
+	ml.registry_parameters(model.params[:], list)
 
-@(require_results)
-lora_parameter_count :: proc(model: Gemma) -> int {
-	total := 0
-	for layer in model.layers {
-		if layer.q_lora.rank    > 0 { total += lora.parameter_count(layer.q_lora) }
-		if layer.k_lora.rank    > 0 { total += lora.parameter_count(layer.k_lora) }
-		if layer.v_lora.rank    > 0 { total += lora.parameter_count(layer.v_lora) }
-		if layer.o_lora.rank    > 0 { total += lora.parameter_count(layer.o_lora) }
-		if layer.gate_lora.rank > 0 { total += lora.parameter_count(layer.gate_lora) }
-		if layer.up_lora.rank   > 0 { total += lora.parameter_count(layer.up_lora) }
-		if layer.down_lora.rank > 0 { total += lora.parameter_count(layer.down_lora) }
+	for layer, layer_idx in model.layers {
+		attn_prefix := fmt.tprintf("model.language_model.layers.%v.self_attn", layer_idx)
+		mlp_prefix  := fmt.tprintf("model.language_model.layers.%v.mlp",       layer_idx)
+		if layer.q_lora.rank    > 0 { lora.parameters(layer.q_lora,    fmt.tprintf("%v.q_proj",    attn_prefix), list) }
+		if layer.k_lora.rank    > 0 { lora.parameters(layer.k_lora,    fmt.tprintf("%v.k_proj",    attn_prefix), list) }
+		if layer.v_lora.rank    > 0 { lora.parameters(layer.v_lora,    fmt.tprintf("%v.v_proj",    attn_prefix), list) }
+		if layer.o_lora.rank    > 0 { lora.parameters(layer.o_lora,    fmt.tprintf("%v.o_proj",    attn_prefix), list) }
+		if layer.gate_lora.rank > 0 { lora.parameters(layer.gate_lora, fmt.tprintf("%v.gate_proj", mlp_prefix),  list) }
+		if layer.up_lora.rank   > 0 { lora.parameters(layer.up_lora,   fmt.tprintf("%v.up_proj",   mlp_prefix),  list) }
+		if layer.down_lora.rank > 0 { lora.parameters(layer.down_lora, fmt.tprintf("%v.down_proj", mlp_prefix),  list) }
 	}
-	return total
 }
 
 @(require_results)
@@ -591,33 +514,14 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	return combined
 }
 
-@(require_results)
-_qkv_norm :: proc(model: Gemma, x: ml.Tensor, weight: ml.Tensor, n_heads, head_dim: int, eps: f32) -> ml.Tensor {
-	token_count := x.shape[0]
-	flat_shape  := []int{token_count * n_heads, head_dim}
-	view        := ml.reshape(x, flat_shape)
-	normed      := ml.rmsnorm(view, weight, eps)
-	out_shape   := []int{token_count, n_heads * head_dim}
-	return ml.reshape(normed, out_shape)
-}
-
-Layer_Cache :: struct {
-	k: ml.Tensor, // [t_capacity, num_kv_heads * head_dim] (t_capacity = sliding_window for sliding layers, t_max otherwise)
-	v: ml.Tensor,
-}
-
-Cache :: struct {
-	t_max:  int,
-	length: int,
-	layers: []Layer_Cache,
-}
+Cache :: ml.Kv_Cache
 
 @(require_results)
 cache_make :: proc(model: Gemma, t_max: int, allocator := context.allocator) -> (cache: Cache) {
 	cfg := model.config
 	cache.t_max  = t_max
 	cache.length = 0
-	cache.layers = builtin.make([]Layer_Cache, cfg.num_hidden_layers, allocator)
+	cache.layers = builtin.make([]ml.Kv_Layer_Cache, cfg.num_hidden_layers, allocator)
 
 	for i in 0 ..< cfg.num_hidden_layers {
 		if is_kv_shared_layer(cfg, i) {
@@ -635,157 +539,42 @@ cache_make :: proc(model: Gemma, t_max: int, allocator := context.allocator) -> 
 }
 
 cache_destroy :: proc(cache: Cache) {
-	for layer_cache in cache.layers {
-		if layer_cache.k.rank > 0 {
-			ml.destroy(layer_cache.k)
-		}
-		if layer_cache.v.rank > 0 {
-			ml.destroy(layer_cache.v)
-		}
-	}
-	delete(cache.layers)
+	ml.kv_cache_destroy(cache)
 }
 
 cache_reset :: proc(cache: ^Cache) {
-	cache.length = 0
+	ml.kv_cache_reset(cache)
 }
 
 @(require_results)
 forward :: proc(model: Gemma, tokens: []int) -> (logits: ml.Tensor) {
-	logits, _ = forward_with_hidden(model, tokens)
-	return
-}
-
-@(require_results)
-forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int, loc := #caller_location) -> (logits: ml.Tensor) {
-	cfg := model.config
-	token_count := builtin.len(new_tokens)
-	assert(token_count > 0, "requires at least one new token", loc=loc)
-	assert(cache.length + token_count <= cache.t_max, "would overflow KV cache", loc=loc)
-	assert(builtin.len(cache.layers) == cfg.num_hidden_layers, "cache layer count must match model", loc=loc)
-
-	cache_position := cache.length
-
-	embeds := ml.select(model.embed_tokens_weight, new_tokens)
-	embeds  = ml.mul(embeds, model.embed_scale)
-	inputs_embeds := embeds
-
-	per_layer_inputs := _per_layer_inputs(model, new_tokens, inputs_embeds)
-	ple_dim := cfg.hidden_size_per_layer_input
-
-	Step_KV :: struct {
-		k, v: ml.Tensor
-	}
-	step_kvs := builtin.make([]Step_KV, cfg.num_hidden_layers, context.temp_allocator)
-
-	residual := embeds
-
-	for layer, layer_idx in model.layers {
-		head_dim      := config_head_dim(cfg, layer_idx)
-		rope_base     := config_rope_base(cfg, layer_idx)
-		rope_fraction := config_rope_fraction(cfg, layer_idx)
-		is_sliding    := cfg.layer_types[layer_idx] == .Sliding
-		window        := cfg.sliding_window if is_sliding else 0
-
-		hidden := ml.rmsnorm(residual, layer.input_norm_weight, cfg.rms_norm_eps)
-
-		q := _linear(hidden, layer.q_proj_weight)
-		if layer.q_lora.rank > 0 {
-			q = lora.apply(hidden, q, layer.q_lora)
-		}
-		q  = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
-
-		cache_layer_idx := layer_idx if !is_kv_shared_layer(cfg, layer_idx) else kv_source_layer_idx(cfg, layer_idx)
-		k_cache := cache.layers[cache_layer_idx].k
-		v_cache := cache.layers[cache_layer_idx].v
-
-		k, v: ml.Tensor
-		if is_kv_shared_layer(cfg, layer_idx) {
-			source := kv_source_layer_idx(cfg, layer_idx)
-			k = step_kvs[source].k
-			v = step_kvs[source].v
-		} else {
-			k = _linear(hidden, layer.k_proj_weight)
-			if layer.k_lora.rank > 0 {
-				k = lora.apply(hidden, k, layer.k_lora)
-			}
-			k = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction, k_cache, k_cache.shape[0])
-
-			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
-			v = _linear(hidden, layer.v_proj_weight)
-			if layer.v_lora.rank > 0 {
-				v = lora.apply(hidden, v, layer.v_lora)
-			}
-			v = _qkv_norm(model, v, v_norm_ones, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
-
-			step_kvs[layer_idx] = Step_KV{k = k, v = v}
-		}
-
-		attn := ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window)
-		attn_pre_o := attn
-		attn  = _linear(attn_pre_o, layer.o_proj_weight)
-		if layer.o_lora.rank > 0 {
-			attn = lora.apply(attn_pre_o, attn, layer.o_lora)
-		}
-		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
-
-		mlp_in: ml.Tensor
-		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
-
-		// When gate/up adapters are present, break the fused gate_up_geglu so
-		// each linear's adapter contribution can land on its own output.
-		mlp_act: ml.Tensor
-		if layer.gate_lora.rank > 0 || layer.up_lora.rank > 0 {
-			gate := _linear(mlp_in, layer.gate_proj_weight)
-			if layer.gate_lora.rank > 0 {
-				gate = lora.apply(mlp_in, gate, layer.gate_lora)
-			}
-			up := _linear(mlp_in, layer.up_proj_weight)
-			if layer.up_lora.rank > 0 {
-				up = lora.apply(mlp_in, up, layer.up_lora)
-			}
-			mlp_act = ml.gelu_mul(gate, up)
-		} else {
-			mlp_act = _gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight)
-		}
-		mlp := _linear(mlp_act, layer.down_proj_weight)
-		if layer.down_lora.rank > 0 {
-			mlp = lora.apply(mlp_act, mlp, layer.down_lora)
-		}
-		mlp  = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
-
-		residual = ml.add(residual, mlp)
-
-		ple_input := ml.slice_trailing(per_layer_inputs, layer_idx * ple_dim, (layer_idx + 1) * ple_dim)
-		ple       := _linear(residual, layer.per_layer_input_gate_weight)
-		ple        = ml.gelu_mul(ple, ple_input)
-		ple        = _linear(ple, layer.per_layer_projection_weight)
-		ple        = ml.rmsnorm(ple, layer.post_per_layer_input_norm_weight, cfg.rms_norm_eps)
-		residual   = ml.add(residual, ple)
-
-		residual = ml.mul(residual, layer.layer_scalar)
-	}
-
-	final_hidden := ml.rmsnorm(residual, model.output_norm_weight, cfg.rms_norm_eps)
-
-	logits = _linear(final_hidden, model.lm_head_weight)
-	if cfg.final_logit_softcapping > 0 {
-		logits = ml.mul(logits, model.softcap_inv)
-		logits = ml.tanh(logits)
-		logits = ml.mul(logits, model.softcap)
-	}
-	if logits.type != .F32 {
-		logits = ml.cast_to(logits, .F32)
-	}
-
-	cache.length += token_count
-
+	logits, _ = _forward(model, nil, tokens)
 	return
 }
 
 @(require_results)
 forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidden: ml.Tensor) {
-	cfg := model.config
+	return _forward(model, nil, tokens)
+}
+
+@(require_results)
+forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int, loc := #caller_location) -> (logits: ml.Tensor) {
+	logits, _ = _forward(model, cache, new_tokens, loc=loc)
+	return
+}
+
+@(require_results)
+_forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_location) -> (logits, final_hidden: ml.Tensor) {
+	cfg         := model.config
+	token_count := builtin.len(tokens)
+
+	cache_position := 0
+	if cache != nil {
+		assert(token_count > 0, "requires at least one new token", loc=loc)
+		assert(cache.length + token_count <= cache.t_max, "would overflow KV cache", loc=loc)
+		assert(builtin.len(cache.layers) == cfg.num_hidden_layers, "cache layer count must match model", loc=loc)
+		cache_position = cache.length
+	}
 
 	embeds := ml.select(model.embed_tokens_weight, tokens)
 	embeds  = ml.mul(embeds, model.embed_scale)
@@ -812,7 +601,7 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		if layer.q_lora.rank > 0 {
 			q = lora.apply(hidden, q, layer.q_lora)
 		}
-		q = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, cfg.rms_norm_eps, rope_base, 0, rope_fraction)
+		q = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
 
 		k, v: ml.Tensor
 		if is_kv_shared_layer(cfg, layer_idx) {
@@ -824,22 +613,36 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 			if layer.k_lora.rank > 0 {
 				k = lora.apply(hidden, k, layer.k_lora)
 			}
-			k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, 0, rope_fraction)
+			if cache != nil {
+				k_cache := cache.layers[layer_idx].k
+				k = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction, k_cache, k_cache.shape[0])
+			} else {
+				k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
+			}
 
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
 			v = _linear(hidden, layer.v_proj_weight)
 			if layer.v_lora.rank > 0 {
 				v = lora.apply(hidden, v, layer.v_lora)
 			}
-			v = _qkv_norm(model, v, v_norm_ones, cfg.num_key_value_heads, head_dim, cfg.rms_norm_eps)
+			v = ml.per_head_rmsnorm(v, v_norm_ones, cfg.num_key_value_heads, eps=cfg.rms_norm_eps)
 
 			shared_keys  [layer_idx] = k
 			shared_values[layer_idx] = v
 		}
 
-		attn := ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
+		attn: ml.Tensor
+		if cache != nil {
+			cache_layer_idx := layer_idx if !is_kv_shared_layer(cfg, layer_idx) else kv_source_layer_idx(cfg, layer_idx)
+			k_cache := cache.layers[cache_layer_idx].k
+			v_cache := cache.layers[cache_layer_idx].v
+			attn = ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window)
+		} else {
+			attn = ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
+		}
+
 		attn_pre_o := attn
-		attn  = _linear(attn, layer.o_proj_weight)
+		attn  = _linear(attn_pre_o, layer.o_proj_weight)
 		if layer.o_lora.rank > 0 {
 			attn = lora.apply(attn_pre_o, attn, layer.o_lora)
 		}
@@ -848,20 +651,26 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		mlp_in: ml.Tensor
 		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
 
-		gate := _linear(mlp_in, layer.gate_proj_weight)
-		if layer.gate_lora.rank > 0 {
-			gate = lora.apply(mlp_in, gate, layer.gate_lora)
+		mlp_act: ml.Tensor
+		if cache != nil && layer.gate_lora.rank == 0 && layer.up_lora.rank == 0 {
+			mlp_act = _gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight)
+		} else {
+			gate := _linear(mlp_in, layer.gate_proj_weight)
+			if layer.gate_lora.rank > 0 {
+				gate = lora.apply(mlp_in, gate, layer.gate_lora)
+			}
+			up := _linear(mlp_in, layer.up_proj_weight)
+			if layer.up_lora.rank > 0 {
+				up = lora.apply(mlp_in, up, layer.up_lora)
+			}
+			mlp_act = ml.gelu_mul(gate, up)
 		}
-		up := _linear(mlp_in, layer.up_proj_weight)
-		if layer.up_lora.rank > 0 {
-			up = lora.apply(mlp_in, up, layer.up_lora)
-		}
-		mlp_act := ml.gelu_mul(gate, up)
-		mlp     := _linear(mlp_act, layer.down_proj_weight)
+		mlp := _linear(mlp_act, layer.down_proj_weight)
 		if layer.down_lora.rank > 0 {
 			mlp = lora.apply(mlp_act, mlp, layer.down_lora)
 		}
-		mlp      = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
+		mlp  = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
+
 		residual = ml.add(residual, mlp)
 
 		ple_input := ml.slice_trailing(per_layer_inputs, layer_idx * ple_dim, (layer_idx + 1) * ple_dim)
@@ -881,9 +690,17 @@ forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidde
 		logits = ml.tanh(logits)
 		logits = ml.mul(logits, model.softcap)
 	}
-	if model.dtype != .F32 {
-		final_hidden = ml.cast_to(final_hidden, .F32)
-		logits       = ml.cast_to(logits,       .F32)
+
+	if cache != nil {
+		if logits.type != .F32 {
+			logits = ml.cast_to(logits, .F32)
+		}
+		cache.length += token_count
+	} else {
+		if model.dtype != .F32 {
+			final_hidden = ml.cast_to(final_hidden, .F32)
+			logits       = ml.cast_to(logits,       .F32)
+		}
 	}
 
 	return

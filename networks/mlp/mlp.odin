@@ -13,14 +13,17 @@ Layer :: struct {
 
 Mlp :: struct {
 	layers: []Layer,
+	params: [dynamic]ml.Parameter_Info,
 }
 
 make :: proc(sizes: ..int, allocator := context.allocator) -> (mlp: Mlp) {
+	context.allocator = allocator
+
 	mlp.layers = builtin.make([]Layer, len(sizes) - 1)
 
 	for i in 0 ..< len(mlp.layers) {
-		mlp.layers[i].weight = ml.make(.F32, {sizes[i + 1], sizes[i]})
-		mlp.layers[i].bias   = ml.make(.F32, {sizes[i + 1]})
+		mlp.layers[i].weight = ml.parameter_make(&mlp.params, "", fmt.tprintf("%d.weight", i), .F32, {sizes[i + 1], sizes[i]}, init=ml.Init_He{})
+		mlp.layers[i].bias   = ml.parameter_make(&mlp.params, "", fmt.tprintf("%d.bias",   i), .F32, {sizes[i + 1]}, init=ml.Init_Value{value=0})
 	}
 
 	randomize(mlp)
@@ -29,33 +32,21 @@ make :: proc(sizes: ..int, allocator := context.allocator) -> (mlp: Mlp) {
 }
 
 destroy :: proc(mlp: Mlp) {
-	for layer in mlp.layers {
-		ml.destroy(layer.weight)
-		ml.destroy(layer.bias)
-	}
+	mlp := mlp
+	ml.registry_destroy(&mlp.params)
 	delete(mlp.layers)
 }
 
 parameters :: proc(mlp: Mlp, prefix: string, list: ^[dynamic]ml.Parameter) {
-	for layer, i in mlp.layers {
-		ml.parameter_append(list, prefix, fmt.tprintf("%d.weight", i), layer.weight)
-		ml.parameter_append(list, prefix, fmt.tprintf("%d.bias",   i), layer.bias)
-	}
+	ml.registry_parameters(mlp.params[:], list, prefix=prefix)
 }
 
 copy :: proc(dst, src: Mlp) {
-	for i in 0 ..< len(dst.layers) {
-		ml.copy(dst.layers[i].weight, src.layers[i].weight)
-		ml.copy(dst.layers[i].bias,   src.layers[i].bias)
-	}
+	ml.registry_copy(dst.params[:], src.params[:])
 }
 
 randomize :: proc(mlp: Mlp) {
-	for i in 0 ..< len(mlp.layers) {
-		input_size := mlp.layers[i].weight.shape[1]
-		ml.he_initialization(mlp.layers[i].weight, input_size)
-		ml.fill_value(mlp.layers[i].bias, 0)
-	}
+	ml.registry_randomize(mlp.params[:])
 }
 
 @(require_results)
@@ -74,8 +65,5 @@ forward :: proc(mlp: Mlp, input: ml.Tensor) -> (output: ml.Tensor) {
 }
 
 update :: proc(opt: ^ml.Optimizer, mlp: Mlp) {
-	for layer in mlp.layers {
-		ml.update(opt, layer.weight)
-		ml.update(opt, layer.bias)
-	}
+	ml.registry_update(opt, mlp.params[:])
 }

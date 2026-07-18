@@ -289,6 +289,22 @@ scalar :: proc(type: Data_Type, value: f32, loc := #caller_location) -> (t: Tens
 }
 
 @(require_results)
+const_scalar :: proc(type: Data_Type, value: f32, loc := #caller_location) -> (t: Tensor) {
+	t = alloc(type, {1}, persistent=true, buffers={.Data}, loc=loc)
+	switch type {
+	case .F32:
+		src := [1]f32{value}
+		set_data_bytes(t, mem.slice_to_bytes(src[:]), loc=loc)
+	case .Bf16:
+		src := [1]Bf16{bf16_from_f32(value)}
+		set_data_bytes(t, mem.slice_to_bytes(src[:]), loc=loc)
+	case .Q4_K, .Q6_K:
+		fmt.panicf("const_scalar does not support dtype %v", type, loc=loc)
+	}
+	return
+}
+
+@(require_results)
 _zeros_drop_last :: proc(src: Tensor, loc := #caller_location) -> Tensor {
 	if src.rank <= 1 {
 		shape := [1]int{1}
@@ -1676,6 +1692,18 @@ rmsnorm :: proc(input, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #c
 	_record_forward(op, loc=loc)
 
 	return
+}
+
+@(require_results)
+per_head_rmsnorm :: proc(x, weight: Tensor, head_count: int, eps: f32 = RMSNORM_DEFAULT_EPS, loc := #caller_location) -> Tensor {
+	assert(x.rank == 2, "per_head_rmsnorm requires a 2-D [tokens, heads * head_size] tensor", loc=loc)
+	assert(x.shape[1] % head_count == 0, "per_head_rmsnorm trailing dim must be divisible by head_count", loc=loc)
+
+	token_count := x.shape[0]
+	head_size   := x.shape[1] / head_count
+	view        := reshape(x, {token_count * head_count, head_size}, loc=loc)
+	normed      := rmsnorm(view, weight, eps=eps, loc=loc)
+	return reshape(normed, {token_count, head_count * head_size}, loc=loc)
 }
 
 Rmsnorm_Rope :: struct {

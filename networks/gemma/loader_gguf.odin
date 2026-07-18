@@ -76,6 +76,9 @@ load_gguf :: proc(model: ^Gemma, path: string) -> bool {
 		return false
 	}
 
+	ml.registry_clear(&model.params)
+	_register_parameters(model)
+
 	return true
 }
 

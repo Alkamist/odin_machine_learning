@@ -1,6 +1,7 @@
 package llama
 
 import "base:builtin"
+import "core:fmt"
 import "core:math"
 
 import ml "../../"
@@ -53,6 +54,8 @@ Llama :: struct {
 
 	output_norm_weight: ml.Tensor, // [embedding_size]
 	lm_head_weight:     ml.Tensor, // [vocabulary_size, embedding_size]; aliases token_embeddings when tied.
+
+	params: [dynamic]ml.Parameter_Info,
 }
 
 make :: proc(config: Config, dtype: ml.Data_Type = .F32, allocator := context.allocator) -> (model: Llama) {
@@ -61,31 +64,40 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, allocator := context.al
 	q_size  := config.n_q_heads  * config.head_size
 	kv_size := config.n_kv_heads * config.head_size
 
-	model.config           = config
-	model.layers           = builtin.make([]Layer, config.layer_count)
-	model.token_embeddings = ml.make(dtype, {config.vocabulary_size, config.embedding_size})
+	residual_scale := 0.02 / math.sqrt(f32(2 * config.layer_count))
 
-	for &layer in model.layers {
-		layer.input_norm_weight     = ml.make(dtype, {config.embedding_size})
-		layer.q_proj_weight         = ml.make(dtype, {q_size,  config.embedding_size})
-		layer.k_proj_weight         = ml.make(dtype, {kv_size, config.embedding_size})
-		layer.v_proj_weight         = ml.make(dtype, {kv_size, config.embedding_size})
-		layer.o_proj_weight         = ml.make(dtype, {config.embedding_size, q_size})
+	model.config        = config
+	model.layers        = builtin.make([]Layer, config.layer_count)
+	model.params.allocator = allocator
+
+	model.token_embeddings = ml.parameter_make(&model.params, "", "model.embed_tokens.weight", dtype, {config.vocabulary_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
+
+	for &layer, i in model.layers {
+		prefix := fmt.tprintf("model.layers.%v", i)
+
+		layer.input_norm_weight = ml.parameter_make(&model.params, prefix, "input_layernorm.weight",  dtype, {config.embedding_size}, init=ml.Init_Value{value=1})
+		layer.q_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.q_proj.weight", dtype, {q_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
+		layer.k_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.k_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
+		layer.v_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.v_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
+		layer.o_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.o_proj.weight", dtype, {config.embedding_size, q_size}, init=ml.Init_Normal{mean=0, std=residual_scale})
+
 		if config.use_qk_norm {
-			layer.q_norm_weight = ml.make(dtype, {config.head_size})
-			layer.k_norm_weight = ml.make(dtype, {config.head_size})
+			layer.q_norm_weight = ml.parameter_make(&model.params, prefix, "self_attn.q_norm.weight", dtype, {config.head_size}, init=ml.Init_Value{value=1})
+			layer.k_norm_weight = ml.parameter_make(&model.params, prefix, "self_attn.k_norm.weight", dtype, {config.head_size}, init=ml.Init_Value{value=1})
 		}
-		layer.post_attn_norm_weight = ml.make(dtype, {config.embedding_size})
-		layer.gate_proj_weight      = ml.make(dtype, {config.intermediate_size, config.embedding_size})
-		layer.up_proj_weight        = ml.make(dtype, {config.intermediate_size, config.embedding_size})
-		layer.down_proj_weight      = ml.make(dtype, {config.embedding_size,    config.intermediate_size})
+
+		layer.post_attn_norm_weight = ml.parameter_make(&model.params, prefix, "post_attention_layernorm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1})
+		layer.gate_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.gate_proj.weight", dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
+		layer.up_proj_weight        = ml.parameter_make(&model.params, prefix, "mlp.up_proj.weight",   dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
+		layer.down_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.down_proj.weight", dtype, {config.embedding_size, config.intermediate_size}, init=ml.Init_Normal{mean=0, std=residual_scale})
 	}
 
-	model.output_norm_weight = ml.make(dtype, {config.embedding_size})
+	model.output_norm_weight = ml.parameter_make(&model.params, "", "model.norm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1})
+
 	if config.tied_embeddings {
 		model.lm_head_weight = model.token_embeddings
 	} else {
-		model.lm_head_weight = ml.make(dtype, {config.vocabulary_size, config.embedding_size})
+		model.lm_head_weight = ml.parameter_make(&model.params, "", "lm_head.weight", dtype, {config.vocabulary_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
 	}
 
 	randomize(model)
@@ -94,95 +106,24 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, allocator := context.al
 }
 
 destroy :: proc(model: Llama) {
-	ml.destroy(model.token_embeddings)
-
-	for layer in model.layers {
-		ml.destroy(layer.input_norm_weight)
-		ml.destroy(layer.q_proj_weight)
-		ml.destroy(layer.k_proj_weight)
-		ml.destroy(layer.v_proj_weight)
-		ml.destroy(layer.o_proj_weight)
-		ml.destroy(layer.q_norm_weight)
-		ml.destroy(layer.k_norm_weight)
-		ml.destroy(layer.post_attn_norm_weight)
-		ml.destroy(layer.gate_proj_weight)
-		ml.destroy(layer.up_proj_weight)
-		ml.destroy(layer.down_proj_weight)
-	}
-
-	ml.destroy(model.output_norm_weight)
-	if !model.config.tied_embeddings {
-		ml.destroy(model.lm_head_weight)
-	}
-
+	model := model
+	ml.registry_destroy(&model.params)
 	delete(model.layers)
 }
 
 copy :: proc(dst, src: Llama) {
-	ml.copy(dst.token_embeddings, src.token_embeddings)
-
-	for i in 0 ..< len(dst.layers) {
-		ml.copy(dst.layers[i].input_norm_weight,     src.layers[i].input_norm_weight)
-		ml.copy(dst.layers[i].q_proj_weight,         src.layers[i].q_proj_weight)
-		ml.copy(dst.layers[i].k_proj_weight,         src.layers[i].k_proj_weight)
-		ml.copy(dst.layers[i].v_proj_weight,         src.layers[i].v_proj_weight)
-		ml.copy(dst.layers[i].o_proj_weight,         src.layers[i].o_proj_weight)
-		if dst.config.use_qk_norm {
-			ml.copy(dst.layers[i].q_norm_weight, src.layers[i].q_norm_weight)
-			ml.copy(dst.layers[i].k_norm_weight, src.layers[i].k_norm_weight)
-		}
-		ml.copy(dst.layers[i].post_attn_norm_weight, src.layers[i].post_attn_norm_weight)
-		ml.copy(dst.layers[i].gate_proj_weight,      src.layers[i].gate_proj_weight)
-		ml.copy(dst.layers[i].up_proj_weight,        src.layers[i].up_proj_weight)
-		ml.copy(dst.layers[i].down_proj_weight,      src.layers[i].down_proj_weight)
-	}
-
-	ml.copy(dst.output_norm_weight, src.output_norm_weight)
-	if !dst.config.tied_embeddings {
-		ml.copy(dst.lm_head_weight, src.lm_head_weight)
-	}
+	ml.registry_copy(dst.params[:], src.params[:])
 }
 
 randomize :: proc(model: Llama) {
-	layer_count := len(model.layers)
-	residual_scale := 0.02 / math.sqrt(f32(2 * layer_count))
-
-	ml.fill_normal(model.token_embeddings, 0, 0.02)
-
-	for &layer in model.layers {
-		ml.fill_value(layer.input_norm_weight, 1)
-		ml.fill_normal(layer.q_proj_weight, 0, 0.02)
-		ml.fill_normal(layer.k_proj_weight, 0, 0.02)
-		ml.fill_normal(layer.v_proj_weight, 0, 0.02)
-		ml.fill_normal(layer.o_proj_weight, 0, residual_scale)
-
-		if model.config.use_qk_norm {
-			ml.fill_value(layer.q_norm_weight, 1)
-			ml.fill_value(layer.k_norm_weight, 1)
-		}
-
-		ml.fill_value(layer.post_attn_norm_weight, 1)
-		ml.fill_normal(layer.gate_proj_weight, 0, 0.02)
-		ml.fill_normal(layer.up_proj_weight,   0, 0.02)
-		ml.fill_normal(layer.down_proj_weight, 0, residual_scale)
-	}
-
-	ml.fill_value(model.output_norm_weight, 1)
-	if !model.config.tied_embeddings {
-		ml.fill_normal(model.lm_head_weight, 0, 0.02)
-	}
+	ml.registry_randomize(model.params[:])
 }
 
-Layer_Cache :: struct {
-	k: ml.Tensor, // [t_max, n_kv_heads * head_size]
-	v: ml.Tensor,
+parameters :: proc(model: Llama, list: ^[dynamic]ml.Parameter) {
+	ml.registry_parameters(model.params[:], list)
 }
 
-Cache :: struct {
-	t_max:  int,
-	length: int,
-	layers: []Layer_Cache,
-}
+Cache :: ml.Kv_Cache
 
 // Cache dtype tracks the model's weight dtype: K/V projections produce values
 // in that dtype, so storing them otherwise would cost a per-token cast.
@@ -192,7 +133,7 @@ cache_make :: proc(model: Llama, t_max: int, allocator := context.allocator) -> 
 
 	cache.t_max  = t_max
 	cache.length = 0
-	cache.layers = builtin.make([]Layer_Cache, len(model.layers), allocator)
+	cache.layers = builtin.make([]ml.Kv_Layer_Cache, len(model.layers), allocator)
 
 	for &layer_cache in cache.layers {
 		layer_cache.k = ml.alloc(cache_type, {t_max, kv_size}, persistent=true, buffers={.Data})
@@ -203,36 +144,25 @@ cache_make :: proc(model: Llama, t_max: int, allocator := context.allocator) -> 
 }
 
 cache_destroy :: proc(cache: Cache) {
-	for layer_cache in cache.layers {
-		ml.destroy(layer_cache.k)
-		ml.destroy(layer_cache.v)
-	}
-	delete(cache.layers)
+	ml.kv_cache_destroy(cache)
 }
 
 cache_reset :: proc(cache: ^Cache) {
-	cache.length = 0
+	ml.kv_cache_reset(cache)
 }
 
 @(require_results)
-_per_head_rmsnorm :: proc(x: ml.Tensor, weight: ml.Tensor, head_count: int) -> ml.Tensor {
-	token_count := x.shape[0]
-	head_size   := x.shape[1] / head_count
-	view        := ml.reshape(x, {token_count * head_count, head_size})
-	normed      := ml.rmsnorm(view, weight)
-	return ml.reshape(normed, {token_count, head_count * head_size})
-}
+_forward :: proc(model: Llama, tokens: []int, cache: ^Cache = nil, loc := #caller_location) -> (output: ml.Tensor) {
+	position_offset := 0
+	if cache != nil {
+		token_count := builtin.len(tokens)
+		assert(token_count > 0,                           "requires at least one new token", loc=loc)
+		assert(cache.length + token_count <= cache.t_max, "would overflow KV cache", loc=loc)
+		assert(len(cache.layers) == len(model.layers),    "cache layer count must match model", loc=loc)
+		position_offset = cache.length
+	}
 
-@(require_results)
-forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int, loc := #caller_location) -> (output: ml.Tensor) {
-	token_count := builtin.len(new_tokens)
-	assert(token_count > 0,                           "requires at least one new token", loc=loc)
-	assert(cache.length + token_count <= cache.t_max, "would overflow KV cache", loc=loc)
-	assert(len(cache.layers) == len(model.layers),    "cache layer count must match model", loc=loc)
-
-	cache_position := cache.length
-
-	output = ml.select(model.token_embeddings, new_tokens)
+	output = ml.select(model.token_embeddings, tokens)
 
 	residual := output
 
@@ -244,20 +174,25 @@ forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int, loc := #c
 		v := ml.linear(normed, layer.v_proj_weight)
 
 		if model.config.use_qk_norm {
-			q = _per_head_rmsnorm(q, layer.q_norm_weight, model.config.n_q_heads)
-			k = _per_head_rmsnorm(k, layer.k_norm_weight, model.config.n_kv_heads)
+			q = ml.per_head_rmsnorm(q, layer.q_norm_weight, model.config.n_q_heads)
+			k = ml.per_head_rmsnorm(k, layer.k_norm_weight, model.config.n_kv_heads)
 		}
 
-		q = ml.rope(q, model.config.n_q_heads,  model.config.rope_base, cache_position)
-		k = ml.rope(k, model.config.n_kv_heads, model.config.rope_base, cache_position)
+		q = ml.rope(q, model.config.n_q_heads,  model.config.rope_base, position_offset)
+		k = ml.rope(k, model.config.n_kv_heads, model.config.rope_base, position_offset)
 
-		attn_output := ml.attention_with_cache(
-			q, k, v,
-			cache.layers[i].k, cache.layers[i].v,
-			cache_position,
-			model.config.n_q_heads,
-			model.config.n_kv_heads,
-		)
+		attn_output: ml.Tensor
+		if cache != nil {
+			attn_output = ml.attention_with_cache(
+				q, k, v,
+				cache.layers[i].k, cache.layers[i].v,
+				position_offset,
+				model.config.n_q_heads,
+				model.config.n_kv_heads,
+			)
+		} else {
+			attn_output = ml.attention(q, k, v, model.config.n_q_heads, model.config.n_kv_heads)
+		}
 		attn_output = ml.linear(attn_output, layer.o_proj_weight)
 
 		residual = ml.add(residual, attn_output)
@@ -277,75 +212,23 @@ forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int, loc := #c
 		output = ml.cast_to(output, .F32)
 	}
 
-	cache.length += token_count
+	if cache != nil {
+		cache.length += builtin.len(tokens)
+	}
 
 	return
 }
 
 @(require_results)
-forward :: proc(model: Llama, tokens: []int) -> (output: ml.Tensor) {
-	output = ml.select(model.token_embeddings, tokens)
+forward :: proc(model: Llama, tokens: []int, loc := #caller_location) -> (output: ml.Tensor) {
+	return _forward(model, tokens, loc=loc)
+}
 
-	residual := output
-
-	for layer in model.layers {
-		normed := ml.rmsnorm(residual, layer.input_norm_weight)
-
-		q := ml.linear(normed, layer.q_proj_weight)
-		k := ml.linear(normed, layer.k_proj_weight)
-		v := ml.linear(normed, layer.v_proj_weight)
-
-		if model.config.use_qk_norm {
-			q = _per_head_rmsnorm(q, layer.q_norm_weight, model.config.n_q_heads)
-			k = _per_head_rmsnorm(k, layer.k_norm_weight, model.config.n_kv_heads)
-		}
-
-		q = ml.rope(q, model.config.n_q_heads,  model.config.rope_base)
-		k = ml.rope(k, model.config.n_kv_heads, model.config.rope_base)
-
-		attn_output := ml.attention(q, k, v, model.config.n_q_heads, model.config.n_kv_heads)
-		attn_output  = ml.linear(attn_output, layer.o_proj_weight)
-
-		residual = ml.add(residual, attn_output)
-
-		normed = ml.rmsnorm(residual, layer.post_attn_norm_weight)
-
-		gate       := ml.linear(normed, layer.gate_proj_weight)
-		up         := ml.linear(normed, layer.up_proj_weight)
-		mlp_output := ml.linear(ml.mul(ml.silu(gate), up), layer.down_proj_weight)
-
-		residual = ml.add(residual, mlp_output)
-	}
-
-	output = ml.rmsnorm(residual, model.output_norm_weight)
-	output = ml.linear(output, model.lm_head_weight)
-	if output.type != .F32 {
-		output = ml.cast_to(output, .F32)
-	}
-	return
+@(require_results)
+forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int, loc := #caller_location) -> (output: ml.Tensor) {
+	return _forward(model, new_tokens, cache=cache, loc=loc)
 }
 
 update :: proc(opt: ^ml.Optimizer, model: Llama) {
-	ml.update(opt, model.token_embeddings)
-
-	for layer in model.layers {
-		ml.update(opt, layer.input_norm_weight)
-		ml.update(opt, layer.q_proj_weight)
-		ml.update(opt, layer.k_proj_weight)
-		ml.update(opt, layer.v_proj_weight)
-		ml.update(opt, layer.o_proj_weight)
-		if model.config.use_qk_norm {
-			ml.update(opt, layer.q_norm_weight)
-			ml.update(opt, layer.k_norm_weight)
-		}
-		ml.update(opt, layer.post_attn_norm_weight)
-		ml.update(opt, layer.gate_proj_weight)
-		ml.update(opt, layer.up_proj_weight)
-		ml.update(opt, layer.down_proj_weight)
-	}
-
-	ml.update(opt, model.output_norm_weight)
-	if !model.config.tied_embeddings {
-		ml.update(opt, model.lm_head_weight)
-	}
+	ml.registry_update(opt, model.params[:])
 }
