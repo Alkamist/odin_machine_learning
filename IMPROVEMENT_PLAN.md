@@ -21,9 +21,23 @@ Build/check commands:
 
 ---
 
-## Phase 1 — Memory-safety and correctness bugs
+## Phase 1 — Memory-safety and correctness bugs — DONE (2026-07-18)
 
-These are fix-now items. Each was verified or reported with a concrete failure path. Fix independently; each fix should come with a regression test where feasible.
+All items below are fixed on `ai_improvements`. Decisions and contracts established while fixing them:
+
+- **Gradient-sink contract (1.2):** a tensor without a gradient buffer is a gradient sink — backend backward procs skip accumulation into it. This is what makes frozen weights (QLoRA base, including rmsnorm norm weights) and `scratch` inputs safe, and gives stop-gradient semantics for free. Enforced in every backward proc on both backends (`ml.has_gradient` on CPU, `.ptr == 0` on CUDA); CUDA rmsnorm kernels take nullable `dx`/`dw`; CUDA attention backward asserts against partial-null dq/dk/dv. Regression test: `tests/gradient_sink_check.odin`.
+- **1.3 decision: option (b), not (a).** Quantized-in-file → quantized-in-model replacement is required (GGUF Q4_K/Q6_K inference), so `write_tensor` keeps its replace semantics and all loaders now take models by pointer (`gemma.load_safetensors(^Gemma)`, `llama.load_safetensors(^Llama)`) and re-establish tied-embedding aliases after load. Note: safetensors sources can never be quantized (`_safetensors_dtype` maps only F32/F16/BF16), so the old by-value bug was latent, not live.
+- **Zeros contract (1.5): option (b).** Transient `.Data` buffers are uninitialized storage — every op must fully overwrite its output and must not read it before writing. `.Gradient` buffers and persistent buffers ARE zeroed on both backends (backward accumulates into gradients). CPU `batched_matmul_forward_f32` was the one violator (axpy accumulation) and now zeroes its output rows first. `-define:ML_CPU_POISON=true` fills transient `.Data` with NaN to enforce this; the CPU test suite passes under it. `lerp_assign`/`accumulate_mean` operate on caller-provided persistent tensors and are exempt by design.
+- **1.6:** minimum fix taken — `_emit_position_upload` now records the per-forward position and panics on a conflicting second value instead of silently reusing the first. Per-op position slots remain future work if heterogeneous positions in one forward are ever needed.
+- **1.8:** commit `3af9acd` only bound the context on the creating thread. Now `_gctx` and `_compile_pipeline` lazily bind the primary context per thread, keyed on a device generation counter so re-init after full teardown rebinds correctly.
+- **1.9 tokenizer finding:** the plan's `▁` dummy-prefix claim is WRONG for Gemma — the shipped `tokenizer.json` normalizer is only `Replace(" " → "▁")` (Gemma uses `add_dummy_prefix=false`), which matches the Odin implementation exactly. No fix needed; golden-token tests remain Phase 5.3 work.
+- **1.9 `_upload_indices`:** replaced temp-allocator staging (use-after-free window under `backward`'s temp guard; pageable async HtoD illegal during capture) with a reusable pinned staging pool on the CUDA `Context`, released after the stream sync in `clear`. Auto-capture re-captures every decode step and patches via `GraphExecUpdate`, so host pointers stay fresh.
+- **1.9 grid limits:** `_dispatch` centrally asserts `grid_y`/`grid_z <= MAX_GRID_DIM_YZ`.
+- **1.9 quant-linear dtype:** both backends assume Bf16 activations for `linear_q4_k`/`linear_q6_k` (CPU reads `[^]Bf16`, CUDA runs `.R_16BF` GEMM/MMVQ), so the front end now asserts Bf16-only input instead of the previous "Bf16 or F32".
+- 1.1 front-end F32 asserts added to `clamp`/`min`/`max`/`mean_squared_error`/`smooth_l1`/`cross_entropy`; `ml.copy` asserts dtype+shape; `scalar`/`fill_normal`/`fill_value` panic on quant dtypes; gguf loader rejects dim/count overflow, hostile string lengths, and duplicate tensor names; safetensors validates byte ranges against shape×dtype; llama `make` honors its allocator; tokenizer `encode` returns `(ids, ok) #optional_ok`; gemma prefill tail runs as one chunk; 1.4 saves/restores `ml.optimizer_iteration` (round-trip test in `tests/checkpoint_check.odin`); 1.7 pipeline cache is mutex-guarded and keyed by source+options.
+- Verified: `odin check` clean on all touched packages, `odin test tests` green (6 tests incl. poison mode), `odin test tests\parity` green on an RTX 3090 Ti.
+
+Original findings kept below for reference.
 
 ### 1.1 CPU F32-only ops overflow buffers on Bf16 input (VERIFIED)
 

@@ -675,6 +675,7 @@ cast_forward :: proc(op: ml.Operation) {
 }
 
 cast_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	src_grad := gradient(op.output)
 	dst_grad := gradient(op.input)
 	for i in 0 ..< op.input.count {
@@ -765,12 +766,13 @@ add_backward :: proc(op: ml.Operation) {
 	stride, width := _broadcast_tiling(a, b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
+	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	#no_bounds_check for i in 0 ..< stride {
 		row_da := da[i * width:]
 		row_dy := dy[i * width:]
 		for j in 0 ..< width {
-			row_da[j] += row_dy[j]
-			db[j]     += row_dy[j]
+			if have_da { row_da[j] += row_dy[j] }
+			if have_db { db[j]     += row_dy[j] }
 		}
 	}
 }
@@ -808,11 +810,12 @@ sub_backward :: proc(op: ml.Operation) {
 	stride, width := _broadcast_tiling(a, b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
+	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
 			o := i * width + j
-			da[o] += dy[o]
-			db[j] -= dy[o]
+			if have_da { da[o] += dy[o] }
+			if have_db { db[j] -= dy[o] }
 		}
 	}
 }
@@ -850,14 +853,15 @@ mul_backward :: proc(op: ml.Operation) {
 	stride, width := _broadcast_tiling(a, b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
+	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	#partial switch a.type {
 	case .F32:
 		av, bv := data(a), data(b)
 		for i in 0 ..< stride {
 			for j in 0 ..< width {
 				o := i * width + j
-				da[o] += dy[o] * bv[j]
-				db[j] += dy[o] * av[o]
+				if have_da { da[o] += dy[o] * bv[j] }
+				if have_db { db[j] += dy[o] * av[o] }
 			}
 		}
 	case .Bf16:
@@ -865,8 +869,8 @@ mul_backward :: proc(op: ml.Operation) {
 		for i in 0 ..< stride {
 			for j in 0 ..< width {
 				o := i * width + j
-				da[o] += dy[o] * ml.bf16_to_f32(bv[j])
-				db[j] += dy[o] * ml.bf16_to_f32(av[o])
+				if have_da { da[o] += dy[o] * ml.bf16_to_f32(bv[j]) }
+				if have_db { db[j] += dy[o] * ml.bf16_to_f32(av[o]) }
 			}
 		}
 	}
@@ -905,14 +909,15 @@ div_backward :: proc(op: ml.Operation) {
 	stride, width := _broadcast_tiling(a, b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
+	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	#partial switch a.type {
 	case .F32:
 		av, bv := data(a), data(b)
 		for i in 0 ..< stride {
 			for j in 0 ..< width {
 				o := i * width + j
-				da[o] += dy[o] / bv[j]
-				db[j] += dy[o] * (-av[o] / (bv[j] * bv[j]))
+				if have_da { da[o] += dy[o] / bv[j] }
+				if have_db { db[j] += dy[o] * (-av[o] / (bv[j] * bv[j])) }
 			}
 		}
 	case .Bf16:
@@ -922,8 +927,8 @@ div_backward :: proc(op: ml.Operation) {
 				o := i * width + j
 				a_v := ml.bf16_to_f32(av[o])
 				b_v := ml.bf16_to_f32(bv[j])
-				da[o] += dy[o] / b_v
-				db[j] += dy[o] * (-a_v / (b_v * b_v))
+				if have_da { da[o] += dy[o] / b_v }
+				if have_db { db[j] += dy[o] * (-a_v / (b_v * b_v)) }
 			}
 		}
 	}
@@ -948,6 +953,7 @@ exp_forward :: proc(op: ml.Operation) {
 }
 
 exp_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
 	dx, dy := gradient(input), gradient(output)
@@ -977,6 +983,7 @@ sqrt_forward :: proc(op: ml.Operation, loc := #caller_location) {
 }
 
 sqrt_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
 	dx, dy := gradient(input), gradient(output)
@@ -1001,6 +1008,7 @@ clamp_forward :: proc(op: ml.Operation) {
 }
 
 clamp_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
 	variant := op.variant.(ml.Clamp)
@@ -1031,11 +1039,12 @@ min_backward :: proc(op: ml.Operation) {
 	variant := op.variant.(ml.Min)
 	b       := variant.b
 
+	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< ml.len(a) {
 		if data(a)[i] <= data(b)[i] {
-			gradient(a)[i] += gradient(output)[i]
+			if have_da { gradient(a)[i] += gradient(output)[i] }
 		} else {
-			gradient(b)[i] += gradient(output)[i]
+			if have_db { gradient(b)[i] += gradient(output)[i] }
 		}
 	}
 }
@@ -1057,11 +1066,12 @@ max_backward :: proc(op: ml.Operation) {
 	variant := op.variant.(ml.Max)
 	b       := variant.b
 
+	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< ml.len(a) {
 		if data(a)[i] >= data(b)[i] {
-			gradient(a)[i] += gradient(output)[i]
+			if have_da { gradient(a)[i] += gradient(output)[i] }
 		} else {
-			gradient(b)[i] += gradient(output)[i]
+			if have_db { gradient(b)[i] += gradient(output)[i] }
 		}
 	}
 }
@@ -1108,6 +1118,7 @@ mean_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 mean_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 	count := ml.len(output)
 	size  := ml.len(input) / count
@@ -1136,6 +1147,7 @@ transpose_forward :: proc(op: ml.Operation) {
 }
 
 transpose_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 	rows    := input.shape[0]
 	columns := input.shape[1]
@@ -1166,6 +1178,7 @@ select_forward :: proc(op: ml.Operation) {
 }
 
 select_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	weight, output := op.input, op.output
 	indices := op.variant.(ml.Select).indices
 	size    := ml.len(output) / builtin.len(indices)
@@ -1198,6 +1211,7 @@ slice_forward :: proc(op: ml.Operation) {
 }
 
 slice_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
 	variant := op.variant.(ml.Slice)
@@ -1242,6 +1256,7 @@ slice_trailing_forward :: proc(op: ml.Operation) {
 }
 
 slice_trailing_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
 	variant := op.variant.(ml.Slice_Trailing)
@@ -1313,13 +1328,15 @@ concat_backward :: proc(op: ml.Operation) {
 	dy := gradient(output)
 	src_col := 0
 	for input in inputs {
-		dx          := gradient(input)
 		in_trailing := input.shape[input.rank - 1]
-		for r in 0 ..< leading {
-			out_off := r * out_trailing + src_col
-			in_off  := r * in_trailing
-			for i in 0 ..< in_trailing {
-				dx[in_off + i] += dy[out_off + i]
+		if ml.has_gradient(input) {
+			dx := gradient(input)
+			for r in 0 ..< leading {
+				out_off := r * out_trailing + src_col
+				in_off  := r * in_trailing
+				for i in 0 ..< in_trailing {
+					dx[in_off + i] += dy[out_off + i]
+				}
 			}
 		}
 		src_col += in_trailing
@@ -1510,45 +1527,49 @@ linear_backward_bf16 :: proc(op: ml.Operation) {
 	output_size := weight.shape[0]
 	count       := ml.len(op.input) / weight.shape[1]
 
-	parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
-		weight      := op.variant.(ml.Linear).weight
-		input_size  := weight.shape[1]
-		output_size := weight.shape[0]
-		count       := ml.len(op.input) / input_size
+	if ml.has_gradient(weight) {
+		parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
+			weight      := op.variant.(ml.Linear).weight
+			input_size  := weight.shape[1]
+			output_size := weight.shape[0]
+			count       := ml.len(op.input) / input_size
 
-		x_bf := data_bf16(op.input)
-		dy   := gradient(op.output)
-		dw   := gradient(weight)
+			x_bf := data_bf16(op.input)
+			dy   := gradient(op.output)
+			dw   := gradient(weight)
 
-		dw_row := dw[o * input_size:]
-		for k in 0 ..< input_size {
-			acc: f32
-			for c in 0 ..< count {
-				acc += ml.bf16_to_f32(x_bf[c * input_size + k]) * dy[c * output_size + o]
+			dw_row := dw[o * input_size:]
+			for k in 0 ..< input_size {
+				acc: f32
+				for c in 0 ..< count {
+					acc += ml.bf16_to_f32(x_bf[c * input_size + k]) * dy[c * output_size + o]
+				}
+				dw_row[k] += acc
 			}
-			dw_row[k] += acc
-		}
-	})
+		})
+	}
 
-	parallelize(count, count, op, proc(c: int, op: ml.Operation) {
-		weight      := op.variant.(ml.Linear).weight
-		input_size  := weight.shape[1]
-		output_size := weight.shape[0]
+	if ml.has_gradient(op.input) {
+		parallelize(count, count, op, proc(c: int, op: ml.Operation) {
+			weight      := op.variant.(ml.Linear).weight
+			input_size  := weight.shape[1]
+			output_size := weight.shape[0]
 
-		w_bf := data_bf16(weight)
-		dy   := gradient(op.output)
-		dx   := gradient(op.input)
+			w_bf := data_bf16(weight)
+			dy   := gradient(op.output)
+			dx   := gradient(op.input)
 
-		dx_row := dx[c * input_size:]
-		dy_row := dy[c * output_size:]
-		for k in 0 ..< input_size {
-			acc: f32
-			for o in 0 ..< output_size {
-				acc += ml.bf16_to_f32(w_bf[o * input_size + k]) * dy_row[o]
+			dx_row := dx[c * input_size:]
+			dy_row := dy[c * output_size:]
+			for k in 0 ..< input_size {
+				acc: f32
+				for o in 0 ..< output_size {
+					acc += ml.bf16_to_f32(w_bf[o * input_size + k]) * dy_row[o]
+				}
+				dx_row[k] += acc
 			}
-			dx_row[k] += acc
-		}
-	})
+		})
+	}
 }
 
 linear_backward_f32 :: proc(op: ml.Operation) {
@@ -1559,51 +1580,55 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 
 	work := count * output_size * input_size
 
-	parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
-		input, output := op.input, op.output
-		weight      := op.variant.(ml.Linear).weight
-		output_size := weight.shape[0]
-		input_size  := weight.shape[1]
-		count       := ml.len(input) / input_size
+	if ml.has_gradient(weight) {
+		parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
+			input, output := op.input, op.output
+			weight      := op.variant.(ml.Linear).weight
+			output_size := weight.shape[0]
+			input_size  := weight.shape[1]
+			count       := ml.len(input) / input_size
 
-		input_data_ptr  := ([^]f32)(raw_data(data(input)))
-		output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
-		weight_grad_ptr := ([^]f32)(raw_data(gradient(weight)))
+			input_data_ptr  := ([^]f32)(raw_data(data(input)))
+			output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
+			weight_grad_ptr := ([^]f32)(raw_data(gradient(weight)))
 
-		w_grad := weight_grad_ptr[o * input_size:]
+			w_grad := weight_grad_ptr[o * input_size:]
 
-		for b in 0 ..< count {
-			dout := output_grad_ptr[b * output_size + o]
-			if dout == 0 {
-				continue
+			for b in 0 ..< count {
+				dout := output_grad_ptr[b * output_size + o]
+				if dout == 0 {
+					continue
+				}
+				x := input_data_ptr[b * input_size:]
+				_simd_axpy_f32(w_grad, x, dout, input_size)
 			}
-			x := input_data_ptr[b * input_size:]
-			_simd_axpy_f32(w_grad, x, dout, input_size)
-		}
-	}, work=work)
+		}, work=work)
+	}
 
-	parallelize(count, count, op, proc(b: int, op: ml.Operation) {
-		input, output := op.input, op.output
-		weight      := op.variant.(ml.Linear).weight
-		output_size := weight.shape[0]
-		input_size  := weight.shape[1]
+	if ml.has_gradient(op.input) {
+		parallelize(count, count, op, proc(b: int, op: ml.Operation) {
+			input, output := op.input, op.output
+			weight      := op.variant.(ml.Linear).weight
+			output_size := weight.shape[0]
+			input_size  := weight.shape[1]
 
-		input_grad_ptr  := ([^]f32)(raw_data(gradient(input)))
-		output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
-		weight_data_ptr := ([^]f32)(raw_data(data(weight)))
+			input_grad_ptr  := ([^]f32)(raw_data(gradient(input)))
+			output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
+			weight_data_ptr := ([^]f32)(raw_data(data(weight)))
 
-		dx := input_grad_ptr [b * input_size:]
-		dy := output_grad_ptr[b * output_size:]
+			dx := input_grad_ptr [b * input_size:]
+			dy := output_grad_ptr[b * output_size:]
 
-		for o in 0 ..< output_size {
-			dout := dy[o]
-			if dout == 0 {
-				continue
+			for o in 0 ..< output_size {
+				dout := dy[o]
+				if dout == 0 {
+					continue
+				}
+				w_data := weight_data_ptr[o * input_size:]
+				_simd_axpy_f32(dx, w_data, dout, input_size)
 			}
-			w_data := weight_data_ptr[o * input_size:]
-			_simd_axpy_f32(dx, w_data, dout, input_size)
-		}
-	}, work=work)
+		}, work=work)
+	}
 }
 
 rope_forward :: proc(op: ml.Operation) {
@@ -1709,6 +1734,7 @@ rope_forward_bf16 :: proc(op: ml.Operation) {
 }
 
 rope_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
 	variant           := op.variant.(ml.Rope)
@@ -1848,6 +1874,9 @@ layernorm_backward_f32 :: proc(op: ml.Operation) {
 	size    := input.shape[input.rank - 1]
 	count   := ml.len(input) / size
 
+	have_dx, have_dw := ml.has_gradient(input), ml.has_gradient(weight)
+	if !have_dx && !have_dw { return }
+
 	for c in 0 ..< count {
 		offset := c * size
 
@@ -1866,15 +1895,19 @@ layernorm_backward_f32 :: proc(op: ml.Operation) {
 			norm  := (data(input)[offset + i] - data(mean)[c]) * data(rstd)[c]
 			dnorm := data(weight)[i] * gradient(output)[offset + i]
 
-			gradient(weight)[i] += norm * gradient(output)[offset + i]
+			if have_dw {
+				gradient(weight)[i] += norm * gradient(output)[offset + i]
+			}
 
-			grad: f32
-			grad += dnorm
-			grad -= dnorm_mean
-			grad -= norm * dnorm_norm_mean
-			grad *= data(rstd)[c]
+			if have_dx {
+				grad: f32
+				grad += dnorm
+				grad -= dnorm_mean
+				grad -= norm * dnorm_norm_mean
+				grad *= data(rstd)[c]
 
-			gradient(input)[offset + i] += grad
+				gradient(input)[offset + i] += grad
+			}
 		}
 	}
 }
@@ -1894,6 +1927,9 @@ layernorm_backward_bf16 :: proc(op: ml.Operation) {
 	dx   := gradient(input)
 	dw   := gradient(weight)
 	dy   := gradient(output)
+
+	have_dx, have_dw := ml.has_gradient(input), ml.has_gradient(weight)
+	if !have_dx && !have_dw { return }
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -1918,12 +1954,16 @@ layernorm_backward_bf16 :: proc(op: ml.Operation) {
 			norm  := (x_v - mean_c) * rstd_c
 			dnorm := w_v * dy_v
 
-			dw[i] += norm * dy_v
+			if have_dw {
+				dw[i] += norm * dy_v
+			}
 
-			grad := dnorm - dnorm_mean - norm * dnorm_norm_mean
-			grad *= rstd_c
+			if have_dx {
+				grad := dnorm - dnorm_mean - norm * dnorm_norm_mean
+				grad *= rstd_c
 
-			dx[offset + i] += grad
+				dx[offset + i] += grad
+			}
 		}
 	}
 }
@@ -2163,6 +2203,9 @@ rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 	size    := input.shape[input.rank - 1]
 	count   := ml.len(input) / size
 
+	have_dx, have_dw := ml.has_gradient(input), ml.has_gradient(weight)
+	if !have_dx && !have_dw { return }
+
 	for c in 0 ..< count {
 		offset := c * size
 		rstd_c := data(rstd)[c]
@@ -2182,10 +2225,14 @@ rmsnorm_backward_f32 :: proc(op: ml.Operation) {
 			norm  := x_v * rstd_c
 			dnorm := w_v * dy_v
 
-			gradient(weight)[i] += norm * dy_v
+			if have_dw {
+				gradient(weight)[i] += norm * dy_v
+			}
 
-			grad := (dnorm - norm * dnorm_norm_mean) * rstd_c
-			gradient(input)[offset + i] += grad
+			if have_dx {
+				grad := (dnorm - norm * dnorm_norm_mean) * rstd_c
+				gradient(input)[offset + i] += grad
+			}
 		}
 	}
 }
@@ -2204,6 +2251,9 @@ rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 	dx   := gradient(input)
 	dw   := gradient(weight)
 	dy   := gradient(output)
+
+	have_dx, have_dw := ml.has_gradient(input), ml.has_gradient(weight)
+	if !have_dx && !have_dw { return }
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -2224,10 +2274,14 @@ rmsnorm_backward_bf16 :: proc(op: ml.Operation) {
 			norm  := x_v * rstd_c
 			dnorm := w_v * dy_v
 
-			dw[i] += norm * dy_v
+			if have_dw {
+				dw[i] += norm * dy_v
+			}
 
-			grad := (dnorm - norm * dnorm_norm_mean) * rstd_c
-			dx[offset + i] += grad
+			if have_dx {
+				grad := (dnorm - norm * dnorm_norm_mean) * rstd_c
+				dx[offset + i] += grad
+			}
 		}
 	}
 }
@@ -2285,6 +2339,7 @@ softmax_forward :: proc(op: ml.Operation) {
 }
 
 softmax_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	size  := op.input.shape[op.input.rank - 1]
 	count := ml.len(op.input) / size
 
@@ -2374,6 +2429,7 @@ log_softmax_forward :: proc(op: ml.Operation) {
 }
 
 log_softmax_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 	size  := input.shape[input.rank - 1]
 	count := ml.len(input) / size
@@ -2444,6 +2500,7 @@ entropy_forward :: proc(op: ml.Operation) {
 }
 
 entropy_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	probabilities, output := op.input, op.output
 	size  := probabilities.shape[probabilities.rank - 1]
 	count := ml.len(probabilities) / size
@@ -2497,6 +2554,7 @@ mean_squared_error_forward :: proc(op: ml.Operation) {
 }
 
 mean_squared_error_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	predictions, output := op.input, op.output
 	targets := op.variant.(ml.Mean_Squared_Error).targets
 	count   := ml.len(output)
@@ -2542,6 +2600,7 @@ smooth_l1_forward :: proc(op: ml.Operation) {
 }
 
 smooth_l1_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	predictions, output := op.input, op.output
 	variant     := op.variant.(ml.Smooth_L1)
 	targets     := variant.targets
@@ -2600,6 +2659,7 @@ cross_entropy_forward :: proc(op: ml.Operation) {
 }
 
 cross_entropy_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
 	variant       := op.variant.(ml.Cross_Entropy)
@@ -2643,6 +2703,7 @@ _unary_forward_dispatch :: proc(op: ml.Operation, fwd_f32: proc(x: f32) -> f32) 
 }
 
 _unary_backward_dispatch :: proc(op: ml.Operation, local_grad_from_input: proc(x: f32) -> f32) {
+	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 	#partial switch input.type {
 	case .F32:
@@ -2677,6 +2738,7 @@ relu_forward :: proc(op: ml.Operation) {
 }
 
 relu_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	if op.input.type != .F32 {
 		_unary_backward_dispatch(op, proc(x: f32) -> f32 { return x > 0 ? 1 : 0 })
 		return
@@ -2843,6 +2905,9 @@ batched_matmul_forward_f32 :: proc(op: ml.Operation) {
 		a_row := a_ptr[bi * m * kk_count + i * kk_count:]
 		c_row := c_ptr[bi * m * n + i * n:]
 
+		for j in 0 ..< n {
+			c_row[j] = 0
+		}
 		for kk in 0 ..< kk_count {
 			b_row := b_ptr[bi * kk_count * n + kk * n:]
 			_simd_axpy_f32(c_row, b_row, a_row[kk], n)
@@ -2859,119 +2924,129 @@ batched_matmul_backward :: proc(op: ml.Operation) {
 
 batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 	a           := op.input
+	bt          := op.variant.(ml.Batched_Matmul).b
 	batch_count := a.shape[0]
 	m           := a.shape[1]
 	k           := a.shape[2]
 
-	parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
-		a       := op.input
-		output  := op.output
-		bt      := op.variant.(ml.Batched_Matmul).b
-		m       := a.shape[1]
-		k_count := a.shape[2]
-		n       := bt.shape[2]
+	if ml.has_gradient(a) {
+		parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
+			a       := op.input
+			output  := op.output
+			bt      := op.variant.(ml.Batched_Matmul).b
+			m       := a.shape[1]
+			k_count := a.shape[2]
+			n       := bt.shape[2]
 
-		bi := idx / m
-		i  := idx % m
+			bi := idx / m
+			i  := idx % m
 
-		b_bf := data_bf16(bt)
-		dc   := gradient(output)
-		da   := gradient(a)
+			b_bf := data_bf16(bt)
+			dc   := gradient(output)
+			da   := gradient(a)
 
-		dc_row := dc[bi * m * n + i * n:]
-		da_row := da[bi * m * k_count + i * k_count:]
+			dc_row := dc[bi * m * n + i * n:]
+			da_row := da[bi * m * k_count + i * k_count:]
 
-		for kk in 0 ..< k_count {
-			acc: f32
+			for kk in 0 ..< k_count {
+				acc: f32
+				for j in 0 ..< n {
+					acc += dc_row[j] * ml.bf16_to_f32(b_bf[bi * k_count * n + kk * n + j])
+				}
+				da_row[kk] += acc
+			}
+		})
+	}
+
+	if ml.has_gradient(bt) {
+		parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
+			a       := op.input
+			output  := op.output
+			bt      := op.variant.(ml.Batched_Matmul).b
+			m       := a.shape[1]
+			k_count := a.shape[2]
+			n       := bt.shape[2]
+
+			bi := idx / k_count
+			kk := idx % k_count
+
+			a_bf := data_bf16(a)
+			dc   := gradient(output)
+			db   := gradient(bt)
+
+			db_row := db[bi * k_count * n + kk * n:]
 			for j in 0 ..< n {
-				acc += dc_row[j] * ml.bf16_to_f32(b_bf[bi * k_count * n + kk * n + j])
+				acc: f32
+				for ii in 0 ..< m {
+					acc += ml.bf16_to_f32(a_bf[bi * m * k_count + ii * k_count + kk]) *
+					       dc[bi * m * n + ii * n + j]
+				}
+				db_row[j] += acc
 			}
-			da_row[kk] += acc
-		}
-	})
-
-	parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
-		a       := op.input
-		output  := op.output
-		bt      := op.variant.(ml.Batched_Matmul).b
-		m       := a.shape[1]
-		k_count := a.shape[2]
-		n       := bt.shape[2]
-
-		bi := idx / k_count
-		kk := idx % k_count
-
-		a_bf := data_bf16(a)
-		dc   := gradient(output)
-		db   := gradient(bt)
-
-		db_row := db[bi * k_count * n + kk * n:]
-		for j in 0 ..< n {
-			acc: f32
-			for ii in 0 ..< m {
-				acc += ml.bf16_to_f32(a_bf[bi * m * k_count + ii * k_count + kk]) *
-				       dc[bi * m * n + ii * n + j]
-			}
-			db_row[j] += acc
-		}
-	})
+		})
+	}
 }
 
 batched_matmul_backward_f32 :: proc(op: ml.Operation) {
 	a := op.input
+	bt := op.variant.(ml.Batched_Matmul).b
 	batch_count := a.shape[0]
 	m := a.shape[1]
 	k := a.shape[2]
 
-	parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
-		a       := op.input
-		output  := op.output
-		bt      := op.variant.(ml.Batched_Matmul).b
+	if ml.has_gradient(a) {
+		parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
+			a       := op.input
+			output  := op.output
+			bt      := op.variant.(ml.Batched_Matmul).b
 
-		m        := a.shape[1]
-		kk_count := a.shape[2]
-		n        := bt.shape[2]
+			m        := a.shape[1]
+			kk_count := a.shape[2]
+			n        := bt.shape[2]
 
-		bi := idx / m
-		i  := idx % m
+			bi := idx / m
+			i  := idx % m
 
-		a_grad_ptr := ([^]f32)(raw_data(gradient(a)))
-		b_data_ptr := ([^]f32)(raw_data(data(bt)))
-		c_grad_ptr := ([^]f32)(raw_data(gradient(output)))
+			a_grad_ptr := ([^]f32)(raw_data(gradient(a)))
+			b_data_ptr := ([^]f32)(raw_data(data(bt)))
+			c_grad_ptr := ([^]f32)(raw_data(gradient(output)))
 
-		dc_row := c_grad_ptr[bi * m * n + i * n:]
-		da_row := a_grad_ptr[bi * m * kk_count + i * kk_count:]
+			dc_row := c_grad_ptr[bi * m * n + i * n:]
+			da_row := a_grad_ptr[bi * m * kk_count + i * kk_count:]
 
-		for kk in 0 ..< kk_count {
-			b_row := b_data_ptr[bi * kk_count * n + kk * n:]
-			da_row[kk] += _simd_dot_f32(dc_row, b_row, n)
-		}
-	})
+			for kk in 0 ..< kk_count {
+				b_row := b_data_ptr[bi * kk_count * n + kk * n:]
+				da_row[kk] += _simd_dot_f32(dc_row, b_row, n)
+			}
+		})
+	}
 
-	parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
-		a       := op.input
-		output  := op.output
-		bt      := op.variant.(ml.Batched_Matmul).b
+	if ml.has_gradient(bt) {
+		parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
+			a       := op.input
+			output  := op.output
+			bt      := op.variant.(ml.Batched_Matmul).b
 
-		m        := a.shape[1]
-		kk_count := a.shape[2]
-		n        := bt.shape[2]
+			m        := a.shape[1]
+			kk_count := a.shape[2]
+			n        := bt.shape[2]
 
-		bi := idx / kk_count
-		kk := idx % kk_count
+			bi := idx / kk_count
+			kk := idx % kk_count
 
-		a_data_ptr := ([^]f32)(raw_data(data(a)))
-		b_grad_ptr := ([^]f32)(raw_data(gradient(bt)))
-		c_grad_ptr := ([^]f32)(raw_data(gradient(output)))
+			a_data_ptr := ([^]f32)(raw_data(data(a)))
+			b_grad_ptr := ([^]f32)(raw_data(gradient(bt)))
+			c_grad_ptr := ([^]f32)(raw_data(gradient(output)))
 
-		db_row := b_grad_ptr[bi * kk_count * n + kk * n:]
+			db_row := b_grad_ptr[bi * kk_count * n + kk * n:]
 
-		for ii in 0 ..< m {
-			a_ik   := a_data_ptr[bi * m * kk_count + ii * kk_count + kk]
-			dc_row := c_grad_ptr[bi * m * n + ii * n:]
-			_simd_axpy_f32(db_row, dc_row, a_ik, n)
-		}
-	})
+			for ii in 0 ..< m {
+				a_ik   := a_data_ptr[bi * m * kk_count + ii * kk_count + kk]
+				dc_row := c_grad_ptr[bi * m * n + ii * n:]
+				_simd_axpy_f32(db_row, dc_row, a_ik, n)
+			}
+		})
+	}
 }
 
 permute_forward :: proc(op: ml.Operation) {
@@ -3022,6 +3097,7 @@ permute_forward :: proc(op: ml.Operation) {
 }
 
 permute_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input   := op.input
 	output  := op.output
 	axes    := op.variant.(ml.Permute).axes
@@ -3092,6 +3168,7 @@ causal_mask_forward :: proc(op: ml.Operation) {
 }
 
 causal_mask_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
 	input  := op.input
 	output := op.output
 
@@ -3296,6 +3373,10 @@ attention_backward_f32 :: proc(op: ml.Operation) {
 		sm_ptr    := ([^]f32)(raw_data(data(v.softmax_outputs)))
 		dp_ptr    := ([^]f32)(raw_data(data(v.d_p_scratch)))
 
+		have_dq := ml.has_gradient(op.input)
+		have_dk := ml.has_gradient(v.key)
+		have_dv := ml.has_gradient(v.value)
+
 		for q_h_off in 0 ..< group_size {
 			h := kv_h * group_size + q_h_off
 
@@ -3317,7 +3398,7 @@ attention_backward_f32 :: proc(op: ml.Operation) {
 				for t_k in t_k_min ..< t_k_max {
 					v_offset := t_k * kv_size + kv_h * head_size
 					d_p[t_k] = _simd_dot_f32(d_out, v_data[v_offset:], head_size)
-					_simd_axpy_f32(v_grad[v_offset:], d_out, sm_row[t_k], head_size)
+					if have_dv { _simd_axpy_f32(v_grad[v_offset:], d_out, sm_row[t_k], head_size) }
 				}
 
 				dot_dp_p: f32
@@ -3334,8 +3415,8 @@ attention_backward_f32 :: proc(op: ml.Operation) {
 
 				for t_k in t_k_min ..< t_k_max {
 					k_offset := t_k * kv_size + kv_h * head_size
-					_simd_axpy_f32(d_q_vec, k_data[k_offset:], d_p[t_k], head_size)
-					_simd_axpy_f32(k_grad[k_offset:], q_vec,   d_p[t_k], head_size)
+					if have_dq { _simd_axpy_f32(d_q_vec, k_data[k_offset:], d_p[t_k], head_size) }
+					if have_dk { _simd_axpy_f32(k_grad[k_offset:], q_vec,   d_p[t_k], head_size) }
 				}
 			}
 		}
@@ -3367,6 +3448,10 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 		sm_ptr   := ([^]f32)(raw_data(data(v.softmax_outputs)))
 		dp_ptr   := ([^]f32)(raw_data(data(v.d_p_scratch)))
 
+		have_dq := ml.has_gradient(op.input)
+		have_dk := ml.has_gradient(v.key)
+		have_dv := ml.has_gradient(v.value)
+
 		for q_h_off in 0 ..< group_size {
 			h := kv_h * group_size + q_h_off
 
@@ -3391,9 +3476,11 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 					}
 					d_p[t_k] = dot
 
-					p_val := sm_row[t_k]
-					for d in 0 ..< head_size {
-						v_grad[v_offset + d] += out_grad[d_out_offset + d] * p_val
+					if have_dv {
+						p_val := sm_row[t_k]
+						for d in 0 ..< head_size {
+							v_grad[v_offset + d] += out_grad[d_out_offset + d] * p_val
+						}
 					}
 				}
 
@@ -3413,8 +3500,8 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 					for d in 0 ..< head_size {
 						q_d := ml.bf16_to_f32(q_data[q_offset + d])
 						k_d := ml.bf16_to_f32(k_data[k_offset + d])
-						q_grad[q_offset + d] += scale * k_d
-						k_grad[k_offset + d] += scale * q_d
+						if have_dq { q_grad[q_offset + d] += scale * k_d }
+						if have_dk { k_grad[k_offset + d] += scale * q_d }
 					}
 				}
 			}

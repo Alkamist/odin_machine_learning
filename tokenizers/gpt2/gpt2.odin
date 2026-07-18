@@ -125,7 +125,7 @@ destroy :: proc(tok: Tokenizer) {
 }
 
 @(require_results)
-encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) -> []int {
+encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) -> (result: []int, ok: bool) #optional_ok {
 	pretokens: [dynamic]string
 	pretokens.allocator = context.temp_allocator
 	_pretokenize(text, &pretokens)
@@ -170,13 +170,13 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) ->
 			id, present := tok.vocab[symbol]
 			if !present {
 				log.errorf("symbol %q not in vocab (pretoken=%q)", symbol, pretoken)
-				return ids[:]
+				return ids[:], false
 			}
 			append(&ids, id)
 		}
 	}
 
-	return ids[:]
+	return ids[:], true
 }
 
 @(require_results)

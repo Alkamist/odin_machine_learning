@@ -275,13 +275,15 @@ tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 scalar :: proc(type: Data_Type, value: f32, loc := #caller_location) -> (t: Tensor) {
 	shape := [1]int{1}
 	t = zeros(type, shape[:], loc=loc)
-	#partial switch type {
+	switch type {
 	case .F32:
 		src := [1]f32{value}
 		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src[:]), loc)
 	case .Bf16:
 		src := [1]Bf16{bf16_from_f32(value)}
 		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src[:]), loc)
+	case .Q4_K, .Q6_K:
+		fmt.panicf("scalar does not support dtype %v", type, loc=loc)
 	}
 	return
 }
@@ -343,7 +345,8 @@ destroy :: proc(t: Tensor, loc := #caller_location) {
 }
 
 copy :: proc(dst, src: Tensor, loc := #caller_location) {
-	assert(len(dst) == len(src), "Tensor lengths must be equal", loc=loc)
+	assert(dst.type == src.type, "Tensor types must be equal", loc=loc)
+	assert(dst.rank == src.rank && dst.shape == src.shape, "Tensor shapes must be equal", loc=loc)
 	assert(dst.backend == src.backend, "Tensor copy across backends not supported", loc=loc)
 	for kind in Buffer_Kind {
 		dst.backend.buffer_copy(dst.buffers[kind], src.buffers[kind], loc)
@@ -384,6 +387,11 @@ set_data_bytes :: proc(t: Tensor, src: []byte, loc := #caller_location) {
 @(require_results)
 has_buffer :: #force_inline proc(t: Tensor, kind: Buffer_Kind) -> bool {
 	return t.buffers[kind] != Backend_Buffer{}
+}
+
+@(require_results)
+has_gradient :: #force_inline proc(t: Tensor) -> bool {
+	return t.buffers[.Gradient] != Backend_Buffer{}
 }
 
 @(require_results)
@@ -436,7 +444,7 @@ fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	n := len(t)
-	#partial switch t.type {
+	switch t.type {
 	case .F32:
 		buf := builtin.make([]f32, n, allocator=context.temp_allocator)
 		for i in 0 ..< n {
@@ -449,6 +457,8 @@ fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
 			buf[i] = bf16_from_f32(rand.float32_normal(mean, std))
 		}
 		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
+	case .Q4_K, .Q6_K:
+		fmt.panicf("fill_normal does not support dtype %v", t.type, loc=loc)
 	}
 }
 
@@ -456,7 +466,7 @@ fill_value :: proc(t: Tensor, value: f32, loc := #caller_location) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	n := len(t)
-	#partial switch t.type {
+	switch t.type {
 	case .F32:
 		buf := builtin.make([]f32, n, allocator=context.temp_allocator)
 		for i in 0 ..< n {
@@ -470,6 +480,8 @@ fill_value :: proc(t: Tensor, value: f32, loc := #caller_location) {
 			buf[i] = value_bf
 		}
 		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(buf), loc)
+	case .Q4_K, .Q6_K:
+		fmt.panicf("fill_value does not support dtype %v", t.type, loc=loc)
 	}
 }
 
@@ -1220,6 +1232,7 @@ Clamp :: struct {
 
 @(require_results)
 clamp :: proc(input: Tensor, min_val, max_val: f32, loc := #caller_location) -> (output: Tensor) {
+	assert(input.type == .F32, "clamp is F32-only", loc=loc)
 	assert(min_val <= max_val, "Requires min_val <= max_val", loc=loc)
 
 	output = zeros_like(input, loc=loc)
@@ -1243,6 +1256,7 @@ Min :: struct {
 
 @(require_results)
 min :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(a.type == .F32 && b.type == .F32, "min is F32-only", loc=loc)
 	_assert_same_shape(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
@@ -1265,6 +1279,7 @@ Max :: struct {
 
 @(require_results)
 max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(a.type == .F32 && b.type == .F32, "max is F32-only", loc=loc)
 	_assert_same_shape(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
@@ -1473,7 +1488,7 @@ linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 	assert(input.rank >= 1, "linear_q4_k input must have rank >= 1", loc=loc)
 	assert(weight.rank == 2, "linear_q4_k weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 	assert(weight.type == .Q4_K, "linear_q4_k weight must be Q4_K", loc=loc)
-	assert(input.type == .Bf16 || input.type == .F32, "linear_q4_k input must be Bf16 or F32", loc=loc)
+	assert(input.type == .Bf16, "linear_q4_k input must be Bf16", loc=loc)
 
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
@@ -1543,7 +1558,7 @@ linear_q6_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: 
 	assert(input.rank  >= 1, "linear_q6_k input must have rank >= 1", loc=loc)
 	assert(weight.rank == 2, "linear_q6_k weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 	assert(weight.type == .Q6_K, "linear_q6_k weight must be Q6_K", loc=loc)
-	assert(input.type == .Bf16 || input.type == .F32, "linear_q6_k input must be Bf16 or F32", loc=loc)
+	assert(input.type == .Bf16, "linear_q6_k input must be Bf16", loc=loc)
 
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
@@ -1872,6 +1887,7 @@ Mean_Squared_Error :: struct {
 
 @(require_results)
 mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(predictions.type == .F32 && targets.type == .F32, "mean_squared_error is F32-only", loc=loc)
 	assert(len(predictions) == len(targets), "Predictions and targets must have same length", loc=loc)
 
 	output = _zeros_drop_last(predictions, loc=loc)
@@ -1895,6 +1911,7 @@ Smooth_L1 :: struct {
 
 @(require_results)
 smooth_l1 :: proc(predictions, targets: Tensor, beta: f32 = 1.0, loc := #caller_location) -> (output: Tensor) {
+	assert(predictions.type == .F32 && targets.type == .F32, "smooth_l1 is F32-only", loc=loc)
 	assert(len(predictions) == len(targets), "Predictions and targets must have same length", loc=loc)
 	assert(beta > 0, "smooth_l1 beta must be positive", loc=loc)
 
@@ -1922,6 +1939,7 @@ Cross_Entropy :: struct {
 @(require_results)
 cross_entropy :: proc(input: Tensor, targets: []int, loc := #caller_location) -> (output: Tensor) {
 	sample_count := builtin.len(targets)
+	assert(input.type == .F32, "cross_entropy is F32-only", loc=loc)
 	assert(sample_count > 0, "Must have at least one target", loc=loc)
 	assert(input.rank >= 1, "cross_entropy input must have rank >= 1", loc=loc)
 	assert(_leading_count(input) == sample_count, "Input leading-dim product must equal number of targets", loc=loc)

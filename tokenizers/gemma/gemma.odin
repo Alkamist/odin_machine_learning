@@ -151,10 +151,11 @@ destroy :: proc(tok: Tokenizer) {
 }
 
 @(require_results)
-encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) -> []int {
+encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) -> (result: []int, ok: bool) #optional_ok {
 	ids: [dynamic]int
 	ids.allocator = allocator
 
+	ok = true
 	cursor := 0
 	for cursor < len(text) {
 		match_content: string
@@ -186,16 +187,18 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) ->
 				next_special = cursor + idx
 			}
 		}
-		_encode_text_segment(tok, text[cursor:next_special], &ids)
+		if !_encode_text_segment(tok, text[cursor:next_special], &ids) {
+			ok = false
+		}
 		cursor = next_special
 	}
 
-	return ids[:]
+	return ids[:], ok
 }
 
-_encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) {
+_encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) -> bool {
 	if len(text) == 0 {
-		return
+		return true
 	}
 
 	normalized, _ := strings.replace_all(text, " ", WHITESPACE_PIECE, context.temp_allocator)
@@ -221,7 +224,7 @@ _encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) 
 					append(&symbols, strings.clone(byte_token, context.temp_allocator))
 				} else {
 					log.errorf("byte 0x%02X has no fallback token in vocab", normalized[offset + k])
-					return
+					return false
 				}
 			}
 		}
@@ -234,10 +237,11 @@ _encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) 
 		id, present := tok.vocab[symbol]
 		if !present {
 			log.errorf("symbol %q not in vocab", symbol)
-			return
+			return false
 		}
 		append(ids, id)
 	}
+	return true
 }
 
 @(require_results)

@@ -6,6 +6,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 
 import "bindings/cuda"
 import "bindings/nvrtc"
@@ -76,10 +77,16 @@ _compile_pipeline :: proc(
 	extra_options: []cstring = nil,
 	loc                     := #caller_location,
 ) -> ^Pipeline {
-	key := string(source_name)
-	if cached, ok := _gpu.pipeline_cache[key]; ok {
+	key := _pipeline_cache_key(source_name, extra_options)
+
+	sync.lock(&_gpu_mutex)
+	cached, cache_hit := _gpu.pipeline_cache[key]
+	sync.unlock(&_gpu_mutex)
+	if cache_hit {
 		return cached
 	}
+
+	_bind_thread_ctx(loc)
 
 	src_cstr := _src_to_temp_cstring(src)
 
@@ -123,9 +130,29 @@ _compile_pipeline :: proc(
 	cuda.check(cuda.ModuleGetFunction(&pipeline.function, pipeline.module, entry), loc=loc)
 	pipeline.name = builtin.string(entry)
 
-	_gpu.pipeline_cache[key] = pipeline
+	sync.lock(&_gpu_mutex)
+	if existing, exists := _gpu.pipeline_cache[key]; exists {
+		sync.unlock(&_gpu_mutex)
+		_destroy_pipeline(pipeline)
+		return existing
+	}
+	_gpu.pipeline_cache[strings.clone(key)] = pipeline
+	sync.unlock(&_gpu_mutex)
 
 	return pipeline
+}
+
+@(require_results)
+_pipeline_cache_key :: proc(source_name: cstring, extra_options: []cstring) -> string {
+	if builtin.len(extra_options) == 0 {
+		return string(source_name)
+	}
+	parts := builtin.make([dynamic]string, 0, 1 + builtin.len(extra_options), context.temp_allocator)
+	builtin.append(&parts, string(source_name))
+	for option in extra_options {
+		builtin.append(&parts, string(option))
+	}
+	return strings.join(parts[:], "|", context.temp_allocator)
 }
 
 _destroy_pipeline :: proc(p: ^Pipeline) {
@@ -162,6 +189,9 @@ _dispatch :: proc(
 	kernel_args:               []rawptr,
 	loc                        := #caller_location,
 ) {
+	fmt.assertf(grid_y <= MAX_GRID_DIM_YZ && grid_z <= MAX_GRID_DIM_YZ,
+		"grid y/z (%v, %v) exceed the CUDA launch limit %v", grid_y, grid_z, MAX_GRID_DIM_YZ, loc=loc)
+
 	gctx := _gctx(loc)
 
 	if gctx.timing_enabled {

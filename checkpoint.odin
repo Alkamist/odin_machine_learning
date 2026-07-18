@@ -54,6 +54,9 @@ checkpoint_save :: proc(path: string, params: []Parameter, opt: ^Optimizer, meta
 		full_metadata[key] = value
 	}
 	full_metadata["ml.checkpoint_version"] = CHECKPOINT_VERSION
+	if opt != nil {
+		full_metadata["ml.optimizer_iteration"] = fmt.tprintf("%v", opt.iteration)
+	}
 
 	return st.save(path, entries[:], full_metadata, loc=loc)
 }
@@ -125,6 +128,10 @@ checkpoint_load :: proc(path: string, params: []Parameter, opt: ^Optimizer, loc 
 				tensor.backend.buffer_set(state.v, v_bytes, loc)
 			}
 		}
+	}
+
+	if opt != nil {
+		opt.iteration = checkpoint_metadata_u64(loader.metadata, "ml.optimizer_iteration", fallback=opt.iteration)
 	}
 
 	metadata = builtin.make(map[string]string)

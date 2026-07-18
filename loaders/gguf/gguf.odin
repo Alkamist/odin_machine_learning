@@ -175,14 +175,18 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		}
 
 		shape := make([]int, n_dims)
+		element_count := 1
+		max_element_count := len(file_bytes) * 4
 		for i in 0 ..< int(n_dims) {
 			d, d_ok := _read_u64(&r)
-			if !d_ok {
+			if !d_ok || d == 0 || d > u64(max_element_count) || element_count > max_element_count / int(d) {
+				log.errorf("%v: tensor %q has invalid dimensions", path, name, location=loc)
 				delete(shape)
 				_destroy_partial(file_bytes, kv, tensors)
 				return {}, false
 			}
 			shape[i] = int(d)
+			element_count *= int(d)
 		}
 
 		ty_raw, ty_raw_ok := _read_u32(&r)
@@ -193,15 +197,17 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 			return {}, false
 		}
 
-		element_count := 1
-		for d in shape {
-			element_count *= d
-		}
-
 		ty := Tensor_Type(ty_raw)
 		bc, bc_ok := _byte_count(ty, element_count)
 		if !bc_ok {
 			log.errorf("tensor %q has unsupported type id %v", name, ty_raw, location=loc)
+			delete(shape)
+			_destroy_partial(file_bytes, kv, tensors)
+			return {}, false
+		}
+
+		if name in tensors {
+			log.errorf("%v: duplicate tensor name %q", path, name, location=loc)
 			delete(shape)
 			_destroy_partial(file_bytes, kv, tensors)
 			return {}, false
@@ -439,11 +445,14 @@ _skip_scalar_payload :: proc(r: ^Reader, ty: Value_Type) -> bool {
 		if !n_ok {
 			return false
 		}
+		if n > u64(len(r.bytes) - r.offset) {
+			return false
+		}
 		bytes_to_skip = int(n)
 	case:
 		return false
 	}
-	if r.offset + bytes_to_skip > len(r.bytes) {
+	if bytes_to_skip < 0 || r.offset + bytes_to_skip > len(r.bytes) {
 		return false
 	}
 	r.offset += bytes_to_skip
@@ -452,46 +461,42 @@ _skip_scalar_payload :: proc(r: ^Reader, ty: Value_Type) -> bool {
 
 @(require_results)
 _skip_array_payload :: proc(r: ^Reader, elem_type: Value_Type, count: int) -> bool {
+	if count < 0 {
+		return false
+	}
+	remaining := len(r.bytes) - r.offset
+
+	skip_fixed :: proc(r: ^Reader, count, elem_size, remaining: int) -> bool {
+		if count > remaining / elem_size {
+			return false
+		}
+		r.offset += count * elem_size
+		return true
+	}
+
 	#partial switch elem_type {
 	case .U8, .I8, .Bool:
-		need := count
-		if r.offset + need > len(r.bytes) {
-			return false
-		}
-		r.offset += need
+		return skip_fixed(r, count, 1, remaining)
 	case .U16, .I16:
-		need := count * 2
-		if r.offset + need > len(r.bytes) {
-			return false
-		}
-		r.offset += need
+		return skip_fixed(r, count, 2, remaining)
 	case .U32, .I32, .F32:
-		need := count * 4
-		if r.offset + need > len(r.bytes) {
-			return false
-		}
-		r.offset += need
+		return skip_fixed(r, count, 4, remaining)
 	case .U64, .I64, .F64:
-		need := count * 8
-		if r.offset + need > len(r.bytes) {
-			return false
-		}
-		r.offset += need
+		return skip_fixed(r, count, 8, remaining)
 	case .String:
 		for _ in 0 ..< count {
 			n, n_ok := _read_u64(r)
 			if !n_ok {
 				return false
 			}
-			if r.offset + int(n) > len(r.bytes) {
+			if n > u64(len(r.bytes) - r.offset) {
 				return false
 			}
 			r.offset += int(n)
 		}
-	case:
-		return false
+		return true
 	}
-	return true
+	return false
 }
 
 @(require_results)

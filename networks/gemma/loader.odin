@@ -11,7 +11,7 @@ import    "../../loaders/safetensors"
 import    "../../loaders/weights"
 
 @(require_results)
-load_safetensors :: proc(model: Gemma, path: string) -> bool {
+load_safetensors :: proc(model: ^Gemma, path: string) -> bool {
 	loader, load_ok := safetensors.load(path)
 	if !load_ok {
 		return false
@@ -21,17 +21,16 @@ load_safetensors :: proc(model: Gemma, path: string) -> bool {
 	source := weights.from_safetensors(&loader)
 	cfg    := model.config
 
-	embed_tokens := model.embed_tokens_weight
-	output_norm  := model.output_norm_weight
-	per_layer_projection := model.per_layer_model_projection_weight
-	per_layer_norm       := model.per_layer_projection_norm_weight
-	ok := weights.write_tensor(&embed_tokens, source, "model.language_model.embed_tokens.weight") &&
-	      weights.write_tensor(&output_norm,  source, "model.language_model.norm.weight") &&
-	      _load_per_layer_embedding_host(loader, model) &&
-	      weights.write_tensor(&per_layer_projection, source, "model.language_model.per_layer_model_projection.weight") &&
-	      weights.write_tensor(&per_layer_norm,       source, "model.language_model.per_layer_projection_norm.weight")
+	ok := weights.write_tensor(&model.embed_tokens_weight, source, "model.language_model.embed_tokens.weight") &&
+	      weights.write_tensor(&model.output_norm_weight,  source, "model.language_model.norm.weight") &&
+	      _load_per_layer_embedding_host(loader, model^) &&
+	      weights.write_tensor(&model.per_layer_model_projection_weight, source, "model.language_model.per_layer_model_projection.weight") &&
+	      weights.write_tensor(&model.per_layer_projection_norm_weight,  source, "model.language_model.per_layer_projection_norm.weight")
 	if !ok {
 		return false
+	}
+	if cfg.tie_word_embeddings {
+		model.lm_head_weight = model.embed_tokens_weight
 	}
 
 	for &layer, layer_idx in model.layers {
@@ -67,8 +66,7 @@ load_safetensors :: proc(model: Gemma, path: string) -> bool {
 	}
 
 	if !cfg.tie_word_embeddings {
-		lm_head := model.lm_head_weight
-		if !weights.write_tensor(&lm_head, source, "lm_head.weight") {
+		if !weights.write_tensor(&model.lm_head_weight, source, "lm_head.weight") {
 			return false
 		}
 	}

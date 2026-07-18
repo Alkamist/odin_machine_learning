@@ -78,11 +78,15 @@ _emit_quantize_q8_1 :: proc(gctx: ^Context, xp: cuda.DevicePtr, input_size: int,
 
 _emit_position_upload :: proc(gctx: ^Context, value: int, loc: runtime.Source_Code_Location) {
 	if gctx.position_written_this_forward {
+		fmt.assertf(value == gctx.position_value_this_forward,
+			"conflicting positions in one forward pass: %v after %v (position_dev is shared per forward)",
+			value, gctx.position_value_this_forward, loc=loc)
 		return
 	}
 	(^i32)(gctx.position_pinned)^ = i32(value)
 	cuda.check(cuda.MemcpyHtoDAsync(gctx.position_dev, gctx.position_pinned, 4, gctx.stream), loc=loc)
 	gctx.position_written_this_forward = true
+	gctx.position_value_this_forward   = value
 }
 
 _ensure_shift_scratch :: proc(gctx: ^Context, byte_count: u64, loc: runtime.Source_Code_Location) {
@@ -157,6 +161,8 @@ _backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 _cast_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
+
+	if gradient(x).ptr == 0 { return }
 
 	// With F32 grads, cast backward is dx += dy in f32 regardless of the
 	// forward cast direction. The data-side conversion has no effect on
@@ -573,38 +579,46 @@ _add_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	b      := op.variant.(ml.Add).b
 	stride := ml.len(a) / ml.len(b)
 
+	dyp := gradient(output).ptr
+	dap := gradient(a).ptr
+	dbp := gradient(b).ptr
+
 	#partial switch a.type {
 	case .F32:
-		_add_back_a_pipeline := _compile_pipeline(ADD_BACK_A_SRC, "add_back_a.cu", "add_back_a_f32")
-		dyp := gradient(output).ptr; dap := gradient(a).ptr
-		n := i32(ml.len(a))
-		args_a := [?]rawptr{&dyp, &dap, &n}
-		grid_a := _div_up(ml.len(a), ADD_LOCAL_SIZE)
-		_dispatch(_add_back_a_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
+		if dap != 0 {
+			_add_back_a_pipeline := _compile_pipeline(ADD_BACK_A_SRC, "add_back_a.cu", "add_back_a_f32")
+			n := i32(ml.len(a))
+			args_a := [?]rawptr{&dyp, &dap, &n}
+			grid_a := _div_up(ml.len(a), ADD_LOCAL_SIZE)
+			_dispatch(_add_back_a_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
+		}
 
-		_add_back_b_pipeline := _compile_pipeline(ADD_BACK_B_SRC, "add_back_b.cu", "add_back_b_f32")
-		dbp := gradient(b).ptr
-		n_b := i32(ml.len(b)); st := i32(stride)
-		args_b := [?]rawptr{&dyp, &dbp, &n_b, &st}
-		grid_b := _div_up(ml.len(b), ADD_LOCAL_SIZE)
-		_dispatch(_add_back_b_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
+		if dbp != 0 {
+			_add_back_b_pipeline := _compile_pipeline(ADD_BACK_B_SRC, "add_back_b.cu", "add_back_b_f32")
+			n_b := i32(ml.len(b)); st := i32(stride)
+			args_b := [?]rawptr{&dyp, &dbp, &n_b, &st}
+			grid_b := _div_up(ml.len(b), ADD_LOCAL_SIZE)
+			_dispatch(_add_back_b_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
+		}
 
 	case .Bf16:
-		_add_back_a_bf16_pipeline := _compile_pipeline(ADD_BACK_A_BF16_SRC, "add_back_a_bf16.cu", "add_back_a_bf16")
-		dyp := gradient(output).ptr; dap := gradient(a).ptr
-		a_pairs := (ml.len(a) + 1) / 2
-		n := i32(ml.len(a)); pc := i32(a_pairs)
-		args_a := [?]rawptr{&dyp, &dap, &n, &pc}
-		grid_a := _div_up(a_pairs, ADD_LOCAL_SIZE)
-		_dispatch(_add_back_a_bf16_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
+		if dap != 0 {
+			_add_back_a_bf16_pipeline := _compile_pipeline(ADD_BACK_A_BF16_SRC, "add_back_a_bf16.cu", "add_back_a_bf16")
+			a_pairs := (ml.len(a) + 1) / 2
+			n := i32(ml.len(a)); pc := i32(a_pairs)
+			args_a := [?]rawptr{&dyp, &dap, &n, &pc}
+			grid_a := _div_up(a_pairs, ADD_LOCAL_SIZE)
+			_dispatch(_add_back_a_bf16_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
+		}
 
-		_add_back_b_bf16_pipeline := _compile_pipeline(ADD_BACK_B_BF16_SRC, "add_back_b_bf16.cu", "add_back_b_bf16")
-		dbp := gradient(b).ptr
-		b_pairs := (ml.len(b) + 1) / 2
-		n_b := i32(ml.len(b)); st := i32(stride); pcb := i32(b_pairs)
-		args_b := [?]rawptr{&dyp, &dbp, &n_b, &st, &pcb}
-		grid_b := _div_up(b_pairs, ADD_LOCAL_SIZE)
-		_dispatch(_add_back_b_bf16_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
+		if dbp != 0 {
+			_add_back_b_bf16_pipeline := _compile_pipeline(ADD_BACK_B_BF16_SRC, "add_back_b_bf16.cu", "add_back_b_bf16")
+			b_pairs := (ml.len(b) + 1) / 2
+			n_b := i32(ml.len(b)); st := i32(stride); pcb := i32(b_pairs)
+			args_b := [?]rawptr{&dyp, &dbp, &n_b, &st, &pcb}
+			grid_b := _div_up(b_pairs, ADD_LOCAL_SIZE)
+			_dispatch(_add_back_b_bf16_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
+		}
 
 	case:
 		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
@@ -702,6 +716,8 @@ _exp_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
 
+	if gradient(x).ptr == 0 { return }
+
 	yp  := data(y).ptr
 	dyp := gradient(y).ptr
 	dxp := gradient(x).ptr
@@ -740,6 +756,8 @@ _clamp_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	y := op.output
 	v := op.variant.(ml.Clamp)
 	lo := v.min_val; hi := v.max_val
+
+	if gradient(x).ptr == 0 { return }
 
 	xp  := data(x).ptr
 	dyp := gradient(y).ptr
@@ -830,6 +848,8 @@ _softmax_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	cols := x.shape[x.rank - 1]
 	rows := ml.len(x) / cols
 
+	if gradient(x).ptr == 0 { return }
+
 	yp := data(y).ptr; dyp := gradient(y).ptr; dxp := gradient(x).ptr
 	rr := i32(rows); cc := i32(cols)
 	args := [?]rawptr{&yp, &dyp, &dxp, &rr, &cc}
@@ -866,6 +886,8 @@ _entropy_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	h := op.output
 	cols := p.shape[p.rank - 1]
 	rows := ml.len(p) / cols
+
+	if gradient(p).ptr == 0 { return }
 
 	pp := data(p).ptr; dyp := gradient(h).ptr; dpp := gradient(p).ptr
 	rr := i32(rows); cc := i32(cols)
@@ -1376,11 +1398,11 @@ _upload_indices :: proc(gctx: ^Context, indices: []int, loc: runtime.Source_Code
 	bytes := uint(builtin.len(indices) * size_of(u32))
 	dev_ptr := _activation_alloc(gctx, u64(bytes), loc)
 
-	host := builtin.make([]u32, builtin.len(indices), context.temp_allocator)
+	host := ([^]u32)(_pinned_staging_take(gctx, u64(bytes), loc))
 	for v, i in indices {
 		host[i] = u32(v)
 	}
-	cuda.check(cuda.MemcpyHtoDAsync(dev_ptr, raw_data(host), bytes, gctx.stream), loc=loc)
+	cuda.check(cuda.MemcpyHtoDAsync(dev_ptr, host, bytes, gctx.stream), loc=loc)
 	return dev_ptr
 }
 
@@ -1490,6 +1512,8 @@ _gelu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
 
+	if gradient(x).ptr == 0 { return }
+
 	xp  := data(x).ptr
 	dyp := gradient(y).ptr
 	dxp := gradient(x).ptr
@@ -1511,6 +1535,8 @@ _gelu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 _tanh_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
+
+	if gradient(x).ptr == 0 { return }
 
 	yp  := data(y).ptr
 	dyp := gradient(y).ptr
@@ -1540,6 +1566,8 @@ _slice_trailing_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	leading      := ml.len(x) / trailing
 	total        := leading * new_trailing
 
+	if gradient(x).ptr == 0 { return }
+
 	dyp := gradient(y).ptr
 	dxp := gradient(x).ptr
 	ld := i32(leading); tr := i32(trailing); nt := i32(new_trailing); st := i32(v.start)
@@ -1561,6 +1589,8 @@ _slice_trailing_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 _silu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
+
+	if gradient(x).ptr == 0 { return }
 
 	xp  := data(x).ptr
 	dyp := gradient(y).ptr
@@ -1605,6 +1635,8 @@ _cross_entropy_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 	x := op.input
 	y := op.output
 	v := op.variant.(ml.Cross_Entropy)
+
+	if gradient(x).ptr == 0 { return }
 
 	_cross_entropy_back_f32_pipeline := _compile_pipeline(CROSS_ENTROPY_BACK_F32_SRC, "cross_entropy_back_f32.cu", "cross_entropy_back_f32")
 
@@ -1720,6 +1752,8 @@ _rmsnorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	dwp    := gradient(v.weight).ptr
 	c      := i32(count); s := i32(size)
 
+	if dxp == 0 && dwp == 0 { return }
+
 	args := [?]rawptr{&xp, &wp, &rstd_p, &dyp, &dxp, &dwp, &c, &s}
 
 	#partial switch x.type {
@@ -1739,6 +1773,8 @@ _rope_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	x := op.input
 	y := op.output
 	v := op.variant.(ml.Rope)
+
+	if gradient(x).ptr == 0 { return }
 
 	gctx := _gctx(loc)
 	_emit_position_upload(gctx, v.position_offset, loc)
@@ -1787,6 +1823,9 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 	dqp := gradient(q).ptr
 	dkp := gradient(k).ptr
 	dvp := gradient(val).ptr
+
+	if dqp == 0 && dkp == 0 && dvp == 0 { return }
+	fmt.assertf(dqp != 0 && dkp != 0 && dvp != 0, "attention backward requires dq, dk, and dv gradient buffers (partial-null unsupported)", loc=loc)
 
 	n_q_heads  := i32(v.n_q_heads)
 	n_kv_heads := i32(v.n_kv_heads)

@@ -78,7 +78,7 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 	model := llama.make(llama.SMOLLM2_135M_CONFIG, dtype = .Bf16)
 
 	log.infof("loading weights from %v", path)
-	load_ok := llama.load_safetensors(model, path)
+	load_ok := llama.load_safetensors(&model, path)
 	if !load_ok {
 		log.errorf("could not load weights from %v", path)
 		llama.destroy(model)

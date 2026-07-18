@@ -56,6 +56,8 @@ Llama :: struct {
 }
 
 make :: proc(config: Config, dtype: ml.Data_Type = .F32, allocator := context.allocator) -> (model: Llama) {
+	context.allocator = allocator
+
 	q_size  := config.n_q_heads  * config.head_size
 	kv_size := config.n_kv_heads * config.head_size
 

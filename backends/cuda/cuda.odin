@@ -27,7 +27,8 @@ Gpu_Device :: struct {
 	name_buf: [128]u8,
 	name_len: int,
 
-	refcount: int,
+	refcount:   int,
+	generation: u64,
 
 	pipeline_cache: map[string]^Pipeline,
 }
@@ -65,9 +66,38 @@ Context :: struct {
 	position_pinned:                rawptr,
 	position_dev:                   cuda.DevicePtr,
 	position_written_this_forward:  bool,
+	position_value_this_forward:    int,
 
 	shift_scratch_dev:  cuda.DevicePtr,
 	shift_scratch_size: u64,
+
+	pinned_staging: [dynamic]Pinned_Staging_Block,
+}
+
+Pinned_Staging_Block :: struct {
+	ptr:    rawptr,
+	size:   u64,
+	in_use: bool,
+}
+
+@(require_results)
+_pinned_staging_take :: proc(gctx: ^Context, byte_count: u64, loc: runtime.Source_Code_Location) -> rawptr {
+	for &block in gctx.pinned_staging {
+		if !block.in_use && block.size >= byte_count {
+			block.in_use = true
+			return block.ptr
+		}
+	}
+	ptr: rawptr
+	cuda.check(cuda.MemAllocHost(&ptr, uint(byte_count)), loc=loc)
+	builtin.append(&gctx.pinned_staging, Pinned_Staging_Block{ptr=ptr, size=byte_count, in_use=true})
+	return ptr
+}
+
+_pinned_staging_release_all :: proc(gctx: ^Context) {
+	for &block in gctx.pinned_staging {
+		block.in_use = false
+	}
 }
 
 _activation_pool_ops :: proc(gctx: ^Context) -> pool.Ops(cuda.DevicePtr) {
@@ -98,8 +128,19 @@ Timing_Slot :: struct {
 _gpu:       Gpu_Device
 _gpu_mutex: sync.Mutex
 
+@(thread_local) _thread_ctx_generation: u64
+
+_bind_thread_ctx :: #force_inline proc(loc := #caller_location) {
+	generation := sync.atomic_load(&_gpu.generation)
+	if _thread_ctx_generation != generation {
+		cuda.check(cuda.CtxSetCurrent(_gpu.ctx), loc=loc)
+		_thread_ctx_generation = generation
+	}
+}
+
 @(require_results)
 _gctx :: #force_inline proc(loc := #caller_location) -> ^Context {
+	_bind_thread_ctx(loc)
 	return cast(^Context)ml.current_context(loc=loc)
 }
 
@@ -140,6 +181,7 @@ _device_init_locked :: proc(loc := #caller_location) {
 	cuda.check(cuda.DeviceGetAttribute(&_gpu.max_smem_optin,     .MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, _gpu.dev))
 
 	cuda.check(cuda.DevicePrimaryCtxRetain(&_gpu.ctx, _gpu.dev))
+	sync.atomic_add(&_gpu.generation, 1)
 
 	_gpu.pipeline_cache = builtin.make(map[string]^Pipeline)
 
@@ -157,8 +199,9 @@ device_destroy :: proc() {
 		return
 	}
 
-	for _, p in _gpu.pipeline_cache {
+	for key, p in _gpu.pipeline_cache {
 		_destroy_pipeline(p)
+		builtin.delete(key)
 	}
 	builtin.delete(_gpu.pipeline_cache)
 	_gpu.pipeline_cache = nil
@@ -211,7 +254,7 @@ context_create :: proc(decode_graph := false, allocator := context.allocator, lo
 
 	_device_init_locked()
 	_gpu.refcount += 1
-	cuda.check(cuda.CtxSetCurrent(_gpu.ctx), loc=loc)
+	_bind_thread_ctx(loc)
 
 	gctx, err := builtin.new(Context, allocator=allocator, loc=loc)
 	fmt.assertf(err == nil, "Failed to allocate Context: %v", err, loc=loc)
@@ -281,6 +324,10 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 		cuda.MemFreeHost(gctx.position_pinned)
 		gctx.position_pinned = nil
 	}
+	for block in gctx.pinned_staging {
+		cuda.MemFreeHost(block.ptr)
+	}
+	builtin.delete(gctx.pinned_staging)
 	if gctx.shift_scratch_dev != 0 {
 		cuda.MemFree(gctx.shift_scratch_dev)
 		gctx.shift_scratch_dev = 0
@@ -328,6 +375,7 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 	}
 
 	pool.reset(&gctx.activation_pool)
+	_pinned_staging_release_all(gctx)
 
 	builtin.clear(&gctx.q8_1_cache)
 	builtin.clear(&gctx.dequant_cache)

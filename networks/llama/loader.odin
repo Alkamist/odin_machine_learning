@@ -5,7 +5,7 @@ import "core:fmt"
 import "../../loaders/safetensors"
 import "../../loaders/weights"
 
-load_safetensors :: proc(model: Llama, path: string) -> bool {
+load_safetensors :: proc(model: ^Llama, path: string) -> bool {
 	loader, load_ok := safetensors.load(path)
 	if !load_ok {
 		return false
@@ -15,9 +15,11 @@ load_safetensors :: proc(model: Llama, path: string) -> bool {
 	source := weights.from_safetensors(&loader)
 	cfg    := model.config
 
-	embed := model.token_embeddings
-	if !weights.write_tensor(&embed, source, "model.embed_tokens.weight") {
+	if !weights.write_tensor(&model.token_embeddings, source, "model.embed_tokens.weight") {
 		return false
+	}
+	if cfg.tied_embeddings {
+		model.lm_head_weight = model.token_embeddings
 	}
 
 	for &layer, i in model.layers {
@@ -35,15 +37,13 @@ load_safetensors :: proc(model: Llama, path: string) -> bool {
 		}
 	}
 
-	output_norm := model.output_norm_weight
-	if !weights.write_tensor(&output_norm, source, "model.norm.weight") {
+	if !weights.write_tensor(&model.output_norm_weight, source, "model.norm.weight") {
 		return false
 	}
 
 	if _, has_lm_head := safetensors.get_info(loader, "lm_head.weight"); has_lm_head {
-		if !model.config.tied_embeddings {
-			lm_head := model.lm_head_weight
-			if !weights.write_tensor(&lm_head, source, "lm_head.weight") {
+		if !cfg.tied_embeddings {
+			if !weights.write_tensor(&model.lm_head_weight, source, "lm_head.weight") {
 				return false
 			}
 		}

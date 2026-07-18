@@ -14,7 +14,7 @@
 
 ## Sub-Agents
 
-- When doing large edit arcs, spawn an instance of Opus as a sub-agent to do it, then check and critique its work in an adversarial way. The goal is to arrive at the best possible code you can agree on.
+- When doing large edit arcs, spawn an instance of Opus as a sub-agent to do it, then check and critique its work in an adversarial way. The goal is to arrive at the best possible code you can agree on. Keep context short, don't reuse a subagent for numerous requests.
 
 ## Style
 

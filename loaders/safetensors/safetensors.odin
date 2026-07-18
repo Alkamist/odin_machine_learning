@@ -104,15 +104,17 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		}
 
 		shape := make([]int, len(shape_array))
+		element_count := i64(1)
 		for axis_value, axis_index in shape_array {
 			axis_int, axis_int_ok := axis_value.(json.Integer)
-			if !axis_int_ok {
-				log.errorf("tensor %q shape[%v] is not an integer", name, axis_index, location=loc)
+			if !axis_int_ok || axis_int < 0 || (axis_int > 0 && element_count > (1 << 62) / axis_int) {
+				log.errorf("tensor %q shape[%v] is not a valid dimension", name, axis_index, location=loc)
 				delete(shape)
 				_destroy_partial(root, file_bytes, tensors)
 				return {}, false
 			}
 			shape[axis_index] = int(axis_int)
+			element_count *= axis_int
 		}
 
 		if len(offsets_array) != 2 {
@@ -137,6 +139,14 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 			delete(shape)
 			_destroy_partial(root, file_bytes, tensors)
 			return {}, false
+		}
+		if dtype_size, dtype_size_known := _dtype_size(dtype_string); dtype_size_known {
+			if i64(end - start) != element_count * i64(dtype_size) {
+				log.errorf("tensor %q byte range %v does not match shape element count %v x dtype size %v", name, end - start, element_count, dtype_size, location=loc)
+				delete(shape)
+				_destroy_partial(root, file_bytes, tensors)
+				return {}, false
+			}
 		}
 
 		tensors[name] = Tensor_Info{
@@ -164,6 +174,17 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	loader._json_root = root
 
 	return loader, true
+}
+
+@(require_results)
+_dtype_size :: proc(dtype: string) -> (int, bool) {
+	switch dtype {
+	case "F64", "I64", "U64":         return 8, true
+	case "F32", "I32", "U32":         return 4, true
+	case "F16", "BF16", "I16", "U16": return 2, true
+	case "I8", "U8", "BOOL":          return 1, true
+	}
+	return 0, false
 }
 
 _destroy_partial :: proc(root: json.Value, file_bytes: []byte, tensors: map[string]Tensor_Info) {

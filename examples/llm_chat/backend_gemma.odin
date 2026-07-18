@@ -120,10 +120,7 @@ _gemma_eval :: proc(data: rawptr, tokens: []int, logits_out: []f32) {
 	pos := 0
 	for pos < n {
 		ml.clear()
-		take := GEMMA_PREFILL_CHUNK
-		if pos + take > n {
-			take = 1
-		}
+		take := min(GEMMA_PREFILL_CHUNK, n - pos)
 		chunk := tokens[pos : pos + take]
 		logits := gemma.forward_cached(backend.model, &backend.cache, chunk)
 		if pos + take == n {
