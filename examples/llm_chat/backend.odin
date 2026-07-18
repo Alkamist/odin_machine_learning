@@ -22,5 +22,6 @@ backend_destroy :: proc(ctx: ^ml.Context) {
 		cpu.context_destroy(ctx)
 	} else {
 		cuda.context_destroy(ctx)
+		cuda.device_destroy()
 	}
 }

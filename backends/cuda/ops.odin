@@ -10,109 +10,29 @@ import "bindings/cublas"
 
 import ml "../.."
 
-_add_pipeline:             ^Pipeline
-_add_bf16_pipeline:        ^Pipeline
-_add_back_a_pipeline:      ^Pipeline
-_add_back_b_pipeline:      ^Pipeline
-_add_back_a_bf16_pipeline: ^Pipeline
-_add_back_b_bf16_pipeline: ^Pipeline
 
-_quantize_q8_1_pipeline:                  ^Pipeline
-_linear_q4_k_mmvq_pipeline:               ^Pipeline
-_linear_q4_k_gate_up_geglu_bf16_pipeline: ^Pipeline
-_linear_q6_k_mmvq_pipeline:               ^Pipeline
-_dequantize_q4_k_to_bf16_pipeline:        ^Pipeline
-_dequantize_q6_k_to_bf16_pipeline:        ^Pipeline
 
-_mul_pipeline:      ^Pipeline
-_mul_bf16_pipeline: ^Pipeline
 
-_gelu_mul_bf16_pipeline: ^Pipeline
-_gelu_mul_f32_pipeline:  ^Pipeline
 
-_gelu_f32_pipeline:       ^Pipeline
-_gelu_bf16_pipeline:      ^Pipeline
-_gelu_back_f32_pipeline:  ^Pipeline
-_gelu_back_bf16_pipeline: ^Pipeline
 
-_tanh_pipeline:           ^Pipeline
-_tanh_bf16_pipeline:      ^Pipeline
-_tanh_back_f32_pipeline:  ^Pipeline
-_tanh_back_bf16_pipeline: ^Pipeline
 
-_exp_pipeline:            ^Pipeline
-_exp_back_f32_pipeline:   ^Pipeline
-_clamp_pipeline:          ^Pipeline
-_clamp_back_f32_pipeline: ^Pipeline
-_min_pipeline:            ^Pipeline
-_min_back_a_f32_pipeline: ^Pipeline
-_min_back_b_f32_pipeline: ^Pipeline
 
-_softmax_pipeline:          ^Pipeline
-_softmax_back_f32_pipeline: ^Pipeline
-_entropy_pipeline:          ^Pipeline
-_entropy_back_f32_pipeline: ^Pipeline
 
-_cast_bf16_to_f32_pipeline: ^Pipeline
-_cast_f32_to_bf16_pipeline: ^Pipeline
-_cast_back_f32_pipeline:    ^Pipeline
 
-_rmsnorm_pipeline:       ^Pipeline
-_rmsnorm_bf16_pipeline:  ^Pipeline
 
-_add_rmsnorm_bf16_pipeline: ^Pipeline
-_add_rmsnorm_f32_pipeline:  ^Pipeline
 
-_rmsnorm_rope_bf16_pipeline:       ^Pipeline
-_rmsnorm_rope_f32_pipeline:        ^Pipeline
-_rmsnorm_rope_cache_bf16_pipeline: ^Pipeline
 
-_rope_pipeline:      ^Pipeline
-_rope_bf16_pipeline:     ^Pipeline
 
-_attention_bf16_pipeline:                ^Pipeline
-_attention_cache_bf16_pipeline:          ^Pipeline
-_attention_cache_vec_bf16_d256_pipeline: ^Pipeline
-_attention_cache_vec_bf16_d512_pipeline: ^Pipeline
-_cache_write_bf16_pipeline:              ^Pipeline
 
-_select_f32_pipeline:  ^Pipeline
-_select_bf16_pipeline: ^Pipeline
 
-_slice_trailing_f32_pipeline:       ^Pipeline
-_slice_trailing_bf16_pipeline:      ^Pipeline
-_slice_trailing_back_f32_pipeline:  ^Pipeline
-_slice_trailing_back_bf16_pipeline: ^Pipeline
 
-_adam_f32_pipeline:  ^Pipeline
-_adam_bf16_pipeline: ^Pipeline
 
-_silu_f32_pipeline:       ^Pipeline
-_silu_bf16_pipeline:      ^Pipeline
-_silu_back_f32_pipeline:  ^Pipeline
-_silu_back_bf16_pipeline: ^Pipeline
 
-_cross_entropy_f32_pipeline:      ^Pipeline
-_cross_entropy_back_f32_pipeline: ^Pipeline
 
-_mul_back_a_f32_pipeline:  ^Pipeline
-_mul_back_b_f32_pipeline:  ^Pipeline
-_mul_back_a_bf16_pipeline: ^Pipeline
-_mul_back_b_bf16_pipeline: ^Pipeline
 
-_select_back_f32_pipeline:  ^Pipeline
-_select_back_bf16_pipeline: ^Pipeline
 
-_rope_back_f32_pipeline:  ^Pipeline
-_rope_back_bf16_pipeline: ^Pipeline
 
-_rmsnorm_back_f32_pipeline:  ^Pipeline
-_rmsnorm_back_bf16_pipeline: ^Pipeline
 
-_attention_train_f32_pipeline:       ^Pipeline
-_attention_train_back_f32_pipeline:  ^Pipeline
-_attention_train_bf16_pipeline:      ^Pipeline
-_attention_train_back_bf16_pipeline: ^Pipeline
 
 @(require_results)
 data :: #force_inline proc(t: ml.Tensor) -> Gpu_Buffer {
@@ -135,9 +55,7 @@ MAX_GRID_DIM_YZ :: 65535
 
 _dispatch_cache_write :: proc(src_type: ml.Data_Type, grid: u32, args: []rawptr, loc: runtime.Source_Code_Location) {
 	fmt.assertf(src_type == .Bf16, "unsupported src dtype %v", src_type, loc=loc)
-	if _cache_write_bf16_pipeline == nil {
-		_cache_write_bf16_pipeline = _compile_pipeline(CACHE_WRITE_BF16_SRC, "cache_write_bf16.cu", "cache_write_bf16")
-	}
+	_cache_write_bf16_pipeline := _compile_pipeline(CACHE_WRITE_BF16_SRC, "cache_write_bf16.cu", "cache_write_bf16")
 	_dispatch(_cache_write_bf16_pipeline, grid, 1, 1, 256, 1, 1, 0, args, loc)
 }
 
@@ -150,9 +68,7 @@ _emit_quantize_q8_1 :: proc(gctx: ^Context, xp: cuda.DevicePtr, input_size: int,
 	K  := i32(input_size)
 	args := [?]rawptr{&xp, &q8, &K }
 
-	if _quantize_q8_1_pipeline == nil {
-		_quantize_q8_1_pipeline = _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC, "quantize_q8_1_bf16.cu", "quantize_q8_1_bf16")
-	}
+	_quantize_q8_1_pipeline := _compile_pipeline(QUANTIZE_Q8_1_BF16_SRC, "quantize_q8_1_bf16.cu", "quantize_q8_1_bf16")
 	_dispatch(_quantize_q8_1_pipeline,
 		_div_up(input_size, 256), 1, 1,
 		256, 1, 1,
@@ -245,9 +161,7 @@ _cast_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	// With F32 grads, cast backward is dx += dy in f32 regardless of the
 	// forward cast direction. The data-side conversion has no effect on
 	// the gradient flow.
-	if _cast_back_f32_pipeline == nil {
-		_cast_back_f32_pipeline = _compile_pipeline(CAST_BACK_F32_SRC, "cast_back_f32.cu", "cast_back_f32")
-	}
+	_cast_back_f32_pipeline := _compile_pipeline(CAST_BACK_F32_SRC, "cast_back_f32.cu", "cast_back_f32")
 
 	dyp := gradient(y).ptr
 	dxp := gradient(x).ptr
@@ -274,14 +188,10 @@ _update :: proc(opt: ml.Optimizer, t: ml.Tensor, loc: runtime.Source_Code_Locati
 
 	#partial switch t.type {
 	case .F32:
-		if _adam_f32_pipeline == nil {
-			_adam_f32_pipeline = _compile_pipeline(ADAM_F32_SRC, "adam_f32.cu", "adam_f32")
-		}
+		_adam_f32_pipeline := _compile_pipeline(ADAM_F32_SRC, "adam_f32.cu", "adam_f32")
 		_dispatch(_adam_f32_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _adam_bf16_pipeline == nil {
-			_adam_bf16_pipeline = _compile_pipeline(ADAM_BF16_SRC, "adam_bf16.cu", "adam_bf16")
-		}
+		_adam_bf16_pipeline := _compile_pipeline(ADAM_BF16_SRC, "adam_bf16.cu", "adam_bf16")
 		_dispatch(_adam_bf16_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", t.type, loc=loc)
@@ -366,9 +276,7 @@ _linear_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		dy_bf_size := uintptr(dy_count) * 2
 		dy_bf_ptr  := _activation_alloc(gctx, u64(dy_bf_size), loc)
 
-		if _cast_f32_to_bf16_pipeline == nil {
-			_cast_f32_to_bf16_pipeline = _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
-		}
+		_cast_f32_to_bf16_pipeline := _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
 		dy_p := dy_ptr
 		bf_p := dy_bf_ptr
 		nc   := i32(dy_count)
@@ -459,9 +367,7 @@ _linear_q4_k_forward_mmvq :: proc(op: ml.Operation, loc: runtime.Source_Code_Loc
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
 
-	if _linear_q4_k_mmvq_pipeline == nil {
-		_linear_q4_k_mmvq_pipeline = _compile_pipeline(LINEAR_Q4_K_MMVQ_SRC, "linear_q4_k_mmvq.cu", "linear_q4_k_mmvq")
-	}
+	_linear_q4_k_mmvq_pipeline := _compile_pipeline(LINEAR_Q4_K_MMVQ_SRC, "linear_q4_k_mmvq.cu", "linear_q4_k_mmvq")
 
 	gctx := _gctx(loc)
 
@@ -515,9 +421,7 @@ _linear_q4_k_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locatio
 	dy_count   := count * output_size
 	dy_bf_size := uintptr(dy_count) * 2
 	dy_bf_ptr  := _activation_alloc(gctx, u64(dy_bf_size), loc)
-	if _cast_f32_to_bf16_pipeline == nil {
-		_cast_f32_to_bf16_pipeline = _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
-	}
+	_cast_f32_to_bf16_pipeline := _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
 	dy_p := gradient(output).ptr
 	bf_p := dy_bf_ptr
 	nc   := i32(dy_count)
@@ -561,9 +465,7 @@ _dequantize_q4_k :: proc(gctx: ^Context, src: cuda.DevicePtr, output_size, input
 
 	dst := _activation_alloc(gctx, u64(count) * 2, loc)
 
-	if _dequantize_q4_k_to_bf16_pipeline == nil {
-		_dequantize_q4_k_to_bf16_pipeline = _compile_pipeline(DEQUANTIZE_Q4_K_TO_BF16_SRC, "dequantize_q4_k_to_bf16.cu", "dequantize_q4_k_to_bf16")
-	}
+	_dequantize_q4_k_to_bf16_pipeline := _compile_pipeline(DEQUANTIZE_Q4_K_TO_BF16_SRC, "dequantize_q4_k_to_bf16.cu", "dequantize_q4_k_to_bf16")
 	total := i32(count)
 	args := [?]rawptr{&src, &dst, &total}
 	_dispatch(_dequantize_q4_k_to_bf16_pipeline, u32(num_blocks), 1, 1, 256, 1, 1, 0, args[:], loc)
@@ -586,9 +488,7 @@ _linear_q4_k_gate_up_geglu_forward :: proc(op: ml.Operation, loc: runtime.Source
 	fmt.assertf(count == 1, "linear_q4_k_gate_up_geglu requires M=1 (decode); got M=%v", count, loc=loc)
 	fmt.assertf(output.type == .Bf16, "linear_q4_k_gate_up_geglu requires Bf16 output (got %v)", output.type, loc=loc)
 
-	if _linear_q4_k_gate_up_geglu_bf16_pipeline == nil {
-		_linear_q4_k_gate_up_geglu_bf16_pipeline = _compile_pipeline(LINEAR_Q4_K_GATE_UP_GEGLU_BF16_SRC, "linear_q4_k_gate_up_geglu_bf16.cu", "linear_q4_k_gate_up_geglu_bf16")
-	}
+	_linear_q4_k_gate_up_geglu_bf16_pipeline := _compile_pipeline(LINEAR_Q4_K_GATE_UP_GEGLU_BF16_SRC, "linear_q4_k_gate_up_geglu_bf16.cu", "linear_q4_k_gate_up_geglu_bf16")
 
 	gctx := _gctx(loc)
 
@@ -624,9 +524,7 @@ _add_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch a.type {
 	case .F32:
-		if _add_pipeline == nil {
-			_add_pipeline = _compile_pipeline(ADD_F32_SRC, "add.cu", "add_f32")
-		}
+		_add_pipeline := _compile_pipeline(ADD_F32_SRC, "add.cu", "add_f32")
 		ap := data(a).ptr; bp := data(b).ptr; cp := data(output).ptr
 		n   := i32(ml.len(a))
 		n_b := i32(ml.len(b))
@@ -635,9 +533,7 @@ _add_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		_dispatch(_add_pipeline, grid, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args[:], loc)
 
 	case .Bf16:
-		if _add_bf16_pipeline == nil {
-			_add_bf16_pipeline = _compile_pipeline(ADD_BF16_SRC, "add_bf16.cu", "add_bf16")
-		}
+		_add_bf16_pipeline := _compile_pipeline(ADD_BF16_SRC, "add_bf16.cu", "add_bf16")
 		ap := data(a).ptr; bp := data(b).ptr; cp := data(output).ptr
 		pair_count := (ml.len(a) + 1) / 2
 		n          := i32(ml.len(a))
@@ -660,18 +556,14 @@ _add_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch a.type {
 	case .F32:
-		if _add_back_a_pipeline == nil {
-			_add_back_a_pipeline = _compile_pipeline(ADD_BACK_A_SRC, "add_back_a.cu", "add_back_a_f32")
-		}
+		_add_back_a_pipeline := _compile_pipeline(ADD_BACK_A_SRC, "add_back_a.cu", "add_back_a_f32")
 		dyp := gradient(output).ptr; dap := gradient(a).ptr
 		n := i32(ml.len(a))
 		args_a := [?]rawptr{&dyp, &dap, &n}
 		grid_a := _div_up(ml.len(a), ADD_LOCAL_SIZE)
 		_dispatch(_add_back_a_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
 
-		if _add_back_b_pipeline == nil {
-			_add_back_b_pipeline = _compile_pipeline(ADD_BACK_B_SRC, "add_back_b.cu", "add_back_b_f32")
-		}
+		_add_back_b_pipeline := _compile_pipeline(ADD_BACK_B_SRC, "add_back_b.cu", "add_back_b_f32")
 		dbp := gradient(b).ptr
 		n_b := i32(ml.len(b)); st := i32(stride)
 		args_b := [?]rawptr{&dyp, &dbp, &n_b, &st}
@@ -679,9 +571,7 @@ _add_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		_dispatch(_add_back_b_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
 
 	case .Bf16:
-		if _add_back_a_bf16_pipeline == nil {
-			_add_back_a_bf16_pipeline = _compile_pipeline(ADD_BACK_A_BF16_SRC, "add_back_a_bf16.cu", "add_back_a_bf16")
-		}
+		_add_back_a_bf16_pipeline := _compile_pipeline(ADD_BACK_A_BF16_SRC, "add_back_a_bf16.cu", "add_back_a_bf16")
 		dyp := gradient(output).ptr; dap := gradient(a).ptr
 		a_pairs := (ml.len(a) + 1) / 2
 		n := i32(ml.len(a)); pc := i32(a_pairs)
@@ -689,9 +579,7 @@ _add_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		grid_a := _div_up(a_pairs, ADD_LOCAL_SIZE)
 		_dispatch(_add_back_a_bf16_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
 
-		if _add_back_b_bf16_pipeline == nil {
-			_add_back_b_bf16_pipeline = _compile_pipeline(ADD_BACK_B_BF16_SRC, "add_back_b_bf16.cu", "add_back_b_bf16")
-		}
+		_add_back_b_bf16_pipeline := _compile_pipeline(ADD_BACK_B_BF16_SRC, "add_back_b_bf16.cu", "add_back_b_bf16")
 		dbp := gradient(b).ptr
 		b_pairs := (ml.len(b) + 1) / 2
 		n_b := i32(ml.len(b)); st := i32(stride); pcb := i32(b_pairs)
@@ -711,17 +599,13 @@ _mul_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch a.type {
 	case .F32:
-		if _mul_pipeline == nil {
-			_mul_pipeline = _compile_pipeline(MUL_F32_SRC, "mul.cu", "mul_f32")
-		}
+		_mul_pipeline := _compile_pipeline(MUL_F32_SRC, "mul.cu", "mul_f32")
 		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
 		n   := i32(ml.len(a)); n_b := i32(ml.len(b))
 		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b}
 		_dispatch(_mul_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _mul_bf16_pipeline == nil {
-			_mul_bf16_pipeline = _compile_pipeline(MUL_BF16_SRC, "mul_bf16.cu", "mul_bf16")
-		}
+		_mul_bf16_pipeline := _compile_pipeline(MUL_BF16_SRC, "mul_bf16.cu", "mul_bf16")
 		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
 		pair_count := (ml.len(a) + 1) / 2
 		n   := i32(ml.len(a)); n_b := i32(ml.len(b)); pc := i32(pair_count)
@@ -739,18 +623,14 @@ _gelu_mul_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch a.type {
 	case .Bf16:
-		if _gelu_mul_bf16_pipeline == nil {
-			_gelu_mul_bf16_pipeline = _compile_pipeline(GELU_MUL_BF16_SRC, "gelu_mul_bf16.cu", "gelu_mul_bf16")
-		}
+		_gelu_mul_bf16_pipeline := _compile_pipeline(GELU_MUL_BF16_SRC, "gelu_mul_bf16.cu", "gelu_mul_bf16")
 		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
 		pair_count := (ml.len(a) + 1) / 2
 		n   := i32(ml.len(a)); n_b := i32(ml.len(b)); pc := i32(pair_count)
 		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b, &pc}
 		_dispatch(_gelu_mul_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
-		if _gelu_mul_f32_pipeline == nil {
-			_gelu_mul_f32_pipeline = _compile_pipeline(GELU_MUL_F32_SRC, "gelu_mul_f32.cu", "gelu_mul_f32")
-		}
+		_gelu_mul_f32_pipeline := _compile_pipeline(GELU_MUL_F32_SRC, "gelu_mul_f32.cu", "gelu_mul_f32")
 		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
 		n   := i32(ml.len(a)); n_b := i32(ml.len(b))
 		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b}
@@ -766,17 +646,13 @@ _tanh_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _tanh_pipeline == nil {
-			_tanh_pipeline = _compile_pipeline(TANH_F32_SRC,          "tanh.cu",          "tanh_f32")
-		}
+		_tanh_pipeline := _compile_pipeline(TANH_F32_SRC,          "tanh.cu",          "tanh_f32")
 		xp := data(x).ptr; yp := data(y).ptr
 		n := i32(ml.len(x))
 		args := [?]rawptr{&xp, &yp, &n}
 		_dispatch(_tanh_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _tanh_bf16_pipeline == nil {
-			_tanh_bf16_pipeline = _compile_pipeline(TANH_BF16_SRC,         "tanh_bf16.cu",     "tanh_bf16")
-		}
+		_tanh_bf16_pipeline := _compile_pipeline(TANH_BF16_SRC,         "tanh_bf16.cu",     "tanh_bf16")
 		xp := data(x).ptr; yp := data(y).ptr
 		pair_count := (ml.len(x) + 1) / 2
 		n := i32(ml.len(x)); pc := i32(pair_count)
@@ -793,9 +669,7 @@ _exp_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _exp_pipeline == nil {
-			_exp_pipeline = _compile_pipeline(EXP_F32_SRC, "exp.cu", "exp_f32")
-		}
+		_exp_pipeline := _compile_pipeline(EXP_F32_SRC, "exp.cu", "exp_f32")
 		xp := data(x).ptr; yp := data(y).ptr
 		n := i32(ml.len(x))
 		args := [?]rawptr{&xp, &yp, &n}
@@ -817,9 +691,7 @@ _exp_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _exp_back_f32_pipeline == nil {
-			_exp_back_f32_pipeline = _compile_pipeline(EXP_BACK_F32_SRC, "exp_back_f32.cu", "exp_back_f32")
-		}
+		_exp_back_f32_pipeline := _compile_pipeline(EXP_BACK_F32_SRC, "exp_back_f32.cu", "exp_back_f32")
 		_dispatch(_exp_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -834,9 +706,7 @@ _clamp_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _clamp_pipeline == nil {
-			_clamp_pipeline = _compile_pipeline(CLAMP_F32_SRC, "clamp.cu", "clamp_f32")
-		}
+		_clamp_pipeline := _compile_pipeline(CLAMP_F32_SRC, "clamp.cu", "clamp_f32")
 		xp := data(x).ptr; yp := data(y).ptr
 		n := i32(ml.len(x))
 		args := [?]rawptr{&xp, &yp, &lo, &hi, &n}
@@ -860,9 +730,7 @@ _clamp_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _clamp_back_f32_pipeline == nil {
-			_clamp_back_f32_pipeline = _compile_pipeline(CLAMP_BACK_F32_SRC, "clamp_back_f32.cu", "clamp_back_f32")
-		}
+		_clamp_back_f32_pipeline := _compile_pipeline(CLAMP_BACK_F32_SRC, "clamp_back_f32.cu", "clamp_back_f32")
 		_dispatch(_clamp_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -876,9 +744,7 @@ _min_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch a.type {
 	case .F32:
-		if _min_pipeline == nil {
-			_min_pipeline = _compile_pipeline(MIN_F32_SRC, "min.cu", "min_f32")
-		}
+		_min_pipeline := _compile_pipeline(MIN_F32_SRC, "min.cu", "min_f32")
 		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
 		n := i32(ml.len(a))
 		args := [?]rawptr{&ap, &bp, &cp, &n}
@@ -909,15 +775,11 @@ _min_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	#partial switch a.type {
 	case .F32:
 		if have_a_grad {
-			if _min_back_a_f32_pipeline == nil {
-				_min_back_a_f32_pipeline = _compile_pipeline(MIN_BACK_A_F32_SRC, "min_back_a_f32.cu", "min_back_a_f32")
-			}
+			_min_back_a_f32_pipeline := _compile_pipeline(MIN_BACK_A_F32_SRC, "min_back_a_f32.cu", "min_back_a_f32")
 			_dispatch(_min_back_a_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
 		}
 		if have_b_grad {
-			if _min_back_b_f32_pipeline == nil {
-				_min_back_b_f32_pipeline = _compile_pipeline(MIN_BACK_B_F32_SRC, "min_back_b_f32.cu", "min_back_b_f32")
-			}
+			_min_back_b_f32_pipeline := _compile_pipeline(MIN_BACK_B_F32_SRC, "min_back_b_f32.cu", "min_back_b_f32")
 			_dispatch(_min_back_b_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
 		}
 	case:
@@ -933,9 +795,7 @@ _softmax_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _softmax_pipeline == nil {
-			_softmax_pipeline = _compile_pipeline(SOFTMAX_F32_SRC, "softmax.cu", "softmax_f32")
-		}
+		_softmax_pipeline := _compile_pipeline(SOFTMAX_F32_SRC, "softmax.cu", "softmax_f32")
 		xp := data(x).ptr; yp := data(y).ptr
 		rr := i32(rows); cc := i32(cols)
 		args := [?]rawptr{&xp, &yp, &rr, &cc}
@@ -957,9 +817,7 @@ _softmax_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _softmax_back_f32_pipeline == nil {
-			_softmax_back_f32_pipeline = _compile_pipeline(SOFTMAX_BACK_F32_SRC, "softmax_back_f32.cu", "softmax_back_f32")
-		}
+		_softmax_back_f32_pipeline := _compile_pipeline(SOFTMAX_BACK_F32_SRC, "softmax_back_f32.cu", "softmax_back_f32")
 		_dispatch(_softmax_back_f32_pipeline, _div_up(rows, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -974,9 +832,7 @@ _entropy_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch p.type {
 	case .F32:
-		if _entropy_pipeline == nil {
-			_entropy_pipeline = _compile_pipeline(ENTROPY_F32_SRC, "entropy.cu", "entropy_f32")
-		}
+		_entropy_pipeline := _compile_pipeline(ENTROPY_F32_SRC, "entropy.cu", "entropy_f32")
 		pp := data(p).ptr; hp := data(h).ptr
 		rr := i32(rows); cc := i32(cols)
 		args := [?]rawptr{&pp, &hp, &rr, &cc}
@@ -998,9 +854,7 @@ _entropy_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch p.type {
 	case .F32:
-		if _entropy_back_f32_pipeline == nil {
-			_entropy_back_f32_pipeline = _compile_pipeline(ENTROPY_BACK_F32_SRC, "entropy_back_f32.cu", "entropy_back_f32")
-		}
+		_entropy_back_f32_pipeline := _compile_pipeline(ENTROPY_BACK_F32_SRC, "entropy_back_f32.cu", "entropy_back_f32")
 		_dispatch(_entropy_back_f32_pipeline, _div_up(rows, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", p.type, loc=loc)
@@ -1024,15 +878,11 @@ _cast_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	switch {
 	case x.type == .Bf16 && y.type == .F32:
-		if _cast_bf16_to_f32_pipeline == nil {
-			_cast_bf16_to_f32_pipeline = _compile_pipeline(CAST_BF16_TO_F32_SRC,  "cast_bf16_to_f32.cu", "cast_bf16_to_f32")
-		}
+		_cast_bf16_to_f32_pipeline := _compile_pipeline(CAST_BF16_TO_F32_SRC,  "cast_bf16_to_f32.cu", "cast_bf16_to_f32")
 		args := [?]rawptr{&xp, &yp, &n, &pc}
 		_dispatch(_cast_bf16_to_f32_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case x.type == .F32 && y.type == .Bf16:
-		if _cast_f32_to_bf16_pipeline == nil {
-			_cast_f32_to_bf16_pipeline = _compile_pipeline(CAST_F32_TO_BF16_SRC,  "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
-		}
+		_cast_f32_to_bf16_pipeline := _compile_pipeline(CAST_F32_TO_BF16_SRC,  "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
 		args := [?]rawptr{&xp, &yp, &n, &pc}
 		_dispatch(_cast_f32_to_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
@@ -1053,17 +903,13 @@ _rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	#partial switch x.type {
 	case .Bf16:
 		fmt.assertf(size % 2 == 0, "rmsnorm bf16 requires even size (got %v)", size, loc=loc)
-		if _rmsnorm_bf16_pipeline == nil {
-			_rmsnorm_bf16_pipeline = _compile_pipeline(RMSNORM_BF16_SRC,      "rmsnorm_bf16.cu",  "rmsnorm_bf16")
-		}
+		_rmsnorm_bf16_pipeline := _compile_pipeline(RMSNORM_BF16_SRC,      "rmsnorm_bf16.cu",  "rmsnorm_bf16")
 		rstd_p := data(v.rstd).ptr
 		args := [?]rawptr{&xp, &wp, &yp, &rstd_p, &c, &s, &eps}
 		_dispatch(_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
 		fmt.assertf(v.weight.type == .F32, "rmsnorm f32 requires F32 weight (got %v)", v.weight.type, loc=loc)
-		if _rmsnorm_pipeline == nil {
-			_rmsnorm_pipeline = _compile_pipeline(RMSNORM_F32_SRC, "rmsnorm.cu", "rmsnorm_f32")
-		}
+		_rmsnorm_pipeline := _compile_pipeline(RMSNORM_F32_SRC, "rmsnorm.cu", "rmsnorm_f32")
 		rstd_p := data(v.rstd).ptr
 		args := [?]rawptr{&xp, &wp, &yp, &rstd_p, &c, &s, &eps}
 		_dispatch(_rmsnorm_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
@@ -1091,14 +937,10 @@ _add_rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 
 	#partial switch a.type {
 	case .Bf16:
-		if _add_rmsnorm_bf16_pipeline == nil {
-			_add_rmsnorm_bf16_pipeline = _compile_pipeline(ADD_RMSNORM_BF16_SRC, "add_rmsnorm_bf16.cu", "add_rmsnorm_bf16")
-		}
+		_add_rmsnorm_bf16_pipeline := _compile_pipeline(ADD_RMSNORM_BF16_SRC, "add_rmsnorm_bf16.cu", "add_rmsnorm_bf16")
 		_dispatch(_add_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
-		if _add_rmsnorm_f32_pipeline == nil {
-			_add_rmsnorm_f32_pipeline = _compile_pipeline(ADD_RMSNORM_F32_SRC, "add_rmsnorm_f32.cu", "add_rmsnorm_f32")
-		}
+		_add_rmsnorm_f32_pipeline := _compile_pipeline(ADD_RMSNORM_F32_SRC, "add_rmsnorm_f32.cu", "add_rmsnorm_f32")
 		_dispatch(_add_rmsnorm_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
@@ -1125,14 +967,10 @@ _rmsnorm_rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locatio
 
 	#partial switch x.type {
 	case .Bf16:
-		if _rmsnorm_rope_bf16_pipeline == nil {
-			_rmsnorm_rope_bf16_pipeline = _compile_pipeline(RMSNORM_ROPE_BF16_SRC, "rmsnorm_rope_bf16.cu", "rmsnorm_rope_bf16")
-		}
+		_rmsnorm_rope_bf16_pipeline := _compile_pipeline(RMSNORM_ROPE_BF16_SRC, "rmsnorm_rope_bf16.cu", "rmsnorm_rope_bf16")
 		_dispatch(_rmsnorm_rope_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 	case .F32:
-		if _rmsnorm_rope_f32_pipeline == nil {
-			_rmsnorm_rope_f32_pipeline = _compile_pipeline(RMSNORM_ROPE_F32_SRC, "rmsnorm_rope_f32.cu", "rmsnorm_rope_f32")
-		}
+		_rmsnorm_rope_f32_pipeline := _compile_pipeline(RMSNORM_ROPE_F32_SRC, "rmsnorm_rope_f32.cu", "rmsnorm_rope_f32")
 		_dispatch(_rmsnorm_rope_f32_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1176,9 +1014,7 @@ _rmsnorm_rope_write_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_
 	args := [?]rawptr{&xp, &wp, &cp, &tc, &hc, &hs, &eps, &base, &pos_dev, &rpc, &cap}
 
 	fmt.assertf(x.type == .Bf16, "unsupported input dtype %v", x.type, loc=loc)
-	if _rmsnorm_rope_cache_bf16_pipeline == nil {
-		_rmsnorm_rope_cache_bf16_pipeline = _compile_pipeline(RMSNORM_ROPE_CACHE_BF16_SRC, "rmsnorm_rope_cache_bf16.cu", "rmsnorm_rope_cache_bf16")
-	}
+	_rmsnorm_rope_cache_bf16_pipeline := _compile_pipeline(RMSNORM_ROPE_CACHE_BF16_SRC, "rmsnorm_rope_cache_bf16.cu", "rmsnorm_rope_cache_bf16")
 	_dispatch(_rmsnorm_rope_cache_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 
 	gctx.k_cache_written_this_forward[cp] = true
@@ -1202,15 +1038,11 @@ _rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _rope_pipeline == nil {
-			_rope_pipeline = _compile_pipeline(ROPE_F32_SRC,          "rope.cu",          "rope_f32")
-		}
+		_rope_pipeline := _compile_pipeline(ROPE_F32_SRC,          "rope.cu",          "rope_f32")
 		_dispatch(_rope_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
 		fmt.assertf(head_size % 2 == 0, "rope bf16 requires even head_size (got %v)", head_size, loc=loc)
-		if _rope_bf16_pipeline == nil {
-			_rope_bf16_pipeline = _compile_pipeline(ROPE_BF16_SRC,         "rope_bf16.cu",     "rope_bf16")
-		}
+		_rope_bf16_pipeline := _compile_pipeline(ROPE_BF16_SRC,         "rope_bf16.cu",     "rope_bf16")
 		_dispatch(_rope_bf16_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1261,9 +1093,7 @@ _linear_q6_k_forward_mmvq :: proc(op: ml.Operation, loc: runtime.Source_Code_Loc
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
 
-	if _linear_q6_k_mmvq_pipeline == nil {
-		_linear_q6_k_mmvq_pipeline = _compile_pipeline(LINEAR_Q6_K_MMVQ_SRC, "linear_q6_k_mmvq.cu", "linear_q6_k_mmvq")
-	}
+	_linear_q6_k_mmvq_pipeline := _compile_pipeline(LINEAR_Q6_K_MMVQ_SRC, "linear_q6_k_mmvq.cu", "linear_q6_k_mmvq")
 
 	gctx := _gctx(loc)
 
@@ -1301,9 +1131,7 @@ _dequantize_q6_k :: proc(gctx: ^Context, src: cuda.DevicePtr, output_size, input
 
 	dst := _activation_alloc(gctx, u64(count) * 2, loc)
 
-	if _dequantize_q6_k_to_bf16_pipeline == nil {
-		_dequantize_q6_k_to_bf16_pipeline = _compile_pipeline(DEQUANTIZE_Q6_K_TO_BF16_SRC, "dequantize_q6_k_to_bf16.cu", "dequantize_q6_k_to_bf16")
-	}
+	_dequantize_q6_k_to_bf16_pipeline := _compile_pipeline(DEQUANTIZE_Q6_K_TO_BF16_SRC, "dequantize_q6_k_to_bf16.cu", "dequantize_q6_k_to_bf16")
 	total := i32(count)
 	args := [?]rawptr{&src, &dst, &total}
 	_dispatch(_dequantize_q6_k_to_bf16_pipeline, u32(num_blocks), 1, 1, 256, 1, 1, 0, args[:], loc)
@@ -1331,9 +1159,7 @@ _linear_q6_k_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locatio
 	dy_count   := count * output_size
 	dy_bf_size := uintptr(dy_count) * 2
 	dy_bf_ptr  := _activation_alloc(gctx, u64(dy_bf_size), loc)
-	if _cast_f32_to_bf16_pipeline == nil {
-		_cast_f32_to_bf16_pipeline = _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
-	}
+	_cast_f32_to_bf16_pipeline := _compile_pipeline(CAST_F32_TO_BF16_SRC, "cast_f32_to_bf16.cu", "cast_f32_to_bf16")
 	dy_p := gradient(output).ptr
 	bf_p := dy_bf_ptr
 	nc   := i32(dy_count)
@@ -1386,9 +1212,7 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 		training := gctx.training
 		if training {
 			fmt.assertf(token_count <= 2048, "attention_train_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
-			if _attention_train_bf16_pipeline == nil {
-				_attention_train_bf16_pipeline = _compile_pipeline(ATTENTION_TRAIN_BF16_SRC, "attention_train_bf16.cu", "attention_train_bf16")
-			}
+			_attention_train_bf16_pipeline := _compile_pipeline(ATTENTION_TRAIN_BF16_SRC, "attention_train_bf16.cu", "attention_train_bf16")
 			sm_ptr := data(v.softmax_outputs).ptr
 			args := [?]rawptr{
 				&qp, &kp, &vp, &op_ptr, &sm_ptr,
@@ -1396,9 +1220,7 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 			}
 			_dispatch(_attention_train_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 256, 1, 1, 0, args[:], loc)
 		} else {
-			if _attention_bf16_pipeline == nil {
-				_attention_bf16_pipeline = _compile_pipeline(ATTENTION_BF16_SRC, "attention_bf16.cu", "attention_bf16")
-			}
+			_attention_bf16_pipeline := _compile_pipeline(ATTENTION_BF16_SRC, "attention_bf16.cu", "attention_bf16")
 			lse_ptr := data(v.lse).ptr
 			args := [?]rawptr{
 				&qp, &kp, &vp, &op_ptr, &lse_ptr,
@@ -1409,9 +1231,7 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 
 	case .F32:
 		fmt.assertf(token_count <= 2048, "attention_train_f32 caps token_count at 2048 (got %v)", token_count, loc=loc)
-		if _attention_train_f32_pipeline == nil {
-			_attention_train_f32_pipeline = _compile_pipeline(ATTENTION_TRAIN_F32_SRC, "attention_train_f32.cu", "attention_train_f32")
-		}
+		_attention_train_f32_pipeline := _compile_pipeline(ATTENTION_TRAIN_F32_SRC, "attention_train_f32.cu", "attention_train_f32")
 		sm_ptr := data(v.softmax_outputs).ptr
 		args := [?]rawptr{
 			&qp, &kp, &vp, &op_ptr, &sm_ptr,
@@ -1520,21 +1340,15 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 
 	switch head_size {
 	case 256:
-		if _attention_cache_vec_bf16_d256_pipeline == nil {
-			opts := [?]cstring{"-DD_HEAD=256"}
-			_attention_cache_vec_bf16_d256_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d256.cu", "attention_cache_vec_bf16", opts[:])
-		}
+		opts := [?]cstring{"-DD_HEAD=256"}
+		_attention_cache_vec_bf16_d256_pipeline := _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d256.cu", "attention_cache_vec_bf16", opts[:])
 		_dispatch(_attention_cache_vec_bf16_d256_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
 	case 512:
-		if _attention_cache_vec_bf16_d512_pipeline == nil {
-			opts := [?]cstring{"-DD_HEAD=512"}
-			_attention_cache_vec_bf16_d512_pipeline = _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d512.cu", "attention_cache_vec_bf16", opts[:])
-		}
+		opts := [?]cstring{"-DD_HEAD=512"}
+		_attention_cache_vec_bf16_d512_pipeline := _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d512.cu", "attention_cache_vec_bf16", opts[:])
 		_dispatch(_attention_cache_vec_bf16_d512_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
 	case:
-		if _attention_cache_bf16_pipeline == nil {
-			_attention_cache_bf16_pipeline = _compile_pipeline(ATTENTION_CACHE_BF16_SRC, "attention_cache_bf16.cu", "attention_cache_bf16")
-		}
+		_attention_cache_bf16_pipeline := _compile_pipeline(ATTENTION_CACHE_BF16_SRC, "attention_cache_bf16.cu", "attention_cache_bf16")
 		_dispatch(_attention_cache_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
 	}
 }
@@ -1566,16 +1380,12 @@ _select_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	#partial switch x.type {
 	case .Bf16:
 		fmt.assertf(size % 2 == 0, "bf16 select requires even row size (got %v)", size, loc=loc)
-		if _select_bf16_pipeline == nil {
-			_select_bf16_pipeline = _compile_pipeline(SELECT_BF16_SRC, "select_bf16.cu", "select_bf16")
-		}
+		_select_bf16_pipeline := _compile_pipeline(SELECT_BF16_SRC, "select_bf16.cu", "select_bf16")
 		pair_count := size / 2
 		args := [?]rawptr{&xp, &idx_ptr, &yp, &n_idx, &s}
 		_dispatch(_select_bf16_pipeline, _div_up(pair_count, 256), u32(min(builtin.len(indices), MAX_GRID_DIM_YZ)), 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
-		if _select_f32_pipeline == nil {
-			_select_f32_pipeline = _compile_pipeline(SELECT_F32_SRC, "select.cu", "select_f32")
-		}
+		_select_f32_pipeline := _compile_pipeline(SELECT_F32_SRC, "select.cu", "select_f32")
 		args := [?]rawptr{&xp, &idx_ptr, &yp, &n_idx, &s}
 		_dispatch(_select_f32_pipeline, _div_up(size, 256), u32(min(builtin.len(indices), MAX_GRID_DIM_YZ)), 1, 256, 1, 1, 0, args[:], loc)
 	case:
@@ -1597,17 +1407,13 @@ _slice_trailing_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 
 	#partial switch x.type {
 	case .Bf16:
-		if _slice_trailing_bf16_pipeline == nil {
-			_slice_trailing_bf16_pipeline = _compile_pipeline(SLICE_TRAILING_BF16_SRC, "slice_trailing_bf16.cu", "slice_trailing_bf16")
-		}
+		_slice_trailing_bf16_pipeline := _compile_pipeline(SLICE_TRAILING_BF16_SRC, "slice_trailing_bf16.cu", "slice_trailing_bf16")
 		pair_count := (leading * new_trailing + 1) / 2
 		pc := i32(pair_count)
 		args := [?]rawptr{&xp, &yp, &ld, &tr, &nt, &st, &pc}
 		_dispatch(_slice_trailing_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
-		if _slice_trailing_f32_pipeline == nil {
-			_slice_trailing_f32_pipeline = _compile_pipeline(SLICE_TRAILING_F32_SRC, "slice_trailing.cu", "slice_trailing_f32")
-		}
+		_slice_trailing_f32_pipeline := _compile_pipeline(SLICE_TRAILING_F32_SRC, "slice_trailing.cu", "slice_trailing_f32")
 		args := [?]rawptr{&xp, &yp, &ld, &tr, &nt, &st}
 		_dispatch(_slice_trailing_f32_pipeline, _div_up(leading * new_trailing, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
@@ -1624,15 +1430,11 @@ _silu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _silu_f32_pipeline == nil {
-			_silu_f32_pipeline = _compile_pipeline(SILU_F32_SRC, "silu_f32.cu", "silu_f32")
-		}
+		_silu_f32_pipeline := _compile_pipeline(SILU_F32_SRC, "silu_f32.cu", "silu_f32")
 		args := [?]rawptr{&xp, &yp, &n}
 		_dispatch(_silu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _silu_bf16_pipeline == nil {
-			_silu_bf16_pipeline = _compile_pipeline(SILU_BF16_SRC, "silu_bf16.cu", "silu_bf16")
-		}
+		_silu_bf16_pipeline := _compile_pipeline(SILU_BF16_SRC, "silu_bf16.cu", "silu_bf16")
 		pair_count := (ml.len(x) + 1) / 2
 		pc := i32(pair_count)
 		args := [?]rawptr{&xp, &yp, &n, &pc}
@@ -1651,15 +1453,11 @@ _gelu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _gelu_f32_pipeline == nil {
-			_gelu_f32_pipeline = _compile_pipeline(GELU_F32_SRC, "gelu_f32.cu", "gelu_f32")
-		}
+		_gelu_f32_pipeline := _compile_pipeline(GELU_F32_SRC, "gelu_f32.cu", "gelu_f32")
 		args := [?]rawptr{&xp, &yp, &n}
 		_dispatch(_gelu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _gelu_bf16_pipeline == nil {
-			_gelu_bf16_pipeline = _compile_pipeline(GELU_BF16_SRC, "gelu_bf16.cu", "gelu_bf16")
-		}
+		_gelu_bf16_pipeline := _compile_pipeline(GELU_BF16_SRC, "gelu_bf16.cu", "gelu_bf16")
 		pair_count := (ml.len(x) + 1) / 2
 		pc := i32(pair_count)
 		args := [?]rawptr{&xp, &yp, &n, &pc}
@@ -1681,14 +1479,10 @@ _gelu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _gelu_back_f32_pipeline == nil {
-			_gelu_back_f32_pipeline = _compile_pipeline(GELU_BACK_F32_SRC, "gelu_back_f32.cu", "gelu_back_f32")
-		}
+		_gelu_back_f32_pipeline := _compile_pipeline(GELU_BACK_F32_SRC, "gelu_back_f32.cu", "gelu_back_f32")
 		_dispatch(_gelu_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _gelu_back_bf16_pipeline == nil {
-			_gelu_back_bf16_pipeline = _compile_pipeline(GELU_BACK_BF16_SRC, "gelu_back_bf16.cu", "gelu_back_bf16")
-		}
+		_gelu_back_bf16_pipeline := _compile_pipeline(GELU_BACK_BF16_SRC, "gelu_back_bf16.cu", "gelu_back_bf16")
 		_dispatch(_gelu_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1707,14 +1501,10 @@ _tanh_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _tanh_back_f32_pipeline == nil {
-			_tanh_back_f32_pipeline = _compile_pipeline(TANH_BACK_F32_SRC, "tanh_back_f32.cu", "tanh_back_f32")
-		}
+		_tanh_back_f32_pipeline := _compile_pipeline(TANH_BACK_F32_SRC, "tanh_back_f32.cu", "tanh_back_f32")
 		_dispatch(_tanh_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _tanh_back_bf16_pipeline == nil {
-			_tanh_back_bf16_pipeline = _compile_pipeline(TANH_BACK_BF16_SRC, "tanh_back_bf16.cu", "tanh_back_bf16")
-		}
+		_tanh_back_bf16_pipeline := _compile_pipeline(TANH_BACK_BF16_SRC, "tanh_back_bf16.cu", "tanh_back_bf16")
 		_dispatch(_tanh_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1739,14 +1529,10 @@ _slice_trailing_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	// F32 grads everywhere now -> bf16 and f32 paths are byte-identical.
 	#partial switch x.type {
 	case .F32:
-		if _slice_trailing_back_f32_pipeline == nil {
-			_slice_trailing_back_f32_pipeline = _compile_pipeline(SLICE_TRAILING_BACK_F32_SRC, "slice_trailing_back_f32.cu", "slice_trailing_back_f32")
-		}
+		_slice_trailing_back_f32_pipeline := _compile_pipeline(SLICE_TRAILING_BACK_F32_SRC, "slice_trailing_back_f32.cu", "slice_trailing_back_f32")
 		_dispatch(_slice_trailing_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _slice_trailing_back_bf16_pipeline == nil {
-			_slice_trailing_back_bf16_pipeline = _compile_pipeline(SLICE_TRAILING_BACK_BF16_SRC, "slice_trailing_back_bf16.cu", "slice_trailing_back_bf16")
-		}
+		_slice_trailing_back_bf16_pipeline := _compile_pipeline(SLICE_TRAILING_BACK_BF16_SRC, "slice_trailing_back_bf16.cu", "slice_trailing_back_bf16")
 		_dispatch(_slice_trailing_back_bf16_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1765,14 +1551,10 @@ _silu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _silu_back_f32_pipeline == nil {
-			_silu_back_f32_pipeline = _compile_pipeline(SILU_BACK_F32_SRC, "silu_back_f32.cu", "silu_back_f32")
-		}
+		_silu_back_f32_pipeline := _compile_pipeline(SILU_BACK_F32_SRC, "silu_back_f32.cu", "silu_back_f32")
 		_dispatch(_silu_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _silu_back_bf16_pipeline == nil {
-			_silu_back_bf16_pipeline = _compile_pipeline(SILU_BACK_BF16_SRC, "silu_back_bf16.cu", "silu_back_bf16")
-		}
+		_silu_back_bf16_pipeline := _compile_pipeline(SILU_BACK_BF16_SRC, "silu_back_bf16.cu", "silu_back_bf16")
 		_dispatch(_silu_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1785,9 +1567,7 @@ _cross_entropy_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locati
 	v := op.variant.(ml.Cross_Entropy)
 	fmt.assertf(x.type == .F32, "cross_entropy requires F32 (got %v)", x.type, loc=loc)
 
-	if _cross_entropy_f32_pipeline == nil {
-		_cross_entropy_f32_pipeline = _compile_pipeline(CROSS_ENTROPY_F32_SRC, "cross_entropy_f32.cu", "cross_entropy_f32")
-	}
+	_cross_entropy_f32_pipeline := _compile_pipeline(CROSS_ENTROPY_F32_SRC, "cross_entropy_f32.cu", "cross_entropy_f32")
 
 	gctx := _gctx(loc)
 	idx_ptr := _upload_indices(gctx, v.targets, loc)
@@ -1807,9 +1587,7 @@ _cross_entropy_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 	y := op.output
 	v := op.variant.(ml.Cross_Entropy)
 
-	if _cross_entropy_back_f32_pipeline == nil {
-		_cross_entropy_back_f32_pipeline = _compile_pipeline(CROSS_ENTROPY_BACK_F32_SRC, "cross_entropy_back_f32.cu", "cross_entropy_back_f32")
-	}
+	_cross_entropy_back_f32_pipeline := _compile_pipeline(CROSS_ENTROPY_BACK_F32_SRC, "cross_entropy_back_f32.cu", "cross_entropy_back_f32")
 
 	gctx := _gctx(loc)
 	idx_ptr := _upload_indices(gctx, v.targets, loc)
@@ -1850,28 +1628,20 @@ _mul_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	#partial switch a.type {
 	case .F32:
 		if have_a_grad {
-			if _mul_back_a_f32_pipeline == nil {
-				_mul_back_a_f32_pipeline = _compile_pipeline(MUL_BACK_A_F32_SRC, "mul_back_a_f32.cu", "mul_back_a_f32")
-			}
+			_mul_back_a_f32_pipeline := _compile_pipeline(MUL_BACK_A_F32_SRC, "mul_back_a_f32.cu", "mul_back_a_f32")
 			_dispatch(_mul_back_a_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
 		}
 		if have_b_grad {
-			if _mul_back_b_f32_pipeline == nil {
-				_mul_back_b_f32_pipeline = _compile_pipeline(MUL_BACK_B_F32_SRC, "mul_back_b_f32.cu", "mul_back_b_f32")
-			}
+			_mul_back_b_f32_pipeline := _compile_pipeline(MUL_BACK_B_F32_SRC, "mul_back_b_f32.cu", "mul_back_b_f32")
 			_dispatch(_mul_back_b_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
 		}
 	case .Bf16:
 		if have_a_grad {
-			if _mul_back_a_bf16_pipeline == nil {
-				_mul_back_a_bf16_pipeline = _compile_pipeline(MUL_BACK_A_BF16_SRC, "mul_back_a_bf16.cu", "mul_back_a_bf16")
-			}
+			_mul_back_a_bf16_pipeline := _compile_pipeline(MUL_BACK_A_BF16_SRC, "mul_back_a_bf16.cu", "mul_back_a_bf16")
 			_dispatch(_mul_back_a_bf16_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
 		}
 		if have_b_grad {
-			if _mul_back_b_bf16_pipeline == nil {
-				_mul_back_b_bf16_pipeline = _compile_pipeline(MUL_BACK_B_BF16_SRC, "mul_back_b_bf16.cu", "mul_back_b_bf16")
-			}
+			_mul_back_b_bf16_pipeline := _compile_pipeline(MUL_BACK_B_BF16_SRC, "mul_back_b_bf16.cu", "mul_back_b_bf16")
 			_dispatch(_mul_back_b_bf16_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
 		}
 	case:
@@ -1904,14 +1674,10 @@ _select_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch w.type {
 	case .F32:
-		if _select_back_f32_pipeline == nil {
-			_select_back_f32_pipeline = _compile_pipeline(SELECT_BACK_F32_SRC, "select_back_f32.cu", "select_back_f32")
-		}
+		_select_back_f32_pipeline := _compile_pipeline(SELECT_BACK_F32_SRC, "select_back_f32.cu", "select_back_f32")
 		_dispatch(_select_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		if _select_back_bf16_pipeline == nil {
-			_select_back_bf16_pipeline = _compile_pipeline(SELECT_BACK_BF16_SRC, "select_back_bf16.cu", "select_back_bf16")
-		}
+		_select_back_bf16_pipeline := _compile_pipeline(SELECT_BACK_BF16_SRC, "select_back_bf16.cu", "select_back_bf16")
 		_dispatch(_select_back_bf16_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", w.type, loc=loc)
@@ -1939,15 +1705,11 @@ _rmsnorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _rmsnorm_back_f32_pipeline == nil {
-			_rmsnorm_back_f32_pipeline = _compile_pipeline(RMSNORM_BACK_F32_SRC, "rmsnorm_back_f32.cu", "rmsnorm_back_f32")
-		}
+		_rmsnorm_back_f32_pipeline := _compile_pipeline(RMSNORM_BACK_F32_SRC, "rmsnorm_back_f32.cu", "rmsnorm_back_f32")
 		_dispatch(_rmsnorm_back_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
 		fmt.assertf(size % 2 == 0, "rmsnorm backward bf16 requires even trailing dim (got %v)", size, loc=loc)
-		if _rmsnorm_back_bf16_pipeline == nil {
-			_rmsnorm_back_bf16_pipeline = _compile_pipeline(RMSNORM_BACK_BF16_SRC, "rmsnorm_back_bf16.cu", "rmsnorm_back_bf16")
-		}
+		_rmsnorm_back_bf16_pipeline := _compile_pipeline(RMSNORM_BACK_BF16_SRC, "rmsnorm_back_bf16.cu", "rmsnorm_back_bf16")
 		_dispatch(_rmsnorm_back_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1974,15 +1736,11 @@ _rope_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		if _rope_back_f32_pipeline == nil {
-			_rope_back_f32_pipeline = _compile_pipeline(ROPE_BACK_F32_SRC, "rope_back_f32.cu", "rope_back_f32")
-		}
+		_rope_back_f32_pipeline := _compile_pipeline(ROPE_BACK_F32_SRC, "rope_back_f32.cu", "rope_back_f32")
 		_dispatch(_rope_back_f32_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
 		fmt.assertf(head_size % 2 == 0, "rope backward bf16 requires even head_size (got %v)", head_size, loc=loc)
-		if _rope_back_bf16_pipeline == nil {
-			_rope_back_bf16_pipeline = _compile_pipeline(ROPE_BACK_BF16_SRC, "rope_back_bf16.cu", "rope_back_bf16")
-		}
+		_rope_back_bf16_pipeline := _compile_pipeline(ROPE_BACK_BF16_SRC, "rope_back_bf16.cu", "rope_back_bf16")
 		_dispatch(_rope_back_bf16_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -2023,9 +1781,7 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 
 	#partial switch q.type {
 	case .F32:
-		if _attention_train_back_f32_pipeline == nil {
-			_attention_train_back_f32_pipeline = _compile_pipeline(ATTENTION_TRAIN_BACK_F32_SRC, "attention_train_back_f32.cu", "attention_train_back_f32")
-		}
+		_attention_train_back_f32_pipeline := _compile_pipeline(ATTENTION_TRAIN_BACK_F32_SRC, "attention_train_back_f32.cu", "attention_train_back_f32")
 		_dispatch(_attention_train_back_f32_pipeline,
 			u32(v.n_kv_heads), u32(gqa), u32(token_count),
 			256, 1, 1,
@@ -2034,9 +1790,7 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 	case .Bf16:
 		fmt.assertf(token_count <= 2048, "attention_train_back_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
 		fmt.assertf(head_size % 2 == 0, "attention backward bf16 requires even head_size (got %v)", head_size, loc=loc)
-		if _attention_train_back_bf16_pipeline == nil {
-			_attention_train_back_bf16_pipeline = _compile_pipeline(ATTENTION_TRAIN_BACK_BF16_SRC, "attention_train_back_bf16.cu", "attention_train_back_bf16")
-		}
+		_attention_train_back_bf16_pipeline := _compile_pipeline(ATTENTION_TRAIN_BACK_BF16_SRC, "attention_train_back_bf16.cu", "attention_train_back_bf16")
 		_dispatch(_attention_train_back_bf16_pipeline,
 			u32(v.n_kv_heads), u32(gqa), u32(token_count),
 			256, 1, 1,

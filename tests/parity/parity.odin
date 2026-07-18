@@ -171,4 +171,5 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 
 	cpu.context_destroy(cpu_ctx)
 	cuda.context_destroy(cuda_ctx)
+	cuda.device_destroy()
 }

@@ -53,21 +53,11 @@ _resolve_include_arg :: proc() -> cstring {
 	fmt.panicf("could not locate CUDA include directory; set CUDA_PATH or install the CUDA toolkit")
 }
 
-_kernel_cstring_cache: map[rawptr]cstring
-
-_bytes_to_cstring :: proc(src: []u8) -> cstring {
-	key := rawptr(raw_data(src))
-	if c, ok := _kernel_cstring_cache[key]; ok {
-		return c
-	}
-
-	buf := builtin.make([]u8, builtin.len(src) + 1)
+_src_to_temp_cstring :: proc(src: []u8) -> cstring {
+	buf := builtin.make([]u8, builtin.len(src) + 1, context.temp_allocator)
 	builtin.copy(buf, src)
 	buf[builtin.len(src)] = 0
-	c := cstring(raw_data(buf))
-	_kernel_cstring_cache[key] = c
-
-	return c
+	return cstring(raw_data(buf))
 }
 
 Pipeline :: struct {
@@ -86,7 +76,12 @@ _compile_pipeline :: proc(
 	extra_options: []cstring = nil,
 	loc                     := #caller_location,
 ) -> ^Pipeline {
-	src_cstr := _bytes_to_cstring(src)
+	key := string(source_name)
+	if cached, ok := _gpu.pipeline_cache[key]; ok {
+		return cached
+	}
+
+	src_cstr := _src_to_temp_cstring(src)
 
 	prog: nvrtc.Program
 	nvrtc.check(nvrtc.CreateProgram(&prog, src_cstr, source_name, 0, nil, nil), loc=loc)
@@ -96,20 +91,9 @@ _compile_pipeline :: proc(
 	arch_str := fmt.bprintf(arch_buf[:], "--gpu-architecture=sm_%d%d", _gpu.cc_major, _gpu.cc_minor)
 	arch_buf[builtin.len(arch_str)] = 0
 
-	strict := false
-	for o in extra_options {
-		s := string(o)
-		if s == "--fmad=false" || s == "-fmad=false" {
-			strict = true
-			break
-		}
-	}
-
-	options := builtin.make([dynamic]cstring, 0, 5 + builtin.len(extra_options), context.temp_allocator)
+	options := builtin.make([dynamic]cstring, 0, 4 + builtin.len(extra_options), context.temp_allocator)
 	builtin.append(&options, cstring(raw_data(arch_buf[:])))
-	if !strict {
-		builtin.append(&options, cstring("--use_fast_math"))
-	}
+	builtin.append(&options, cstring("--use_fast_math"))
 	builtin.append(&options, cstring("-default-device"))
 	builtin.append(&options, _resolve_include_arg())
 	for o in extra_options {
@@ -136,7 +120,7 @@ _compile_pipeline :: proc(
 	cuda.check(cuda.ModuleGetFunction(&pipeline.function, pipeline.module, entry), loc=loc)
 	pipeline.name = builtin.string(entry)
 
-	builtin.append(&_gpu.pipelines, pipeline)
+	_gpu.pipeline_cache[key] = pipeline
 
 	return pipeline
 }

@@ -26,7 +26,7 @@ Gpu_Device :: struct {
 
 	device_name: string,
 
-	pipelines: [dynamic]^Pipeline,
+	pipeline_cache: map[string]^Pipeline,
 }
 
 Context :: struct {
@@ -142,6 +142,8 @@ _device_init_locked :: proc(loc := #caller_location) {
 
 	cuda.check(cuda.CtxCreate(&_gpu.ctx, cuda.CTX_SCHED_BLOCKING_SYNC, _gpu.dev))
 
+	_gpu.pipeline_cache = builtin.make(map[string]^Pipeline)
+
 	log.infof("%s  cc=%d.%d  SMs=%d  warp=%d", _gpu.device_name, _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
 }
 
@@ -149,11 +151,11 @@ device_destroy :: proc() {
 	sync.lock(&_gpu_mutex)
 	defer sync.unlock(&_gpu_mutex)
 
-	for p in _gpu.pipelines {
+	for _, p in _gpu.pipeline_cache {
 		_destroy_pipeline(p)
 	}
-	builtin.delete(_gpu.pipelines)
-	_gpu.pipelines = nil
+	builtin.delete(_gpu.pipeline_cache)
+	_gpu.pipeline_cache = nil
 
 	if _gpu.ctx != nil {
 		cuda.CtxDestroy(_gpu.ctx)
