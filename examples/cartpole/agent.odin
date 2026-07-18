@@ -19,7 +19,6 @@ ENSEMBLE_SIZE :: 5
 PLAN_HORIZON  :: 20
 PLAN_SAMPLES  :: 64
 PLAN_ELITES   :: 8
-PLAN_ITERS    :: 3
 PLAN_DISCOUNT :: f32(0.98)
 
 PESSIMISM :: f32(1)
@@ -109,6 +108,9 @@ agent_step :: proc(agent: ^Agent, state: State) -> Action {
 
 	if agent.hold > 0 {
 		agent.hold -= 1
+		if agent.decisions >= WARMUP_DECISIONS {
+			agent_plan_refine(agent, agent.previous)
+		}
 		return agent.action
 	}
 
@@ -129,7 +131,9 @@ agent_step :: proc(agent: ^Agent, state: State) -> Action {
 		agent.action = Action(rand.int_max(ACTION_COUNT))
 	}
 	else {
-		agent.action = agent_plan(agent, observation)
+		agent_plan_shift(agent)
+		agent_plan_refine(agent, observation)
+		agent.action = agent_plan_action(agent)
 	}
 
 	agent.previous     = observation
@@ -240,53 +244,17 @@ agent_train :: proc(agent: ^Agent, steps: int) {
 	}
 }
 
-@(require_results)
-agent_plan :: proc(agent: ^Agent, observation: Observation) -> Action {
-	sequences := make([][PLAN_HORIZON]Action, PLAN_SAMPLES, context.temp_allocator)
-	returns   := make([]f32,                  PLAN_SAMPLES, context.temp_allocator)
-	order     := make([]int,                  PLAN_SAMPLES, context.temp_allocator)
-
+agent_plan_shift :: proc(agent: ^Agent) {
 	for h in 0 ..< PLAN_HORIZON - 1 {
 		agent.plan[h] = agent.plan[h + 1]
 	}
 	for a in 0 ..< ACTION_COUNT {
 		agent.plan[PLAN_HORIZON - 1][a] = 1.0 / f32(ACTION_COUNT)
 	}
+}
 
-	for _ in 0 ..< PLAN_ITERS {
-		for n in 0 ..< PLAN_SAMPLES {
-			for h in 0 ..< PLAN_HORIZON {
-				sequences[n][h] = sample_action(agent.plan[h])
-			}
-		}
-
-		agent_rollout(agent, observation, sequences, returns)
-
-		for i in 0 ..< PLAN_SAMPLES {
-			order[i] = i
-		}
-		for e in 0 ..< PLAN_ELITES {
-			best := e
-			for i in e + 1 ..< PLAN_SAMPLES {
-				if returns[order[i]] > returns[order[best]] {
-					best = i
-				}
-			}
-			slice.swap(order, e, best)
-		}
-
-		for h in 0 ..< PLAN_HORIZON {
-			counts: [ACTION_COUNT]f32
-			for e in 0 ..< PLAN_ELITES {
-				counts[int(sequences[order[e]][h])] += 1.0 / f32(PLAN_ELITES)
-			}
-			for a in 0 ..< ACTION_COUNT {
-				agent.plan[h][a] = 0.5 * agent.plan[h][a] + 0.5 * counts[a]
-				agent.plan[h][a] = max(agent.plan[h][a], 0.02)
-			}
-		}
-	}
-
+@(require_results)
+agent_plan_action :: proc(agent: ^Agent) -> Action {
 	best := 0
 	for a in 1 ..< ACTION_COUNT {
 		if agent.plan[0][a] > agent.plan[0][best] {
@@ -294,6 +262,44 @@ agent_plan :: proc(agent: ^Agent, observation: Observation) -> Action {
 		}
 	}
 	return Action(best)
+}
+
+agent_plan_refine :: proc(agent: ^Agent, observation: Observation) {
+	sequences := make([][PLAN_HORIZON]Action, PLAN_SAMPLES, context.temp_allocator)
+	returns   := make([]f32,                  PLAN_SAMPLES, context.temp_allocator)
+	order     := make([]int,                  PLAN_SAMPLES, context.temp_allocator)
+
+	for n in 0 ..< PLAN_SAMPLES {
+		for h in 0 ..< PLAN_HORIZON {
+			sequences[n][h] = sample_action(agent.plan[h])
+		}
+	}
+
+	agent_rollout(agent, observation, sequences, returns)
+
+	for i in 0 ..< PLAN_SAMPLES {
+		order[i] = i
+	}
+	for e in 0 ..< PLAN_ELITES {
+		best := e
+		for i in e + 1 ..< PLAN_SAMPLES {
+			if returns[order[i]] > returns[order[best]] {
+				best = i
+			}
+		}
+		slice.swap(order, e, best)
+	}
+
+	for h in 0 ..< PLAN_HORIZON {
+		counts: [ACTION_COUNT]f32
+		for e in 0 ..< PLAN_ELITES {
+			counts[int(sequences[order[e]][h])] += 1.0 / f32(PLAN_ELITES)
+		}
+		for a in 0 ..< ACTION_COUNT {
+			agent.plan[h][a] = 0.5 * agent.plan[h][a] + 0.5 * counts[a]
+			agent.plan[h][a] = max(agent.plan[h][a], 0.02)
+		}
+	}
 }
 
 agent_rollout :: proc(agent: ^Agent, observation: Observation, sequences: [][PLAN_HORIZON]Action, returns: []f32) {
