@@ -1,16 +1,18 @@
-package example_chat
+package fetch
 
-// Automatic download of model weights and tokenizers.
+// Automatic download of large example assets: model weights, tokenizers, and
+// training data.
 //
-// Everything llm_chat needs is fetched over plain HTTPS with vendor:curl, which
-// links statically against Schannel on Windows -- no DLLs, no cert bundle, no
-// Python. Assets are pinned by exact byte size so a truncated or interrupted
-// download is detected rather than surfacing later as a confusing parse error.
+// Everything is fetched over plain HTTPS with vendor:curl, which links
+// statically against Schannel on Windows -- no DLLs, no cert bundle, no Python.
+// Assets are pinned by exact byte size so a truncated or interrupted download is
+// detected rather than surfacing later as a confusing parse error.
 //
 // Gemma weights come from Ollama's registry, which is content-addressed: the
 // blob is named by its own sha256, so the URL can never silently start serving
 // different bytes.
 
+import "base:builtin"
 import "base:runtime"
 
 import "core:c"
@@ -21,6 +23,32 @@ import "core:path/filepath"
 import "core:strings"
 
 import curl "vendor:curl"
+
+// Reads a single line from stdin, stopping at the newline so any following
+// lines stay available to the caller rather than being swallowed here.
+read_line :: proc(buffer: []byte) -> (line: string, ok: bool) {
+	cursor := 0
+	one: [1]byte
+	for cursor < builtin.len(buffer) {
+		n, err := os.read(os.stdin, one[:])
+		if err != nil || n == 0 {
+			if cursor == 0 {
+				return "", false
+			}
+			break
+		}
+		c := one[0]
+		if c == '\n' {
+			break
+		}
+		buffer[cursor] = c
+		cursor += 1
+	}
+	if cursor > 0 && buffer[cursor - 1] == '\r' {
+		cursor -= 1
+	}
+	return string(buffer[:cursor]), true
+}
 
 Asset :: struct {
 	url:  string,
@@ -90,8 +118,6 @@ ensure_assets :: proc(assets: []Asset, model_label: string) -> bool {
 	}
 	fmt.print("Download now? [y/N] ")
 
-	// read_line stops at the newline, so piped input keeps any following lines
-	// available for the chat loop rather than swallowing them here.
 	buf: [16]byte
 	line, line_ok := read_line(buf[:])
 	if !line_ok {

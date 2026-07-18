@@ -9,12 +9,13 @@ import "core:os"
 import ml    "../../"
 import llama "../../networks/llama"
 import gpt2  "../../tokenizers/gpt2"
+import       "../fetch"
 
 LLAMA_DATA_DIR       :: #directory + "data/smollm"
 LLAMA_DEFAULT_MODEL  :: LLAMA_DATA_DIR + "/model_instruct.safetensors"
 LLAMA_TOKENIZER_PATH :: LLAMA_DATA_DIR + "/tokenizer.json"
 
-LLAMA_ASSETS := []Asset {
+LLAMA_ASSETS := []fetch.Asset {
 	{
 		url  = "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/model.safetensors",
 		dest = LLAMA_DEFAULT_MODEL,
@@ -48,7 +49,7 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 	// fetch when we are using the default location.
 	path := model_path
 	if builtin.len(path) == 0 {
-		if !ensure_assets(LLAMA_ASSETS, "SmolLM2-135M-Instruct") {
+		if !fetch.ensure_assets(LLAMA_ASSETS, "SmolLM2-135M-Instruct") {
 			return {}, false
 		}
 		path = LLAMA_DEFAULT_MODEL

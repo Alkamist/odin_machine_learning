@@ -11,54 +11,25 @@
 *.so
 *.dylib
 
-# CUDA compilation output
-*.ptx
-*.cubin
-*.fatbin
-
-# Vendored / external libraries
+# Vendored CUDA import libraries (also matched by *.lib above; listed so the
+# whole directory stays ignored if a .dll is ever dropped alongside them)
 backends/cuda/lib/
 backends/cuda/bindings/lib/
-ggml/
-llama.cpp/
-ollama/
 
 # Model weights and checkpoints
 *.safetensors
 *.gguf
-*.ckpt
-*.pt
-*.pth
-*.onnx
-*.npy
-*.npz
-*.bin
-models/
-*.part
 
-# Auto-downloaded by examples/llm_chat (see fetch.odin). The tokenizer.json
-# files are not covered by the extension globs above, so match the whole tree.
+# Auto-downloaded by the examples (see examples/fetch/fetch.odin). Neither the
+# tokenizer.json files nor the idx-ubyte.gz files are covered by the globs
+# above, so match the whole trees. *.part is fetch.odin's in-progress download.
 examples/llm_chat/data/
-
-# Data and generated assets
-*.csv
-*.png
-*.jpg
-*.jpeg
-*.wav
-*.mp3
-*.ttf
-*.log
-audio_sources/
-examples/data/audio_samples
-examples/data/audio_lm.ckpt
-examples/data/mnist_flow_samples
-tests/pytorch_parity/artifacts
+examples/mnist/data/
+*.part
 
 # Tooling
 ols.json
 .claude/
-__pycache__/
 
 # Editors
 .vs/

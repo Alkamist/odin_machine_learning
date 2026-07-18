@@ -11,6 +11,7 @@ import "core:time"
 import ml        "../../"
 import gemma     "../../networks/gemma"
 import gemma_tok "../../tokenizers/gemma"
+import           "../fetch"
 
 GEMMA_DATA_DIR       :: #directory + "data/gemma"
 GEMMA_GGUF_PATH      :: GEMMA_DATA_DIR + "/model.gguf"
@@ -21,7 +22,7 @@ GEMMA_TOKENIZER_PATH :: GEMMA_DATA_DIR + "/tokenizer.json"
 // dequantizes. The GGUFs published under ggml-org and google are Q4_0/Q8_0,
 // which load_gguf rejects. The blob is addressed by its own sha256, so this
 // URL is immutable.
-GEMMA_ASSETS := []Asset {
+GEMMA_ASSETS := []fetch.Asset {
 	{
 		url  = "https://registry.ollama.ai/v2/library/gemma4/blobs/sha256:4c27e0f5b5adf02ac956c7322bd2ee7636fe3f45a8512c9aba5385242cb6e09a",
 		dest = GEMMA_GGUF_PATH,
@@ -56,7 +57,7 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 	// fetch when we are using the default location.
 	weights_path := gguf_path
 	if builtin.len(weights_path) == 0 {
-		if !ensure_assets(GEMMA_ASSETS, "Gemma 4 E4B") {
+		if !fetch.ensure_assets(GEMMA_ASSETS, "Gemma 4 E4B") {
 			return {}, false
 		}
 		weights_path = GEMMA_GGUF_PATH

@@ -11,6 +11,7 @@ import "core:strings"
 import "core:time"
 
 import ml "../../"
+import    "../fetch"
 
 Chat_Model :: struct {
 	data:        rawptr,
@@ -98,7 +99,7 @@ main :: proc() {
 		fmt.print("> ")
 		os.flush(os.stdout)
 
-		line, line_ok := read_line(input_buffer[:])
+		line, line_ok := fetch.read_line(input_buffer[:])
 		if !line_ok {
 			fmt.println()
 			break
@@ -178,30 +179,6 @@ _copy_last_row :: proc(logits: ml.Tensor, out: []f32) {
 	buffer := make([]f32, ml.len(logits), context.temp_allocator)
 	ml.get_data(logits, buffer)
 	copy(out, buffer[(rows - 1) * vocab:])
-}
-
-read_line :: proc(buffer: []byte) -> (line: string, ok: bool) {
-	cursor := 0
-	one: [1]byte
-	for cursor < builtin.len(buffer) {
-		n, err := os.read(os.stdin, one[:])
-		if err != nil || n == 0 {
-			if cursor == 0 {
-				return "", false
-			}
-			break
-		}
-		c := one[0]
-		if c == '\n' {
-			break
-		}
-		buffer[cursor] = c
-		cursor += 1
-	}
-	if cursor > 0 && buffer[cursor - 1] == '\r' {
-		cursor -= 1
-	}
-	return string(buffer[:cursor]), true
 }
 
 sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> int {
