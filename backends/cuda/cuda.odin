@@ -24,7 +24,10 @@ Gpu_Device :: struct {
 	max_smem_per_block: i32,
 	max_smem_optin:     i32,
 
-	device_name: string,
+	name_buf: [128]u8,
+	name_len: int,
+
+	refcount: int,
 
 	pipeline_cache: map[string]^Pipeline,
 }
@@ -119,18 +122,14 @@ _device_init_locked :: proc(loc := #caller_location) {
 
 	cuda.check(cuda.DeviceGet(&_gpu.dev, 0))
 
-	name_buf: [128]u8
-	cuda.check(cuda.DeviceGetName(raw_data(name_buf[:]), i32(builtin.len(name_buf)), _gpu.dev))
-	name_len := 0
-	for c, i in name_buf {
+	cuda.check(cuda.DeviceGetName(raw_data(_gpu.name_buf[:]), i32(builtin.len(_gpu.name_buf)), _gpu.dev))
+	_gpu.name_len = 0
+	for c, i in _gpu.name_buf {
 		if c == 0 {
-			name_len = i
+			_gpu.name_len = i
 			break
 		}
 	}
-	owned := builtin.make([]u8, name_len)
-	builtin.copy(owned, name_buf[:name_len])
-	_gpu.device_name = builtin.string(owned)
 
 	cuda.check(cuda.DeviceGetAttribute(&_gpu.cc_major,           .COMPUTE_CAPABILITY_MAJOR,          _gpu.dev))
 	cuda.check(cuda.DeviceGetAttribute(&_gpu.cc_minor,           .COMPUTE_CAPABILITY_MINOR,          _gpu.dev))
@@ -140,16 +139,23 @@ _device_init_locked :: proc(loc := #caller_location) {
 	cuda.check(cuda.DeviceGetAttribute(&_gpu.max_smem_per_block, .MAX_SHARED_MEMORY_PER_BLOCK,       _gpu.dev))
 	cuda.check(cuda.DeviceGetAttribute(&_gpu.max_smem_optin,     .MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, _gpu.dev))
 
-	cuda.check(cuda.CtxCreate(&_gpu.ctx, cuda.CTX_SCHED_BLOCKING_SYNC, _gpu.dev))
+	cuda.check(cuda.DevicePrimaryCtxRetain(&_gpu.ctx, _gpu.dev))
 
 	_gpu.pipeline_cache = builtin.make(map[string]^Pipeline)
 
-	log.infof("%s  cc=%d.%d  SMs=%d  warp=%d", _gpu.device_name, _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
+	log.infof("%s  cc=%d.%d  SMs=%d  warp=%d", builtin.string(_gpu.name_buf[:_gpu.name_len]), _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
 }
 
 device_destroy :: proc() {
 	sync.lock(&_gpu_mutex)
 	defer sync.unlock(&_gpu_mutex)
+
+	if _gpu.refcount > 0 {
+		_gpu.refcount -= 1
+	}
+	if _gpu.refcount > 0 || _gpu.ctx == nil {
+		return
+	}
 
 	for _, p in _gpu.pipeline_cache {
 		_destroy_pipeline(p)
@@ -157,18 +163,13 @@ device_destroy :: proc() {
 	builtin.delete(_gpu.pipeline_cache)
 	_gpu.pipeline_cache = nil
 
-	if _gpu.ctx != nil {
-		cuda.CtxDestroy(_gpu.ctx)
-		_gpu.ctx = nil
-	}
-	if _gpu.device_name != "" {
-		builtin.delete(_gpu.device_name)
-		_gpu.device_name = ""
-	}
+	cuda.DevicePrimaryCtxRelease(_gpu.dev)
+	_gpu.ctx = nil
+	_gpu.name_len = 0
 }
 
 device_name :: proc() -> string {
-	return _gpu.device_name
+	return builtin.string(_gpu.name_buf[:_gpu.name_len])
 }
 
 _backend := ml.Backend{
@@ -206,6 +207,8 @@ context_create :: proc(decode_graph := false, allocator := context.allocator, lo
 	defer sync.unlock(&_gpu_mutex)
 
 	_device_init_locked()
+	_gpu.refcount += 1
+	cuda.check(cuda.CtxSetCurrent(_gpu.ctx), loc=loc)
 
 	gctx, err := builtin.new(Context, allocator=allocator, loc=loc)
 	fmt.assertf(err == nil, "Failed to allocate Context: %v", err, loc=loc)

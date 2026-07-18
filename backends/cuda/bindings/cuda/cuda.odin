@@ -193,6 +193,9 @@ foreign lib {
 	@(link_name="cuDeviceTotalMem_v2")
 	DeviceTotalMem      :: proc(bytes: ^uint, dev: Device) -> Result ---
 
+	DevicePrimaryCtxRetain :: proc(ctx: ^Context, dev: Device) -> Result ---
+	@(link_name="cuDevicePrimaryCtxRelease_v2") DevicePrimaryCtxRelease :: proc(dev: Device) -> Result ---
+
 	// Contexts. `_v2` is the actual export; the `cu*` macro aliases it.
 	@(link_name="cuCtxCreate_v2")      CtxCreate      :: proc(ctx: ^Context, flags: u32, dev: Device) -> Result ---
 	@(link_name="cuCtxDestroy_v2")     CtxDestroy     :: proc(ctx: Context) -> Result ---

@@ -190,6 +190,33 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 	cuda.device_destroy()
 }
 
+@(test)
+test_cuda_lifecycle :: proc(t: ^testing.T) {
+	if !_cuda_available() {
+		log.info("CUDA device not available; skipping CUDA lifecycle test")
+		return
+	}
+
+	for cycle in 0 ..< 2 {
+		ctx := cuda.context_create()
+		ml.context_begin(ctx)
+
+		param := ml.make(.F32, {4})
+		src := [4]f32{1, 2, 3, 4}
+		ml.set_data(param, src[:])
+		got: [4]f32
+		ml.get_data(param, got[:])
+		for i in 0 ..< 4 {
+			testing.expectf(t, got[i] == src[i], "lifecycle cycle %d elem %d got=%v want=%v", cycle, i, got[i], src[i])
+		}
+		ml.destroy(param)
+
+		ml.context_end()
+		cuda.context_destroy(ctx)
+		cuda.device_destroy()
+	}
+}
+
 ADAM_SIZE  :: 8
 ADAM_STEPS :: 12
 
