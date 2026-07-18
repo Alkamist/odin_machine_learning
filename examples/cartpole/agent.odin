@@ -12,7 +12,7 @@ OBS_SIZE     :: 5
 MODEL_INPUT  :: OBS_SIZE + ACTION_COUNT
 HIDDEN_SIZE  :: 32
 
-ACTION_REPEAT :: 1
+ACTION_REPEAT :: 3
 
 ENSEMBLE_SIZE :: 5
 
@@ -22,14 +22,12 @@ PLAN_ELITES   :: 8
 PLAN_ITERS    :: 3
 PLAN_DISCOUNT :: f32(0.98)
 
-PESSIMISM         :: f32(1)
-DISTURBANCE_SCALE :: f32(1)
-ERROR_RATE        :: f32(0.01)
+PESSIMISM :: f32(1)
 
 BUFFER_CAPACITY  :: 4096
 TRAIN_BATCH_SIZE :: 64
 TRAIN_MINIMUM    :: 8
-TRAIN_STEPS      :: 8
+TRAIN_STEPS      :: 24
 LEARNING_RATE    :: 3e-3
 
 WARMUP_DECISIONS :: 24
@@ -67,10 +65,6 @@ Agent :: struct {
 	delta_sq_mean:  Observation,
 	delta_samples:  int,
 
-	error_sq_mean: Observation,
-	predicted:     Observation,
-	has_predicted: bool,
-
 	plan: [PLAN_HORIZON][ACTION_COUNT]f32,
 
 	action:       Action,
@@ -96,10 +90,9 @@ agent_destroy :: proc(agent: Agent) {
 }
 
 agent_forget_episode :: proc(agent: ^Agent) {
-	agent.has_previous  = false
-	agent.has_predicted = false
-	agent.hold          = 0
-	agent.action        = .None
+	agent.has_previous = false
+	agent.hold         = 0
+	agent.action       = .None
 	for h in 0 ..< PLAN_HORIZON {
 		for a in 0 ..< ACTION_COUNT {
 			agent.plan[h][a] = 1.0 / f32(ACTION_COUNT)
@@ -130,13 +123,6 @@ agent_step :: proc(agent: ^Agent, state: State) -> Action {
 			transition.delta[i] = observation[i] - agent.previous[i]
 		}
 		agent_remember(agent, transition)
-
-		if agent.has_predicted {
-			for i in 0 ..< OBS_SIZE {
-				error := transition.delta[i] - agent.predicted[i]
-				agent.error_sq_mean[i] += (error * error - agent.error_sq_mean[i]) * ERROR_RATE
-			}
-		}
 	}
 
 	if agent.decisions < WARMUP_DECISIONS {
@@ -145,9 +131,6 @@ agent_step :: proc(agent: ^Agent, state: State) -> Action {
 	else {
 		agent.action = agent_plan(agent, observation)
 	}
-
-	agent.predicted     = agent_predict(agent, observation, agent.action)
-	agent.has_predicted = true
 
 	agent.previous     = observation
 	agent.has_previous = true
@@ -188,33 +171,6 @@ agent_sample_index :: proc(agent: ^Agent) -> int {
 agent_delta_deviation :: proc(agent: ^Agent, i: int) -> f32 {
 	variance := agent.delta_sq_mean[i] - agent.delta_mean[i] * agent.delta_mean[i]
 	return max(math.sqrt(max(variance, 0)), 1e-4)
-}
-
-@(require_results)
-agent_error_deviation :: proc(agent: ^Agent, i: int) -> f32 {
-	return math.sqrt(agent.error_sq_mean[i])
-}
-
-@(require_results)
-agent_predict :: proc(agent: ^Agent, observation: Observation, action: Action) -> (delta: Observation) {
-	input  := make([]f32, MODEL_INPUT, context.temp_allocator)
-	output := make([]f32, OBS_SIZE,    context.temp_allocator)
-
-	encode(observation, action, input)
-
-	for m in 0 ..< ENSEMBLE_SIZE {
-		ml.clear()
-
-		x          := ml.reshape(ml.tensor(input), {1, MODEL_INPUT})
-		prediction := mlp.forward(agent.models[m], x)
-		ml.get_data(prediction, output)
-
-		for i in 0 ..< OBS_SIZE {
-			delta[i] += (output[i] * agent_delta_deviation(agent, i) + agent.delta_mean[i]) / f32(ENSEMBLE_SIZE)
-		}
-	}
-
-	return
 }
 
 @(require_results)
@@ -358,12 +314,12 @@ agent_rollout :: proc(agent: ^Agent, observation: Observation, sequences: [][PLA
 	discount := f32(1)
 
 	for h in 0 ..< PLAN_HORIZON {
+		ml.clear()
+
 		for m in 0 ..< ENSEMBLE_SIZE {
 			for n in 0 ..< PLAN_SAMPLES {
 				encode(states[n * ENSEMBLE_SIZE + m], sequences[n][h], inputs[n * MODEL_INPUT:][:MODEL_INPUT])
 			}
-
-			ml.clear()
 
 			x          := ml.reshape(ml.tensor(inputs), {PLAN_SAMPLES, MODEL_INPUT})
 			prediction := mlp.forward(agent.models[m], x)
@@ -377,7 +333,6 @@ agent_rollout :: proc(agent: ^Agent, observation: Observation, sequences: [][PLA
 
 				for i in 0 ..< OBS_SIZE {
 					states[p][i] += deltas[n * OBS_SIZE + i] * agent_delta_deviation(agent, i) + agent.delta_mean[i]
-					states[p][i] += rand.float32_normal(0, DISTURBANCE_SCALE * agent_error_deviation(agent, i))
 				}
 
 				length := math.sqrt(states[p][2] * states[p][2] + states[p][3] * states[p][3])
