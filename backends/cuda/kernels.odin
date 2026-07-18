@@ -2,6 +2,8 @@ package machine_learning_backend_cuda
 
 ADD_LOCAL_SIZE :: 256
 
+BROADCAST_CUH_SRC :: #load("kernels/common/broadcast.cuh", []u8)
+
 Q4_K_MMVQ_ROWS_PER_WG :: 2
 Q8_1_BLOCK_BYTES      :: 36
 Q8_1_BLOCK_UINTS      :: 9

@@ -1,6 +1,7 @@
 // da_b[j] += sum_i dy[i*n_b + j], bf16 packed-pair output. Walks the
 // broadcast slab serially, accumulating in fp32 for stability.
 #include <cuda_bf16.h>
+#include "broadcast.cuh"
 
 extern "C" __global__
 void add_back_b_bf16(const unsigned int* __restrict__ dy,
@@ -14,8 +15,8 @@ void add_back_b_bf16(const unsigned int* __restrict__ dy,
 
 	float acc0 = 0.0f, acc1 = 0.0f;
 	for (int i = 0; i < stride; ++i) {
-		int idx0 = i * n_b + j0;
-		int idx1 = i * n_b + j1;
+		int idx0 = bc_tile_index(i, j0, n_b);
+		int idx1 = bc_tile_index(i, j1, n_b);
 		unsigned int dy0_pack = dy[idx0 >> 1];
 		unsigned short dy0 = (unsigned short)((dy0_pack >> ((idx0 & 1) * 16)) & 0xffffu);
 		acc0 += __bfloat162float(__ushort_as_bfloat16(dy0));

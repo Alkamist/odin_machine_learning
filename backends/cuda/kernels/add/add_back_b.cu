@@ -1,3 +1,4 @@
+#include "broadcast.cuh"
 // da_b[j] += sum_i dy[i*n_b + j]. Thread per b element, serial reduce.
 extern "C" __global__
 void add_back_b_f32(const float* __restrict__ dy,
@@ -7,7 +8,7 @@ void add_back_b_f32(const float* __restrict__ dy,
 	if (j >= n_b) return;
 	float acc = 0.0f;
 	for (int i = 0; i < stride; ++i) {
-		acc += dy[i * n_b + j];
+		acc += dy[bc_tile_index(i, j, n_b)];
 	}
 	da_b[j] += acc;
 }

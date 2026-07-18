@@ -1,5 +1,6 @@
 // Bf16 broadcast mul. Native __hmul on Ampere.
 #include <cuda_bf16.h>
+#include "broadcast.cuh"
 
 extern "C" __global__
 void mul_bf16(const unsigned int* __restrict__ a,
@@ -18,12 +19,12 @@ void mul_bf16(const unsigned int* __restrict__ a,
 	unsigned short c0 = 0, c1 = 0;
 
 	if (i0 < n) {
-		int j = i0 % n_b;
+		int j = bc_b_index(i0, n_b);
 		unsigned short b0 = (unsigned short)((b[j >> 1] >> ((j & 1) * 16)) & 0xffffu);
 		c0 = __bfloat16_as_ushort(__hmul(__ushort_as_bfloat16(a0), __ushort_as_bfloat16(b0)));
 	}
 	if (i1 < n) {
-		int j = i1 % n_b;
+		int j = bc_b_index(i1, n_b);
 		unsigned short b1 = (unsigned short)((b[j >> 1] >> ((j & 1) * 16)) & 0xffffu);
 		c1 = __bfloat16_as_ushort(__hmul(__ushort_as_bfloat16(a1), __ushort_as_bfloat16(b1)));
 	}

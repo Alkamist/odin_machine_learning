@@ -703,13 +703,17 @@ _cast_bytes_accumulate :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte,
 	}
 }
 
+_broadcast_tiling :: #force_inline proc(a, b: ml.Tensor) -> (stride, width: int) {
+	width  = ml.len(b)
+	stride = ml.len(a) / width
+	return
+}
+
 add_forward :: proc(op: ml.Operation) {
 	a      := op.input
 	output := op.output
 	b      := op.variant.(ml.Add).b
-	stride := ml.len(a) / ml.len(b)
-
-	width := ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	#partial switch a.type {
 	case .F32:
@@ -739,10 +743,9 @@ add_forward :: proc(op: ml.Operation) {
 add_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b      := op.variant.(ml.Add).b
-	stride := ml.len(a) / ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
-	width := ml.len(b)
 	#no_bounds_check for i in 0 ..< stride {
 		row_da := da[i * width:]
 		row_dy := dy[i * width:]
@@ -757,13 +760,13 @@ sub_forward :: proc(op: ml.Operation) {
 	a      := op.input
 	output := op.output
 	b      := op.variant.(ml.Sub).b
-	stride := ml.len(a) / ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				data(output)[o] = data(a)[o] - data(b)[j]
 			}
 		}
@@ -772,8 +775,8 @@ sub_forward :: proc(op: ml.Operation) {
 		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
 		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) - ml.bf16_to_f32(b_bf[j]))
 			}
 		}
@@ -783,12 +786,12 @@ sub_forward :: proc(op: ml.Operation) {
 sub_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b      := op.variant.(ml.Sub).b
-	stride := ml.len(a) / ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
 	for i in 0 ..< stride {
-		for j in 0 ..< ml.len(b) {
-			o := i * ml.len(b) + j
+		for j in 0 ..< width {
+			o := i * width + j
 			da[o] += dy[o]
 			db[j] -= dy[o]
 		}
@@ -799,13 +802,13 @@ mul_forward :: proc(op: ml.Operation) {
 	a      := op.input
 	output := op.output
 	b      := op.variant.(ml.Mul).b
-	stride := ml.len(a) / ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				data(output)[o] = data(a)[o] * data(b)[j]
 			}
 		}
@@ -814,8 +817,8 @@ mul_forward :: proc(op: ml.Operation) {
 		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
 		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) * ml.bf16_to_f32(b_bf[j]))
 			}
 		}
@@ -825,15 +828,15 @@ mul_forward :: proc(op: ml.Operation) {
 mul_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b      := op.variant.(ml.Mul).b
-	stride := ml.len(a) / ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
 	#partial switch a.type {
 	case .F32:
 		av, bv := data(a), data(b)
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				da[o] += dy[o] * bv[j]
 				db[j] += dy[o] * av[o]
 			}
@@ -841,8 +844,8 @@ mul_backward :: proc(op: ml.Operation) {
 	case .Bf16:
 		av, bv := data_bf16(a), data_bf16(b)
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				da[o] += dy[o] * ml.bf16_to_f32(bv[j])
 				db[j] += dy[o] * ml.bf16_to_f32(av[o])
 			}
@@ -854,13 +857,13 @@ div_forward :: proc(op: ml.Operation) {
 	a      := op.input
 	output := op.output
 	b      := op.variant.(ml.Div).b
-	stride := ml.len(a) / ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				data(output)[o] = data(a)[o] / data(b)[j]
 			}
 		}
@@ -869,8 +872,8 @@ div_forward :: proc(op: ml.Operation) {
 		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
 		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				o_bf[o] = ml.bf16_from_f32(ml.bf16_to_f32(a_bf[o]) / ml.bf16_to_f32(b_bf[j]))
 			}
 		}
@@ -880,15 +883,15 @@ div_forward :: proc(op: ml.Operation) {
 div_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b      := op.variant.(ml.Div).b
-	stride := ml.len(a) / ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	da, db, dy := gradient(a), gradient(b), gradient(output)
 	#partial switch a.type {
 	case .F32:
 		av, bv := data(a), data(b)
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				da[o] += dy[o] / bv[j]
 				db[j] += dy[o] * (-av[o] / (bv[j] * bv[j]))
 			}
@@ -896,8 +899,8 @@ div_backward :: proc(op: ml.Operation) {
 	case .Bf16:
 		av, bv := data_bf16(a), data_bf16(b)
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				a_v := ml.bf16_to_f32(av[o])
 				b_v := ml.bf16_to_f32(bv[j])
 				da[o] += dy[o] / b_v
@@ -2703,7 +2706,7 @@ gelu_mul_forward :: proc(op: ml.Operation) {
 	a      := op.input
 	output := op.output
 	b      := op.variant.(ml.Gelu_Mul).b
-	stride := ml.len(a) / ml.len(b)
+	stride, width := _broadcast_tiling(a, b)
 
 	gelu :: proc(x: f32) -> f32 {
 		cube := f32(0.044715) * x * x * x
@@ -2713,8 +2716,8 @@ gelu_mul_forward :: proc(op: ml.Operation) {
 	#partial switch a.type {
 	case .F32:
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				data(output)[o] = gelu(data(a)[o]) * data(b)[j]
 			}
 		}
@@ -2723,8 +2726,8 @@ gelu_mul_forward :: proc(op: ml.Operation) {
 		b_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)b.buffers     [.Data]))
 		o_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
 		for i in 0 ..< stride {
-			for j in 0 ..< ml.len(b) {
-				o := i * ml.len(b) + j
+			for j in 0 ..< width {
+				o := i * width + j
 				o_bf[o] = ml.bf16_from_f32(gelu(ml.bf16_to_f32(a_bf[o])) * ml.bf16_to_f32(b_bf[j]))
 			}
 		}

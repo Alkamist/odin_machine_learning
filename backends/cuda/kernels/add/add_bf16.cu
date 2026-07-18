@@ -2,6 +2,7 @@
 // Uses native __hadd, so each pair is two BF16 ALU ops vs the four fp32 ops
 // vulkan needs (expand x2, add, round x1).
 #include <cuda_bf16.h>
+#include "broadcast.cuh"
 
 extern "C" __global__
 void add_bf16(const unsigned int* __restrict__ a,
@@ -20,12 +21,12 @@ void add_bf16(const unsigned int* __restrict__ a,
 	unsigned short c0 = 0, c1 = 0;
 
 	if (i0 < n) {
-		int j = i0 % n_b;
+		int j = bc_b_index(i0, n_b);
 		unsigned short b0 = (unsigned short)((b[j >> 1] >> ((j & 1) * 16)) & 0xffffu);
 		c0 = __bfloat16_as_ushort(__hadd(__ushort_as_bfloat16(a0), __ushort_as_bfloat16(b0)));
 	}
 	if (i1 < n) {
-		int j = i1 % n_b;
+		int j = bc_b_index(i1, n_b);
 		unsigned short b1 = (unsigned short)((b[j >> 1] >> ((j & 1) * 16)) & 0xffffu);
 		c1 = __bfloat16_as_ushort(__hadd(__ushort_as_bfloat16(a1), __ushort_as_bfloat16(b1)));
 	}

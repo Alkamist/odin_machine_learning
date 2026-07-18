@@ -1,3 +1,4 @@
+#include "broadcast.cuh"
 // Fused y = gelu(a) * b for fp32 inputs and output.
 
 #define GELU_SCALE 0.7978845608028654f
@@ -15,6 +16,6 @@ void gelu_mul_f32(const float* __restrict__ a,
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n) return;
 
-	int j = i % n_b;
+	int j = bc_b_index(i, n_b);
 	c[i] = gelu_tanh(a[i]) * b[j];
 }

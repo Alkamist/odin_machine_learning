@@ -3,6 +3,7 @@
 // b broadcasts over leading dims; many a-elements may target the same b
 // cell, so native f32 atomicAdd handles the contention.
 #include <cuda_bf16.h>
+#include "broadcast.cuh"
 
 extern "C" __global__
 void mul_back_b_bf16(const unsigned int* __restrict__ a,
@@ -13,6 +14,6 @@ void mul_back_b_bf16(const unsigned int* __restrict__ a,
 	if (o >= n_a) return;
 	unsigned short ab = (unsigned short)((a[o >> 1] >> ((o & 1) * 16)) & 0xffffu);
 	float av = __bfloat162float(__ushort_as_bfloat16(ab));
-	int j = o % n_b;
+	int j = bc_b_index(o, n_b);
 	atomicAdd(&db[j], dy[o] * av);
 }

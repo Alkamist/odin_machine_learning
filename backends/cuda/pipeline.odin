@@ -83,8 +83,11 @@ _compile_pipeline :: proc(
 
 	src_cstr := _src_to_temp_cstring(src)
 
+	header_srcs  := [1]cstring{_src_to_temp_cstring(BROADCAST_CUH_SRC)}
+	header_names := [1]cstring{"broadcast.cuh"}
+
 	prog: nvrtc.Program
-	nvrtc.check(nvrtc.CreateProgram(&prog, src_cstr, source_name, 0, nil, nil), loc=loc)
+	nvrtc.check(nvrtc.CreateProgram(&prog, src_cstr, source_name, 1, raw_data(header_srcs[:]), raw_data(header_names[:])), loc=loc)
 	defer nvrtc.DestroyProgram(&prog)
 
 	arch_buf: [32]u8
