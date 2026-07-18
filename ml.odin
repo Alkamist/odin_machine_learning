@@ -102,7 +102,7 @@ Backend :: struct #all_or_none {
 }
 
 Context :: struct {
-	backend: Backend,
+	backend: ^Backend,
 
 	op_arena:      mem.Arena,
 	_op_arena_buf: []byte,
@@ -118,7 +118,7 @@ Context :: struct {
 @(thread_local)
 _current_ctx: ^Context
 
-_context_init :: proc(ctx: ^Context, backend: Backend, allocator: mem.Allocator, loc: runtime.Source_Code_Location) {
+_context_init :: proc(ctx: ^Context, backend: ^Backend, allocator: mem.Allocator, loc: runtime.Source_Code_Location) {
 	ctx.backend  = backend
 	ctx.training = true
 
@@ -217,7 +217,7 @@ alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_S
 	element_count := shape_element_count(shape)
 	assert(element_count > 0, "Tensor element count must be positive", loc=loc)
 
-	t.backend = &_current_ctx.backend
+	t.backend = _current_ctx.backend
 	t.type    = type
 	t.count   = element_count
 	t.rank    = builtin.len(shape)
@@ -771,7 +771,7 @@ backward :: proc(loss: Tensor, loc := #caller_location) {
 	backend := _current_ctx.backend
 
 	assert(_current_ctx.training, "backward called on an inference pass (did you forget clear(training=true)?)", loc=loc)
-	assert(loss.backend == &_current_ctx.backend, "loss tensor is not from the active context", loc=loc)
+	assert(loss.backend == _current_ctx.backend, "loss tensor is not from the active context", loc=loc)
 	assert(loss.type == .F32, "backward requires an F32 loss tensor", loc=loc)
 	assert(loss.buffers[.Gradient] != Backend_Buffer{}, "loss tensor has no gradient buffer", loc=loc)
 

@@ -330,6 +330,25 @@ Context :: struct {
 
 POISON_TRANSIENT :: #config(ML_CPU_POISON, false)
 
+_backend := ml.Backend{
+	clear        = clear,
+	forward      = forward,
+	backward     = backward,
+	update       = update,
+	buffer_alloc = buffer_alloc,
+	buffer_free  = buffer_free,
+	buffer_get   = buffer_get,
+	buffer_set   = buffer_set,
+	buffer_copy  = buffer_copy,
+
+	forward_ops  = ml.OPERATION_SET_ALL - {.Linear_Q4_K_Gate_Up_Geglu, .Rmsnorm_Rope_Write_Cache},
+	backward_ops = ml.OPERATION_SET_ALL - {
+		.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
+		.Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache, .Add_Rmsnorm,
+		.Gelu_Mul, .Lerp_Assign, .Accumulate_Mean,
+	},
+}
+
 @(require_results)
 context_create :: proc(size: int, allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
 	_enable_flush_to_zero()
@@ -343,24 +362,7 @@ context_create :: proc(size: int, allocator := context.allocator, loc := #caller
 
 	ctx.persistent = builtin.make(map[rawptr]bool, allocator=allocator)
 
-	ml._context_init(ctx, {
-		clear        = clear,
-		forward      = forward,
-		backward     = backward,
-		update       = update,
-		buffer_alloc = buffer_alloc,
-		buffer_free  = buffer_free,
-		buffer_get   = buffer_get,
-		buffer_set   = buffer_set,
-		buffer_copy  = buffer_copy,
-
-		forward_ops  = ml.OPERATION_SET_ALL - {.Linear_Q4_K_Gate_Up_Geglu, .Rmsnorm_Rope_Write_Cache},
-		backward_ops = ml.OPERATION_SET_ALL - {
-			.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
-			.Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache, .Add_Rmsnorm,
-			.Gelu_Mul, .Lerp_Assign, .Accumulate_Mean,
-		},
-	}, allocator, loc)
+	ml._context_init(ctx, &_backend, allocator, loc)
 
 	return ctx
 }

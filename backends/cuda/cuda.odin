@@ -171,6 +171,31 @@ device_name :: proc() -> string {
 	return _gpu.device_name
 }
 
+_backend := ml.Backend{
+	clear        = clear,
+	forward      = forward,
+	backward     = backward,
+	update       = update,
+	buffer_alloc = buffer_alloc,
+	buffer_free  = buffer_free,
+	buffer_get   = buffer_get,
+	buffer_set   = buffer_set,
+	buffer_copy  = buffer_copy,
+
+	forward_ops = {
+		.Add, .Mul, .Gelu_Mul, .Gelu, .Silu, .Tanh, .Cast, .Linear,
+		.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
+		.Rmsnorm, .Add_Rmsnorm, .Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache,
+		.Rope, .Attention, .Attention_Cache, .Cross_Entropy,
+		.Select, .Slice_Trailing, .Exp, .Clamp, .Min, .Softmax, .Entropy,
+	},
+	backward_ops = {
+		.Add, .Mul, .Linear, .Linear_Q4_K, .Linear_Q6_K, .Silu, .Gelu,
+		.Tanh, .Select, .Slice_Trailing, .Rmsnorm, .Rope, .Attention,
+		.Cross_Entropy, .Cast, .Exp, .Clamp, .Min, .Softmax, .Entropy,
+	},
+}
+
 @(require_results)
 // decode_graph arms CUDA auto-graph capture: after a warmup step, single-token
 // decode replays a captured graph instead of re-issuing every kernel launch, so
@@ -196,30 +221,7 @@ context_create :: proc(decode_graph := false, allocator := context.allocator, lo
 	cuda.check(cuda.MemsetD32(gctx.position_dev, 0, 1))
 	(^i32)(gctx.position_pinned)^ = 0
 
-	ml._context_init(gctx, {
-		clear        = clear,
-		forward      = forward,
-		backward     = backward,
-		update       = update,
-		buffer_alloc = buffer_alloc,
-		buffer_free  = buffer_free,
-		buffer_get   = buffer_get,
-		buffer_set   = buffer_set,
-		buffer_copy  = buffer_copy,
-
-		forward_ops = {
-			.Add, .Mul, .Gelu_Mul, .Gelu, .Silu, .Tanh, .Cast, .Linear,
-			.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
-			.Rmsnorm, .Add_Rmsnorm, .Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache,
-			.Rope, .Attention, .Attention_Cache, .Cross_Entropy,
-			.Select, .Slice_Trailing, .Exp, .Clamp, .Min, .Softmax, .Entropy,
-		},
-		backward_ops = {
-			.Add, .Mul, .Linear, .Linear_Q4_K, .Linear_Q6_K, .Silu, .Gelu,
-			.Tanh, .Select, .Slice_Trailing, .Rmsnorm, .Rope, .Attention,
-			.Cross_Entropy, .Cast, .Exp, .Clamp, .Min, .Softmax, .Entropy,
-		},
-	}, allocator, loc)
+	ml._context_init(gctx, &_backend, allocator, loc)
 
 	return gctx
 }
