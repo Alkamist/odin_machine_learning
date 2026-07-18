@@ -429,7 +429,7 @@ draw_status :: proc(human: bool, decisions: int) {
 		rl.DrawText(rl.TextFormat("Agent, %d decisions learned (TAB to take over)", decisions), 20, 20, 20, rl.WHITE)
 	}
 
-	rl.DrawText(rl.TextFormat("%d FPS", rl.GetFPS()), 20, 44, 20, rl.LIGHTGRAY)
+	rl.DrawText(rl.TextFormat("%d FPS", rl.GetFPS()), 20, 44, 20, rl.WHITE)
 }
 
 draw_text :: proc(text: cstring, font_size: int, x, y: f32, color: rl.Color) {

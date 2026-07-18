@@ -284,8 +284,8 @@ agent_plan :: proc(agent: ^Agent, observation: Observation) -> Action {
 agent_rollout :: proc(agent: ^Agent, observation: Observation, sequences: [][PLAN_HORIZON]Action, returns: []f32) {
 	ml.clear()
 
-	states := make([]Observation, PLAN_SAMPLES, context.temp_allocator)
-	alive  := make([]bool,        PLAN_SAMPLES, context.temp_allocator)
+	states := make([]Observation, PLAN_SAMPLES,               context.temp_allocator)
+	alive  := make([]bool,        PLAN_SAMPLES,               context.temp_allocator)
 	inputs := make([]f32,         PLAN_SAMPLES * MODEL_INPUT, context.temp_allocator)
 	deltas := make([]f32,         PLAN_SAMPLES * OBS_SIZE,    context.temp_allocator)
 
