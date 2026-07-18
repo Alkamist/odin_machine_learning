@@ -27,6 +27,31 @@ frame_end :: proc() {
 	rl.EndDrawing()
 }
 
+toggle_pressed :: proc() -> bool {
+	return rl.IsKeyPressed(.TAB)
+}
+
+// The world is drawn with {0, 0} at the middle of the window and y pointing up,
+// so screen coordinates have to be recentered and flipped to match.
+@(require_results)
+mouse_position :: proc() -> [2]f32 {
+	position := rl.GetMousePosition()
+	return {
+		position.x - f32(rl.GetScreenWidth())  / 2.0,
+		-(position.y - f32(rl.GetScreenHeight()) / 2.0),
+	}
+}
+
+@(require_results)
+mouse_held :: proc() -> bool {
+	return rl.IsMouseButtonDown(.LEFT)
+}
+
+@(require_results)
+mouse_pressed :: proc() -> bool {
+	return rl.IsMouseButtonPressed(.LEFT)
+}
+
 human_action :: proc(previous: Action) -> (res: Action) {
 	if !rl.IsKeyDown(.A) && !rl.IsKeyDown(.D) {
 		return .None
@@ -64,6 +89,7 @@ human_action :: proc(previous: Action) -> (res: Action) {
 Category :: enum u64 {
 	Normal,
 	Pole,
+	Mouse,
 }
 
 Category_Set :: bit_set[Category; u64]
@@ -125,7 +151,9 @@ box_draw :: proc(box: Box, color: rl.Color, interpolation: f32) {
 }
 
 TIME_LIMIT :: 30
+GRAVITY    :: 2000
 CART_LIMIT :: 500
+CART_SPEED :: 500
 CART_SIZE  :: [2]f32{100,   50}
 POLE_SIZE  :: [2]f32{  8,  300}
 WALL_SIZE  :: [2]f32{ 10, 1000}
@@ -151,13 +179,59 @@ State :: struct {
 	anchor_body:     b2.BodyId,
 	revolute_joint:  b2.JointId,
 	prismatic_joint: b2.JointId,
+
+	mouse_body:   b2.BodyId,
+	mouse_shape:  b2.ShapeId,
+	mouse_active: bool,
+	mouse_target: [2]f32,
+}
+
+// A kinematic disc the mouse drives around to shove the pole with. Kinematic so
+// the pole cannot push back on it, and driven by velocity rather than by
+// teleporting its transform, because a body that jumps between positions has no
+// velocity for the solver to transfer into whatever it lands on.
+MOUSE_RADIUS :: 20.0
+
+mouse_destroy :: proc(state: State) {
+	if state.mouse_shape != {} {
+		b2.DestroyShape(state.mouse_shape, true)
+	}
+	if state.mouse_body != {} {
+		b2.DestroyBody(state.mouse_body)
+	}
+}
+
+mouse_begin :: proc(state: ^State, world: [2]f32) {
+	state.mouse_target = world
+	state.mouse_active = true
+
+	b2.Body_SetTransform(state.mouse_body, world, b2.MakeRot(0))
+	b2.Body_SetLinearVelocity(state.mouse_body, {0, 0})
+	b2.Body_Enable(state.mouse_body)
+}
+
+mouse_end :: proc(state: ^State) {
+	if !state.mouse_active {
+		return
+	}
+	state.mouse_active = false
+	b2.Body_Disable(state.mouse_body)
+}
+
+mouse_apply :: proc(state: ^State, delta: f32) {
+	if !state.mouse_active {
+		return
+	}
+
+	position := b2.Body_GetPosition(state.mouse_body)
+	b2.Body_SetLinearVelocity(state.mouse_body, (state.mouse_target - position) / delta)
 }
 
 init :: proc(state: ^State) {
 	b2.SetLengthUnitsPerMeter(PIXELS_PER_METER)
 
 	world_def          := b2.DefaultWorldDef()
-	world_def.gravity.y = -2000
+	world_def.gravity.y = -GRAVITY
 	state.world         = b2.CreateWorld(world_def)
 
 	reset(state)
@@ -173,6 +247,7 @@ destroy :: proc(state: ^State) {
 	if state.anchor_body     != {} {
 		b2.DestroyBody(state.anchor_body)
 	}
+	mouse_destroy(state^)
 	box_destroy(state.pole)
 	box_destroy(state.cart)
 	box_destroy(state.left_wall)
@@ -190,6 +265,7 @@ reset :: proc(state: ^State) {
 	if state.anchor_body     != {} {
 		b2.DestroyBody(state.anchor_body)
 	}
+	mouse_destroy(state^)
 	box_destroy(state.cart)
 	box_destroy(state.pole)
 	box_destroy(state.left_wall)
@@ -198,6 +274,9 @@ reset :: proc(state: ^State) {
 	state.time     = 0
 	state.score    = 0
 
+	// The disc is recreated below along with everything else.
+	state.mouse_active = false
+
 	// Create static anchor body for the prismatic joint
 	anchor_def         := b2.DefaultBodyDef()
 	anchor_def.type     = .staticBody
@@ -205,7 +284,24 @@ reset :: proc(state: ^State) {
 	state.anchor_body   = b2.CreateBody(state.world, anchor_def)
 
 	state.cart = box_make(state^, .dynamicBody, {0, 0}, CART_SIZE, 5)
-	state.pole = box_make(state^, .dynamicBody, {0, -POLE_SIZE.y * 0.5}, POLE_SIZE, 2, category={.Pole}, mask={})
+	state.pole = box_make(state^, .dynamicBody, {0, -POLE_SIZE.y * 0.5}, POLE_SIZE, 2, category={.Pole}, mask={.Mouse})
+
+	// The disc the mouse pushes the pole with. It only ever interacts with the
+	// pole, and stays disabled until the left button is actually held.
+	mouse_def         := b2.DefaultBodyDef()
+	mouse_def.type     = .kinematicBody
+	mouse_def.position = {0, 0}
+	state.mouse_body   = b2.CreateBody(state.world, mouse_def)
+
+	mouse_shape_def                    := b2.DefaultShapeDef()
+	mouse_shape_def.density             = 1
+	mouse_shape_def.filter.categoryBits = transmute(u64)Category_Set{.Mouse}
+	mouse_shape_def.filter.maskBits     = transmute(u64)Category_Set{.Pole}
+
+	state.mouse_shape = b2.CreateCircleShape(state.mouse_body, mouse_shape_def, b2.Circle{center = {0, 0}, radius = MOUSE_RADIUS})
+
+	b2.Shape_SetFriction(state.mouse_shape, 0)
+	b2.Body_Disable(state.mouse_body)
 
 	// Create walls
 	state.left_wall  = box_make(state^, .staticBody, {-CART_LIMIT, 0}, WALL_SIZE, 0)
@@ -229,15 +325,40 @@ reset :: proc(state: ^State) {
 	state.revolute_joint      = b2.CreateRevoluteJoint(state.world, revolute_def)
 }
 
+// The four numbers that fully describe the system, for whoever is playing it.
+// The pole hangs straight down at angle 0 and stands upright at +/-pi.
+
+@(require_results)
+cart_position :: proc(state: State) -> f32 {
+	return b2.Body_GetPosition(state.cart.body).x
+}
+
+@(require_results)
+cart_velocity :: proc(state: State) -> f32 {
+	return b2.Body_GetLinearVelocity(state.cart.body).x
+}
+
+@(require_results)
+pole_angle :: proc(state: State) -> f32 {
+	return b2.Rot_GetAngle(b2.Body_GetRotation(state.pole.body))
+}
+
+@(require_results)
+pole_spin :: proc(state: State) -> f32 {
+	return b2.Body_GetAngularVelocity(state.pole.body)
+}
+
 step :: proc(state: ^State, action: Action, delta: f32) -> (done: bool) {
 	state.time += delta
+
+	mouse_apply(state, delta)
 
 	// Apply a force to the cart based on action
 	target_speed: f32
 	switch action {
 	case .None:
-	case .Left:  target_speed = -500.0
-	case .Right: target_speed =  500.0
+	case .Left:  target_speed = -CART_SPEED
+	case .Right: target_speed =  CART_SPEED
 	}
 
 	speed_diff := target_speed - b2.Body_GetLinearVelocity(state.cart.body).x
@@ -303,6 +424,11 @@ draw :: proc(state: State, interpolation: f32) {
 	box_draw(state.cart, rl.DARKBLUE, interpolation)
 	box_draw(state.pole, rl.GREEN,    interpolation)
 
+	if state.mouse_active {
+		position := b2.Body_GetPosition(state.mouse_body)
+		rl.DrawCircleV({position.x, -position.y}, MOUSE_RADIUS, rl.YELLOW)
+	}
+
 	position := math.lerp(state.cart.position_, b2.Body_GetPosition(state.cart.body), interpolation)
 	draw_text_centered(rl.TextFormat("%.2f", state.score), 10, position.x, position.y + 50, rl.WHITE)
 
@@ -310,6 +436,15 @@ draw :: proc(state: State, interpolation: f32) {
 	draw_text(rl.TextFormat("Time: %.2f",       TIME_LIMIT - state.time), 20, 0,               340, rl.WHITE)
 
 	rl.EndMode2D()
+}
+
+draw_status :: proc(human: bool, decisions: int) {
+	if human {
+		rl.DrawText("Human (TAB to hand back to the agent) - A/D to move", 20, 20, 20, rl.WHITE)
+	}
+	else {
+		rl.DrawText(rl.TextFormat("Agent, %d decisions learned (TAB to take over)", decisions), 20, 20, 20, rl.WHITE)
+	}
 }
 
 draw_text :: proc(text: cstring, font_size: int, x, y: f32, color: rl.Color) {
