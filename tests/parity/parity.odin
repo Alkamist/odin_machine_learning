@@ -280,7 +280,7 @@ test_cuda_lifecycle :: proc(t: ^testing.T) {
 	}
 
 	for cycle in 0 ..< 2 {
-		ctx := cuda.context_create()
+		ctx := cuda.context_create(fast_math=cycle == 0)
 		defer cuda.device_destroy()
 		defer cuda.context_destroy(ctx)
 		ml.context_scope(ctx)
@@ -293,6 +293,18 @@ test_cuda_lifecycle :: proc(t: ^testing.T) {
 		for i in 0 ..< 4 {
 			testing.expectf(t, got[i] == src[i], "lifecycle cycle %d elem %d got=%v want=%v", cycle, i, got[i], src[i])
 		}
+
+		a := ml.tensor([]f32{1, 2, 3, 4})
+		b := ml.tensor([]f32{5, 6, 7, 8})
+		c := ml.mul(a, b)
+		product: [4]f32
+		ml.get_data(c, product[:])
+		for i in 0 ..< 4 {
+			want := src[i] * (src[i] + 4)
+			testing.expectf(t, product[i] == want, "lifecycle cycle %d mul elem %d got=%v want=%v", cycle, i, product[i], want)
+		}
+		ml.clear()
+
 		ml.destroy(param)
 	}
 }

@@ -57,6 +57,8 @@ Context :: struct {
 	auto_warmup_done:   bool,
 	auto_exec:          cuda.GraphExec,
 
+	fast_math: bool,
+
 	q8_1_cache:    map[cuda.DevicePtr]cuda.DevicePtr,
 	dequant_cache: map[cuda.DevicePtr]cuda.DevicePtr, // Q4_K/Q6_K weight ptr -> bf16 dequantized scratch
 
@@ -256,7 +258,7 @@ _backend := ml.Backend{
 // decode replays a captured graph instead of re-issuing every kernel launch, so
 // pass true for inference. Leave false for training or when using enable_timing
 // (graph capture cannot coexist with cuEventRecord).
-context_create :: proc(decode_graph := false, allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
+context_create :: proc(decode_graph := false, fast_math := true, allocator := context.allocator, loc := #caller_location) -> ^ml.Context {
 	sync.lock(&_gpu_mutex)
 	defer sync.unlock(&_gpu_mutex)
 
@@ -268,6 +270,7 @@ context_create :: proc(decode_graph := false, allocator := context.allocator, lo
 	fmt.assertf(err == nil, "Failed to allocate Context: %v", err, loc=loc)
 
 	gctx.auto_graph_enabled = decode_graph
+	gctx.fast_math          = fast_math
 
 	cuda.check(cuda.StreamCreate(&gctx.stream, cuda.STREAM_NON_BLOCKING))
 	cublas.check(cublas.Create_v2(&gctx.cublas_handle))

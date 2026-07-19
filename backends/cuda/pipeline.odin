@@ -77,7 +77,8 @@ _compile_pipeline :: proc(
 	extra_options: []cstring = nil,
 	loc                     := #caller_location,
 ) -> ^Pipeline {
-	key := _pipeline_cache_key(source_name, extra_options)
+	gctx := _gctx(loc)
+	key := _pipeline_cache_key(source_name, extra_options, gctx.fast_math)
 
 	sync.lock(&_gpu_mutex)
 	cached, cache_hit := _gpu.pipeline_cache[key]
@@ -85,8 +86,6 @@ _compile_pipeline :: proc(
 	if cache_hit {
 		return cached
 	}
-
-	_bind_thread_ctx(loc)
 
 	src_cstr := _src_to_temp_cstring(src)
 
@@ -103,7 +102,9 @@ _compile_pipeline :: proc(
 
 	options := builtin.make([dynamic]cstring, 0, 4 + builtin.len(extra_options), context.temp_allocator)
 	builtin.append(&options, cstring(raw_data(arch_buf[:])))
-	builtin.append(&options, cstring("--use_fast_math"))
+	if gctx.fast_math {
+		builtin.append(&options, cstring("--use_fast_math"))
+	}
 	builtin.append(&options, cstring("-default-device"))
 	builtin.append(&options, _resolve_include_arg())
 	for o in extra_options {
@@ -143,14 +144,17 @@ _compile_pipeline :: proc(
 }
 
 @(require_results)
-_pipeline_cache_key :: proc(source_name: cstring, extra_options: []cstring) -> string {
-	if builtin.len(extra_options) == 0 {
+_pipeline_cache_key :: proc(source_name: cstring, extra_options: []cstring, fast_math: bool) -> string {
+	if builtin.len(extra_options) == 0 && fast_math {
 		return string(source_name)
 	}
-	parts := builtin.make([dynamic]string, 0, 1 + builtin.len(extra_options), context.temp_allocator)
+	parts := builtin.make([dynamic]string, 0, 2 + builtin.len(extra_options), context.temp_allocator)
 	builtin.append(&parts, string(source_name))
 	for option in extra_options {
 		builtin.append(&parts, string(option))
+	}
+	if !fast_math {
+		builtin.append(&parts, "no_fast_math")
 	}
 	return strings.join(parts[:], "|", context.temp_allocator)
 }
