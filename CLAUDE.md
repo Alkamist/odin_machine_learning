@@ -7,6 +7,7 @@
 - Don't leave old cruft if it is never going to be useful later.
 - Always be on the lookout for bad practices and correct them.
 - Don't spend time solving problems that are already publicly solved optimally.
+- Be honest with me, don't just blindly agree. I'm interested in creating the best possible software, if we fall into a bad pattern, I want to be aware.
 
 ## Comments
 

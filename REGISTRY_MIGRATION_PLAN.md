@@ -1,8 +1,11 @@
 # Registry and Tensor Construction Migration Plan
 
 Outcome of a design deliberation on the public API. The goal is one correct way to do
-everything around parameters and tensor construction. Execute the phases in order; each
-phase leaves the tree compiling and tests passing.
+everything around parameters and tensor construction. Execute the phases in order.
+Phases 1-4 are one atomic change: Phase 1 deletes API the networks still call, so the
+tree does not compile again until Phases 3 and 4 are done. Do not build compatibility
+shims to fake a green tree in between; run the full verification once Phase 4 lands.
+Phase 5 is a separate change with its own verification.
 
 Follow CLAUDE.md at all times: no comments, tabs for indentation, named default args,
 one-liner named-arg style `f(a, b, c=foo)`, do not commit without asking.
@@ -40,20 +43,22 @@ Parameter :: struct {
 }
 
 Registry :: struct {
-	parameters: [dynamic]Parameter,
+	parameters:   [dynamic]Parameter,
+	owns_tensors: bool,
 }
 
 parameter_make     :: proc(r: ^Registry, prefix, name: string, type: Data_Type, shape: []int, init: Init = nil, flags := PARAMETER_DEFAULT_FLAGS, loc := #caller_location) -> Tensor
 parameter_register :: proc(r: ^Registry, prefix, name: string, tensor: Tensor, init: Init = nil, flags := PARAMETER_DEFAULT_FLAGS, loc := #caller_location)
 
-registry_destroy   :: proc(r: ^Registry, loc := #caller_location)
-registry_randomize :: proc(r: ^Registry, loc := #caller_location)
-registry_update    :: proc(opt: ^Optimizer, r: ^Registry, loc := #caller_location)
-registry_copy      :: proc(dst, src: ^Registry, loc := #caller_location)
-registry_gather    :: proc(dst, src: ^Registry, prefix := "")
-registry_count     :: proc(r: ^Registry, flags := Parameter_Flags{.Train}) -> int
-registry_read      :: proc(r: ^Registry, dst: []f32, loc := #caller_location)
-registry_write     :: proc(r: ^Registry, src: []f32, loc := #caller_location)
+registry_destroy       :: proc(r: ^Registry, loc := #caller_location)
+registry_clear         :: proc(r: ^Registry, loc := #caller_location)
+registry_randomize     :: proc(r: ^Registry, loc := #caller_location)
+registry_update        :: proc(opt: ^Optimizer, r: ^Registry, loc := #caller_location)
+registry_copy          :: proc(dst, src: ^Registry, loc := #caller_location)
+registry_gather        :: proc(dst, src: ^Registry, prefix := "")
+registry_element_count :: proc(r: ^Registry, flags := Parameter_Flags{.Train}) -> int
+registry_read          :: proc(r: ^Registry, dst: []f32, loc := #caller_location)
+registry_write         :: proc(r: ^Registry, src: []f32, loc := #caller_location)
 
 checkpoint_save    :: proc(path: string, r: ^Registry, opt: ^Optimizer, metadata: map[string]string, loc := #caller_location) -> bool
 checkpoint_load    :: proc(path: string, r: ^Registry, opt: ^Optimizer, loc := #caller_location) -> (metadata: map[string]string, ok: bool)
@@ -68,7 +73,7 @@ clip_gradient_norm :: proc(r: ^Registry, max_norm: f32, loc := #caller_location)
 | `checkpoint_save`, `checkpoint_load` | `.Checkpoint in flags` |
 | `registry_randomize` | applies `init` unless it is `Init_None` |
 | loaders (gguf/safetensors) | every entry, by name |
-| `registry_count(r, flags=F)` | entries whose flags contain F; `{}` counts all |
+| `registry_element_count(r, flags=F)` | element sum over entries whose flags contain F; `{}` counts all |
 
 - `parameter_make` allocates `{.Data, .Gradient}` iff `.Train in flags`, else `{.Data}`.
   Always `persistent=true`.
@@ -81,11 +86,20 @@ clip_gradient_norm :: proc(r: ^Registry, max_norm: f32, loc := #caller_location)
   slice.
 - Name handling is unchanged from today's registry: names are cloned into the
   registry's allocator, prefixed with `prefix + "."` when prefix is non-empty.
-- `registry_gather` clones names (applying prefix) into `dst`; the tensors are
-  borrowed. Convention: gathered registries are call-scoped, built with
-  `context.temp_allocator`, and never passed to `registry_destroy`. This is how
-  composite models (jepa, gemma+lora) present a merged registry to
-  checkpoint/clip/read/write.
+- Ownership: `parameter_make` and `parameter_register` set `r.owns_tensors = true`.
+  `registry_destroy` destroys tensors only when `owns_tensors`; it always frees the
+  names and the array. Destroying a gathered registry is therefore safe, not
+  forbidden.
+- `registry_clear` frees the names and clears the array but never touches tensors or
+  `owns_tensors`. It exists for loaders that reallocate tensors mid-load (gemma GGUF
+  quant loading replaces tensors via `weights.write_tensor`, invalidating the
+  registry's copies) and then re-register.
+- `registry_gather` clones names (applying prefix) and copies `init` and `flags`
+  verbatim into `dst`; the tensors are borrowed. It asserts `!dst.owns_tensors` and
+  leaves it false — never mix owned and gathered entries in one registry.
+  Convention: gathered registries are call-scoped and built with
+  `context.temp_allocator`. This is how composite models (jepa, gemma+lora) present a
+  merged registry to checkpoint/clip/read/write.
 - `registry_copy` keeps today's semantics: equal length, matching names, tensor copy.
 - `checkpoint_save` keeps the F32/Bf16 assert, but it now only applies to
   `.Checkpoint` entries, so quantized frozen weights are skipped naturally rather
@@ -99,9 +113,10 @@ From `ml.odin`:
 - `parameter_append`, `parameters_len`, `parameters_read`, `parameters_write`
 
 From `parameters.odin`:
-- `Parameter_Info`, `register`, `registry_parameters`, `registry_parameter_count`,
-  `registry_clear` (audit first: if `registry_clear` has callers, migrate them to
-  `registry_destroy` or delete the call; do not keep it "just in case")
+- `Parameter_Info`, `register`, `registry_parameters`, `registry_parameter_count`.
+  `registry_clear` is NOT deleted: its caller in `networks/gemma/loader_gguf.odin`
+  genuinely needs clear-names-keep-tensors semantics (see the ownership bullets
+  above); it is re-pointed at `^Registry` and kept.
 
 Tensor construction, from `ml.odin`:
 - `make` — replaced by `alloc` with defaults (see Phase 2)
@@ -117,7 +132,7 @@ at `^Registry` with the `.Checkpoint` filter.
 Notes:
 - `registry_randomize` keeps today's He/Xavier rank-2 asserts and shape-derived fans.
 - `registry_read`/`registry_write` iterate `.Train` entries in registry order; length
-  asserts against `registry_count(r, flags={.Train})` element sum as today.
+  asserts against `registry_element_count(r, flags={.Train})` as today.
 
 ## Phase 2 — tensor construction (`ml.odin`)
 
@@ -126,7 +141,11 @@ Notes:
   `alloc(type, shape, persistent=true, buffers=DEFAULT_PARAMETER_BUFFERS)`.
 - Fold `const_scalar` into `scalar`: `scalar :: proc(type, value, persistent := false, loc := #caller_location) -> Tensor`.
   `persistent=true` gives today's `const_scalar` behavior (persistent, `{.Data}` only);
-  the default gives today's step-scoped `scalar`.
+  the default gives today's step-scoped `scalar`. The flag deliberately switches the
+  buffer set along with the lifetime: a persistent scalar is a frozen constant with no
+  gradient buffer, invisible to autodiff (backward skips it; gradients still flow
+  through the other operand of any op it appears in). Do not "fix" this asymmetry
+  later.
 - `zeros`, `zeros_like`, `scratch`, `tensor` are unchanged. Add no new constructors.
 
 ## Phase 3 — networks
@@ -188,12 +207,13 @@ Deliberately deferred items from the same API sweep; do not fold them in:
 
 ## Verification
 
-After each phase:
+After Phase 4 (the tree does not compile between Phases 1 and 3, so this runs once the
+atomic change is complete; repeat after Phase 5 if that lands):
 1. `odin check . -no-entry-point` for the root package; `odin check` each backend,
    network, example, and test package that was touched.
 2. Build and run the test programs under `tests/` (CPU at minimum; CUDA tests if the
    machine allows).
-3. After Phase 3: run `examples/mnist` briefly and confirm loss decreases; run
+3. Run `examples/mnist` briefly and confirm loss decreases; run
    `tests/gemma_lora_check` and `tests/checkpoint_check`.
 4. Grep-verify the deletions list: `Parameter_Info`, `parameter_append`,
    `parameters_len`, `parameters_read`, `parameters_write`, `registry_parameters`,
