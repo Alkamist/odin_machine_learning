@@ -33,16 +33,20 @@ POLICY_TEMPERATURE  :: f32(1)
 
 PESSIMISM :: f32(1)
 
+VALUE_ENSEMBLE :: 2
+TAU            :: f32(0.01)
+ENTROPY_WEIGHT :: f32(1)
+DEATH_PENALTY  :: f32(40)
+
 BUFFER_CAPACITY  :: 4096
 TRAIN_BATCH_SIZE :: 64
 TRAIN_MINIMUM    :: 8
 TRAIN_STEPS      :: 24
+TRAIN_BACKLOG    :: TRAIN_STEPS * 2
 LEARNING_RATE    :: 3e-3
 
-POLICY_CAPACITY :: 4096
-POLICY_MINIMUM  :: 64
-POLICY_RATE     :: 1e-3
-AGREEMENT_RATE  :: f32(0.01)
+POLICY_RATE    :: 1e-3
+AGREEMENT_RATE :: f32(0.01)
 
 WARMUP_DECISIONS :: 24
 
@@ -58,11 +62,8 @@ Transition :: struct {
 	sensor: Sensor,
 	action: int,
 	delta:  Sensor,
-}
-
-Policy_Sample :: struct {
-	sensor: Sensor,
-	action: int,
+	reward: f32,
+	dead:   bool,
 }
 
 Snapshot :: struct {
@@ -92,13 +93,13 @@ Agent :: struct {
 	policy:     mlp.Mlp,
 	policy_opt: ml.Optimizer,
 
+	values:        [VALUE_ENSEMBLE]mlp.Mlp,
+	value_targets: [VALUE_ENSEMBLE]mlp.Mlp,
+	value_opts:    [VALUE_ENSEMBLE]ml.Optimizer,
+
 	buffer:       [BUFFER_CAPACITY]Transition,
 	buffer_count: int,
 	buffer_next:  int,
-
-	policy_buffer:       [POLICY_CAPACITY]Policy_Sample,
-	policy_buffer_count: int,
-	policy_buffer_next:  int,
 
 	agreement: f32,
 
@@ -157,12 +158,7 @@ agreement :: proc(a: ^Agent) -> f32 {
 	return transmute(f32)sync.atomic_load(&a.agreement_bits)
 }
 
-_run :: proc(a: ^Agent) {
-	ctx := cpu.context_create(CONTEXT_SIZE)
-	defer cpu.context_destroy(ctx)
-
-	ml.context_scope(ctx)
-
+boot :: proc(a: ^Agent) {
 	for m in 0 ..< ENSEMBLE_SIZE {
 		a.models[m] = mlp.make(MODEL_INPUT, HIDDEN_SIZE, SENSOR_SIZE)
 		a.opts[m]   = ml.optimizer_make(learning_rate=LEARNING_RATE)
@@ -170,19 +166,83 @@ _run :: proc(a: ^Agent) {
 	a.policy     = mlp.make(SENSOR_SIZE, HIDDEN_SIZE, ACTION_COUNT)
 	a.policy_opt = ml.optimizer_make(learning_rate=POLICY_RATE)
 
-	defer {
-		for m in 0 ..< ENSEMBLE_SIZE {
-			ml.optimizer_destroy(&a.opts[m])
-			mlp.destroy(a.models[m])
-		}
-		ml.optimizer_destroy(&a.policy_opt)
-		mlp.destroy(a.policy)
+	for v in 0 ..< VALUE_ENSEMBLE {
+		a.values[v]        = mlp.make(SENSOR_SIZE, HIDDEN_SIZE, ACTION_COUNT)
+		a.value_targets[v] = mlp.make(SENSOR_SIZE, HIDDEN_SIZE, ACTION_COUNT)
+		a.value_opts[v]    = ml.optimizer_make(learning_rate=LEARNING_RATE)
+		mlp.copy(a.value_targets[v], a.values[v])
 	}
 
 	_forget_episode(a)
+}
+
+shutdown :: proc(a: ^Agent) {
+	for m in 0 ..< ENSEMBLE_SIZE {
+		ml.optimizer_destroy(&a.opts[m])
+		mlp.destroy(a.models[m])
+	}
+	ml.optimizer_destroy(&a.policy_opt)
+	mlp.destroy(a.policy)
+	for v in 0 ..< VALUE_ENSEMBLE {
+		ml.optimizer_destroy(&a.value_opts[v])
+		mlp.destroy(a.values[v])
+		mlp.destroy(a.value_targets[v])
+	}
+}
+
+_step_brain :: proc(a: ^Agent, snapshot: Snapshot) -> (idle: bool) {
+	if snapshot.episode != a.last_episode {
+		_forget_episode(a)
+		a.last_episode = snapshot.episode
+	}
+
+	if snapshot.time >= a.next_decision_time {
+		_decide(a, snapshot)
+		a.next_decision_time = snapshot.time + DECISION_PERIOD
+	}
+	else if a.train_credit > 0 || a.refine_budget > 0 {
+		if a.train_credit > 0 {
+			_train(a)
+			_train_value(a)
+			_train_policy(a)
+			a.train_credit -= 1
+		}
+		if a.refine_budget > 0 && a.train_credit % REFINE_INTERVAL == 0 {
+			if a.has_previous && a.decisions >= WARMUP_DECISIONS {
+				_plan_refine(a, a.previous)
+			}
+			a.refine_budget -= 1
+		}
+	}
+	else {
+		idle = true
+	}
+
+	return
+}
+
+drive :: proc(a: ^Agent, time: f64, sensor: [SENSOR_SIZE]f32, applied: int, episode: u64) {
+	snapshot := Snapshot{valid=true, time=time, sensor=sensor, applied=applied, episode=episode}
+	for {
+		idle := _step_brain(a, snapshot)
+		free_all(context.temp_allocator)
+		if idle {
+			break
+		}
+	}
+}
+
+_run :: proc(a: ^Agent) {
+	ctx := cpu.context_create(CONTEXT_SIZE)
+	defer cpu.context_destroy(ctx)
+
+	ml.context_scope(ctx)
+
+	boot(a)
+	defer shutdown(a)
 
 	for sync.atomic_load(&a.running) {
-		defer free_all(context.temp_allocator)
+		free_all(context.temp_allocator)
 
 		sync.mutex_lock(&a.mailbox_mutex)
 		snapshot := a.mailbox
@@ -193,29 +253,7 @@ _run :: proc(a: ^Agent) {
 			continue
 		}
 
-		if snapshot.episode != a.last_episode {
-			_forget_episode(a)
-			a.last_episode = snapshot.episode
-		}
-
-		if snapshot.time >= a.next_decision_time {
-			_decide(a, snapshot)
-			a.next_decision_time = snapshot.time + DECISION_PERIOD
-		}
-		else if a.train_credit > 0 || a.refine_budget > 0 {
-			if a.train_credit > 0 {
-				_train(a)
-				_train_policy(a)
-				a.train_credit -= 1
-			}
-			if a.refine_budget > 0 && a.train_credit % REFINE_INTERVAL == 0 {
-				if a.has_previous && a.decisions >= WARMUP_DECISIONS {
-					_plan_refine(a, a.previous)
-				}
-				a.refine_budget -= 1
-			}
-		}
-		else {
+		if _step_brain(a, snapshot) {
 			time.sleep(500 * time.Microsecond)
 		}
 	}
@@ -232,7 +270,8 @@ _forget_episode :: proc(a: ^Agent) {
 
 _decide :: proc(a: ^Agent, snapshot: Snapshot) {
 	if a.has_previous {
-		transition := Transition{sensor=a.previous, action=snapshot.applied}
+		transition_reward, transition_dead := a.reward(snapshot.sensor)
+		transition := Transition{sensor=a.previous, action=snapshot.applied, reward=transition_reward, dead=transition_dead}
 		for i in 0 ..< SENSOR_SIZE {
 			transition.delta[i] = snapshot.sensor[i] - a.previous[i]
 		}
@@ -248,23 +287,19 @@ _decide :: proc(a: ^Agent, snapshot: Snapshot) {
 		_plan_refine(a, snapshot.sensor)
 		action = _plan_action(a)
 
-		if a.policy_buffer_count >= POLICY_MINIMUM {
-			match := f32(0)
-			if _policy_action(a, snapshot.sensor) == action {
-				match = 1
-			}
-			a.agreement += (match - a.agreement) * AGREEMENT_RATE
-			sync.atomic_store(&a.agreement_bits, transmute(u32)a.agreement)
+		match := f32(0)
+		if _policy_action(a, snapshot.sensor) == action {
+			match = 1
 		}
-
-		_remember_policy(a, snapshot.sensor, action)
+		a.agreement += (match - a.agreement) * AGREEMENT_RATE
+		sync.atomic_store(&a.agreement_bits, transmute(u32)a.agreement)
 	}
 
 	sync.atomic_store(&a.latch, action)
 
 	a.previous      = snapshot.sensor
 	a.has_previous  = true
-	a.train_credit += TRAIN_STEPS
+	a.train_credit  = min(a.train_credit + TRAIN_STEPS, TRAIN_BACKLOG)
 	a.refine_budget = REFINES_PER_DECISION - 1
 
 	sync.atomic_store(&a.decisions, a.decisions + 1)
@@ -283,14 +318,6 @@ _remember :: proc(a: ^Agent, transition: Transition) {
 		d := transition.delta[i]
 		a.delta_mean[i]    += (d     - a.delta_mean[i])    * rate
 		a.delta_sq_mean[i] += (d * d - a.delta_sq_mean[i]) * rate
-	}
-}
-
-_remember_policy :: proc(a: ^Agent, sensor: Sensor, action: int) {
-	a.policy_buffer[a.policy_buffer_next] = {sensor=sensor, action=action}
-	a.policy_buffer_next = (a.policy_buffer_next + 1) % POLICY_CAPACITY
-	if a.policy_buffer_count < POLICY_CAPACITY {
-		a.policy_buffer_count += 1
 	}
 }
 
@@ -318,28 +345,144 @@ _policy_action :: proc(a: ^Agent, sensor: Sensor) -> int {
 	return best
 }
 
-_train_policy :: proc(a: ^Agent) {
-	if a.policy_buffer_count < POLICY_MINIMUM {
+_train_value :: proc(a: ^Agent) {
+	if a.buffer_count < TRAIN_MINIMUM {
 		return
 	}
 
-	inputs  := builtin.make([]f32, TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
-	targets := builtin.make([]int, TRAIN_BATCH_SIZE,               context.temp_allocator)
+	states     := builtin.make([]f32,  TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
+	successors := builtin.make([]f32,  TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
+	actions    := builtin.make([]int,  TRAIN_BATCH_SIZE,               context.temp_allocator)
+	rewards    := builtin.make([]f32,  TRAIN_BATCH_SIZE,               context.temp_allocator)
+	deaths     := builtin.make([]bool, TRAIN_BATCH_SIZE,               context.temp_allocator)
+
+	for b in 0 ..< TRAIN_BATCH_SIZE {
+		transition := a.buffer[_sample_index(a)]
+		for i in 0 ..< SENSOR_SIZE {
+			states[b * SENSOR_SIZE + i]     = transition.sensor[i]
+			successors[b * SENSOR_SIZE + i] = transition.sensor[i] + transition.delta[i]
+		}
+		actions[b] = transition.action
+		rewards[b] = transition.reward
+		deaths[b]  = transition.dead
+	}
+
+	probabilities := builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
+	targets       := builtin.make([]f32, TRAIN_BATCH_SIZE,               context.temp_allocator)
+
+	target_q: [VALUE_ENSEMBLE][]f32
+	for v in 0 ..< VALUE_ENSEMBLE {
+		target_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
+	}
+
+	ml.clear()
+	{
+		successor_tensor := ml.tensor(successors, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+		ml.get_data(ml.softmax(mlp.forward(a.policy, successor_tensor)), probabilities)
+		for v in 0 ..< VALUE_ENSEMBLE {
+			ml.get_data(mlp.forward(a.value_targets[v], successor_tensor), target_q[v])
+		}
+	}
+
+	for b in 0 ..< TRAIN_BATCH_SIZE {
+		if deaths[b] {
+			targets[b] = rewards[b] - DEATH_PENALTY
+			continue
+		}
+
+		expectation: f32
+		for action_index in 0 ..< ACTION_COUNT {
+			idx := b * ACTION_COUNT + action_index
+			q   := target_q[0][idx]
+			for v in 1 ..< VALUE_ENSEMBLE {
+				q = min(q, target_q[v][idx])
+			}
+			expectation += probabilities[idx] * q
+		}
+		targets[b] = rewards[b] + PLAN_DISCOUNT * expectation
+	}
+
+	gather := builtin.make([]int, TRAIN_BATCH_SIZE, context.temp_allocator)
+	for b in 0 ..< TRAIN_BATCH_SIZE {
+		gather[b] = b * ACTION_COUNT + actions[b]
+	}
 
 	ml.clear(training=true)
 
-	for b in 0 ..< TRAIN_BATCH_SIZE {
-		sample := a.policy_buffer[rand.int_max(a.policy_buffer_count)]
+	x        := ml.tensor(states,  []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+	y        := ml.tensor(targets, []int{TRAIN_BATCH_SIZE})
+	total: ml.Tensor
 
-		for i in 0 ..< SENSOR_SIZE {
-			inputs[b * SENSOR_SIZE + i] = sample.sensor[i]
-		}
-		targets[b] = sample.action
+	for v in 0 ..< VALUE_ENSEMBLE {
+		q_values   := mlp.forward(a.values[v], x)
+		flat       := ml.reshape(q_values, []int{TRAIN_BATCH_SIZE * ACTION_COUNT})
+		prediction := ml.select(flat, gather)
+		loss       := ml.mean(ml.mean_squared_error(prediction, y))
+
+		total = loss if v == 0 else ml.add(total, loss)
 	}
 
-	x      := ml.tensor(inputs, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
-	logits := mlp.forward(a.policy, x)
-	loss   := ml.mean(ml.cross_entropy(logits, targets))
+	ml.backward(total)
+
+	for v in 0 ..< VALUE_ENSEMBLE {
+		if ml.optimizer_step(&a.value_opts[v]) {
+			mlp.update(&a.value_opts[v], a.values[v])
+		}
+	}
+
+	for v in 0 ..< VALUE_ENSEMBLE {
+		for layer, layer_index in a.values[v].layers {
+			ml.lerp_assign(a.value_targets[v].layers[layer_index].weight, layer.weight, TAU)
+			ml.lerp_assign(a.value_targets[v].layers[layer_index].bias,   layer.bias,   TAU)
+		}
+	}
+}
+
+_train_policy :: proc(a: ^Agent) {
+	if a.buffer_count < TRAIN_MINIMUM {
+		return
+	}
+
+	states := builtin.make([]f32, TRAIN_BATCH_SIZE * SENSOR_SIZE,  context.temp_allocator)
+	neg_q  := builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
+
+	for b in 0 ..< TRAIN_BATCH_SIZE {
+		transition := a.buffer[_sample_index(a)]
+		for i in 0 ..< SENSOR_SIZE {
+			states[b * SENSOR_SIZE + i] = transition.sensor[i]
+		}
+	}
+
+	online_q: [VALUE_ENSEMBLE][]f32
+	for v in 0 ..< VALUE_ENSEMBLE {
+		online_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
+	}
+
+	ml.clear()
+	{
+		state_tensor := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+		for v in 0 ..< VALUE_ENSEMBLE {
+			ml.get_data(mlp.forward(a.values[v], state_tensor), online_q[v])
+		}
+	}
+
+	for idx in 0 ..< TRAIN_BATCH_SIZE * ACTION_COUNT {
+		q := online_q[0][idx]
+		for v in 1 ..< VALUE_ENSEMBLE {
+			q = min(q, online_q[v][idx])
+		}
+		neg_q[idx] = -q
+	}
+
+	ml.clear(training=true)
+
+	x             := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+	neg_q_tensor  := ml.tensor(neg_q,  []int{TRAIN_BATCH_SIZE, ACTION_COUNT})
+	logits        := mlp.forward(a.policy, x)
+	probabilities := ml.softmax(logits)
+	value_term    := ml.mean(ml.sum(ml.mul(probabilities, neg_q_tensor)))
+	entropy_term  := ml.mul(ml.mean(ml.entropy(probabilities)), ml.scalar(.F32, -ENTROPY_WEIGHT))
+	loss          := ml.add(value_term, entropy_term)
 
 	ml.backward(loss)
 
@@ -440,11 +583,8 @@ _plan_refine :: proc(a: ^Agent, sensor: Sensor) {
 	returns   := builtin.make([]f32,               PLAN_SAMPLES, context.temp_allocator)
 	order     := builtin.make([]int,               PLAN_SAMPLES, context.temp_allocator)
 
-	seeded := 0
-	if a.policy_buffer_count >= POLICY_MINIMUM {
-		seeded = POLICY_SEED_SAMPLES
-		_policy_seed(a, sensor, sequences[:seeded])
-	}
+	seeded := POLICY_SEED_SAMPLES
+	_policy_seed(a, sensor, sequences[:seeded])
 
 	for n in seeded ..< PLAN_SAMPLES {
 		for h in 0 ..< PLAN_HORIZON {
@@ -587,13 +727,52 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 				scores[p]    += discount * reward
 
 				if dead {
-					scores[p] -= 40
+					scores[p] -= DEATH_PENALTY
 					alive[p]   = false
 				}
 			}
 		}
 
 		discount *= PLAN_DISCOUNT
+	}
+
+	ml.clear()
+
+	terminal_states := builtin.make([]f32, PARTICLES * SENSOR_SIZE,  context.temp_allocator)
+	terminal_probs  := builtin.make([]f32, PARTICLES * ACTION_COUNT, context.temp_allocator)
+
+	terminal_q: [VALUE_ENSEMBLE][]f32
+	for v in 0 ..< VALUE_ENSEMBLE {
+		terminal_q[v] = builtin.make([]f32, PARTICLES * ACTION_COUNT, context.temp_allocator)
+	}
+
+	for p in 0 ..< PARTICLES {
+		for i in 0 ..< SENSOR_SIZE {
+			terminal_states[p * SENSOR_SIZE + i] = states[p][i]
+		}
+	}
+
+	terminal_input := ml.tensor(terminal_states, []int{PARTICLES, SENSOR_SIZE})
+	ml.get_data(ml.softmax(mlp.forward(a.policy, terminal_input)), terminal_probs)
+	for v in 0 ..< VALUE_ENSEMBLE {
+		ml.get_data(mlp.forward(a.values[v], terminal_input), terminal_q[v])
+	}
+
+	for p in 0 ..< PARTICLES {
+		if !alive[p] {
+			continue
+		}
+
+		bootstrap: f32
+		for action_index in 0 ..< ACTION_COUNT {
+			idx := p * ACTION_COUNT + action_index
+			q   := terminal_q[0][idx]
+			for v in 1 ..< VALUE_ENSEMBLE {
+				q = min(q, terminal_q[v][idx])
+			}
+			bootstrap += terminal_probs[idx] * q
+		}
+		scores[p] += discount * bootstrap
 	}
 
 	for n in 0 ..< PLAN_SAMPLES {
