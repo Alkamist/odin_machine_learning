@@ -6,10 +6,10 @@ import "core:bytes"
 import "core:compress/gzip"
 import "core:fmt"
 import "core:log"
-import "core:math/rand"
 
 import ml  "../../"
 import cpu "../../backends/cpu"
+import     "../../dataset"
 import     "../../networks/mlp"
 import     "../fetch"
 
@@ -44,30 +44,39 @@ main :: proc() {
 	}
 	defer mnist_destroy(validation_set)
 
-	order := make([]int, training_set.samples / BATCH_SIZE)
-	defer delete(order)
-	for i in 0 ..< len(order) {
-		order[i] = i
-	}
+	training_batcher := dataset.batcher_make(training_set.samples, BATCH_SIZE)
+	defer dataset.batcher_destroy(&training_batcher)
+
+	validation_batcher := dataset.batcher_make(validation_set.samples, BATCH_SIZE, shuffle=false)
+	defer dataset.batcher_destroy(&validation_batcher)
+
+	batch_inputs := make([]f32, BATCH_SIZE * MNIST_IMAGE_SIZE)
+	defer delete(batch_inputs)
+
+	batch_targets := make([]int, BATCH_SIZE)
+	defer delete(batch_targets)
 
 	for epoch in 0 ..< 50 {
 		defer free_all(context.temp_allocator)
 
-		rand.shuffle(order)
-
-		for b in 0 ..< training_set.samples / BATCH_SIZE {
-			model_learn(&model, mnist_sample(training_set, order[b], BATCH_SIZE))
+		dataset.batcher_reset(&training_batcher)
+		for batch in dataset.batcher_next(&training_batcher) {
+			dataset.gather(batch_inputs, training_set.inputs, batch, stride=MNIST_IMAGE_SIZE)
+			dataset.gather(batch_targets, training_set.targets, batch)
+			model_learn(&model, batch_inputs, batch_targets)
 		}
 
 		score := 0
-		for b in 0 ..< validation_set.samples / BATCH_SIZE {
-			inputs, targets := mnist_sample(validation_set, b, BATCH_SIZE)
+		dataset.batcher_reset(&validation_batcher)
+		for batch in dataset.batcher_next(&validation_batcher) {
+			dataset.gather(batch_inputs, validation_set.inputs, batch, stride=MNIST_IMAGE_SIZE)
+			dataset.gather(batch_targets, validation_set.targets, batch)
 
 			predictions: [BATCH_SIZE]int
-			model_predict(model, inputs, predictions[:])
+			model_predict(model, batch_inputs, predictions[:])
 
 			for i in 0 ..< BATCH_SIZE {
-				if predictions[i] == targets[i] {
+				if predictions[i] == batch_targets[i] {
 					score += 1
 				}
 			}
@@ -233,10 +242,4 @@ mnist_load :: proc(images_file, labels_file: string, allocator := context.alloca
 mnist_destroy :: proc(mnist: Mnist) {
 	delete(mnist.inputs)
 	delete(mnist.targets)
-}
-
-mnist_sample :: proc(mnist: Mnist, i, batch_size: int) -> (inputs: []f32, targets: []int) {
-	inputs  = mnist.inputs[i * MNIST_IMAGE_SIZE * batch_size:][:MNIST_IMAGE_SIZE * batch_size]
-	targets = mnist.targets[i * batch_size:][:batch_size]
-	return
 }
