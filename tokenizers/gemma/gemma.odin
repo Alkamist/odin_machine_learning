@@ -33,50 +33,50 @@ Error :: enum {
 }
 
 @(require_results)
-load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, err: Error) {
+load :: proc(path: string, allocator := context.allocator, loc := #caller_location) -> (tok: Tokenizer, err: Error) {
 	context.allocator = allocator
 
 	bytes, read_err := os.read_entire_file_from_path(path, allocator)
 	if read_err != nil {
 		if !os.exists(path) {
-			log.debugf("gemma tokenizer file not found: %v", path)
+			log.debugf("tokenizer file not found: %v", path, location=loc)
 			return {}, .Not_Found
 		}
-		log.errorf("failed to read %v: %v", path, read_err)
+		log.errorf("failed to read %v: %v", path, read_err, location=loc)
 		return {}, .Read_Failed
 	}
 	defer delete(bytes)
 
 	root, parse_err := json.parse(bytes, parse_integers = true)
 	if parse_err != .None {
-		log.errorf("JSON parse error %v in %v", parse_err, path)
+		log.errorf("JSON parse error %v in %v", parse_err, path, location=loc)
 		return {}, .Malformed
 	}
 
 	root_object, root_object_ok := root.(json.Object)
 	if !root_object_ok {
-		log.error("tokenizer.json root is not an object")
+		log.error("tokenizer.json root is not an object", location=loc)
 		json.destroy_value(root)
 		return {}, .Malformed
 	}
 
 	model_object, model_object_ok := root_object["model"].(json.Object)
 	if !model_object_ok {
-		log.error("missing 'model' object")
+		log.error("missing 'model' object", location=loc)
 		json.destroy_value(root)
 		return {}, .Malformed
 	}
 
 	vocab_object, vocab_object_ok := model_object["vocab"].(json.Object)
 	if !vocab_object_ok {
-		log.error("missing 'model.vocab' object")
+		log.error("missing 'model.vocab' object", location=loc)
 		json.destroy_value(root)
 		return {}, .Malformed
 	}
 
 	merges_array, merges_array_ok := model_object["merges"].(json.Array)
 	if !merges_array_ok {
-		log.error("missing 'model.merges' array")
+		log.error("missing 'model.merges' array", location=loc)
 		json.destroy_value(root)
 		return {}, .Malformed
 	}
@@ -86,7 +86,7 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, e
 	for piece, id_value in vocab_object {
 		id_int, id_int_ok := id_value.(json.Integer)
 		if !id_int_ok || int(id_int) < 0 || int(id_int) >= len(vocab_object) {
-			log.errorf("vocab entry %q has invalid id", piece)
+			log.errorf("vocab entry %q has invalid id", piece, location=loc)
 			destroy(tok)
 			return {}, .Malformed
 		}
@@ -97,14 +97,14 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, e
 	for merge_value, merge_index in merges_array {
 		if merge_array, is_array := merge_value.(json.Array); is_array {
 			if len(merge_array) != 2 {
-				log.errorf("merge[%v] is not a 2-element array", merge_index)
+				log.errorf("merge[%v] is not a 2-element array", merge_index, location=loc)
 				destroy(tok)
 				return {}, .Malformed
 			}
 			a_string, a_string_ok := merge_array[0].(string)
 			b_string, b_string_ok := merge_array[1].(string)
 			if !a_string_ok || !b_string_ok {
-				log.errorf("merge[%v] contains a non-string", merge_index)
+				log.errorf("merge[%v] contains a non-string", merge_index, location=loc)
 				destroy(tok)
 				return {}, .Malformed
 			}
@@ -112,13 +112,13 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, e
 		} else if merge_string, is_string := merge_value.(string); is_string {
 			space_index := strings.index_byte(merge_string, ' ')
 			if space_index <= 0 || space_index >= len(merge_string) - 1 {
-				log.errorf("merge[%v] = %q has no space separator", merge_index, merge_string)
+				log.errorf("merge[%v] = %q has no space separator", merge_index, merge_string, location=loc)
 				destroy(tok)
 				return {}, .Malformed
 			}
 			tok.merge_rank[Pair{merge_string[:space_index], merge_string[space_index + 1:]}] = merge_index
 		} else {
-			log.errorf("merge[%v] has unsupported JSON type", merge_index)
+			log.errorf("merge[%v] has unsupported JSON type", merge_index, location=loc)
 			destroy(tok)
 			return {}, .Malformed
 		}
@@ -162,7 +162,7 @@ destroy :: proc(tok: Tokenizer) {
 }
 
 @(require_results)
-encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) -> (result: []int, ok: bool) #optional_ok {
+encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator, loc := #caller_location) -> (result: []int, ok: bool) #optional_ok {
 	ids: [dynamic]int
 	ids.allocator = allocator
 
@@ -198,7 +198,7 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) ->
 				next_special = cursor + idx
 			}
 		}
-		if !_encode_text_segment(tok, text[cursor:next_special], &ids) {
+		if !_encode_text_segment(tok, text[cursor:next_special], &ids, loc=loc) {
 			ok = false
 		}
 		cursor = next_special
@@ -207,7 +207,7 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator) ->
 	return ids[:], ok
 }
 
-_encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) -> bool {
+_encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int, loc := #caller_location) -> bool {
 	if len(text) == 0 {
 		return true
 	}
@@ -234,7 +234,7 @@ _encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) 
 					_ = id
 					append(&symbols, strings.clone(byte_token, context.temp_allocator))
 				} else {
-					log.errorf("byte 0x%02X has no fallback token in vocab", normalized[offset + k])
+					log.errorf("byte 0x%02X has no fallback token in vocab", normalized[offset + k], location=loc)
 					return false
 				}
 			}
@@ -247,7 +247,7 @@ _encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int) 
 	for symbol in symbols {
 		id, present := tok.vocab[symbol]
 		if !present {
-			log.errorf("symbol %q not in vocab", symbol)
+			log.errorf("symbol %q not in vocab", symbol, location=loc)
 			return false
 		}
 		append(ids, id)

@@ -13,7 +13,7 @@ Sampler :: struct {
 }
 
 argmax :: proc(logits: []f32, loc := #caller_location) -> int {
-	assert(builtin.len(logits) > 0, "argmax requires a non-empty logits row", loc)
+	assert(builtin.len(logits) > 0, "argmax requires a non-empty logits row", loc=loc)
 	best := 0
 	for i in 1 ..< builtin.len(logits) {
 		if logits[i] > logits[best] {
@@ -25,7 +25,7 @@ argmax :: proc(logits: []f32, loc := #caller_location) -> int {
 
 sample :: proc(logits: []f32, sampler: Sampler, loc := #caller_location) -> int {
 	n := builtin.len(logits)
-	assert(n > 0, "sample requires a non-empty logits row", loc)
+	assert(n > 0, "sample requires a non-empty logits row", loc=loc)
 	if sampler.temperature <= 0 || sampler.top_k == 1 {
 		return argmax(logits, loc=loc)
 	}
@@ -131,9 +131,9 @@ Generate_Stats :: struct {
 }
 
 generate :: proc(eval: Eval_Proc, eval_data: rawptr, prompt: []int, logits: []f32, options: Generate_Options, out_tokens: ^[dynamic]int, loc := #caller_location) -> Generate_Stats {
-	assert(eval != nil, "generate requires an eval proc", loc)
-	assert(builtin.len(prompt) > 0, "generate requires a non-empty prompt", loc)
-	assert(builtin.len(logits) > 0, "generate requires a non-empty logits row", loc)
+	assert(eval != nil, "generate requires an eval proc", loc=loc)
+	assert(builtin.len(prompt) > 0, "generate requires a non-empty prompt", loc=loc)
+	assert(builtin.len(logits) > 0, "generate requires a non-empty logits row", loc=loc)
 	stats := Generate_Stats{prefill_tokens=builtin.len(prompt)}
 
 	t_prefill := time.tick_now()
@@ -154,7 +154,7 @@ generate :: proc(eval: Eval_Proc, eval_data: rawptr, prompt: []int, logits: []f3
 
 	t_decode := time.tick_now()
 	for step in 0 ..< options.max_new_tokens {
-		next_id := sample(logits, options.sampler)
+		next_id := sample(logits, options.sampler, loc=loc)
 		stats.decode_tokens += 1
 
 		is_stop := false

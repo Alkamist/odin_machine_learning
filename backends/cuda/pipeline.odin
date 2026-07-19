@@ -125,7 +125,7 @@ _compile_pipeline :: proc(
 	nvrtc.check(nvrtc.GetCUBIN(prog, raw_data(cubin)), loc=loc)
 
 	pipeline, err := builtin.new(Pipeline, allocator=runtime.default_allocator(), loc=loc)
-	fmt.assertf(err == nil, "Failed to allocate Pipeline: %v", err, loc=loc)
+	fmt.assertf(err == nil, "failed to allocate Pipeline: %v", err, loc=loc)
 
 	cuda.check(cuda.ModuleLoadData(&pipeline.module, raw_data(cubin)), loc=loc)
 	cuda.check(cuda.ModuleGetFunction(&pipeline.function, pipeline.module, entry), loc=loc)

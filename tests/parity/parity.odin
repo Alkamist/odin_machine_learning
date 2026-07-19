@@ -37,7 +37,7 @@ _cuda_ready :: proc(t: ^testing.T, what: string) -> bool {
 	when ML_REQUIRE_CUDA {
 		testing.expectf(t, false, "ML_REQUIRE_CUDA is set but no CUDA device is available; %s cannot run", what)
 	} else {
-		log.warnf("============ SKIPPED: %s (no CUDA device available) ============", what)
+		log.warnf("============ skipped: %s (no CUDA device available) ============", what)
 	}
 	return false
 }
@@ -178,12 +178,12 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 	backward_ops := cuda_ctx.backend.backward_ops
 
 	for tc in cases.get() {
-		if !testing.expectf(t, tc.kind in forward_ops, "parity: %s has a cases-registry entry but %v is not in CUDA forward_ops — every registry op must stay parity-covered", tc.name, tc.kind) {
+		if !testing.expectf(t, tc.kind in forward_ops, "%s has a cases-registry entry but %v is not in CUDA forward_ops — every registry op must stay parity-covered", tc.name, tc.kind) {
 			continue
 		}
 		do_backward := tc.kind in backward_ops
 		if !do_backward {
-			log.infof("parity: %s forward-only (op not in CUDA backward_ops)", tc.name)
+			log.infof("%s forward-only (op not in CUDA backward_ops)", tc.name)
 		}
 		_run_parity(t, tc, cpu_ctx, cuda_ctx, do_backward)
 	}

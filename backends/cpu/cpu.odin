@@ -108,7 +108,7 @@ when thread.IS_SUPPORTED {
 	}
 
 	set_thread_count :: proc(count: int, loc := #caller_location) {
-		assert(count > 0, "Thread count must be at least 1", loc=loc)
+		assert(count > 0, "thread count must be at least 1", loc=loc)
 
 		sync.mutex_lock(&_pool_mutex)
 		defer sync.mutex_unlock(&_pool_mutex)
@@ -359,10 +359,10 @@ context_create :: proc(size: int, allocator := context.allocator, loc := #caller
 	_enable_flush_to_zero()
 
 	ctx, ctx_err := builtin.new(Context, allocator=allocator, loc=loc)
-	assert(ctx_err == nil, "Failed to allocate Context", loc=loc)
+	assert(ctx_err == nil, "failed to allocate Context", loc=loc)
 
 	arena_buf, arena_buf_err := builtin.make([]byte, size, allocator=context.allocator, loc=loc)
-	assert(arena_buf_err == nil, "Failed to allocate CPU backend arena data", loc=loc)
+	assert(arena_buf_err == nil, "failed to allocate CPU backend arena data", loc=loc)
 	mem.arena_init(&ctx.arena, arena_buf)
 
 	ctx.persistent = builtin.make(map[rawptr]bool, allocator=allocator)
@@ -418,7 +418,7 @@ _buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc:
 	allocator := persist ? context.allocator : mem.arena_allocator(&ctx.arena)
 
 	bytes, err := builtin.make([]byte, byte_count, allocator=allocator, loc=loc)
-	fmt.assertf(err == nil, "Failed to allocate CPU buffer: %v", err, loc=loc)
+	fmt.assertf(err == nil, "failed to allocate CPU buffer: %v", err, loc=loc)
 
 	if persist {
 		ctx.persistent[rawptr(raw_data(bytes))] = true
@@ -483,9 +483,9 @@ _update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer
 	m := _moment(m_buf, t.count)
 	v := _moment(v_buf, t.count)
 
-	assert(g != nil, "Tensor Gradient is nil", loc=loc)
-	assert(m != nil, "Optimizer moment m is nil", loc=loc)
-	assert(v != nil, "Optimizer moment v is nil", loc=loc)
+	assert(g != nil, "tensor gradient is nil", loc=loc)
+	assert(m != nil, "optimizer moment m is nil", loc=loc)
+	assert(v != nil, "optimizer moment v is nil", loc=loc)
 
 	d_bf: [^]ml.Bf16
 	d_f32: []f32

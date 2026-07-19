@@ -131,8 +131,8 @@ registry_copy :: proc(dst, src: ^Registry, loc := #caller_location) {
 	}
 }
 
-registry_gather :: proc(dst, src: ^Registry, prefix := "") {
-	assert(!dst.owns_tensors, "registry_gather requires a registry that does not own tensors")
+registry_gather :: proc(dst, src: ^Registry, prefix := "", loc := #caller_location) {
+	assert(!dst.owns_tensors, "registry_gather requires a registry that does not own tensors", loc=loc)
 	for parameter in src.parameters {
 		append(&dst.parameters, Parameter{name=_registry_clone_name(dst, prefix, parameter.name), tensor=parameter.tensor, init=parameter.init, flags=parameter.flags})
 	}

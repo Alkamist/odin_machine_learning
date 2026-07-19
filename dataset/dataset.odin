@@ -19,25 +19,25 @@ batcher_make :: proc {
 
 @(require_results)
 batcher_make_count :: proc(sample_count, batch_size: int, shuffle := true, drop_last := true, allocator := context.allocator, loc := #caller_location) -> Batcher {
-	assert(sample_count > 0, "batcher requires at least one sample", loc)
+	assert(sample_count > 0, "batcher requires at least one sample", loc=loc)
 	indices := make([]int, sample_count, allocator)
 	for i in 0 ..< sample_count {
 		indices[i] = i
 	}
-	return _batcher_from_owned(indices, batch_size, shuffle, drop_last, loc)
+	return _batcher_from_owned(indices, batch_size, shuffle, drop_last, loc=loc)
 }
 
 @(require_results)
 batcher_make_indices :: proc(indices: []int, batch_size: int, shuffle := true, drop_last := true, allocator := context.allocator, loc := #caller_location) -> Batcher {
-	assert(builtin.len(indices) > 0, "batcher requires at least one sample", loc)
+	assert(builtin.len(indices) > 0, "batcher requires at least one sample", loc=loc)
 	owned := make([]int, builtin.len(indices), allocator)
 	copy(owned, indices)
-	return _batcher_from_owned(owned, batch_size, shuffle, drop_last, loc)
+	return _batcher_from_owned(owned, batch_size, shuffle, drop_last, loc=loc)
 }
 
 @(require_results)
 _batcher_from_owned :: proc(indices: []int, batch_size: int, shuffle, drop_last: bool, loc := #caller_location) -> Batcher {
-	assert(batch_size > 0, "batch_size must be positive", loc)
+	assert(batch_size > 0, "batch_size must be positive", loc=loc)
 	batcher := Batcher{
 		indices    = indices,
 		batch_size = batch_size,
@@ -77,8 +77,8 @@ batcher_next :: proc(b: ^Batcher) -> (batch: []int, ok: bool) {
 }
 
 gather :: proc(dst: []$T, src: []T, indices: []int, stride := 1, loc := #caller_location) {
-	assert(stride > 0, "gather stride must be positive", loc)
-	assert(builtin.len(dst) == builtin.len(indices) * stride, "gather destination length must be len(indices) * stride", loc)
+	assert(stride > 0, "gather stride must be positive", loc=loc)
+	assert(builtin.len(dst) == builtin.len(indices) * stride, "gather destination length must be len(indices) * stride", loc=loc)
 	for index, i in indices {
 		copy(dst[i * stride:][:stride], src[index * stride:][:stride])
 	}
@@ -86,8 +86,8 @@ gather :: proc(dst: []$T, src: []T, indices: []int, stride := 1, loc := #caller_
 
 @(require_results)
 split :: proc(sample_count: int, validation_fraction: f32, shuffle := true, allocator := context.allocator, loc := #caller_location) -> (train, validation: []int) {
-	assert(sample_count > 0, "split requires at least one sample", loc)
-	assert(validation_fraction >= 0 && validation_fraction < 1, "validation_fraction must be in [0, 1)", loc)
+	assert(sample_count > 0, "split requires at least one sample", loc=loc)
+	assert(validation_fraction >= 0 && validation_fraction < 1, "validation_fraction must be in [0, 1)", loc=loc)
 
 	permutation := make([]int, sample_count, allocator)
 	defer delete(permutation, allocator)

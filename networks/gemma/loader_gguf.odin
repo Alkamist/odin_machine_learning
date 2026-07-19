@@ -11,24 +11,24 @@ import    "../../loaders/gguf"
 import    "../../loaders/weights"
 
 @(require_results)
-load_gguf :: proc(model: ^Gemma, path: string) -> bool {
+load_gguf :: proc(model: ^Gemma, path: string, loc := #caller_location) -> bool {
 	loader, load_err := gguf.load(path)
 	if load_err != .None {
 		return false
 	}
 	defer gguf.destroy(loader)
 
-	if !_validate_gguf_metadata(loader, model.config) {
+	if !_validate_gguf_metadata(loader, model.config, loc=loc) {
 		return false
 	}
 
 	source := weights.from_gguf(&loader)
 	cfg    := model.config
 
-	if !_load_dequant_to_bf16(loader, model.embed_tokens_weight, "token_embd.weight") {
+	if !_load_dequant_to_bf16(loader, model.embed_tokens_weight, "token_embd.weight", loc=loc) {
 		return false
 	}
-	if !_load_per_layer_token_embd(loader, model^) {
+	if !_load_per_layer_token_embd(loader, model^, loc=loc) {
 		return false
 	}
 	ok := weights.write_tensor(&model.output_norm_weight,                source, "output_norm.weight") &&
@@ -49,7 +49,7 @@ load_gguf :: proc(model: ^Gemma, path: string) -> bool {
 		            weights.write_tensor(&layer.post_feedforward_norm_weight,     source, fmt.tprintf("%v.post_ffw_norm.weight",       prefix)) &&
 		            weights.write_tensor(&layer.post_per_layer_input_norm_weight, source, fmt.tprintf("%v.post_norm.weight",           prefix)) &&
 		            weights.write_tensor(&layer.layer_scalar,                     source, fmt.tprintf("%v.layer_output_scale.weight",  prefix)) &&
-		            _load_norm_f32_to_dtype(loader, layer.q_norm_weight,          fmt.tprintf("%v.attn_q_norm.weight",                 prefix), q_norm_scale) &&
+		            _load_norm_f32_to_dtype(loader, layer.q_norm_weight,          fmt.tprintf("%v.attn_q_norm.weight",                 prefix), q_norm_scale, loc=loc) &&
 		            weights.write_tensor(&layer.q_proj_weight,                    source, fmt.tprintf("%v.attn_q.weight",              prefix), .Rope_Permute, cfg.num_attention_heads, head_dim) &&
 		            weights.write_tensor(&layer.o_proj_weight,                    source, fmt.tprintf("%v.attn_output.weight",         prefix)) &&
 		            weights.write_tensor(&layer.gate_proj_weight,                 source, fmt.tprintf("%v.ffn_gate.weight",            prefix)) &&
@@ -64,7 +64,7 @@ load_gguf :: proc(model: ^Gemma, path: string) -> bool {
 		if !is_kv_shared_layer(cfg, layer_idx) {
 			kv_ok := weights.write_tensor(&layer.k_proj_weight, source, fmt.tprintf("%v.attn_k.weight", prefix), .Rope_Permute, cfg.num_key_value_heads, head_dim) &&
 			         weights.write_tensor(&layer.v_proj_weight, source, fmt.tprintf("%v.attn_v.weight", prefix)) &&
-			         _load_norm_f32_to_dtype(loader, layer.k_norm_weight, fmt.tprintf("%v.attn_k_norm.weight", prefix), 1.0)
+			         _load_norm_f32_to_dtype(loader, layer.k_norm_weight, fmt.tprintf("%v.attn_k_norm.weight", prefix), 1.0, loc=loc)
 			if !kv_ok {
 				return false
 			}
@@ -72,7 +72,7 @@ load_gguf :: proc(model: ^Gemma, path: string) -> bool {
 	}
 
 	if !cfg.tie_word_embeddings {
-		log.errorf("untied lm_head not present in this GGUF; not implemented")
+		log.errorf("untied lm_head not present in this GGUF; not implemented", location=loc)
 		return false
 	}
 
@@ -86,40 +86,40 @@ load_gguf :: proc(model: ^Gemma, path: string) -> bool {
 // for, so a mismatch fails here with a clear message instead of a tensor-shape
 // crash deep in the load. Deriving the full config from the file is a stretch
 // goal; this only checks the dimensions we can cheaply cross-reference.
-_validate_gguf_metadata :: proc(loader: gguf.Loader, cfg: Config) -> bool {
-	check :: proc(loader: gguf.Loader, key: string, expected: int) -> bool {
+_validate_gguf_metadata :: proc(loader: gguf.Loader, cfg: Config, loc := #caller_location) -> bool {
+	check :: proc(loader: gguf.Loader, key: string, expected: int, loc := #caller_location) -> bool {
 		value, ok := gguf.get_u32(loader, key)
 		if !ok {
 			return true // key absent: nothing to cross-check
 		}
 		if int(value) != expected {
-			log.errorf("GGUF metadata %q = %v does not match config %v", key, value, expected)
+			log.errorf("GGUF metadata %q = %v does not match config %v", key, value, expected, location=loc)
 			return false
 		}
 		return true
 	}
-	return check(loader, "gemma4.block_count",                        cfg.num_hidden_layers)           &&
-	       check(loader, "gemma4.embedding_length",                   cfg.hidden_size)                 &&
-	       check(loader, "gemma4.embedding_length_per_layer_input",   cfg.hidden_size_per_layer_input) &&
-	       check(loader, "gemma4.feed_forward_length",                cfg.intermediate_size)           &&
-	       check(loader, "gemma4.attention.head_count",               cfg.num_attention_heads)         &&
-	       check(loader, "gemma4.attention.head_count_kv",            cfg.num_key_value_heads)
+	return check(loader, "gemma4.block_count",                        cfg.num_hidden_layers,           loc=loc) &&
+	       check(loader, "gemma4.embedding_length",                   cfg.hidden_size,                 loc=loc) &&
+	       check(loader, "gemma4.embedding_length_per_layer_input",   cfg.hidden_size_per_layer_input, loc=loc) &&
+	       check(loader, "gemma4.feed_forward_length",                cfg.intermediate_size,           loc=loc) &&
+	       check(loader, "gemma4.attention.head_count",               cfg.num_attention_heads,         loc=loc) &&
+	       check(loader, "gemma4.attention.head_count_kv",            cfg.num_key_value_heads,         loc=loc)
 }
 
-_load_norm_f32_to_dtype :: proc(loader: gguf.Loader, target: ml.Tensor, name: string, extra_scale: f32) -> bool {
+_load_norm_f32_to_dtype :: proc(loader: gguf.Loader, target: ml.Tensor, name: string, extra_scale: f32, loc := #caller_location) -> bool {
 	info, info_ok := gguf.get_info(loader, name)
 	if !info_ok {
-		log.errorf("missing tensor %q", name)
+		log.errorf("missing tensor %q", name, location=loc)
 		return false
 	}
 	if info.type != .F32 {
-		log.errorf("%q expected F32 norm, got %v", name, info.type)
+		log.errorf("%q expected F32 norm, got %v", name, info.type, location=loc)
 		return false
 	}
 	shape_buf := target.shape
 	target_shape := shape_buf[:target.rank]
 	if !_shape_matches_reversed(info.shape, target_shape) {
-		log.errorf("%q shape %v doesn't match target shape %v", name, info.shape, target_shape)
+		log.errorf("%q shape %v doesn't match target shape %v", name, info.shape, target_shape, location=loc)
 		return false
 	}
 
@@ -150,22 +150,22 @@ _load_norm_f32_to_dtype :: proc(loader: gguf.Loader, target: ml.Tensor, name: st
 		}
 		ml.set_bytes(target, .Data, bytes_out)
 	case:
-		log.errorf("%q unsupported target dtype %v", name, target.type)
+		log.errorf("%q unsupported target dtype %v", name, target.type, location=loc)
 		return false
 	}
 	return true
 }
 
-_load_dequant_to_bf16 :: proc(loader: gguf.Loader, target: ml.Tensor, name: string) -> bool {
+_load_dequant_to_bf16 :: proc(loader: gguf.Loader, target: ml.Tensor, name: string, loc := #caller_location) -> bool {
 	info, info_ok := gguf.get_info(loader, name)
 	if !info_ok {
-		log.errorf("missing tensor %q", name)
+		log.errorf("missing tensor %q", name, location=loc)
 		return false
 	}
 	shape_buf := target.shape
 	target_shape := shape_buf[:target.rank]
 	if !_shape_matches_reversed(info.shape, target_shape) {
-		log.errorf("%q shape %v doesn't match target shape %v", name, info.shape, target_shape)
+		log.errorf("%q shape %v doesn't match target shape %v", name, info.shape, target_shape, location=loc)
 		return false
 	}
 
@@ -181,7 +181,7 @@ _load_dequant_to_bf16 :: proc(loader: gguf.Loader, target: ml.Tensor, name: stri
 	case .Q6_K: ml.dequantize_q6_k(bytes, floats)
 	case .Q4_K: ml.dequantize_q4_k(bytes, floats)
 	case:
-		log.errorf("%q expected Q4_K or Q6_K source for dequant load, got %v", name, info.type)
+		log.errorf("%q expected Q4_K or Q6_K source for dequant load, got %v", name, info.type, location=loc)
 		return false
 	}
 
@@ -196,23 +196,23 @@ _load_dequant_to_bf16 :: proc(loader: gguf.Loader, target: ml.Tensor, name: stri
 		}
 		ml.set_bytes(target, .Data, bytes_out)
 	case:
-		log.errorf("%q unsupported embed target dtype %v", name, target.type)
+		log.errorf("%q unsupported embed target dtype %v", name, target.type, location=loc)
 		return false
 	}
 	return true
 }
 
-_load_per_layer_token_embd :: proc(loader: gguf.Loader, model: Gemma) -> bool {
+_load_per_layer_token_embd :: proc(loader: gguf.Loader, model: Gemma, loc := #caller_location) -> bool {
 	name := "per_layer_token_embd.weight"
 	info, info_ok := gguf.get_info(loader, name)
 	if !info_ok {
-		log.errorf("missing %q", name)
+		log.errorf("missing %q", name, location=loc)
 		return false
 	}
 	cfg := model.config
 	expected_unreversed := []int{cfg.vocab_size, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input}
 	if !_shape_matches_reversed(info.shape, expected_unreversed) {
-		log.errorf("%q shape %v != expected (reversed of %v)", name, info.shape, expected_unreversed)
+		log.errorf("%q shape %v != expected (reversed of %v)", name, info.shape, expected_unreversed, location=loc)
 		return false
 	}
 
@@ -225,11 +225,11 @@ _load_per_layer_token_embd :: proc(loader: gguf.Loader, model: Gemma) -> bool {
 	#partial switch info.type {
 	case .BF16:
 		if model.dtype != .Bf16 {
-			log.errorf("%q BF16 source needs Bf16 model dtype (got %v)", name, model.dtype)
+			log.errorf("%q BF16 source needs Bf16 model dtype (got %v)", name, model.dtype, location=loc)
 			return false
 		}
 		if builtin.len(bytes) != count * 2 {
-			log.errorf("%q BF16 byte count %v != expected %v", name, builtin.len(bytes), count * 2)
+			log.errorf("%q BF16 byte count %v != expected %v", name, builtin.len(bytes), count * 2, location=loc)
 			return false
 		}
 		builtin.copy(model.embed_tokens_per_layer_bytes, bytes)
@@ -244,7 +244,7 @@ _load_per_layer_token_embd :: proc(loader: gguf.Loader, model: Gemma) -> bool {
 			}
 		}
 	case:
-		log.errorf("%q unsupported source dtype %v", name, info.type)
+		log.errorf("%q unsupported source dtype %v", name, info.type, location=loc)
 		return false
 	}
 	return true

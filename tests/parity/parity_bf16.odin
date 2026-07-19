@@ -244,7 +244,7 @@ test_cpu_cuda_bf16_parity :: proc(t: ^testing.T) {
 
 	for tc in _bf16p_cases() {
 		if tc.kind not_in cuda_forward {
-			log.infof("bf16 parity: skipping %s (op not in CUDA forward_ops)", tc.name)
+			log.infof("skipping %s (op not in CUDA forward_ops)", tc.name)
 			continue
 		}
 		do_backward := tc.backward && tc.kind in cuda_backward && tc.kind in cpu_backward

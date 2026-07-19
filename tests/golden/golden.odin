@@ -33,13 +33,13 @@ GEMMA_TOKENIZER_GOLDENS :: []Tokenizer_Golden{
 @(test)
 test_gemma_tokenizer_goldens :: proc(t: ^testing.T) {
 	if !os.exists(GEMMA_TOKENIZER_PATH) {
-		log.warnf("SKIPPED: gemma tokenizer asset not present at %v (run examples/llm_chat once to fetch it)", GEMMA_TOKENIZER_PATH)
+		log.warnf("skipped: gemma tokenizer asset not present at %v (run examples/llm_chat once to fetch it)", GEMMA_TOKENIZER_PATH)
 		return
 	}
 
 	tok, load_err := gemma_tok.load(GEMMA_TOKENIZER_PATH)
 	if load_err == .Not_Found {
-		log.warnf("SKIPPED: gemma tokenizer asset not present at %v (run examples/llm_chat once to fetch it)", GEMMA_TOKENIZER_PATH)
+		log.warnf("skipped: gemma tokenizer asset not present at %v (run examples/llm_chat once to fetch it)", GEMMA_TOKENIZER_PATH)
 		return
 	}
 	testing.expectf(t, load_err == .None, "gemma tokenizer should load, got %v", load_err)

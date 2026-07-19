@@ -51,11 +51,11 @@ Jepa :: struct {
 }
 
 make :: proc(config: Config, allocator := context.allocator, loc := #caller_location) -> (jepa: Jepa) {
-	assert(config.state_size > 0, "jepa config requires state_size > 0", loc=loc)
-	assert(config.action_size > 0, "jepa config requires action_size > 0", loc=loc)
-	assert(config.hidden_size > 0, "jepa config requires hidden_size > 0", loc=loc)
-	assert(config.latent_size > 0, "jepa config requires latent_size > 0", loc=loc)
-	assert(config.rollout_steps >= 1, "jepa config requires rollout_steps >= 1", loc=loc)
+	assert(config.state_size > 0, "config requires state_size > 0", loc=loc)
+	assert(config.action_size > 0, "config requires action_size > 0", loc=loc)
+	assert(config.hidden_size > 0, "config requires hidden_size > 0", loc=loc)
+	assert(config.latent_size > 0, "config requires latent_size > 0", loc=loc)
+	assert(config.rollout_steps >= 1, "config requires rollout_steps >= 1", loc=loc)
 
 	jepa.config = config
 
@@ -352,7 +352,7 @@ train_step :: proc(jepa: Jepa, batch: Batch, loc := #caller_location) -> (metric
 	b := batch.batch_size
 	k := c.rollout_steps
 
-	assert(b >= 2, "train_step requires batch_size >= 2", loc=loc)
+	assert(b >= 2, "batch_size must be at least 2", loc=loc)
 	assert(len(batch.states) == b * c.state_size, "states length mismatch", loc=loc)
 	assert(len(batch.actions) == k * b * c.action_size, "actions length mismatch", loc=loc)
 	assert(len(batch.next_states) == k * b * c.state_size, "next_states length mismatch", loc=loc)

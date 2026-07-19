@@ -187,7 +187,7 @@ _device_init_locked :: proc(loc := #caller_location) {
 
 	_gpu.pipeline_cache = builtin.make(map[string]^Pipeline, allocator=runtime.default_allocator())
 
-	log.infof("%s  cc=%d.%d  SMs=%d  warp=%d", builtin.string(_gpu.name_buf[:_gpu.name_len]), _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
+	log.infof("%s  cc=%d.%d  SMs=%d  warp=%d", builtin.string(_gpu.name_buf[:_gpu.name_len]), _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size, location=loc)
 }
 
 device_destroy :: proc() {
@@ -267,7 +267,7 @@ context_create :: proc(decode_graph := false, fast_math := true, allocator := co
 	_bind_thread_ctx(loc)
 
 	gctx, err := builtin.new(Context, allocator=allocator, loc=loc)
-	fmt.assertf(err == nil, "Failed to allocate Context: %v", err, loc=loc)
+	fmt.assertf(err == nil, "failed to allocate Context: %v", err, loc=loc)
 
 	gctx.auto_graph_enabled = decode_graph
 	gctx.fast_math          = fast_math

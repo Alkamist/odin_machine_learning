@@ -131,7 +131,7 @@ _context_init :: proc(ctx: ^Context, backend: ^Backend, allocator: mem.Allocator
 	ctx.training = true
 
 	op_arena_buf, op_arena_err := builtin.make([]byte, OPERATION_ARENA_DEFAULT_SIZE, allocator=allocator, loc=loc)
-	assert(op_arena_err == nil, "Failed to allocate op-metadata arena", loc=loc)
+	assert(op_arena_err == nil, "failed to allocate op-metadata arena", loc=loc)
 	ctx._op_arena_buf = op_arena_buf
 	mem.arena_init(&ctx.op_arena, op_arena_buf)
 }
@@ -171,7 +171,7 @@ current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
 }
 
 clear :: proc(training := false, loc := #caller_location) {
-	assert(_current_ctx != nil, "Did you forget to call context_create / context_scope?", loc=loc)
+	assert(_current_ctx != nil, "no active context", loc=loc)
 
 	_current_ctx.training = training
 	_current_ctx.backend.clear(loc)
@@ -228,12 +228,12 @@ buffer_dtype :: #force_inline proc(tensor_type: Data_Type, kind: Buffer_Kind) ->
 
 @(require_results)
 alloc :: proc(type: Data_Type, shape: []int, persistent := false, buffers := DEFAULT_ACTIVATION_BUFFERS, loc := #caller_location) -> (t: Tensor) {
-	assert(_current_ctx != nil, "Did you forget to call context_create / context_scope?", loc=loc)
-	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
-	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
+	assert(_current_ctx != nil, "no active context", loc=loc)
+	assert(builtin.len(shape) > 0, "tensor must have at least one dimension", loc=loc)
+	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
 
 	element_count := shape_element_count(shape)
-	assert(element_count > 0, "Tensor element count must be positive", loc=loc)
+	assert(element_count > 0, "tensor element count must be positive", loc=loc)
 
 	assert(type != .I32 || .Gradient not_in buffers, "I32 tensors cannot have gradient buffers", loc=loc)
 
@@ -242,7 +242,7 @@ alloc :: proc(type: Data_Type, shape: []int, persistent := false, buffers := DEF
 	t.count   = element_count
 	t.rank    = builtin.len(shape)
 	for d, i in shape {
-		assert(d > 0, "Tensor dimension must be positive", loc=loc)
+		assert(d > 0, "tensor dimension must be positive", loc=loc)
 		t.shape[i] = d
 	}
 
@@ -250,7 +250,7 @@ alloc :: proc(type: Data_Type, shape: []int, persistent := false, buffers := DEF
 		if kind in buffers {
 			kind_type  := buffer_dtype(type, kind)
 			byte_count := _data_byte_count(kind_type, element_count)
-			assert(byte_count > 0, "Tensor byte count must be positive", loc=loc)
+			assert(byte_count > 0, "tensor byte count must be positive", loc=loc)
 			byte_count = (byte_count + 3) & ~int(3)
 			t.buffers[kind] = t.backend.buffer_alloc(byte_count, kind, persistent, loc)
 		}
@@ -286,7 +286,7 @@ tensor :: proc{_tensor_flat, _tensor_shaped, _tensor_flat_i32, _tensor_shaped_i3
 
 @(require_results)
 _tensor_flat :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
-	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
+	assert(builtin.len(data) > 0, "length must be at least 1", loc=loc)
 	shape := [1]int{builtin.len(data)}
 	t = zeros(.F32, shape[:], loc=loc)
 	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
@@ -295,7 +295,7 @@ _tensor_flat :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 
 @(require_results)
 _tensor_shaped :: proc(data: []f32, shape: []int, loc := #caller_location) -> (t: Tensor) {
-	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
+	assert(builtin.len(data) > 0, "length must be at least 1", loc=loc)
 	assert(shape_element_count(shape) == builtin.len(data), "tensor shape element count must match data length", loc=loc)
 	t = zeros(.F32, shape, loc=loc)
 	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
@@ -304,7 +304,7 @@ _tensor_shaped :: proc(data: []f32, shape: []int, loc := #caller_location) -> (t
 
 @(require_results)
 _tensor_flat_i32 :: proc(data: []i32, loc := #caller_location) -> (t: Tensor) {
-	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
+	assert(builtin.len(data) > 0, "length must be at least 1", loc=loc)
 	shape := [1]int{builtin.len(data)}
 	t = zeros(.I32, shape[:], loc=loc)
 	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
@@ -313,7 +313,7 @@ _tensor_flat_i32 :: proc(data: []i32, loc := #caller_location) -> (t: Tensor) {
 
 @(require_results)
 _tensor_shaped_i32 :: proc(data: []i32, shape: []int, loc := #caller_location) -> (t: Tensor) {
-	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
+	assert(builtin.len(data) > 0, "length must be at least 1", loc=loc)
 	assert(shape_element_count(shape) == builtin.len(data), "tensor shape element count must match data length", loc=loc)
 	t = zeros(.I32, shape, loc=loc)
 	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
@@ -376,9 +376,9 @@ _leading_count :: proc(t: Tensor) -> int {
 
 @(require_results)
 reshape :: proc(src: Tensor, shape: []int, loc := #caller_location) -> (t: Tensor) {
-	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
-	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
-	assert(shape_element_count(shape) == len(src), "Reshape element count mismatch", loc=loc)
+	assert(builtin.len(shape) > 0, "tensor must have at least one dimension", loc=loc)
+	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
+	assert(shape_element_count(shape) == len(src), "reshape element count mismatch", loc=loc)
 
 	t.backend = src.backend
 	t.buffers = src.buffers
@@ -399,9 +399,9 @@ destroy :: proc(t: Tensor, loc := #caller_location) {
 }
 
 copy :: proc(dst, src: Tensor, loc := #caller_location) {
-	assert(dst.type == src.type, "Tensor types must be equal", loc=loc)
-	assert(dst.rank == src.rank && dst.shape == src.shape, "Tensor shapes must be equal", loc=loc)
-	assert(dst.backend == src.backend, "Tensor copy across backends not supported", loc=loc)
+	assert(dst.type == src.type, "tensor types must be equal", loc=loc)
+	assert(dst.rank == src.rank && dst.shape == src.shape, "tensor shapes must be equal", loc=loc)
+	assert(dst.backend == src.backend, "tensor copy across backends not supported", loc=loc)
 	for kind in Buffer_Kind {
 		dst.backend.buffer_copy(dst.buffers[kind], src.buffers[kind], loc)
 	}
@@ -866,7 +866,7 @@ Operation :: struct {
 }
 
 _record_forward :: proc(op: Operation, loc := #caller_location) {
-	assert(_current_ctx.operation_count < MAX_OPERATIONS, "Maximum operations exceeded, did you forget to call clear?", loc=loc)
+	assert(_current_ctx.operation_count < MAX_OPERATIONS, "maximum operations exceeded; call clear to reset", loc=loc)
 	slot := &_current_ctx.operations[_current_ctx.operation_count]
 	slot^ = op
 	_current_ctx.operation_count += 1
@@ -882,7 +882,7 @@ backward :: proc(loss: Tensor, loc := #caller_location) {
 
 	backend := _current_ctx.backend
 
-	assert(_current_ctx.training, "backward called on an inference pass (did you forget clear(training=true)?)", loc=loc)
+	assert(_current_ctx.training, "backward called on an inference pass; call clear(training=true) first", loc=loc)
 	assert(loss.backend == _current_ctx.backend, "loss tensor is not from the active context", loc=loc)
 	assert(loss.type == .F32, "backward requires an F32 loss tensor", loc=loc)
 	assert(loss.count == 1, "backward requires a scalar loss (reduce with mean first)", loc=loc)
@@ -1115,13 +1115,13 @@ _assert_float :: proc(t: Tensor, name: string, loc: runtime.Source_Code_Location
 }
 
 _assert_broadcastable :: proc(a, b: Tensor, loc: runtime.Source_Code_Location) {
-	assert(a.type == b.type, "Broadcast inputs must have the same dtype", loc=loc)
+	assert(a.type == b.type, "broadcast inputs must have the same dtype", loc=loc)
 	if b.count == 1 {
 		return
 	}
-	assert(b.rank <= a.rank, "Broadcast: b's rank must not exceed a's", loc=loc)
+	assert(b.rank <= a.rank, "broadcast: b's rank must not exceed a's", loc=loc)
 	for d in 0 ..< b.rank {
-		assert(b.shape[b.rank - 1 - d] == a.shape[a.rank - 1 - d], "Broadcast: b's shape must equal a's trailing shape", loc=loc)
+		assert(b.shape[b.rank - 1 - d] == a.shape[a.rank - 1 - d], "broadcast: b's shape must equal a's trailing shape", loc=loc)
 	}
 }
 
@@ -1279,7 +1279,7 @@ Clamp :: struct {
 @(require_results)
 clamp :: proc(input: Tensor, min_val, max_val: f32, loc := #caller_location) -> (output: Tensor) {
 	assert(input.type == .F32, "clamp is F32-only", loc=loc)
-	assert(min_val <= max_val, "Requires min_val <= max_val", loc=loc)
+	assert(min_val <= max_val, "requires min_val <= max_val", loc=loc)
 
 	output = zeros_like(input, loc=loc)
 
@@ -1492,7 +1492,7 @@ Slice :: struct {
 
 @(require_results)
 slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
-	fmt.assertf(start >= 0 && end <= len(input) && start <= end, "Slice indices out of bounds %v:%v", start, end, loc=loc)
+	fmt.assertf(start >= 0 && end <= len(input) && start <= end, "slice indices out of bounds %v:%v", start, end, loc=loc)
 
 	output = zeros(input.type, {end - start}, loc=loc)
 
@@ -1567,14 +1567,14 @@ Concat :: struct {
 
 @(require_results)
 concat :: proc(inputs: ..Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(builtin.len(inputs) > 0, "Requires at least one input", loc=loc)
+	assert(builtin.len(inputs) > 0, "requires at least one input", loc=loc)
 
 	first := inputs[0]
 	trailing_sum := first.shape[first.rank - 1]
 	for i in 1 ..< builtin.len(inputs) {
-		assert(inputs[i].rank == first.rank, "All concat inputs must have the same rank", loc=loc)
+		assert(inputs[i].rank == first.rank, "all concat inputs must have the same rank", loc=loc)
 		for d in 0 ..< first.rank - 1 {
-			assert(inputs[i].shape[d] == first.shape[d], "All concat inputs must match in non-trailing dims", loc=loc)
+			assert(inputs[i].shape[d] == first.shape[d], "all concat inputs must match in non-trailing dims", loc=loc)
 		}
 		trailing_sum += inputs[i].shape[inputs[i].rank - 1]
 	}
@@ -1604,12 +1604,12 @@ Linear :: struct {
 
 @(require_results)
 linear :: proc(input, weight: Tensor, bias: Maybe(Tensor) = nil, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank >= 1, "Linear input must have rank >= 1",  loc=loc)
-	assert(weight.rank == 2, "Linear weight must be a 2-D tensor [output_size, input_size]", loc=loc)
+	assert(input.rank >= 1, "linear input must have rank >= 1",  loc=loc)
+	assert(weight.rank == 2, "linear weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
-	assert(input.shape[input.rank - 1] == input_size, "Input trailing dim must equal weight's input dim", loc=loc)
+	assert(input.shape[input.rank - 1] == input_size, "input trailing dim must equal weight's input dim", loc=loc)
 	_assert_float(input, "linear", loc)
 
 	#partial switch weight.type {
@@ -1637,7 +1637,7 @@ linear :: proc(input, weight: Tensor, bias: Maybe(Tensor) = nil, loc := #caller_
 	_record_forward(op, loc=loc)
 
 	if b, has_bias := bias.?; has_bias {
-		assert(b.rank == 1 && b.shape[0] == output_size, "Linear bias must be a 1-D [output_size] tensor", loc=loc)
+		assert(b.rank == 1 && b.shape[0] == output_size, "linear bias must be a 1-D [output_size] tensor", loc=loc)
 		output = add(output, b, loc=loc)
 	}
 
@@ -1744,10 +1744,10 @@ rope :: proc(input: Tensor, head_count: int, base: f32 = 10000, position_offset:
 	assert(rope_fraction > 0 && rope_fraction <= 1, "rope_fraction must be in (0, 1]", loc=loc)
 
 	input_size := input.shape[input.rank - 1]
-	assert(input_size % head_count == 0, "Trailing dim must be divisible by head count", loc=loc)
+	assert(input_size % head_count == 0, "trailing dim must be divisible by head count", loc=loc)
 
 	head_size := input_size / head_count
-	assert(head_size % 2 == 0, "Head size must be even", loc=loc)
+	assert(head_size % 2 == 0, "head size must be even", loc=loc)
 
 	half_head         := head_size / 2
 	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
@@ -1869,9 +1869,9 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32 = RMSNORM_
 	assert(rope_fraction > 0 && rope_fraction <= 1, "rope_fraction must be in (0, 1]", loc=loc)
 
 	input_size := input.shape[1]
-	assert(input_size % head_count == 0, "Trailing dim must be divisible by head count", loc=loc)
+	assert(input_size % head_count == 0, "trailing dim must be divisible by head count", loc=loc)
 	head_size := input_size / head_count
-	assert(head_size % 2 == 0, "Head size must be even", loc=loc)
+	assert(head_size % 2 == 0, "head size must be even", loc=loc)
 	assert(weight.shape[0] == head_size, "rmsnorm_rope weight length must equal head_size", loc=loc)
 
 	half_head         := head_size / 2
@@ -1923,9 +1923,9 @@ rmsnorm_rope_write_cache :: proc(
 	assert(rope_fraction > 0 && rope_fraction <= 1, "rope_fraction must be in (0, 1]", loc=loc)
 
 	input_size := input.shape[1]
-	assert(input_size % head_count == 0, "Trailing dim must be divisible by head count", loc=loc)
+	assert(input_size % head_count == 0, "trailing dim must be divisible by head count", loc=loc)
 	head_size := input_size / head_count
-	assert(head_size % 2 == 0, "Head size must be even", loc=loc)
+	assert(head_size % 2 == 0, "head size must be even", loc=loc)
 	assert(weight.shape[0] == head_size, "rmsnorm_rope_write_cache weight length must equal head_size", loc=loc)
 
 	half_head         := head_size / 2
@@ -2057,7 +2057,7 @@ Mean_Squared_Error :: struct {
 @(require_results)
 mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(predictions.type == .F32 && targets.type == .F32, "mean_squared_error is F32-only", loc=loc)
-	assert(len(predictions) == len(targets), "Predictions and targets must have same length", loc=loc)
+	assert(len(predictions) == len(targets), "predictions and targets must have same length", loc=loc)
 
 	output = _zeros_drop_last(predictions, loc=loc)
 
@@ -2081,7 +2081,7 @@ Smooth_L1 :: struct {
 @(require_results)
 smooth_l1 :: proc(predictions, targets: Tensor, beta: f32 = 1.0, loc := #caller_location) -> (output: Tensor) {
 	assert(predictions.type == .F32 && targets.type == .F32, "smooth_l1 is F32-only", loc=loc)
-	assert(len(predictions) == len(targets), "Predictions and targets must have same length", loc=loc)
+	assert(len(predictions) == len(targets), "predictions and targets must have same length", loc=loc)
 	assert(beta > 0, "smooth_l1 beta must be positive", loc=loc)
 
 	output = _zeros_drop_last(predictions, loc=loc)
@@ -2113,8 +2113,8 @@ _cross_entropy_tensor :: proc(input: Tensor, targets: Tensor, loc := #caller_loc
 	assert(targets.type == .I32, "cross_entropy targets must be an I32 tensor", loc=loc)
 	assert(targets.rank == 1, "cross_entropy targets must be rank-1", loc=loc)
 	assert(input.rank >= 1, "cross_entropy input must have rank >= 1", loc=loc)
-	assert(len(targets) > 0, "Must have at least one target", loc=loc)
-	assert(_leading_count(input) == len(targets), "Input leading-dim product must equal number of targets", loc=loc)
+	assert(len(targets) > 0, "must have at least one target", loc=loc)
+	assert(_leading_count(input) == len(targets), "input leading-dim product must equal number of targets", loc=loc)
 
 	output = _zeros_drop_last(input, loc=loc)
 
@@ -2134,9 +2134,9 @@ _cross_entropy_tensor :: proc(input: Tensor, targets: Tensor, loc := #caller_loc
 _cross_entropy_ints :: proc(input: Tensor, targets: []int, loc := #caller_location) -> (output: Tensor) {
 	sample_count := builtin.len(targets)
 	assert(input.type == .F32, "cross_entropy is F32-only", loc=loc)
-	assert(sample_count > 0, "Must have at least one target", loc=loc)
+	assert(sample_count > 0, "must have at least one target", loc=loc)
 	assert(input.rank >= 1, "cross_entropy input must have rank >= 1", loc=loc)
-	assert(_leading_count(input) == sample_count, "Input leading-dim product must equal number of targets", loc=loc)
+	assert(_leading_count(input) == sample_count, "input leading-dim product must equal number of targets", loc=loc)
 
 	class_size := input.shape[input.rank - 1]
 
@@ -2145,7 +2145,7 @@ _cross_entropy_ints :: proc(input: Tensor, targets: []int, loc := #caller_locati
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		host := builtin.make([]i32, sample_count, allocator=context.temp_allocator, loc=loc)
 		for target, i in targets {
-			assert(target >= 0 && target < class_size, "Target is out of bounds", loc=loc)
+			assert(target >= 0 && target < class_size, "target is out of bounds", loc=loc)
 			host[i] = i32(target)
 		}
 		target_tensor.backend.buffer_set(target_tensor.buffers[.Data], mem.slice_to_bytes(host), loc)
