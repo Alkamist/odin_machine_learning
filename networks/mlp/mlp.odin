@@ -54,8 +54,7 @@ forward :: proc(mlp: Mlp, input: ml.Tensor) -> (output: ml.Tensor) {
 	output = input
 
 	for layer, i in mlp.layers {
-		output = ml.linear(output, layer.weight)
-		output = ml.add(output, layer.bias)
+		output = ml.linear(output, layer.weight, bias=layer.bias)
 		if i < len(mlp.layers) - 1 {
 			output = ml.relu(output)
 		}

@@ -64,6 +64,16 @@ _build :: proc() {
 	_add({name = "sqrt",               kind = .Sqrt,               input_count = 1, inputs = {0 = sp(true, 3, 4)},                    run = run_sqrt,           prepare = prep_sqrt,    tol = 0.02,  seed = 8})
 	_add({name = "clamp",              kind = .Clamp,              input_count = 1, inputs = {0 = sp(true, 4, 5)},                    run = run_clamp,          prepare = prep_clamp,   tol = 0.01,  seed = 9})
 	_add({name = "mean",               kind = .Mean,               input_count = 1, inputs = {0 = sp(true, 3, 4)},                    run = run_mean,           prepare = prep_normal,  tol = 0.01,  seed = 10})
+	_add({name = "mean_axis",          kind = .Mean,               input_count = 1, inputs = {0 = sp(true, 3, 4)},                    run = run_mean_axis,      prepare = prep_normal,  tol = 0.01,  seed = 35})
+	_add({name = "sum",                kind = .Sum,                input_count = 1, inputs = {0 = sp(true, 3, 4)},                    run = run_sum,            prepare = prep_normal,  tol = 0.01,  seed = 36})
+	_add({name = "sum_axis",           kind = .Sum,                input_count = 1, inputs = {0 = sp(true, 3, 4)},                    run = run_sum_axis,       prepare = prep_normal,  tol = 0.01,  seed = 37})
+	_add({name = "max_reduce",         kind = .Max_Reduce,         input_count = 1, inputs = {0 = sp(true, 3, 4)},                    run = run_max_reduce,     prepare = prep_max_reduce, tol = 0.01, seed = 38})
+	_add({name = "min_broadcast",      kind = .Min,                input_count = 2, inputs = {0 = sp(true, 2, 3), 1 = sp(true, 3)},       run = run_min_broadcast,  prepare = prep_minmax_broadcast, tol = 0.01, seed = 39})
+	_add({name = "max_broadcast",      kind = .Max,                input_count = 2, inputs = {0 = sp(true, 2, 3), 1 = sp(true, 3)},       run = run_max_broadcast,  prepare = prep_minmax_broadcast, tol = 0.01, seed = 40})
+	_add({name = "im2col",             kind = .Im2col,             input_count = 1, inputs = {0 = sp(true, 1, 4, 4, 2)},              run = run_im2col,         prepare = prep_normal,  tol = 0.01,  seed = 41})
+	_add({name = "im2col_pad",         kind = .Im2col,             input_count = 1, inputs = {0 = sp(true, 1, 4, 4, 2)},              run = run_im2col_pad,     prepare = prep_normal,  tol = 0.01,  seed = 42})
+	_add({name = "max_pool2d",         kind = .Max_Pool2d,         input_count = 1, inputs = {0 = sp(true, 1, 4, 4, 2)},              run = run_max_pool2d,     prepare = prep_max_reduce, tol = 0.01, seed = 43})
+	_add({name = "avg_pool2d",         kind = .Avg_Pool2d,         input_count = 1, inputs = {0 = sp(true, 1, 4, 4, 2)},              run = run_avg_pool2d,     prepare = prep_normal,  tol = 0.01,  seed = 44})
 	_add({name = "transpose",          kind = .Transpose,          input_count = 1, inputs = {0 = sp(true, 3, 4)},                    run = run_transpose,      prepare = prep_normal,  tol = 0.01,  seed = 11})
 	_add({name = "select",             kind = .Select,             input_count = 1, inputs = {0 = sp(true, 4, 3)},                    run = run_select,         prepare = prep_normal,  tol = 0.01,  seed = 12})
 	_add({name = "slice",              kind = .Slice,              input_count = 1, inputs = {0 = sp(true, 8)},                       run = run_slice,          prepare = prep_normal,  tol = 0.01,  seed = 13})
@@ -158,6 +168,30 @@ prep_minmax :: proc(inputs: [][]f32) {
 	}
 }
 
+prep_minmax_broadcast :: proc(inputs: [][]f32) {
+	a := inputs[0]
+	b := inputs[1]
+	width := len(b)
+	for &value in b {
+		value = rand.float32_normal(0, 0.8)
+	}
+	for i in 0 ..< len(a) {
+		j      := i % width
+		offset := rand.float32_range(0.3, 1.0)
+		a[i]    = rand.float32() < 0.5 ? b[j] - offset : b[j] + offset
+	}
+}
+
+prep_max_reduce :: proc(inputs: [][]f32) {
+	for input in inputs {
+		n := len(input)
+		for i in 0 ..< n {
+			input[i] = -1.5 + 3.0 * f32(i) / f32(n - 1)
+		}
+		rand.shuffle(input)
+	}
+}
+
 prep_entropy :: proc(inputs: [][]f32) {
 	for input in inputs {
 		for &value in input {
@@ -196,6 +230,16 @@ run_exp            :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.exp(t[0]) }
 run_sqrt           :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.sqrt(t[0]) }
 run_clamp          :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.clamp(t[0], -0.5, 0.5) }
 run_mean           :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.mean(t[0]) }
+run_mean_axis      :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.mean(t[0], axis=0) }
+run_sum            :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.sum(t[0]) }
+run_sum_axis       :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.sum(t[0], axis=0) }
+run_max_reduce     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.max_reduce(t[0]) }
+run_min_broadcast  :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.min(t[0], t[1]) }
+run_max_broadcast  :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.max(t[0], t[1]) }
+run_im2col         :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.im2col(t[0], 2, 2, 1, 1, 0, 0) }
+run_im2col_pad     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.im2col(t[0], 2, 2, 1, 1, 1, 1) }
+run_max_pool2d     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.max_pool2d(t[0], size=2) }
+run_avg_pool2d     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.avg_pool2d(t[0], size=2) }
 run_transpose      :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.transpose(t[0]) }
 run_select         :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.select(t[0], {2, 0, 2, 1}) }
 run_slice          :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice(t[0], 2, 6) }

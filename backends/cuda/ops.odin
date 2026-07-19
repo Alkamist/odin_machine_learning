@@ -129,6 +129,30 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Select:          _select_forward(op, loc)
 	case ml.Slice_Trailing:  _slice_trailing_forward(op, loc)
 	case ml.Slice_Leading:   _slice_leading_forward(op, loc)
+	case ml.Sub:                _sub_forward(op, loc)
+	case ml.Div:                _div_forward(op, loc)
+	case ml.Max:                _max_forward(op, loc)
+	case ml.Sqrt:               _sqrt_forward(op, loc)
+	case ml.Relu:               _relu_forward(op, loc)
+	case ml.Sigmoid:            _sigmoid_forward(op, loc)
+	case ml.Mean:               _mean_forward(op, loc)
+	case ml.Sum:                _sum_forward(op, loc)
+	case ml.Max_Reduce:         _max_reduce_forward(op, loc)
+	case ml.Im2col:             _im2col_forward(op, loc)
+	case ml.Max_Pool2d:         _max_pool2d_forward(op, loc)
+	case ml.Avg_Pool2d:         _avg_pool2d_forward(op, loc)
+	case ml.Transpose:          _transpose_forward(op, loc)
+	case ml.Slice:              _slice_forward(op, loc)
+	case ml.Concat:             _concat_forward(op, loc)
+	case ml.Layernorm:          _layernorm_forward(op, loc)
+	case ml.Log_Softmax:        _log_softmax_forward(op, loc)
+	case ml.Mean_Squared_Error: _mean_squared_error_forward(op, loc)
+	case ml.Smooth_L1:          _smooth_l1_forward(op, loc)
+	case ml.Batched_Matmul:     _batched_matmul_forward(op, loc)
+	case ml.Permute:            _permute_forward(op, loc)
+	case ml.Causal_Mask:        _causal_mask_forward(op, loc)
+	case ml.Lerp_Assign:        _lerp_assign_forward(op, loc)
+	case ml.Accumulate_Mean:    _accumulate_mean_forward(op, loc)
 	case: fmt.panicf("forward not implemented for op variant %T", op.variant, loc=loc)
 	}
 }
@@ -156,6 +180,28 @@ _backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Attention:      _attention_backward(op, loc)
 	case ml.Cross_Entropy:  _cross_entropy_backward(op, loc)
 	case ml.Cast:           _cast_backward(op, loc)
+	case ml.Sub:                _sub_backward(op, loc)
+	case ml.Div:                _div_backward(op, loc)
+	case ml.Max:                _max_backward(op, loc)
+	case ml.Sqrt:               _sqrt_backward(op, loc)
+	case ml.Relu:               _relu_backward(op, loc)
+	case ml.Sigmoid:            _sigmoid_backward(op, loc)
+	case ml.Mean:               _mean_backward(op, loc)
+	case ml.Sum:                _sum_backward(op, loc)
+	case ml.Max_Reduce:         _max_reduce_backward(op, loc)
+	case ml.Im2col:             _im2col_backward(op, loc)
+	case ml.Max_Pool2d:         _max_pool2d_backward(op, loc)
+	case ml.Avg_Pool2d:         _avg_pool2d_backward(op, loc)
+	case ml.Transpose:          _transpose_backward(op, loc)
+	case ml.Slice:              _slice_backward(op, loc)
+	case ml.Concat:             _concat_backward(op, loc)
+	case ml.Layernorm:          _layernorm_backward(op, loc)
+	case ml.Log_Softmax:        _log_softmax_backward(op, loc)
+	case ml.Mean_Squared_Error: _mean_squared_error_backward(op, loc)
+	case ml.Smooth_L1:          _smooth_l1_backward(op, loc)
+	case ml.Batched_Matmul:     _batched_matmul_backward(op, loc)
+	case ml.Permute:            _permute_backward(op, loc)
+	case ml.Causal_Mask:        _causal_mask_backward(op, loc)
 	case:                   fmt.panicf("backward not implemented for op variant %T", op.variant, loc=loc)
 	}
 }
@@ -773,56 +819,6 @@ _clamp_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		_dispatch(_clamp_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
-	}
-}
-
-_min_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	a := op.input
-	b := op.variant.(ml.Min).b
-	c := op.output
-
-	#partial switch a.type {
-	case .F32:
-		_min_pipeline := _compile_pipeline(MIN_F32_SRC, "min.cu", "min_f32")
-		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
-		n := i32(ml.len(a))
-		args := [?]rawptr{&ap, &bp, &cp, &n}
-		_dispatch(_min_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
-	}
-}
-
-_min_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	a := op.input
-	b := op.variant.(ml.Min).b
-	c := op.output
-
-	ap  := data(a).ptr
-	bp  := data(b).ptr
-	dyp := gradient(c).ptr
-	dap := gradient(a).ptr
-	dbp := gradient(b).ptr
-	n   := i32(ml.len(a))
-
-	have_a_grad := dap != 0
-	have_b_grad := dbp != 0
-
-	args_a := [?]rawptr{&ap, &bp, &dyp, &dap, &n}
-	args_b := [?]rawptr{&ap, &bp, &dyp, &dbp, &n}
-
-	#partial switch a.type {
-	case .F32:
-		if have_a_grad {
-			_min_back_a_f32_pipeline := _compile_pipeline(MIN_BACK_A_F32_SRC, "min_back_a_f32.cu", "min_back_a_f32")
-			_dispatch(_min_back_a_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
-		}
-		if have_b_grad {
-			_min_back_b_f32_pipeline := _compile_pipeline(MIN_BACK_B_F32_SRC, "min_back_b_f32.cu", "min_back_b_f32")
-			_dispatch(_min_back_b_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
-		}
-	case:
-		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
 	}
 }
 
@@ -1895,4 +1891,621 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 	case:
 		fmt.panicf("unsupported dtype %v", q.type, loc=loc)
 	}
+}
+
+LAYERNORM_EPS :: f32(1e-5)
+
+_unary_ew_forward :: proc(op: ml.Operation, source_name, entry: cstring, opts: []cstring, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "%s requires F32 (got %v)", entry, x.type, loc=loc)
+	p := _compile_pipeline(ELEMENTWISE_UNARY_SRC, source_name, entry, opts)
+	xp := data(x).ptr; yp := data(y).ptr; n := i32(ml.len(x))
+	args := [?]rawptr{&xp, &yp, &n}
+	_dispatch(p, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_unary_ew_backward :: proc(op: ml.Operation, source_name, entry: cstring, opts: []cstring, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	if gradient(x).ptr == 0 { return }
+	fmt.assertf(x.type == .F32, "%s requires F32 (got %v)", entry, x.type, loc=loc)
+	p := _compile_pipeline(ELEMENTWISE_UNARY_BACK_SRC, source_name, entry, opts)
+	xp := data(x).ptr; yp := data(y).ptr; dyp := gradient(y).ptr; dxp := gradient(x).ptr; n := i32(ml.len(x))
+	args := [?]rawptr{&xp, &yp, &dyp, &dxp, &n}
+	_dispatch(p, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_relu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=relu_f32", "-DOP_EXPR=(v<0.0f?0.0f:v)"}
+	_unary_ew_forward(op, "relu.cu", "relu_f32", opts[:], loc)
+}
+_relu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=relu_back_f32", "-DOP_DERIV=(xv>0.0f?1.0f:0.0f)"}
+	_unary_ew_backward(op, "relu_back.cu", "relu_back_f32", opts[:], loc)
+}
+
+_sigmoid_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=sigmoid_f32", "-DOP_EXPR=(1.0f/(1.0f+expf(-v)))"}
+	_unary_ew_forward(op, "sigmoid.cu", "sigmoid_f32", opts[:], loc)
+}
+_sigmoid_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=sigmoid_back_f32", "-DOP_DERIV=((1.0f/(1.0f+expf(-xv)))*(1.0f-(1.0f/(1.0f+expf(-xv)))))"}
+	_unary_ew_backward(op, "sigmoid_back.cu", "sigmoid_back_f32", opts[:], loc)
+}
+
+_sqrt_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=sqrt_f32", "-DOP_EXPR=sqrtf(v)"}
+	_unary_ew_forward(op, "sqrt.cu", "sqrt_f32", opts[:], loc)
+}
+_sqrt_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=sqrt_back_f32", "-DOP_DERIV=(yv>0.0f?0.5f/yv:0.0f)"}
+	_unary_ew_backward(op, "sqrt_back.cu", "sqrt_back_f32", opts[:], loc)
+}
+
+_binary_ew_forward :: proc(op: ml.Operation, b: ml.Tensor, source_name, entry: cstring, opts: []cstring, loc: runtime.Source_Code_Location) {
+	a := op.input
+	c := op.output
+	fmt.assertf(a.type == .F32, "%s requires F32 (got %v)", entry, a.type, loc=loc)
+	p := _compile_pipeline(ELEMENTWISE_BINARY_SRC, source_name, entry, opts)
+	ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
+	n := i32(ml.len(a)); n_b := i32(ml.len(b))
+	args := [?]rawptr{&ap, &bp, &cp, &n, &n_b}
+	_dispatch(p, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_binary_ew_backward :: proc(
+	op: ml.Operation, b: ml.Tensor,
+	back_a_name, back_a_entry: cstring, back_a_opts: []cstring,
+	back_b_name, back_b_entry: cstring, back_b_opts: []cstring,
+	loc: runtime.Source_Code_Location,
+) {
+	a := op.input
+	c := op.output
+	fmt.assertf(a.type == .F32, "%s requires F32 (got %v)", back_a_entry, a.type, loc=loc)
+	ap := data(a).ptr; bp := data(b).ptr
+	dyp := gradient(c).ptr; dap := gradient(a).ptr; dbp := gradient(b).ptr
+	n := i32(ml.len(a)); n_b := i32(ml.len(b)); stride := i32(ml.len(a) / ml.len(b))
+
+	if dap != 0 {
+		p := _compile_pipeline(ELEMENTWISE_BINARY_BACK_A_SRC, back_a_name, back_a_entry, back_a_opts)
+		args := [?]rawptr{&ap, &bp, &dyp, &dap, &n, &n_b}
+		_dispatch(p, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	}
+	if dbp != 0 {
+		p := _compile_pipeline(ELEMENTWISE_BINARY_BACK_B_SRC, back_b_name, back_b_entry, back_b_opts)
+		args := [?]rawptr{&ap, &bp, &dyp, &dbp, &n_b, &stride}
+		_dispatch(p, _div_up(ml.len(b), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	}
+}
+
+_sub_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=sub_f32", "-DOP_EXPR=(av-bv)"}
+	_binary_ew_forward(op, op.variant.(ml.Sub).b, "sub.cu", "sub_f32", opts[:], loc)
+}
+_sub_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a_opts := [?]cstring{"-DOP_NAME=sub_back_a_f32", "-DDA_EXPR=1.0f"}
+	b_opts := [?]cstring{"-DOP_NAME=sub_back_b_f32", "-DDB_EXPR=-1.0f"}
+	_binary_ew_backward(op, op.variant.(ml.Sub).b, "sub_back_a.cu", "sub_back_a_f32", a_opts[:], "sub_back_b.cu", "sub_back_b_f32", b_opts[:], loc)
+}
+
+_div_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=div_f32", "-DOP_EXPR=(av/bv)"}
+	_binary_ew_forward(op, op.variant.(ml.Div).b, "div.cu", "div_f32", opts[:], loc)
+}
+_div_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a_opts := [?]cstring{"-DOP_NAME=div_back_a_f32", "-DDA_EXPR=(1.0f/bv)"}
+	b_opts := [?]cstring{"-DOP_NAME=div_back_b_f32", "-DDB_EXPR=(-av/(bv*bv))"}
+	_binary_ew_backward(op, op.variant.(ml.Div).b, "div_back_a.cu", "div_back_a_f32", a_opts[:], "div_back_b.cu", "div_back_b_f32", b_opts[:], loc)
+}
+
+_max_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=max_f32", "-DOP_EXPR=(av>bv?av:bv)"}
+	_binary_ew_forward(op, op.variant.(ml.Max).b, "max.cu", "max_f32", opts[:], loc)
+}
+_max_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a_opts := [?]cstring{"-DOP_NAME=max_back_a_f32", "-DDA_EXPR=(av>=bv?1.0f:0.0f)"}
+	b_opts := [?]cstring{"-DOP_NAME=max_back_b_f32", "-DDB_EXPR=(av>=bv?0.0f:1.0f)"}
+	_binary_ew_backward(op, op.variant.(ml.Max).b, "max_back_a.cu", "max_back_a_f32", a_opts[:], "max_back_b.cu", "max_back_b_f32", b_opts[:], loc)
+}
+
+_min_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	opts := [?]cstring{"-DOP_NAME=min_f32", "-DOP_EXPR=(av<bv?av:bv)"}
+	_binary_ew_forward(op, op.variant.(ml.Min).b, "min.cu", "min_f32", opts[:], loc)
+}
+_min_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a_opts := [?]cstring{"-DOP_NAME=min_back_a_f32", "-DDA_EXPR=(av<=bv?1.0f:0.0f)"}
+	b_opts := [?]cstring{"-DOP_NAME=min_back_b_f32", "-DDB_EXPR=(av<=bv?0.0f:1.0f)"}
+	_binary_ew_backward(op, op.variant.(ml.Min).b, "min_back_a.cu", "min_back_a_f32", a_opts[:], "min_back_b.cu", "min_back_b_f32", b_opts[:], loc)
+}
+
+_mean_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "mean requires F32 (got %v)", x.type, loc=loc)
+	size := x.shape[x.rank - 1]; count := ml.len(x) / size
+	p := _compile_pipeline(MEAN_F32_SRC, "mean.cu", "mean_f32")
+	xp := data(x).ptr; yp := data(y).ptr; c := i32(count); s := i32(size)
+	args := [?]rawptr{&xp, &yp, &c, &s}
+	_dispatch(p, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_mean_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	if gradient(x).ptr == 0 { return }
+	fmt.assertf(x.type == .F32, "mean requires F32 (got %v)", x.type, loc=loc)
+	size := x.shape[x.rank - 1]; count := ml.len(x) / size; total := count * size
+	p := _compile_pipeline(MEAN_BACK_F32_SRC, "mean_back_f32.cu", "mean_back_f32")
+	dyp := gradient(y).ptr; dxp := gradient(x).ptr; c := i32(count); s := i32(size)
+	args := [?]rawptr{&dyp, &dxp, &c, &s}
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_sum_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "sum requires F32 (got %v)", x.type, loc=loc)
+	size := x.shape[x.rank - 1]; count := ml.len(x) / size
+	p := _compile_pipeline(SUM_F32_SRC, "sum.cu", "sum_f32")
+	xp := data(x).ptr; yp := data(y).ptr; c := i32(count); s := i32(size)
+	args := [?]rawptr{&xp, &yp, &c, &s}
+	_dispatch(p, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_sum_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	if gradient(x).ptr == 0 { return }
+	fmt.assertf(x.type == .F32, "sum requires F32 (got %v)", x.type, loc=loc)
+	size := x.shape[x.rank - 1]; count := ml.len(x) / size; total := count * size
+	p := _compile_pipeline(SUM_BACK_F32_SRC, "sum_back_f32.cu", "sum_back_f32")
+	dyp := gradient(y).ptr; dxp := gradient(x).ptr; c := i32(count); s := i32(size)
+	args := [?]rawptr{&dyp, &dxp, &c, &s}
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_max_reduce_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "max_reduce requires F32 (got %v)", x.type, loc=loc)
+	size := x.shape[x.rank - 1]; count := ml.len(x) / size
+	p := _compile_pipeline(MAX_REDUCE_F32_SRC, "max_reduce.cu", "max_reduce_f32")
+	xp := data(x).ptr; yp := data(y).ptr; c := i32(count); s := i32(size)
+	args := [?]rawptr{&xp, &yp, &c, &s}
+	_dispatch(p, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_max_reduce_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	if gradient(x).ptr == 0 { return }
+	fmt.assertf(x.type == .F32, "max_reduce requires F32 (got %v)", x.type, loc=loc)
+	size := x.shape[x.rank - 1]; count := ml.len(x) / size
+	p := _compile_pipeline(MAX_REDUCE_BACK_F32_SRC, "max_reduce_back_f32.cu", "max_reduce_back_f32")
+	xp := data(x).ptr; dyp := gradient(y).ptr; dxp := gradient(x).ptr; c := i32(count); s := i32(size)
+	args := [?]rawptr{&xp, &dyp, &dxp, &c, &s}
+	_dispatch(p, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_im2col_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Im2col)
+	fmt.assertf(x.type == .F32, "im2col requires F32 (got %v)", x.type, loc=loc)
+
+	n := i32(x.shape[0]); h := i32(x.shape[1]); w := i32(x.shape[2]); c := i32(x.shape[3])
+	kh := i32(v.kernel_h); kw := i32(v.kernel_w)
+	sh := i32(v.stride_h); sw := i32(v.stride_w)
+	ph := i32(v.pad_h); pw := i32(v.pad_w)
+	oh := i32(v.out_h); ow := i32(v.out_w)
+	total := int(n) * int(oh) * int(ow) * int(kh) * int(kw) * int(c)
+
+	xp := data(x).ptr; yp := data(y).ptr
+	args := [?]rawptr{&xp, &yp, &n, &h, &w, &c, &kh, &kw, &sh, &sw, &ph, &pw, &oh, &ow}
+	p := _compile_pipeline(IM2COL_F32_SRC, "im2col_f32.cu", "im2col_f32")
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_im2col_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Im2col)
+	if gradient(x).ptr == 0 { return }
+
+	n := i32(x.shape[0]); h := i32(x.shape[1]); w := i32(x.shape[2]); c := i32(x.shape[3])
+	kh := i32(v.kernel_h); kw := i32(v.kernel_w)
+	sh := i32(v.stride_h); sw := i32(v.stride_w)
+	ph := i32(v.pad_h); pw := i32(v.pad_w)
+	oh := i32(v.out_h); ow := i32(v.out_w)
+	total := int(n) * int(oh) * int(ow) * int(kh) * int(kw) * int(c)
+
+	dyp := gradient(y).ptr; dxp := gradient(x).ptr
+	args := [?]rawptr{&dyp, &dxp, &n, &h, &w, &c, &kh, &kw, &sh, &sw, &ph, &pw, &oh, &ow}
+	p := _compile_pipeline(IM2COL_BACK_F32_SRC, "im2col_back_f32.cu", "im2col_back_f32")
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_max_pool2d_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Max_Pool2d)
+	fmt.assertf(x.type == .F32, "max_pool2d requires F32 (got %v)", x.type, loc=loc)
+
+	n := i32(x.shape[0]); h := i32(x.shape[1]); w := i32(x.shape[2]); c := i32(x.shape[3])
+	kh := i32(v.kernel_h); kw := i32(v.kernel_w)
+	sh := i32(v.stride_h); sw := i32(v.stride_w)
+	oh := i32(y.shape[1]); ow := i32(y.shape[2])
+	total := int(n) * int(oh) * int(ow) * int(c)
+
+	xp := data(x).ptr; yp := data(y).ptr
+	args := [?]rawptr{&xp, &yp, &n, &h, &w, &c, &kh, &kw, &sh, &sw, &oh, &ow}
+	p := _compile_pipeline(MAX_POOL2D_F32_SRC, "max_pool2d_f32.cu", "max_pool2d_f32")
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_max_pool2d_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Max_Pool2d)
+	if gradient(x).ptr == 0 { return }
+
+	n := i32(x.shape[0]); h := i32(x.shape[1]); w := i32(x.shape[2]); c := i32(x.shape[3])
+	kh := i32(v.kernel_h); kw := i32(v.kernel_w)
+	sh := i32(v.stride_h); sw := i32(v.stride_w)
+	oh := i32(y.shape[1]); ow := i32(y.shape[2])
+	total := int(n) * int(oh) * int(ow) * int(c)
+
+	xp := data(x).ptr; dyp := gradient(y).ptr; dxp := gradient(x).ptr
+	args := [?]rawptr{&xp, &dyp, &dxp, &n, &h, &w, &c, &kh, &kw, &sh, &sw, &oh, &ow}
+	p := _compile_pipeline(MAX_POOL2D_BACK_F32_SRC, "max_pool2d_back_f32.cu", "max_pool2d_back_f32")
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_avg_pool2d_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Avg_Pool2d)
+	fmt.assertf(x.type == .F32, "avg_pool2d requires F32 (got %v)", x.type, loc=loc)
+
+	n := i32(x.shape[0]); h := i32(x.shape[1]); w := i32(x.shape[2]); c := i32(x.shape[3])
+	kh := i32(v.kernel_h); kw := i32(v.kernel_w)
+	sh := i32(v.stride_h); sw := i32(v.stride_w)
+	oh := i32(y.shape[1]); ow := i32(y.shape[2])
+	total := int(n) * int(oh) * int(ow) * int(c)
+
+	xp := data(x).ptr; yp := data(y).ptr
+	args := [?]rawptr{&xp, &yp, &n, &h, &w, &c, &kh, &kw, &sh, &sw, &oh, &ow}
+	p := _compile_pipeline(AVG_POOL2D_F32_SRC, "avg_pool2d_f32.cu", "avg_pool2d_f32")
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_avg_pool2d_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Avg_Pool2d)
+	if gradient(x).ptr == 0 { return }
+
+	n := i32(x.shape[0]); h := i32(x.shape[1]); w := i32(x.shape[2]); c := i32(x.shape[3])
+	kh := i32(v.kernel_h); kw := i32(v.kernel_w)
+	sh := i32(v.stride_h); sw := i32(v.stride_w)
+	oh := i32(y.shape[1]); ow := i32(y.shape[2])
+	total := int(n) * int(oh) * int(ow) * int(c)
+
+	dyp := gradient(y).ptr; dxp := gradient(x).ptr
+	args := [?]rawptr{&dyp, &dxp, &n, &h, &w, &c, &kh, &kw, &sh, &sw, &oh, &ow}
+	p := _compile_pipeline(AVG_POOL2D_BACK_F32_SRC, "avg_pool2d_back_f32.cu", "avg_pool2d_back_f32")
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_transpose_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "transpose requires F32 (got %v)", x.type, loc=loc)
+	rows := x.shape[0]; cols := x.shape[1]; total := rows * cols
+	p := _compile_pipeline(TRANSPOSE_F32_SRC, "transpose_f32.cu", "transpose_f32")
+	xp := data(x).ptr; yp := data(y).ptr; r := i32(rows); c := i32(cols)
+	args := [?]rawptr{&xp, &yp, &r, &c}
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_transpose_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	if gradient(x).ptr == 0 { return }
+	rows := x.shape[0]; cols := x.shape[1]; total := rows * cols
+	p := _compile_pipeline(TRANSPOSE_BACK_F32_SRC, "transpose_back_f32.cu", "transpose_back_f32")
+	dyp := gradient(y).ptr; dxp := gradient(x).ptr; r := i32(rows); c := i32(cols)
+	args := [?]rawptr{&dyp, &dxp, &r, &c}
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_slice_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Slice)
+	fmt.assertf(x.type == .F32, "slice requires F32 (got %v)", x.type, loc=loc)
+	gctx := _gctx(loc)
+	bytes := uint(ml.len(y) * 4)
+	src_off := uint(v.start * 4)
+	cuda.check(cuda.MemcpyDtoDAsync(data(y).ptr, data(x).ptr + cuda.DevicePtr(src_off), bytes, gctx.stream), loc=loc)
+}
+_slice_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Slice)
+	if gradient(x).ptr == 0 { return }
+	count := ml.len(y)
+	dyp := gradient(y).ptr; dxp := gradient(x).ptr; cnt := i32(count); off := i32(v.start)
+	args := [?]rawptr{&dyp, &dxp, &cnt, &off}
+	p := _compile_pipeline(SLICE_LEADING_BACK_F32_SRC, "slice_leading_back_f32.cu", "slice_leading_back_f32")
+	_dispatch(p, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_concat_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	output := op.output
+	inputs := op.variant.(ml.Concat).inputs
+	fmt.assertf(output.type == .F32, "concat requires F32 (got %v)", output.type, loc=loc)
+	out_trailing := output.shape[output.rank - 1]
+	p := _compile_pipeline(CONCAT_F32_SRC, "concat_f32.cu", "concat_f32")
+	outp := data(output).ptr
+	ot := i32(out_trailing)
+	dst_col := 0
+	for input in inputs {
+		in_trailing := input.shape[input.rank - 1]
+		leading := ml.len(input) / in_trailing
+		inp := data(input).ptr
+		ld := i32(leading); it := i32(in_trailing); dc := i32(dst_col)
+		args := [?]rawptr{&inp, &outp, &ld, &it, &ot, &dc}
+		_dispatch(p, _div_up(leading * in_trailing, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+		dst_col += in_trailing
+	}
+}
+_concat_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	output := op.output
+	inputs := op.variant.(ml.Concat).inputs
+	out_trailing := output.shape[output.rank - 1]
+	p := _compile_pipeline(CONCAT_BACK_F32_SRC, "concat_back_f32.cu", "concat_back_f32")
+	dyp := gradient(output).ptr
+	ot := i32(out_trailing)
+	src_col := 0
+	for input in inputs {
+		in_trailing := input.shape[input.rank - 1]
+		leading := ml.len(input) / in_trailing
+		dxp := gradient(input).ptr
+		if dxp != 0 {
+			ld := i32(leading); it := i32(in_trailing); sc := i32(src_col)
+			args := [?]rawptr{&dyp, &dxp, &ld, &it, &ot, &sc}
+			_dispatch(p, _div_up(leading * in_trailing, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+		}
+		src_col += in_trailing
+	}
+}
+
+_layernorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Layernorm)
+	fmt.assertf(x.type == .F32, "layernorm requires F32 (got %v)", x.type, loc=loc)
+	fmt.assertf(v.weight.type == .F32, "layernorm requires F32 weight (got %v)", v.weight.type, loc=loc)
+	size := x.shape[x.rank - 1]; count := ml.len(x) / size
+	p := _compile_pipeline(LAYERNORM_F32_SRC, "layernorm_f32.cu", "layernorm_f32")
+	xp := data(x).ptr; wp := data(v.weight).ptr; yp := data(y).ptr
+	mp := data(v.mean).ptr; rp := data(v.rstd).ptr
+	c := i32(count); s := i32(size); eps := LAYERNORM_EPS
+	args := [?]rawptr{&xp, &wp, &yp, &mp, &rp, &c, &s, &eps}
+	_dispatch(p, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_layernorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Layernorm)
+	fmt.assertf(x.type == .F32, "layernorm requires F32 (got %v)", x.type, loc=loc)
+	size := x.shape[x.rank - 1]; count := ml.len(x) / size
+	dxp := gradient(x).ptr; dwp := gradient(v.weight).ptr
+	if dxp == 0 && dwp == 0 { return }
+	p := _compile_pipeline(LAYERNORM_BACK_F32_SRC, "layernorm_back_f32.cu", "layernorm_back_f32")
+	xp := data(x).ptr; wp := data(v.weight).ptr; mp := data(v.mean).ptr; rp := data(v.rstd).ptr
+	dyp := gradient(y).ptr
+	c := i32(count); s := i32(size)
+	have_dx := i32(dxp != 0 ? 1 : 0); have_dw := i32(dwp != 0 ? 1 : 0)
+	args := [?]rawptr{&xp, &wp, &mp, &rp, &dyp, &dxp, &dwp, &c, &s, &have_dx, &have_dw}
+	_dispatch(p, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_log_softmax_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "log_softmax requires F32 (got %v)", x.type, loc=loc)
+	cols := x.shape[x.rank - 1]; rows := ml.len(x) / cols
+	p := _compile_pipeline(LOG_SOFTMAX_F32_SRC, "log_softmax.cu", "log_softmax_f32")
+	xp := data(x).ptr; yp := data(y).ptr; rr := i32(rows); cc := i32(cols)
+	args := [?]rawptr{&xp, &yp, &rr, &cc}
+	_dispatch(p, _div_up(rows, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_log_softmax_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	if gradient(x).ptr == 0 { return }
+	cols := x.shape[x.rank - 1]; rows := ml.len(x) / cols
+	p := _compile_pipeline(LOG_SOFTMAX_BACK_F32_SRC, "log_softmax_back_f32.cu", "log_softmax_back_f32")
+	yp := data(y).ptr; dyp := gradient(y).ptr; dxp := gradient(x).ptr; rr := i32(rows); cc := i32(cols)
+	args := [?]rawptr{&yp, &dyp, &dxp, &rr, &cc}
+	_dispatch(p, _div_up(rows, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_mean_squared_error_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	pred := op.input
+	out  := op.output
+	v    := op.variant.(ml.Mean_Squared_Error)
+	fmt.assertf(pred.type == .F32, "mean_squared_error requires F32 (got %v)", pred.type, loc=loc)
+	count := ml.len(out); sample_size := ml.len(pred) / count
+	p := _compile_pipeline(MSE_F32_SRC, "mse_f32.cu", "mse_f32")
+	pp := data(pred).ptr; tp := data(v.targets).ptr; outp := data(out).ptr
+	c := i32(count); ss := i32(sample_size)
+	args := [?]rawptr{&pp, &tp, &outp, &c, &ss}
+	_dispatch(p, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_mean_squared_error_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	pred := op.input
+	out  := op.output
+	v    := op.variant.(ml.Mean_Squared_Error)
+	if gradient(pred).ptr == 0 { return }
+	count := ml.len(out); sample_size := ml.len(pred) / count; total := count * sample_size
+	p := _compile_pipeline(MSE_BACK_F32_SRC, "mse_back_f32.cu", "mse_back_f32")
+	pp := data(pred).ptr; tp := data(v.targets).ptr; dyp := gradient(out).ptr; dxp := gradient(pred).ptr
+	c := i32(count); ss := i32(sample_size)
+	args := [?]rawptr{&pp, &tp, &dyp, &dxp, &c, &ss}
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_smooth_l1_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	pred := op.input
+	out  := op.output
+	v    := op.variant.(ml.Smooth_L1)
+	fmt.assertf(pred.type == .F32, "smooth_l1 requires F32 (got %v)", pred.type, loc=loc)
+	count := ml.len(out); sample_size := ml.len(pred) / count
+	p := _compile_pipeline(SMOOTH_L1_F32_SRC, "smooth_l1_f32.cu", "smooth_l1_f32")
+	pp := data(pred).ptr; tp := data(v.targets).ptr; outp := data(out).ptr
+	c := i32(count); ss := i32(sample_size); beta := v.beta
+	args := [?]rawptr{&pp, &tp, &outp, &c, &ss, &beta}
+	_dispatch(p, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_smooth_l1_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	pred := op.input
+	out  := op.output
+	v    := op.variant.(ml.Smooth_L1)
+	if gradient(pred).ptr == 0 { return }
+	count := ml.len(out); sample_size := ml.len(pred) / count; total := count * sample_size
+	p := _compile_pipeline(SMOOTH_L1_BACK_F32_SRC, "smooth_l1_back_f32.cu", "smooth_l1_back_f32")
+	pp := data(pred).ptr; tp := data(v.targets).ptr; dyp := gradient(out).ptr; dxp := gradient(pred).ptr
+	c := i32(count); ss := i32(sample_size); beta := v.beta
+	args := [?]rawptr{&pp, &tp, &dyp, &dxp, &c, &ss, &beta}
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_batched_matmul_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a := op.input
+	b := op.variant.(ml.Batched_Matmul).b
+	c := op.output
+	fmt.assertf(a.type == .F32, "batched_matmul requires F32 (got %v)", a.type, loc=loc)
+	batch := a.shape[0]; m := a.shape[1]; k := a.shape[2]; n := b.shape[2]
+	gctx := _gctx(loc)
+	alpha := f32(1.0); beta := f32(0.0)
+	ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
+	cublas.check(cublas.GemmStridedBatchedEx(
+		gctx.cublas_handle,
+		.N, .N,
+		i32(n), i32(m), i32(k),
+		&alpha,
+		rawptr(uintptr(bp)), .R_32F, i32(n), i64(k * n),
+		rawptr(uintptr(ap)), .R_32F, i32(k), i64(m * k),
+		&beta,
+		rawptr(uintptr(cp)), .R_32F, i32(n), i64(m * n),
+		i32(batch),
+		._32F, .DEFAULT,
+	), loc=loc)
+}
+_batched_matmul_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	a := op.input
+	b := op.variant.(ml.Batched_Matmul).b
+	c := op.output
+	fmt.assertf(a.type == .F32, "batched_matmul requires F32 (got %v)", a.type, loc=loc)
+	batch := a.shape[0]; m := a.shape[1]; k := a.shape[2]; n := b.shape[2]
+	dap := gradient(a).ptr; dbp := gradient(b).ptr
+	if dap == 0 && dbp == 0 { return }
+	gctx := _gctx(loc)
+	alpha := f32(1.0); beta := f32(1.0)
+	ap := data(a).ptr; bp := data(b).ptr; dcp := gradient(c).ptr
+
+	if dap != 0 {
+		cublas.check(cublas.GemmStridedBatchedEx(
+			gctx.cublas_handle,
+			.T, .N,
+			i32(k), i32(m), i32(n),
+			&alpha,
+			rawptr(uintptr(bp)),  .R_32F, i32(n), i64(k * n),
+			rawptr(uintptr(dcp)), .R_32F, i32(n), i64(m * n),
+			&beta,
+			rawptr(uintptr(dap)), .R_32F, i32(k), i64(m * k),
+			i32(batch),
+			._32F, .DEFAULT,
+		), loc=loc)
+	}
+	if dbp != 0 {
+		cublas.check(cublas.GemmStridedBatchedEx(
+			gctx.cublas_handle,
+			.N, .T,
+			i32(n), i32(k), i32(m),
+			&alpha,
+			rawptr(uintptr(dcp)), .R_32F, i32(n), i64(m * n),
+			rawptr(uintptr(ap)),  .R_32F, i32(k), i64(m * k),
+			&beta,
+			rawptr(uintptr(dbp)), .R_32F, i32(n), i64(k * n),
+			i32(batch),
+			._32F, .DEFAULT,
+		), loc=loc)
+	}
+}
+
+_permute_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Permute)
+	fmt.assertf(x.type == .F32, "permute requires F32 (got %v)", x.type, loc=loc)
+	p := _compile_pipeline(PERMUTE_F32_SRC, "permute_f32.cu", "permute_f32")
+	xp := data(x).ptr; yp := data(y).ptr
+	s0 := i32(x.shape[0]); s1 := i32(x.shape[1]); s2 := i32(x.shape[2])
+	a0 := i32(v.axes[0]); a1 := i32(v.axes[1]); a2 := i32(v.axes[2])
+	args := [?]rawptr{&xp, &yp, &s0, &s1, &s2, &a0, &a1, &a2}
+	_dispatch(p, _div_up(ml.len(y), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_permute_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Permute)
+	if gradient(x).ptr == 0 { return }
+	p := _compile_pipeline(PERMUTE_BACK_F32_SRC, "permute_back_f32.cu", "permute_back_f32")
+	dyp := gradient(y).ptr; dxp := gradient(x).ptr
+	s0 := i32(x.shape[0]); s1 := i32(x.shape[1]); s2 := i32(x.shape[2])
+	a0 := i32(v.axes[0]); a1 := i32(v.axes[1]); a2 := i32(v.axes[2])
+	args := [?]rawptr{&dyp, &dxp, &s0, &s1, &s2, &a0, &a1, &a2}
+	_dispatch(p, _div_up(ml.len(y), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_causal_mask_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	fmt.assertf(x.type == .F32, "causal_mask requires F32 (got %v)", x.type, loc=loc)
+	T := x.shape[x.rank - 1]; block := T * T; n_blocks := ml.len(x) / block; total := ml.len(x)
+	p := _compile_pipeline(CAUSAL_MASK_F32_SRC, "causal_mask_f32.cu", "causal_mask_f32")
+	xp := data(x).ptr; yp := data(y).ptr; nb := i32(n_blocks); tt := i32(T)
+	args := [?]rawptr{&xp, &yp, &nb, &tt}
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+_causal_mask_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	if gradient(x).ptr == 0 { return }
+	T := x.shape[x.rank - 1]; block := T * T; n_blocks := ml.len(x) / block; total := ml.len(x)
+	p := _compile_pipeline(CAUSAL_MASK_BACK_F32_SRC, "causal_mask_back_f32.cu", "causal_mask_back_f32")
+	dyp := gradient(y).ptr; dxp := gradient(x).ptr; nb := i32(n_blocks); tt := i32(T)
+	args := [?]rawptr{&dyp, &dxp, &nb, &tt}
+	_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_lerp_assign_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	v := op.variant.(ml.Lerp_Assign)
+	dst := op.output
+	src := v.source
+	fmt.assertf(dst.type == .F32, "lerp_assign requires F32 (got %v)", dst.type, loc=loc)
+	n := ml.len(dst)
+	p := _compile_pipeline(LERP_ASSIGN_F32_SRC, "lerp_assign_f32.cu", "lerp_assign_f32")
+	dstp := data(dst).ptr; srcp := data(src).ptr; alpha := v.alpha; nn := i32(n)
+	args := [?]rawptr{&dstp, &srcp, &alpha, &nn}
+	_dispatch(p, _div_up(n, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_accumulate_mean_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	src := op.input
+	dst := op.output
+	fmt.assertf(src.type == .F32, "accumulate_mean requires F32 (got %v)", src.type, loc=loc)
+	n := ml.len(src)
+	p := _compile_pipeline(ACCUMULATE_MEAN_F32_SRC, "accumulate_mean_f32.cu", "accumulate_mean_f32")
+	srcp := data(src).ptr; dstp := data(dst).ptr; nn := i32(n)
+	args := [?]rawptr{&srcp, &dstp, &nn}
+	_dispatch(p, 1, 1, 1, 256, 1, 1, 0, args[:], loc)
 }

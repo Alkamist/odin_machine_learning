@@ -741,6 +741,11 @@ Operation_Variant :: union {
 	Min,
 	Max,
 	Mean,
+	Sum,
+	Max_Reduce,
+	Im2col,
+	Max_Pool2d,
+	Avg_Pool2d,
 	Transpose,
 	Select,
 	Slice,
@@ -790,6 +795,11 @@ Operation_Kind :: enum {
 	Min,
 	Max,
 	Mean,
+	Sum,
+	Max_Reduce,
+	Im2col,
+	Max_Pool2d,
+	Avg_Pool2d,
 	Transpose,
 	Select,
 	Slice,
@@ -1115,14 +1125,6 @@ _assert_broadcastable :: proc(a, b: Tensor, loc: runtime.Source_Code_Location) {
 	}
 }
 
-_assert_same_shape :: proc(a, b: Tensor, loc: runtime.Source_Code_Location) {
-	assert(a.type == b.type, "Inputs must have the same dtype", loc=loc)
-	assert(a.rank == b.rank, "Inputs must have the same rank", loc=loc)
-	for d in 0 ..< a.rank {
-		assert(a.shape[d] == b.shape[d], "Inputs must have the same shape", loc=loc)
-	}
-}
-
 Add :: struct {
 	b: Tensor,
 }
@@ -1295,7 +1297,7 @@ Min :: struct {
 @(require_results)
 min :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(a.type == .F32 && b.type == .F32, "min is F32-only", loc=loc)
-	_assert_same_shape(a, b, loc)
+	_assert_broadcastable(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -1318,7 +1320,7 @@ Max :: struct {
 @(require_results)
 max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(a.type == .F32 && b.type == .F32, "max is F32-only", loc=loc)
-	_assert_same_shape(a, b, loc)
+	_assert_broadcastable(a, b, loc)
 
 	output = zeros_like(a, loc=loc)
 
@@ -1335,19 +1337,72 @@ max :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 }
 
 Mean :: struct {}
+Sum :: struct {}
+Max_Reduce :: struct {}
 
 @(require_results)
-mean :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+_reduce_trailing_record :: proc(input: Tensor, variant: Operation_Variant, loc: runtime.Source_Code_Location) -> (output: Tensor) {
 	output = _zeros_drop_last(input, loc=loc)
 
 	op := Operation{
 		input   = input,
 		output  = output,
-		variant = Mean{},
+		variant = variant,
 	}
 	_record_forward(op, loc=loc)
 
 	return
+}
+
+@(require_results)
+_reduce_axis :: proc(input: Tensor, axis: int, variant: Operation_Variant, loc: runtime.Source_Code_Location) -> (output: Tensor) {
+	rank := input.rank
+	target := axis < 0 ? rank - 1 : axis
+	assert(target >= 0 && target < rank, "reduce axis out of range", loc=loc)
+
+	if rank == 1 || target == rank - 1 {
+		return _reduce_trailing_record(input, variant, loc=loc)
+	}
+
+	leading := 1
+	for i in 0 ..< target {
+		leading *= input.shape[i]
+	}
+	reduced_dim := input.shape[target]
+	trailing := 1
+	for i in target + 1 ..< rank {
+		trailing *= input.shape[i]
+	}
+
+	collapsed := reshape(input, {leading, reduced_dim, trailing}, loc=loc)
+	swapped   := permute(collapsed, {0, 2, 1}, loc=loc)
+	reduced   := _reduce_trailing_record(swapped, variant, loc=loc)
+
+	out_shape: [MAX_TENSOR_RANK]int
+	out_rank := 0
+	for i in 0 ..< rank {
+		if i == target {
+			continue
+		}
+		out_shape[out_rank] = input.shape[i]
+		out_rank += 1
+	}
+	return reshape(reduced, out_shape[:out_rank], loc=loc)
+}
+
+@(require_results)
+mean :: proc(input: Tensor, axis := -1, loc := #caller_location) -> Tensor {
+	return _reduce_axis(input, axis, Mean{}, loc=loc)
+}
+
+@(require_results)
+sum :: proc(input: Tensor, axis := -1, loc := #caller_location) -> Tensor {
+	return _reduce_axis(input, axis, Sum{}, loc=loc)
+}
+
+@(require_results)
+max_reduce :: proc(input: Tensor, axis := -1, loc := #caller_location) -> Tensor {
+	return _reduce_axis(input, axis, Max_Reduce{}, loc=loc)
 }
 
 Transpose :: struct {}
@@ -1519,7 +1574,7 @@ Linear :: struct {
 }
 
 @(require_results)
-linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
+linear :: proc(input, weight: Tensor, bias: Maybe(Tensor) = nil, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 1, "Linear input must have rank >= 1",  loc=loc)
 	assert(weight.rank == 2, "Linear weight must be a 2-D tensor [output_size, input_size]", loc=loc)
 
@@ -1540,7 +1595,40 @@ linear :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tenso
 	}
 	_record_forward(op, loc=loc)
 
+	if b, has_bias := bias.?; has_bias {
+		assert(b.rank == 1 && b.shape[0] == output_size, "Linear bias must be a 1-D [output_size] tensor", loc=loc)
+		output = add(output, b, loc=loc)
+	}
+
 	return
+}
+
+@(require_results)
+embedding :: proc(table: Tensor, ids: []int, loc := #caller_location) -> Tensor {
+	return select(table, ids, loc=loc)
+}
+
+@(require_results)
+dropout :: proc(input: Tensor, rate: f32, loc := #caller_location) -> Tensor {
+	assert(rate >= 0 && rate < 1, "dropout rate must be in [0, 1)", loc=loc)
+	assert(input.type == .F32, "dropout is F32-only", loc=loc)
+	if !is_training(loc=loc) || rate == 0 {
+		return input
+	}
+
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+
+	scale := 1 / (1 - rate)
+	host  := builtin.make([]f32, input.count, allocator=context.temp_allocator, loc=loc)
+	for &value in host {
+		value = 0 if rand.float32() < rate else scale
+	}
+
+	shape := input.shape
+	mask := scratch(.F32, shape[:input.rank], loc=loc)
+	set_data(mask, host, loc=loc)
+
+	return mul(input, mask, loc=loc)
 }
 
 Linear_Q4_K :: struct {
@@ -2181,6 +2269,188 @@ permute :: proc(input: Tensor, axes: [3]int, loc := #caller_location) -> (output
 		input   = input,
 		output  = output,
 		variant = Permute{axes=axes},
+	}
+	_record_forward(op, loc=loc)
+
+	return
+}
+
+Im2col :: struct {
+	kernel_h: int,
+	kernel_w: int,
+	stride_h: int,
+	stride_w: int,
+	pad_h:    int,
+	pad_w:    int,
+	out_h:    int,
+	out_w:    int,
+}
+
+@(require_results)
+im2col :: proc(input: Tensor, kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w: int, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank == 4, "im2col input must be 4-D [n, h, w, c]", loc=loc)
+	assert(input.type == .F32 || input.type == .Bf16, "im2col requires F32 or Bf16 input", loc=loc)
+	assert(kernel_h >= 1 && kernel_w >= 1, "im2col kernel dims must be >= 1", loc=loc)
+	assert(stride_h >= 1 && stride_w >= 1, "im2col stride must be >= 1", loc=loc)
+	assert(pad_h >= 0 && pad_w >= 0, "im2col padding must be >= 0", loc=loc)
+
+	h := input.shape[1]
+	w := input.shape[2]
+	c := input.shape[3]
+
+	out_h := (h + 2 * pad_h - kernel_h) / stride_h + 1
+	out_w := (w + 2 * pad_w - kernel_w) / stride_w + 1
+	assert(out_h >= 1 && out_w >= 1, "im2col output dims must be >= 1", loc=loc)
+
+	output = zeros(input.type, {input.shape[0] * out_h * out_w, kernel_h * kernel_w * c}, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Im2col{
+			kernel_h = kernel_h,
+			kernel_w = kernel_w,
+			stride_h = stride_h,
+			stride_w = stride_w,
+			pad_h    = pad_h,
+			pad_w    = pad_w,
+			out_h    = out_h,
+			out_w    = out_w,
+		},
+	}
+	_record_forward(op, loc=loc)
+
+	return
+}
+
+@(require_results)
+conv2d :: proc(input, weight: Tensor, bias: Maybe(Tensor) = nil, stride := 1, padding := 0, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank == 4, "conv2d input must be 4-D [n, h, w, c]", loc=loc)
+	assert(weight.rank == 4, "conv2d weight must be 4-D [out_c, kh, kw, in_c]", loc=loc)
+	assert(input.type == .F32 || input.type == .Bf16, "conv2d requires F32 or Bf16 input", loc=loc)
+	assert(stride >= 1, "conv2d stride must be >= 1", loc=loc)
+	assert(padding >= 0, "conv2d padding must be >= 0", loc=loc)
+
+	out_c := weight.shape[0]
+	kernel_h := weight.shape[1]
+	kernel_w := weight.shape[2]
+	in_c     := weight.shape[3]
+	assert(input.shape[3] == in_c, "conv2d weight in_c must match input channel count", loc=loc)
+
+	input_n := input.shape[0]
+	h       := input.shape[1]
+	w       := input.shape[2]
+
+	out_h := (h + 2 * padding - kernel_h) / stride + 1
+	out_w := (w + 2 * padding - kernel_w) / stride + 1
+	assert(out_h >= 1 && out_w >= 1, "conv2d output dims must be >= 1", loc=loc)
+
+	weight_matrix := reshape(weight, {out_c, kernel_h * kernel_w * in_c}, loc=loc)
+	columns       := im2col(input, kernel_h, kernel_w, stride, stride, padding, padding, loc=loc)
+	result        := linear(columns, weight_matrix, bias, loc=loc)
+	output         = reshape(result, {input_n, out_h, out_w, out_c}, loc=loc)
+
+	return
+}
+
+@(require_results)
+conv1d :: proc(input, weight: Tensor, bias: Maybe(Tensor) = nil, stride := 1, padding := 0, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank == 3, "conv1d input must be 3-D [n, w, c]", loc=loc)
+	assert(weight.rank == 3, "conv1d weight must be 3-D [out_c, kw, in_c]", loc=loc)
+	assert(input.type == .F32 || input.type == .Bf16, "conv1d requires F32 or Bf16 input", loc=loc)
+	assert(stride >= 1, "conv1d stride must be >= 1", loc=loc)
+	assert(padding >= 0, "conv1d padding must be >= 0", loc=loc)
+
+	input_n := input.shape[0]
+	w       := input.shape[1]
+	c       := input.shape[2]
+	out_c   := weight.shape[0]
+	kernel_w := weight.shape[1]
+	in_c     := weight.shape[2]
+	assert(c == in_c, "conv1d weight in_c must match input channel count", loc=loc)
+
+	out_w := (w + 2 * padding - kernel_w) / stride + 1
+	assert(out_w >= 1, "conv1d output dim must be >= 1", loc=loc)
+
+	input_2d      := reshape(input, {input_n, 1, w, c}, loc=loc)
+	weight_matrix := reshape(weight, {out_c, kernel_w * in_c}, loc=loc)
+	columns       := im2col(input_2d, 1, kernel_w, stride, stride, 0, padding, loc=loc)
+	result        := linear(columns, weight_matrix, bias, loc=loc)
+	output         = reshape(result, {input_n, out_w, out_c}, loc=loc)
+
+	return
+}
+
+Max_Pool2d :: struct {
+	kernel_h: int,
+	kernel_w: int,
+	stride_h: int,
+	stride_w: int,
+}
+
+Avg_Pool2d :: struct {
+	kernel_h: int,
+	kernel_w: int,
+	stride_h: int,
+	stride_w: int,
+}
+
+@(require_results)
+_pool2d_shape :: proc(input: Tensor, kernel_h, kernel_w, stride_h, stride_w: int, loc: runtime.Source_Code_Location) -> (out_h, out_w: int) {
+	assert(input.rank == 4, "pool2d input must be 4-D [n, h, w, c]", loc=loc)
+	assert(input.type == .F32 || input.type == .Bf16, "pool2d requires F32 or Bf16 input", loc=loc)
+	assert(kernel_h >= 1 && kernel_w >= 1, "pool2d kernel dims must be >= 1", loc=loc)
+	assert(stride_h >= 1 && stride_w >= 1, "pool2d stride must be >= 1", loc=loc)
+
+	h := input.shape[1]
+	w := input.shape[2]
+	assert(h >= kernel_h && w >= kernel_w, "pool2d window must fit inside the input", loc=loc)
+	assert((h - kernel_h) % stride_h == 0, "pool2d height must tile the window exactly", loc=loc)
+	assert((w - kernel_w) % stride_w == 0, "pool2d width must tile the window exactly", loc=loc)
+
+	out_h = (h - kernel_h) / stride_h + 1
+	out_w = (w - kernel_w) / stride_w + 1
+	return
+}
+
+@(require_results)
+max_pool2d :: proc(input: Tensor, size := 2, stride := -1, loc := #caller_location) -> (output: Tensor) {
+	actual_stride := stride if stride > 0 else size
+	out_h, out_w := _pool2d_shape(input, size, size, actual_stride, actual_stride, loc)
+
+	output = zeros(input.type, {input.shape[0], out_h, out_w, input.shape[3]}, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Max_Pool2d{
+			kernel_h = size,
+			kernel_w = size,
+			stride_h = actual_stride,
+			stride_w = actual_stride,
+		},
+	}
+	_record_forward(op, loc=loc)
+
+	return
+}
+
+@(require_results)
+avg_pool2d :: proc(input: Tensor, size := 2, stride := -1, loc := #caller_location) -> (output: Tensor) {
+	actual_stride := stride if stride > 0 else size
+	out_h, out_w := _pool2d_shape(input, size, size, actual_stride, actual_stride, loc)
+
+	output = zeros(input.type, {input.shape[0], out_h, out_w, input.shape[3]}, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Avg_Pool2d{
+			kernel_h = size,
+			kernel_w = size,
+			stride_h = actual_stride,
+			stride_w = actual_stride,
+		},
 	}
 	_record_forward(op, loc=loc)
 

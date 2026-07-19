@@ -37,9 +37,6 @@ EXP_F32_SRC        :: #load("kernels/exp/exp.cu",               []u8)
 EXP_BACK_F32_SRC   :: #load("kernels/exp/exp_back_f32.cu",      []u8)
 CLAMP_F32_SRC      :: #load("kernels/clamp/clamp.cu",           []u8)
 CLAMP_BACK_F32_SRC :: #load("kernels/clamp/clamp_back_f32.cu",  []u8)
-MIN_F32_SRC        :: #load("kernels/min/min.cu",               []u8)
-MIN_BACK_A_F32_SRC :: #load("kernels/min/min_back_a_f32.cu",    []u8)
-MIN_BACK_B_F32_SRC :: #load("kernels/min/min_back_b_f32.cu",    []u8)
 
 // Row-wise softmax and entropy over a head's logits (F32 only).
 SOFTMAX_F32_SRC      :: #load("kernels/softmax/softmax.cu",          []u8)
@@ -118,3 +115,52 @@ ATTENTION_TRAIN_F32_SRC       :: #load("kernels/attention/attention_train_f32.cu
 ATTENTION_TRAIN_BACK_F32_SRC  :: #load("kernels/attention/attention_train_back_f32.cu",  []u8)
 ATTENTION_TRAIN_BF16_SRC      :: #load("kernels/attention/attention_train_bf16.cu",      []u8)
 ATTENTION_TRAIN_BACK_BF16_SRC :: #load("kernels/attention/attention_train_back_bf16.cu", []u8)
+
+ELEMENTWISE_UNARY_SRC         :: #load("kernels/elementwise/unary.cu",         []u8)
+ELEMENTWISE_UNARY_BACK_SRC    :: #load("kernels/elementwise/unary_back.cu",    []u8)
+ELEMENTWISE_BINARY_SRC        :: #load("kernels/elementwise/binary.cu",        []u8)
+ELEMENTWISE_BINARY_BACK_A_SRC :: #load("kernels/elementwise/binary_back_a.cu", []u8)
+ELEMENTWISE_BINARY_BACK_B_SRC :: #load("kernels/elementwise/binary_back_b.cu", []u8)
+
+MEAN_F32_SRC      :: #load("kernels/mean/mean.cu",          []u8)
+MEAN_BACK_F32_SRC :: #load("kernels/mean/mean_back_f32.cu", []u8)
+
+SUM_F32_SRC             :: #load("kernels/reduce/sum.cu",                 []u8)
+SUM_BACK_F32_SRC        :: #load("kernels/reduce/sum_back_f32.cu",        []u8)
+MAX_REDUCE_F32_SRC      :: #load("kernels/reduce/max_reduce.cu",          []u8)
+MAX_REDUCE_BACK_F32_SRC :: #load("kernels/reduce/max_reduce_back_f32.cu", []u8)
+
+IM2COL_F32_SRC      :: #load("kernels/im2col/im2col_f32.cu",      []u8)
+IM2COL_BACK_F32_SRC :: #load("kernels/im2col/im2col_back_f32.cu", []u8)
+
+MAX_POOL2D_F32_SRC      :: #load("kernels/pool/max_pool2d_f32.cu",      []u8)
+MAX_POOL2D_BACK_F32_SRC :: #load("kernels/pool/max_pool2d_back_f32.cu", []u8)
+AVG_POOL2D_F32_SRC      :: #load("kernels/pool/avg_pool2d_f32.cu",      []u8)
+AVG_POOL2D_BACK_F32_SRC :: #load("kernels/pool/avg_pool2d_back_f32.cu", []u8)
+
+LOG_SOFTMAX_F32_SRC      :: #load("kernels/log_softmax/log_softmax.cu",          []u8)
+LOG_SOFTMAX_BACK_F32_SRC :: #load("kernels/log_softmax/log_softmax_back_f32.cu", []u8)
+
+LAYERNORM_F32_SRC      :: #load("kernels/layernorm/layernorm_f32.cu",      []u8)
+LAYERNORM_BACK_F32_SRC :: #load("kernels/layernorm/layernorm_back_f32.cu", []u8)
+
+MSE_F32_SRC      :: #load("kernels/mean_squared_error/mse_f32.cu",      []u8)
+MSE_BACK_F32_SRC :: #load("kernels/mean_squared_error/mse_back_f32.cu", []u8)
+
+SMOOTH_L1_F32_SRC      :: #load("kernels/smooth_l1/smooth_l1_f32.cu",      []u8)
+SMOOTH_L1_BACK_F32_SRC :: #load("kernels/smooth_l1/smooth_l1_back_f32.cu", []u8)
+
+TRANSPOSE_F32_SRC      :: #load("kernels/transpose/transpose_f32.cu",      []u8)
+TRANSPOSE_BACK_F32_SRC :: #load("kernels/transpose/transpose_back_f32.cu", []u8)
+
+PERMUTE_F32_SRC      :: #load("kernels/permute/permute_f32.cu",      []u8)
+PERMUTE_BACK_F32_SRC :: #load("kernels/permute/permute_back_f32.cu", []u8)
+
+CONCAT_F32_SRC      :: #load("kernels/concat/concat_f32.cu",      []u8)
+CONCAT_BACK_F32_SRC :: #load("kernels/concat/concat_back_f32.cu", []u8)
+
+CAUSAL_MASK_F32_SRC      :: #load("kernels/causal_mask/causal_mask_f32.cu",      []u8)
+CAUSAL_MASK_BACK_F32_SRC :: #load("kernels/causal_mask/causal_mask_back_f32.cu", []u8)
+
+LERP_ASSIGN_F32_SRC     :: #load("kernels/lerp_assign/lerp_assign_f32.cu",         []u8)
+ACCUMULATE_MEAN_F32_SRC :: #load("kernels/accumulate_mean/accumulate_mean_f32.cu", []u8)

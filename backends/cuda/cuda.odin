@@ -235,11 +235,19 @@ _backend := ml.Backend{
 		.Rmsnorm, .Add_Rmsnorm, .Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache,
 		.Rope, .Attention, .Attention_Cache, .Cross_Entropy,
 		.Select, .Slice_Trailing, .Slice_Leading, .Exp, .Clamp, .Min, .Softmax, .Entropy,
+		.Sub, .Div, .Sqrt, .Max, .Mean, .Sum, .Max_Reduce, .Transpose, .Slice, .Concat, .Layernorm,
+		.Log_Softmax, .Mean_Squared_Error, .Smooth_L1, .Relu, .Sigmoid, .Batched_Matmul,
+		.Permute, .Causal_Mask, .Lerp_Assign, .Accumulate_Mean,
+		.Im2col, .Max_Pool2d, .Avg_Pool2d,
 	},
 	backward_ops = {
 		.Add, .Mul, .Linear, .Linear_Q4_K, .Linear_Q6_K, .Silu, .Gelu,
 		.Tanh, .Select, .Slice_Trailing, .Slice_Leading, .Rmsnorm, .Rope, .Attention,
 		.Cross_Entropy, .Cast, .Exp, .Clamp, .Min, .Softmax, .Entropy,
+		.Sub, .Div, .Sqrt, .Max, .Mean, .Sum, .Max_Reduce, .Transpose, .Slice, .Concat, .Layernorm,
+		.Log_Softmax, .Mean_Squared_Error, .Smooth_L1, .Relu, .Sigmoid, .Batched_Matmul,
+		.Permute, .Causal_Mask,
+		.Im2col, .Max_Pool2d, .Avg_Pool2d,
 	},
 }
 
@@ -485,6 +493,10 @@ _alloc_scratch :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 		}
 	case ml.Rmsnorm:
 		count := ml.len(op.input) / op.input.shape[op.input.rank - 1]
+		v.rstd = ml.scratch(.F32, {count}, loc=loc)
+	case ml.Layernorm:
+		count := ml.len(op.input) / op.input.shape[op.input.rank - 1]
+		v.mean = ml.scratch(.F32, {count}, loc=loc)
 		v.rstd = ml.scratch(.F32, {count}, loc=loc)
 	case ml.Cross_Entropy:
 		shape := op.input.shape

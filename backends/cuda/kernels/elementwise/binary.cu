@@ -1,10 +1,12 @@
-// out = min(a, b), elementwise, same shape (no broadcast).
+#include "broadcast.cuh"
 extern "C" __global__
-void min_f32(const float* __restrict__ a,
+void OP_NAME(const float* __restrict__ a,
              const float* __restrict__ b,
              float*       __restrict__ c,
-             int n) {
+             int n, int n_b) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n) return;
-	c[i] = a[i] < b[i] ? a[i] : b[i];
+	float av = a[i];
+	float bv = b[bc_b_index(i, n_b)];
+	c[i] = (OP_EXPR);
 }
