@@ -60,7 +60,7 @@ make :: proc(config: Config, allocator := context.allocator, loc := #caller_loca
 	jepa.config = config
 
 	jepa.encoder        = mlp.make(config.state_size, config.hidden_size, config.latent_size, allocator=allocator)
-	jepa.target_encoder = mlp.make(config.state_size, config.hidden_size, config.latent_size, allocator=allocator)
+	jepa.target_encoder = mlp.make(config.state_size, config.hidden_size, config.latent_size, flags=ml.Parameter_Flags{.Checkpoint}, allocator=allocator)
 	jepa.predictor      = mlp.make(config.latent_size + config.action_size, config.hidden_size, config.latent_size, allocator=allocator)
 	jepa.decoder        = mlp.make(config.latent_size, config.hidden_size, config.state_size, allocator=allocator)
 
