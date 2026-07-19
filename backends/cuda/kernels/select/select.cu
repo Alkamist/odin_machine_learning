@@ -7,13 +7,13 @@
 #endif
 
 extern "C" __global__
-void KERNEL_NAME(const DATA_T*       __restrict__ table,
-                 const unsigned int* __restrict__ indices,
-                 DATA_T*             __restrict__ out,
+void KERNEL_NAME(const DATA_T*    __restrict__ table,
+                 const int*       __restrict__ indices,
+                 DATA_T*          __restrict__ out,
                  int n_indices, int size) {
 	int j = blockIdx.x * blockDim.x + threadIdx.x;
 	if (j >= size) return;
 	for (int i = blockIdx.y; i < n_indices; i += gridDim.y) {
-		out[i * size + j] = table[(int)indices[i] * size + j];
+		out[i * size + j] = table[indices[i] * size + j];
 	}
 }

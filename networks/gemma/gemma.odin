@@ -433,7 +433,7 @@ _fill_per_layer_bytes_normal :: proc(model: Gemma, std: f32) {
 		for i in 0 ..< count {
 			f[i] = ml.bf16_from_f32(rand.float32_normal(0, std))
 		}
-	case .Q4_K, .Q6_K:
+	case .I32, .Q4_K, .Q6_K:
 		fmt.panicf("unsupported dtype %v", model.dtype)
 	}
 }

@@ -1297,31 +1297,18 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	}
 }
 
-_upload_indices :: proc(gctx: ^Context, indices: []int, loc: runtime.Source_Code_Location) -> cuda.DevicePtr {
-	bytes := uint(builtin.len(indices) * size_of(u32))
-	dev_ptr := _activation_alloc(gctx, u64(bytes), loc)
-
-	host := ([^]u32)(_pinned_staging_take(gctx, u64(bytes), loc))
-	for v, i in indices {
-		host[i] = u32(v)
-	}
-	cuda.check(cuda.MemcpyHtoDAsync(dev_ptr, host, bytes, gctx.stream), loc=loc)
-	return dev_ptr
-}
-
 _select_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	x       := op.input
-	y       := op.output
-	indices := op.variant.(ml.Select).indices
-	size    := ml.len(y) / builtin.len(indices)
+	x           := op.input
+	y           := op.output
+	index_count := ml.len(op.variant.(ml.Select).indices)
+	size        := ml.len(y) / index_count
 
-	gctx := _gctx(loc)
-	idx_ptr := _upload_indices(gctx, indices, loc)
+	idx_ptr := data(op.variant.(ml.Select).indices).ptr
 
 	xp := data(x).ptr; yp := data(y).ptr
-	n_idx := i32(builtin.len(indices)); s := i32(size)
+	n_idx := i32(index_count); s := i32(size)
 	args := [?]rawptr{&xp, &idx_ptr, &yp, &n_idx, &s}
-	grid_y := u32(min(builtin.len(indices), MAX_GRID_DIM_YZ))
+	grid_y := u32(min(index_count, MAX_GRID_DIM_YZ))
 
 	#partial switch x.type {
 	case .Bf16:
@@ -1468,14 +1455,13 @@ _cross_entropy_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locati
 
 	_cross_entropy_f32_pipeline := _compile_pipeline(CROSS_ENTROPY_F32_SRC, "cross_entropy_f32.cu", "cross_entropy_f32")
 
-	gctx := _gctx(loc)
-	idx_ptr := _upload_indices(gctx, v.targets, loc)
+	idx_ptr := data(v.targets).ptr
 
 	xp := data(x).ptr
 	pp := data(v.probabilities).ptr
 	yp := data(y).ptr
 	class_size := i32(x.shape[x.rank - 1])
-	sample_count := builtin.len(v.targets)
+	sample_count := ml.len(v.targets)
 
 	args := [?]rawptr{&xp, &idx_ptr, &pp, &yp, &class_size}
 	_dispatch(_cross_entropy_f32_pipeline, u32(sample_count), 1, 1, 256, 1, 1, 0, args[:], loc)
@@ -1490,14 +1476,13 @@ _cross_entropy_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 
 	_cross_entropy_back_f32_pipeline := _compile_pipeline(CROSS_ENTROPY_BACK_F32_SRC, "cross_entropy_back_f32.cu", "cross_entropy_back_f32")
 
-	gctx := _gctx(loc)
-	idx_ptr := _upload_indices(gctx, v.targets, loc)
+	idx_ptr := data(v.targets).ptr
 
 	pp  := data(v.probabilities).ptr
 	dyp := gradient(y).ptr
 	dxp := gradient(x).ptr
 	class_size   := i32(x.shape[x.rank - 1])
-	sample_count := i32(builtin.len(v.targets))
+	sample_count := i32(ml.len(v.targets))
 	total        := int(class_size) * int(sample_count)
 
 	args := [?]rawptr{&pp, &idx_ptr, &dyp, &dxp, &sample_count, &class_size}
@@ -1549,7 +1534,7 @@ _mul_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 _select_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	w := op.input
 	y := op.output
-	indices := op.variant.(ml.Select).indices
+	index_count := ml.len(op.variant.(ml.Select).indices)
 
 	dwp := gradient(w).ptr
 	if dwp == 0 {
@@ -1557,15 +1542,14 @@ _select_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 		return
 	}
 
-	gctx := _gctx(loc)
-	idx_ptr := _upload_indices(gctx, indices, loc)
+	idx_ptr := data(op.variant.(ml.Select).indices).ptr
 
 	dyp := gradient(y).ptr
 
-	row_size := ml.len(y) / builtin.len(indices)
-	n_idx    := i32(builtin.len(indices))
+	row_size := ml.len(y) / index_count
+	n_idx    := i32(index_count)
 	rs       := i32(row_size)
-	total    := builtin.len(indices) * row_size
+	total    := index_count * row_size
 
 	args := [?]rawptr{&dyp, &idx_ptr, &dwp, &n_idx, &rs}
 

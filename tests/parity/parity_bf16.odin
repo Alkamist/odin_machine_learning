@@ -187,7 +187,7 @@ _bf16p_run_tanh       :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.tanh(t[0]
 _bf16p_run_gelu_mul   :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.gelu_mul(t[0], t[1]) }
 _bf16p_run_rmsnorm    :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.rmsnorm(t[0], t[1]) }
 _bf16p_run_rope       :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.rope(t[0], 2) }
-_bf16p_run_select     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.select(t[0], {2, 0, 3, 1}) }
+_bf16p_run_select     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.select(t[0], []int{2, 0, 3, 1}) }
 _bf16p_run_slice_tr   :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice_trailing(t[0], 2, 6) }
 _bf16p_run_slice_ld   :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice_leading(t[0], 1, 4) }
 _bf16p_run_cast       :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.cast_to(t[0], .F32) }

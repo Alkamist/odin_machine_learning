@@ -4,6 +4,7 @@ import "base:builtin"
 import "base:runtime"
 
 import "core:fmt"
+import "core:mem"
 import "core:sync"
 
 import "bindings/cuda"
@@ -102,11 +103,16 @@ buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_C
 	fmt.assertf(u64(builtin.len(src)) <= gb.size, "src (%d) larger than buffer (%d)", builtin.len(src), gb.size, loc=loc)
 
 	gctx := _gctx(loc)
-	cuda.check(cuda.MemcpyHtoDAsync(gb.ptr, raw_data(src), uint(builtin.len(src)), gctx.stream), loc=loc)
 
-	if !gctx.auto_capturing {
-		cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)
+	if gctx.auto_capturing {
+		staging := _pinned_staging_take(gctx, u64(builtin.len(src)), loc)
+		mem.copy(staging, raw_data(src), builtin.len(src))
+		cuda.check(cuda.MemcpyHtoDAsync(gb.ptr, staging, uint(builtin.len(src)), gctx.stream), loc=loc)
+		return
 	}
+
+	cuda.check(cuda.MemcpyHtoDAsync(gb.ptr, raw_data(src), uint(builtin.len(src)), gctx.stream), loc=loc)
+	cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)
 }
 
 buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {

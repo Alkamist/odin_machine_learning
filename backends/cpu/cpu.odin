@@ -1493,17 +1493,22 @@ _transpose_backward :: proc(op: ml.Operation) {
 }
 
 _select_forward :: proc(op: ml.Operation) {
-	input   := op.input
-	output  := op.output
-	indices := op.variant.(ml.Select).indices
-	size    := ml.len(output) / builtin.len(indices)
+	input       := op.input
+	output      := op.output
+	index_count := ml.len(op.variant.(ml.Select).indices)
+	indices     := _typed_data(i32, op.variant.(ml.Select).indices)
+	size        := ml.len(output) / index_count
+
+	rows := input.shape[0]
 
 	elem_size := ml.data_type_size(input.type)
 	row_bytes := size * elem_size
 	src_bytes := transmute([]byte)input.buffers [.Data]
 	dst_bytes := transmute([]byte)output.buffers[.Data]
 
-	for index, i in indices {
+	for i in 0 ..< index_count {
+		index := int(indices[i])
+		assert(index >= 0 && index < rows, "select index out of bounds")
 		src_off := index * row_bytes
 		dst_off := i     * row_bytes
 		builtin.copy(dst_bytes[dst_off:dst_off + row_bytes], src_bytes[src_off:src_off + row_bytes])
@@ -1513,13 +1518,14 @@ _select_forward :: proc(op: ml.Operation) {
 _select_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	weight, output := op.input, op.output
-	indices := op.variant.(ml.Select).indices
-	size    := ml.len(output) / builtin.len(indices)
+	index_count    := ml.len(op.variant.(ml.Select).indices)
+	indices        := _typed_data(i32, op.variant.(ml.Select).indices)
+	size           := ml.len(output) / index_count
 
 	dw, dy := _gradient(weight), _gradient(output)
-	for i in 0 ..< builtin.len(indices) {
+	for i in 0 ..< index_count {
 		for j in 0 ..< size {
-			dw[indices[i] * size + j] += dy[i * size + j]
+			dw[int(indices[i]) * size + j] += dy[i * size + j]
 		}
 	}
 }
@@ -2679,12 +2685,14 @@ _cross_entropy_forward :: proc(op: ml.Operation) {
 	output        := op.output
 	variant       := op.variant.(ml.Cross_Entropy)
 	probabilities := variant.probabilities
-	targets       := variant.targets
+	sample_count  := ml.len(variant.targets)
+	targets       := _typed_data(i32, variant.targets)
 	class_size    := input.shape[input.rank - 1]
 
-	for sample in 0 ..< builtin.len(targets) {
+	for sample in 0 ..< sample_count {
 		offset := sample * class_size
-		target := targets[sample]
+		target := int(targets[sample])
+		assert(target >= 0 && target < class_size, "cross_entropy target out of bounds")
 
 		max_value := math.NEG_INF_F32
 		for i in 0 ..< class_size {
@@ -2716,12 +2724,13 @@ _cross_entropy_backward :: proc(op: ml.Operation) {
 
 	variant       := op.variant.(ml.Cross_Entropy)
 	probabilities := variant.probabilities
-	targets       := variant.targets
+	sample_count  := ml.len(variant.targets)
+	targets       := _typed_data(i32, variant.targets)
 	class_size    := input.shape[input.rank - 1]
 
-	for sample in 0 ..< builtin.len(targets) {
+	for sample in 0 ..< sample_count {
 		offset := sample * class_size
-		target := targets[sample]
+		target := int(targets[sample])
 
 		upstream_gradient := _gradient(output)[sample]
 

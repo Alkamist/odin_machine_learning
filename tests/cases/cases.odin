@@ -258,7 +258,7 @@ run_im2col_pad     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.im2col(t[0],
 run_max_pool2d     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.max_pool2d(t[0], size=2)       }
 run_avg_pool2d     :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.avg_pool2d(t[0], size=2)       }
 run_transpose      :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.transpose(t[0])                }
-run_select         :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.select(t[0], {2, 0, 2, 1})     }
+run_select         :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.select(t[0], []int{2, 0, 2, 1}) }
 run_slice          :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice(t[0], 2, 6)              }
 run_slice_trailing :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice_trailing(t[0], 1, 4)     }
 run_slice_leading  :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice_leading(t[0], 1, 4)      }
@@ -272,7 +272,7 @@ run_entropy        :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.entropy(t[0]
 run_log_softmax    :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.log_softmax(t[0])              }
 run_mse            :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.mean_squared_error(t[0], t[1]) }
 run_smooth_l1      :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.smooth_l1(t[0], t[1])          }
-run_cross_entropy  :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.cross_entropy(t[0], {2, 0, 3}) }
+run_cross_entropy  :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.cross_entropy(t[0], []int{2, 0, 3}) }
 run_relu           :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.relu(t[0])                     }
 run_sigmoid        :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.sigmoid(t[0])                  }
 run_gelu           :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.gelu(t[0])                     }
