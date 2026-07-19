@@ -41,6 +41,7 @@ Llama_Backend :: struct {
 	im_end_id:     int,
 	eot_id:        int,
 	first_turn:    bool,
+	stop_tokens:   [2]int,
 }
 
 @(require_results)
@@ -95,16 +96,18 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 	backend.im_end_id     = im_end_id
 	backend.eot_id        = eot_id
 	backend.first_turn    = true
+	backend.stop_tokens   = {im_end_id, eot_id}
 
 	return Chat_Model{
-		data        = backend,
-		vocab_size  = llama.SMOLLM2_135M_CONFIG.vocabulary_size,
-		eval        = _llama_eval,
-		encode_turn = _llama_encode_turn,
-		is_stop     = _llama_is_stop,
-		decode      = _llama_decode,
-		reset       = _llama_reset,
-		destroy     = _llama_destroy,
+		data          = backend,
+		vocab_size    = llama.SMOLLM2_135M_CONFIG.vocabulary_size,
+		prefill_chunk = 0,
+		stop_tokens   = backend.stop_tokens[:],
+		eval          = _llama_eval,
+		encode_turn   = _llama_encode_turn,
+		decode        = _llama_decode,
+		reset         = _llama_reset,
+		destroy       = _llama_destroy,
 	}, true
 }
 
@@ -112,7 +115,9 @@ _llama_eval :: proc(data: rawptr, tokens: []int, logits_out: []f32) {
 	backend := (^Llama_Backend)(data)
 	ml.clear()
 	logits := llama.forward_cached(backend.model, &backend.cache, tokens)
-	_copy_last_row(logits, logits_out)
+	if logits_out != nil {
+		_copy_last_row(logits, logits_out)
+	}
 }
 
 _llama_encode_turn :: proc(data: rawptr, user_text: string) -> []int {
@@ -143,11 +148,6 @@ _chatml_prefix :: proc(out: ^[dynamic]int, backend: ^Llama_Backend, role: string
 	append(out, backend.im_start_id)
 	header := fmt.tprintf("%v\n", role)
 	append(out, ..gpt2.encode(&backend.tokenizer, header, context.temp_allocator))
-}
-
-_llama_is_stop :: proc(data: rawptr, token: int) -> bool {
-	backend := (^Llama_Backend)(data)
-	return token == backend.im_end_id || token == backend.eot_id
 }
 
 _llama_decode :: proc(data: rawptr, tokens: []int) -> string {

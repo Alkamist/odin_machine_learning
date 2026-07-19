@@ -49,6 +49,7 @@ Gemma_Backend :: struct {
 	end_of_turn_id: int,
 	bos_id:         int,
 	first_turn:     bool,
+	stop_tokens:    [2]int,
 }
 
 @(require_results)
@@ -101,32 +102,27 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 	backend.end_of_turn_id = tokenizer.added_tokens[END_OF_TURN_TEXT] if END_OF_TURN_TEXT in tokenizer.added_tokens else -1
 	backend.bos_id         = tokenizer.added_tokens[BOS_TEXT]         if BOS_TEXT         in tokenizer.added_tokens else -1
 	backend.first_turn     = true
+	backend.stop_tokens    = {GEMMA_EOS_ID, backend.end_of_turn_id}
 
 	return Chat_Model{
-		data        = backend,
-		vocab_size  = config.vocab_size,
-		eval        = _gemma_eval,
-		encode_turn = _gemma_encode_turn,
-		is_stop     = _gemma_is_stop,
-		decode      = _gemma_decode,
-		reset       = _gemma_reset,
-		destroy     = _gemma_destroy,
+		data          = backend,
+		vocab_size    = config.vocab_size,
+		prefill_chunk = GEMMA_PREFILL_CHUNK,
+		stop_tokens   = backend.stop_tokens[:],
+		eval          = _gemma_eval,
+		encode_turn   = _gemma_encode_turn,
+		decode        = _gemma_decode,
+		reset         = _gemma_reset,
+		destroy       = _gemma_destroy,
 	}, true
 }
 
 _gemma_eval :: proc(data: rawptr, tokens: []int, logits_out: []f32) {
 	backend := (^Gemma_Backend)(data)
-	n := builtin.len(tokens)
-	pos := 0
-	for pos < n {
-		ml.clear()
-		take := min(GEMMA_PREFILL_CHUNK, n - pos)
-		chunk := tokens[pos : pos + take]
-		logits := gemma.forward_cached(backend.model, &backend.cache, chunk)
-		if pos + take == n {
-			_copy_last_row(logits, logits_out)
-		}
-		pos += take
+	ml.clear()
+	logits := gemma.forward_cached(backend.model, &backend.cache, tokens)
+	if logits_out != nil {
+		_copy_last_row(logits, logits_out)
 	}
 }
 
@@ -144,11 +140,6 @@ _gemma_encode_turn :: proc(data: rawptr, user_text: string) -> []int {
 	append(&out, ..gemma_tok.encode(&backend.tokenizer, turn_text, context.temp_allocator))
 
 	return out[:]
-}
-
-_gemma_is_stop :: proc(data: rawptr, token: int) -> bool {
-	backend := (^Gemma_Backend)(data)
-	return token == GEMMA_EOS_ID || token == backend.end_of_turn_id
 }
 
 _gemma_decode :: proc(data: rawptr, tokens: []int) -> string {

@@ -4,25 +4,40 @@ import "base:builtin"
 
 import "core:fmt"
 import "core:log"
-import "core:math"
-import "core:math/rand"
 import "core:os"
 import "core:strings"
-import "core:time"
 
-import ml "../../"
-import    "../fetch"
+import ml       "../../"
+import sampling "../../sampling"
+import          "../fetch"
 
 Chat_Model :: struct {
-	data:        rawptr,
-	vocab_size:  int,
+	data:          rawptr,
+	vocab_size:    int,
+	prefill_chunk: int,
+	stop_tokens:   []int,
 
-	eval:        proc(data: rawptr, tokens: []int, logits_out: []f32),
-	encode_turn: proc(data: rawptr, user_text: string) -> []int,
-	is_stop:     proc(data: rawptr, token: int) -> bool,
-	decode:      proc(data: rawptr, tokens: []int) -> string,
-	reset:       proc(data: rawptr),
-	destroy:     proc(data: rawptr),
+	eval:          proc(data: rawptr, tokens: []int, logits_out: []f32),
+	encode_turn:   proc(data: rawptr, user_text: string) -> []int,
+	decode:        proc(data: rawptr, tokens: []int) -> string,
+	reset:         proc(data: rawptr),
+	destroy:       proc(data: rawptr),
+}
+
+Stream_State :: struct {
+	model:                ^Chat_Model,
+	tokens:               ^[dynamic]int,
+	previous_text_length: int,
+}
+
+_stream_on_token :: proc(data: rawptr, token: int) {
+	state := (^Stream_State)(data)
+	reply_so_far := state.model.decode(state.model.data, state.tokens[:])
+	if builtin.len(reply_so_far) > state.previous_text_length {
+		fmt.print(reply_so_far[state.previous_text_length:])
+		os.flush(os.stdout)
+		state.previous_text_length = builtin.len(reply_so_far)
+	}
 }
 
 Options :: struct {
@@ -126,45 +141,23 @@ main :: proc() {
 			continue
 		}
 
-		t_prefill := time.tick_now()
-		model.eval(model.data, new_tokens, last_row)
-		prefill_elapsed := time.duration_seconds(time.tick_since(t_prefill))
-
 		clear(&reply_tokens)
-		previous_text_length := 0
-		generated := 0
-		t_generate := time.tick_now()
-
-		for step in 0 ..< options.max_new_tokens {
-			next_id := sample_next(last_row, options.temperature, options.top_k, options.top_p)
-			generated += 1
-
-			if model.is_stop(model.data, next_id) {
-				break
-			}
-
-			append(&reply_tokens, next_id)
-			reply_so_far := model.decode(model.data, reply_tokens[:])
-			if builtin.len(reply_so_far) > previous_text_length {
-				fmt.print(reply_so_far[previous_text_length:])
-				os.flush(os.stdout)
-				previous_text_length = builtin.len(reply_so_far)
-			}
-
-			if step == options.max_new_tokens - 1 {
-				break
-			}
-
-			single := [1]int{next_id}
-			model.eval(model.data, single[:], last_row)
+		stream := Stream_State{model=&model, tokens=&reply_tokens, previous_text_length=0}
+		gen_options := sampling.Generate_Options{
+			sampler        = {temperature=options.temperature, top_k=options.top_k, top_p=options.top_p},
+			max_new_tokens = options.max_new_tokens,
+			prefill_chunk  = model.prefill_chunk,
+			stop_tokens    = model.stop_tokens,
+			on_token       = _stream_on_token,
+			on_token_data  = &stream,
 		}
+		stats := sampling.generate(model.eval, model.data, new_tokens, last_row, gen_options, &reply_tokens)
 
 		fmt.println()
-		decode_elapsed := time.duration_seconds(time.tick_since(t_generate))
-		prefill_rate := f64(builtin.len(new_tokens)) / prefill_elapsed if prefill_elapsed > 0 else 0
-		decode_rate  := f64(generated) / decode_elapsed if decode_elapsed > 0 else 0
+		prefill_rate := f64(stats.prefill_tokens) / stats.prefill_seconds if stats.prefill_seconds > 0 else 0
+		decode_rate  := f64(stats.decode_tokens) / stats.decode_seconds if stats.decode_seconds > 0 else 0
 		fmt.printfln("  [prefill %v tok / %.2f s = %.1f tok/s   decode %v tok / %.2f s = %.1f tok/s]",
-			builtin.len(new_tokens), prefill_elapsed, prefill_rate, generated, decode_elapsed, decode_rate)
+			stats.prefill_tokens, stats.prefill_seconds, prefill_rate, stats.decode_tokens, stats.decode_seconds, decode_rate)
 		fmt.println()
 	}
 }
@@ -173,99 +166,6 @@ _copy_last_row :: proc(logits: ml.Tensor, out: []f32) {
 	rows := logits.shape[0]
 	last := ml.slice_leading(logits, rows - 1, rows)
 	ml.get_data(last, out)
-}
-
-sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> int {
-	n := builtin.len(logits)
-	if temperature <= 0 || top_k == 1 {
-		best := 0
-		for i in 1 ..< n {
-			if logits[i] > logits[best] {
-				best = i
-			}
-		}
-		return best
-	}
-
-	candidate_count := top_k > 0 ? min(top_k, n) : n
-	indices := make([]int, candidate_count, context.temp_allocator)
-
-	for i in 0 ..< candidate_count {
-		indices[i] = i
-	}
-	for i := candidate_count / 2 - 1; i >= 0; i -= 1 {
-		_sift_down_min_logit(indices, logits, i, candidate_count)
-	}
-	for i in candidate_count ..< n {
-		if logits[i] > logits[indices[0]] {
-			indices[0] = i
-			_sift_down_min_logit(indices, logits, 0, candidate_count)
-		}
-	}
-	for end := candidate_count - 1; end > 0; end -= 1 {
-		indices[0], indices[end] = indices[end], indices[0]
-		_sift_down_min_logit(indices, logits, 0, end)
-	}
-
-	max_logit := logits[indices[0]]
-	probabilities := make([]f32, candidate_count, context.temp_allocator)
-	sum: f32
-	for slot in 0 ..< candidate_count {
-		probabilities[slot] = math.exp_f32((logits[indices[slot]] - max_logit) / temperature)
-		sum += probabilities[slot]
-	}
-	for slot in 0 ..< candidate_count {
-		probabilities[slot] /= sum
-	}
-
-	keep := candidate_count
-	if top_p > 0 && top_p < 1 {
-		cumulative: f32
-		for slot in 0 ..< candidate_count {
-			cumulative += probabilities[slot]
-			if cumulative >= top_p {
-				keep = slot + 1
-				break
-			}
-		}
-		new_sum: f32
-		for slot in 0 ..< keep {
-			new_sum += probabilities[slot]
-		}
-		if new_sum > 0 {
-			for slot in 0 ..< keep {
-				probabilities[slot] /= new_sum
-			}
-		}
-	}
-
-	r := rand.float32()
-	cumulative: f32
-	for slot in 0 ..< keep {
-		cumulative += probabilities[slot]
-		if r <= cumulative {
-			return indices[slot]
-		}
-	}
-	return indices[keep - 1]
-}
-
-_sift_down_min_logit :: proc(indices: []int, logits: []f32, start, n: int) {
-	root := start
-	for {
-		child := 2 * root + 1
-		if child >= n {
-			return
-		}
-		if child + 1 < n && logits[indices[child + 1]] < logits[indices[child]] {
-			child += 1
-		}
-		if logits[indices[root]] <= logits[indices[child]] {
-			return
-		}
-		indices[root], indices[child] = indices[child], indices[root]
-		root = child
-	}
 }
 
 parse_args :: proc(options: ^Options) {
