@@ -1,17 +1,8 @@
-// Rope backward. Forward applies rotation
-//   y_lo = x_lo * cos - x_hi * sin
-//   y_hi = x_lo * sin + x_hi * cos
-// to pairs in [0, rotate_pair_count); pairs in [rotate_pair_count, head_size/2)
-// pass through. Backward is the rotation transpose:
-//   dx_lo += dy_lo * cos + dy_hi * sin
-//   dx_hi += -dy_lo * sin + dy_hi * cos
-// Recomputes cos/sin on the fly to avoid materialising them in forward.
-
 extern "C" __global__
-void rope_back_f32(const float* __restrict__ dy,
-                   float*       __restrict__ dx,
-                   int token_count, int head_count, int head_size,
-                   float base, const int* __restrict__ position_offset_dev, int rotate_pair_count) {
+void rope_back(const float* __restrict__ dy,
+               float*       __restrict__ dx,
+               int token_count, int head_count, int head_size,
+               float base, const int* __restrict__ position_offset_dev, int rotate_pair_count) {
 	int gid     = blockIdx.x * blockDim.x + threadIdx.x;
 	int half_hs = head_size / 2;
 	int total   = token_count * head_count * half_hs;

@@ -1,24 +1,27 @@
-// F32 attention forward for training. Materialises softmax_outputs
-// (saved per (head, q_token) row) so the backward pass can reuse it.
-// Standard scaled-dot-product attention; not flash. One block per
-// (head, q_token), 256 threads per block. Suitable for small training
-// sequences (shakespeare/tinystories). For very long sequences, switch
-// to a flash variant.
-//
-// Loss in precision vs flash is fine here: backward needs the materialised
-// softmax row anyway.
+#ifdef DTYPE_BF16
+#include "bf16.cuh"
+#define DATA_T unsigned short
+#define RD(p, i) ld_bf16(p, i)
+#define WR(p, i, val) st_bf16(p, i, (val))
+#define KERNEL_NAME attention_train_bf16
+#else
+#define DATA_T float
+#define RD(p, i) (p[i])
+#define WR(p, i, val) do { (p)[i] = (val); } while (0)
+#define KERNEL_NAME attention_train_f32
+#endif
 
 #define ATT_WG 256
 
 extern "C" __global__
-void attention_train_f32(const float* __restrict__ q,        // [T, n_q_heads*D]
-                         const float* __restrict__ k,        // [T, n_kv_heads*D]
-                         const float* __restrict__ v,        // [T, n_kv_heads*D]
-                         float*       __restrict__ out,       // [T, n_q_heads*D]
-                         float*       __restrict__ sm,        // [n_q_heads, T, T]
-                         int n_q_heads, int n_kv_heads, int head_size,
-                         int token_count, int q_size, int kv_size,
-                         int causal, int window) {
+void KERNEL_NAME(const DATA_T* __restrict__ q,
+                 const DATA_T* __restrict__ k,
+                 const DATA_T* __restrict__ v,
+                 DATA_T*       __restrict__ out,
+                 float*        __restrict__ sm,
+                 int n_q_heads, int n_kv_heads, int head_size,
+                 int token_count, int q_size, int kv_size,
+                 int causal, int window) {
 	int h    = blockIdx.x;
 	int t_q  = blockIdx.y;
 	int tid  = threadIdx.x;
@@ -39,7 +42,6 @@ void attention_train_f32(const float* __restrict__ q,        // [T, n_q_heads*D]
 
 	__shared__ float reduction[ATT_WG];
 
-	// Pass 1: scores into sm (unnormalised). Threads cooperate over t_k.
 	float local_max = -3.402823e38f;
 	for (int t_k = tid; t_k < T; t_k += ATT_WG) {
 		float score;
@@ -47,7 +49,7 @@ void attention_train_f32(const float* __restrict__ q,        // [T, n_q_heads*D]
 			int k_offset = t_k * kv_size + kv_h * D;
 			float dot = 0.0f;
 			for (int d = 0; d < D; ++d) {
-				dot += q[q_offset + d] * k[k_offset + d];
+				dot += RD(q, q_offset + d) * RD(k, k_offset + d);
 			}
 			score = dot * inv_sqrt_d;
 		} else {
@@ -64,7 +66,6 @@ void attention_train_f32(const float* __restrict__ q,        // [T, n_q_heads*D]
 	}
 	float row_max = reduction[0];
 
-	// Pass 2: exp(score - max), sum.
 	float local_sum = 0.0f;
 	for (int t_k = tid; t_k < T; t_k += ATT_WG) {
 		float v_in = sm[sm_offset + t_k];
@@ -85,13 +86,12 @@ void attention_train_f32(const float* __restrict__ q,        // [T, n_q_heads*D]
 	}
 	__syncthreads();
 
-	// Pass 3: output = sum_k sm[k] * V[k]. Threads cooperate over D.
 	for (int d = tid; d < D; d += ATT_WG) {
 		float acc = 0.0f;
 		for (int t_k = t_k_min; t_k < t_k_max; ++t_k) {
 			int v_offset = t_k * kv_size + kv_h * D;
-			acc += sm[sm_offset + t_k] * v[v_offset + d];
+			acc += sm[sm_offset + t_k] * RD(v, v_offset + d);
 		}
-		out[o_offset + d] = acc;
+		WR(out, o_offset + d, acc);
 	}
 }

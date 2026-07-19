@@ -1,8 +1,21 @@
+#ifdef DTYPE_BF16
+#include "bf16.cuh"
+#define DATA_T unsigned short
+#define KERNEL_NAME rope_bf16
+#define RD(p, i) ld_bf16(p, i)
+#define WR(p, i, val) st_bf16(p, i, (val))
+#else
+#define DATA_T float
+#define KERNEL_NAME rope_f32
+#define RD(p, i) (p[i])
+#define WR(p, i, val) do { (p)[i] = (val); } while (0)
+#endif
+
 extern "C" __global__
-void rope_f32(const float* __restrict__ x,
-              float*       __restrict__ y,
-              int token_count, int head_count, int head_size,
-              float base, const int* __restrict__ position_offset_dev, int rotate_pair_count) {
+void KERNEL_NAME(const DATA_T* __restrict__ x,
+                 DATA_T*       __restrict__ y,
+                 int token_count, int head_count, int head_size,
+                 float base, const int* __restrict__ position_offset_dev, int rotate_pair_count) {
 	int gid     = blockIdx.x * blockDim.x + threadIdx.x;
 	int half_hs = head_size / 2;
 	int total   = token_count * head_count * half_hs;
@@ -29,8 +42,8 @@ void rope_f32(const float* __restrict__ x,
 	float c_v, s_v;
 	sincosf(theta, &s_v, &c_v);
 
-	float xv = x[i_lo];
-	float yv = x[i_hi];
-	y[i_lo] = xv * c_v - yv * s_v;
-	y[i_hi] = xv * s_v + yv * c_v;
+	float xv = RD(x, i_lo);
+	float yv = RD(x, i_hi);
+	WR(y, i_lo, xv * c_v - yv * s_v);
+	WR(y, i_hi, xv * s_v + yv * c_v);
 }

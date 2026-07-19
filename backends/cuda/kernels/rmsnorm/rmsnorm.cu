@@ -1,15 +1,24 @@
-// F32 rmsnorm with f32 weight. One block per row, 256-wide butterfly
-// reduction. Used by training paths (Llama defaults to F32 weights).
-// Stores per-row `rstd` so backward doesn't have to recompute.
+#ifdef DTYPE_BF16
+#include "bf16.cuh"
+#define DATA_T unsigned short
+#define RD(p, i) ld_bf16(p, i)
+#define WR(p, i, val) st_bf16(p, i, (val))
+#define KERNEL_NAME rmsnorm_bf16
+#else
+#define DATA_T float
+#define RD(p, i) (p[i])
+#define WR(p, i, val) do { (p)[i] = (val); } while (0)
+#define KERNEL_NAME rmsnorm_f32
+#endif
 
 #define RMS_WG     256
 #define RMS_NWARPS (RMS_WG / 32)
 
 extern "C" __global__
-void rmsnorm_f32(const float* __restrict__ x,
-                 const float* __restrict__ w,
-                 float*       __restrict__ y,
-                 float*       __restrict__ rstd_out,
+void KERNEL_NAME(const DATA_T* __restrict__ x,
+                 const DATA_T* __restrict__ w,
+                 DATA_T*       __restrict__ y,
+                 float*        __restrict__ rstd_out,
                  int count, int size, float eps) {
 	int row = blockIdx.x;
 	int tid = threadIdx.x;
@@ -19,7 +28,7 @@ void rmsnorm_f32(const float* __restrict__ x,
 
 	float s2 = 0.0f;
 	for (int i = tid; i < size; i += RMS_WG) {
-		float v = x[row_base + i];
+		float v = RD(x, row_base + i);
 		s2 += v * v;
 	}
 
@@ -37,9 +46,9 @@ void rmsnorm_f32(const float* __restrict__ x,
 	for (int i = 0; i < RMS_NWARPS; ++i) total += warp_sums[i];
 
 	float rstd = rsqrtf(total / (float)size + eps);
-	if (tid == 0) rstd_out[row] = rstd;
+	if (tid == 0 && rstd_out) rstd_out[row] = rstd;
 
 	for (int i = tid; i < size; i += RMS_WG) {
-		y[row_base + i] = x[row_base + i] * rstd * w[i];
+		WR(y, row_base + i, RD(x, row_base + i) * rstd * RD(w, i));
 	}
 }

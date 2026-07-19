@@ -1,20 +1,26 @@
-// Fused fp32 rmsnorm-with-bf16-weight + rope. Mirrors `rmsnorm_rope_bf16.cu`
-// but reads fp32 activations and writes fp32 output. Weight is bf16
-// (the model's stored dtype); the kernel converts each weight pair on use.
-//
-// One workgroup per (token, head). Activations are fp32, so per-element pair
-// indexing is at half the stride of the bf16-packed-pair layout.
 #include <cuda_bf16.h>
+#ifdef DTYPE_BF16
+#include "bf16.cuh"
+#define DATA_T unsigned short
+#define RD(p, i) ld_bf16(p, i)
+#define WR(p, i, val) st_bf16(p, i, (val))
+#define KERNEL_NAME rmsnorm_rope_bf16
+#else
+#define DATA_T float
+#define RD(p, i) (p[i])
+#define WR(p, i, val) do { (p)[i] = (val); } while (0)
+#define KERNEL_NAME rmsnorm_rope_f32
+#endif
 
 #define RMSROPE_WG     128
 #define RMSROPE_NWARPS (RMSROPE_WG / 32)
 
 extern "C" __global__
-void rmsnorm_rope_f32(const float*        __restrict__ x,
-                      const unsigned int* __restrict__ w,
-                      float*              __restrict__ y,
-                      int token_count, int head_count, int head_size, float eps,
-                      float base, const int* __restrict__ position_offset_dev, int rotate_pair_count) {
+void KERNEL_NAME(const DATA_T*       __restrict__ x,
+                 const unsigned int* __restrict__ w,
+                 DATA_T*             __restrict__ y,
+                 int token_count, int head_count, int head_size, float eps,
+                 float base, const int* __restrict__ position_offset_dev, int rotate_pair_count) {
 	int wg_id = blockIdx.x;
 	int tid   = threadIdx.x;
 	int head  = wg_id % head_count;
@@ -26,8 +32,8 @@ void rmsnorm_rope_f32(const float*        __restrict__ x,
 
 	float s2 = 0.0f;
 	for (int pi = tid; pi < pair_count; pi += RMSROPE_WG) {
-		float v0 = x[base_elem + 2*pi + 0];
-		float v1 = x[base_elem + 2*pi + 1];
+		float v0 = RD(x, base_elem + 2 * pi + 0);
+		float v1 = RD(x, base_elem + 2 * pi + 1);
 		s2 += v0 * v0 + v1 * v1;
 	}
 
@@ -49,8 +55,8 @@ void rmsnorm_rope_f32(const float*        __restrict__ x,
 	float pos_f       = (float)(pos + position_offset);
 	float head_size_f = (float)head_size;
 	for (int pi = tid; pi < pair_count; pi += RMSROPE_WG) {
-		float v0 = x[base_elem + 2*pi + 0];
-		float v1 = x[base_elem + 2*pi + 1];
+		float v0 = RD(x, base_elem + 2 * pi + 0);
+		float v1 = RD(x, base_elem + 2 * pi + 1);
 		unsigned int wp = w[pi];
 		float w0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(wp & 0xffffu)));
 		float w1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((wp >> 16) & 0xffffu)));
@@ -68,7 +74,7 @@ void rmsnorm_rope_f32(const float*        __restrict__ x,
 		} else {
 			o0 = n0; o1 = n1;
 		}
-		y[base_elem + 2*pi + 0] = o0;
-		y[base_elem + 2*pi + 1] = o1;
+		WR(y, base_elem + 2 * pi + 0, o0);
+		WR(y, base_elem + 2 * pi + 1, o1);
 	}
 }

@@ -242,10 +242,11 @@ _update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer
 
 	#partial switch t.type {
 	case .F32:
-		_adam_f32_pipeline := _compile_pipeline(ADAM_F32_SRC, "adam_f32.cu", "adam_f32")
+		_adam_f32_pipeline := _compile_pipeline(ADAM_SRC, "adam_f32.cu", "adam_f32")
 		_dispatch(_adam_f32_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
-		_adam_bf16_pipeline := _compile_pipeline(ADAM_BF16_SRC, "adam_bf16.cu", "adam_bf16")
+		opts := [?]cstring{"-DDTYPE_BF16"}
+		_adam_bf16_pipeline := _compile_pipeline(ADAM_SRC, "adam_bf16.cu", "adam_bf16", opts[:])
 		_dispatch(_adam_bf16_pipeline, _div_up(t.count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", t.type, loc=loc)
@@ -591,34 +592,9 @@ _linear_q4_k_gate_up_geglu_forward :: proc(op: ml.Operation, loc: runtime.Source
 }
 
 _add_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	a      := op.input
-	output := op.output
-	b      := op.variant.(ml.Add).b
-
-	#partial switch a.type {
-	case .F32:
-		_add_pipeline := _compile_pipeline(ADD_F32_SRC, "add.cu", "add_f32")
-		ap := data(a).ptr; bp := data(b).ptr; cp := data(output).ptr
-		n   := i32(ml.len(a))
-		n_b := i32(ml.len(b))
-		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b}
-		grid := _div_up(ml.len(a), ADD_LOCAL_SIZE)
-		_dispatch(_add_pipeline, grid, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args[:], loc)
-
-	case .Bf16:
-		_add_bf16_pipeline := _compile_pipeline(ADD_BF16_SRC, "add_bf16.cu", "add_bf16")
-		ap := data(a).ptr; bp := data(b).ptr; cp := data(output).ptr
-		pair_count := (ml.len(a) + 1) / 2
-		n          := i32(ml.len(a))
-		n_b        := i32(ml.len(b))
-		pc         := i32(pair_count)
-		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b, &pc}
-		grid := _div_up(pair_count, ADD_LOCAL_SIZE)
-		_dispatch(_add_bf16_pipeline, grid, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args[:], loc)
-
-	case:
-		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
-	}
+	f_opts := [?]cstring{"-DOP_NAME=add_f32", "-DOP_EXPR=(av+bv)"}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=add_bf16", "-DOP_EXPR=(av+bv)"}
+	_binary_ew_dual_forward(op, op.variant.(ml.Add).b, "add_f32.cu", "add_f32", f_opts[:], "add_bf16.cu", "add_bf16", b_opts[:], loc)
 }
 
 _add_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -649,74 +625,23 @@ _add_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 }
 
 _mul_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	a := op.input
-	b := op.variant.(ml.Mul).b
-	c := op.output
-
-	#partial switch a.type {
-	case .F32:
-		_mul_pipeline := _compile_pipeline(MUL_F32_SRC, "mul.cu", "mul_f32")
-		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
-		n   := i32(ml.len(a)); n_b := i32(ml.len(b))
-		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b}
-		_dispatch(_mul_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_mul_bf16_pipeline := _compile_pipeline(MUL_BF16_SRC, "mul_bf16.cu", "mul_bf16")
-		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
-		pair_count := (ml.len(a) + 1) / 2
-		n   := i32(ml.len(a)); n_b := i32(ml.len(b)); pc := i32(pair_count)
-		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b, &pc}
-		_dispatch(_mul_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
-	}
+	f_opts := [?]cstring{"-DOP_NAME=mul_f32", "-DOP_EXPR=(av*bv)"}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=mul_bf16", "-DOP_EXPR=(av*bv)"}
+	_binary_ew_dual_forward(op, op.variant.(ml.Mul).b, "mul_f32.cu", "mul_f32", f_opts[:], "mul_bf16.cu", "mul_bf16", b_opts[:], loc)
 }
 
-_gelu_mul_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	a := op.input
-	b := op.variant.(ml.Gelu_Mul).b
-	c := op.output
+GELU_MUL_EXPR :: "-DOP_EXPR=((0.5f*av*(1.0f+tanhf(0.7978845608028654f*(av+0.044715f*av*av*av))))*bv)"
 
-	#partial switch a.type {
-	case .Bf16:
-		_gelu_mul_bf16_pipeline := _compile_pipeline(GELU_MUL_BF16_SRC, "gelu_mul_bf16.cu", "gelu_mul_bf16")
-		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
-		pair_count := (ml.len(a) + 1) / 2
-		n   := i32(ml.len(a)); n_b := i32(ml.len(b)); pc := i32(pair_count)
-		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b, &pc}
-		_dispatch(_gelu_mul_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .F32:
-		_gelu_mul_f32_pipeline := _compile_pipeline(GELU_MUL_F32_SRC, "gelu_mul_f32.cu", "gelu_mul_f32")
-		ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
-		n   := i32(ml.len(a)); n_b := i32(ml.len(b))
-		args := [?]rawptr{&ap, &bp, &cp, &n, &n_b}
-		_dispatch(_gelu_mul_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
-	}
+_gelu_mul_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	f_opts := [?]cstring{"-DOP_NAME=gelu_mul_f32", GELU_MUL_EXPR}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=gelu_mul_bf16", GELU_MUL_EXPR}
+	_binary_ew_dual_forward(op, op.variant.(ml.Gelu_Mul).b, "gelu_mul_f32.cu", "gelu_mul_f32", f_opts[:], "gelu_mul_bf16.cu", "gelu_mul_bf16", b_opts[:], loc)
 }
 
 _tanh_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	x := op.input
-	y := op.output
-
-	#partial switch x.type {
-	case .F32:
-		_tanh_pipeline := _compile_pipeline(TANH_F32_SRC,          "tanh.cu",          "tanh_f32")
-		xp := data(x).ptr; yp := data(y).ptr
-		n := i32(ml.len(x))
-		args := [?]rawptr{&xp, &yp, &n}
-		_dispatch(_tanh_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_tanh_bf16_pipeline := _compile_pipeline(TANH_BF16_SRC,         "tanh_bf16.cu",     "tanh_bf16")
-		xp := data(x).ptr; yp := data(y).ptr
-		pair_count := (ml.len(x) + 1) / 2
-		n := i32(ml.len(x)); pc := i32(pair_count)
-		args := [?]rawptr{&xp, &yp, &n, &pc}
-		_dispatch(_tanh_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
-	}
+	f_opts := [?]cstring{"-DOP_NAME=tanh_f32", "-DOP_EXPR=tanhf(v)"}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=tanh_bf16", "-DOP_EXPR=tanhf(v)"}
+	_unary_ew_dual_forward(op, "tanh_f32.cu", "tanh_f32", f_opts[:], "tanh_bf16.cu", "tanh_bf16", b_opts[:], loc)
 }
 
 _exp_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -917,13 +842,14 @@ _rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	#partial switch x.type {
 	case .Bf16:
 		fmt.assertf(size % 2 == 0, "rmsnorm bf16 requires even size (got %v)", size, loc=loc)
-		_rmsnorm_bf16_pipeline := _compile_pipeline(RMSNORM_BF16_SRC,      "rmsnorm_bf16.cu",  "rmsnorm_bf16")
+		opts := [?]cstring{"-DDTYPE_BF16"}
+		_rmsnorm_bf16_pipeline := _compile_pipeline(RMSNORM_SRC, "rmsnorm_bf16.cu", "rmsnorm_bf16", opts[:])
 		rstd_p := data(v.rstd).ptr
 		args := [?]rawptr{&xp, &wp, &yp, &rstd_p, &c, &s, &eps}
 		_dispatch(_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
 		fmt.assertf(v.weight.type == .F32, "rmsnorm f32 requires F32 weight (got %v)", v.weight.type, loc=loc)
-		_rmsnorm_pipeline := _compile_pipeline(RMSNORM_F32_SRC, "rmsnorm.cu", "rmsnorm_f32")
+		_rmsnorm_pipeline := _compile_pipeline(RMSNORM_SRC, "rmsnorm_f32.cu", "rmsnorm_f32")
 		rstd_p := data(v.rstd).ptr
 		args := [?]rawptr{&xp, &wp, &yp, &rstd_p, &c, &s, &eps}
 		_dispatch(_rmsnorm_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
@@ -951,10 +877,11 @@ _add_rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 
 	#partial switch a.type {
 	case .Bf16:
-		_add_rmsnorm_bf16_pipeline := _compile_pipeline(ADD_RMSNORM_BF16_SRC, "add_rmsnorm_bf16.cu", "add_rmsnorm_bf16")
+		opts := [?]cstring{"-DDTYPE_BF16"}
+		_add_rmsnorm_bf16_pipeline := _compile_pipeline(ADD_RMSNORM_SRC, "add_rmsnorm_bf16.cu", "add_rmsnorm_bf16", opts[:])
 		_dispatch(_add_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
-		_add_rmsnorm_f32_pipeline := _compile_pipeline(ADD_RMSNORM_F32_SRC, "add_rmsnorm_f32.cu", "add_rmsnorm_f32")
+		_add_rmsnorm_f32_pipeline := _compile_pipeline(ADD_RMSNORM_SRC, "add_rmsnorm_f32.cu", "add_rmsnorm_f32")
 		_dispatch(_add_rmsnorm_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
@@ -981,10 +908,11 @@ _rmsnorm_rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locatio
 
 	#partial switch x.type {
 	case .Bf16:
-		_rmsnorm_rope_bf16_pipeline := _compile_pipeline(RMSNORM_ROPE_BF16_SRC, "rmsnorm_rope_bf16.cu", "rmsnorm_rope_bf16")
+		opts := [?]cstring{"-DDTYPE_BF16"}
+		_rmsnorm_rope_bf16_pipeline := _compile_pipeline(RMSNORM_ROPE_SRC, "rmsnorm_rope_bf16.cu", "rmsnorm_rope_bf16", opts[:])
 		_dispatch(_rmsnorm_rope_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 	case .F32:
-		_rmsnorm_rope_f32_pipeline := _compile_pipeline(RMSNORM_ROPE_F32_SRC, "rmsnorm_rope_f32.cu", "rmsnorm_rope_f32")
+		_rmsnorm_rope_f32_pipeline := _compile_pipeline(RMSNORM_ROPE_SRC, "rmsnorm_rope_f32.cu", "rmsnorm_rope_f32")
 		_dispatch(_rmsnorm_rope_f32_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1052,11 +980,12 @@ _rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		_rope_pipeline := _compile_pipeline(ROPE_F32_SRC,          "rope.cu",          "rope_f32")
+		_rope_pipeline := _compile_pipeline(ROPE_SRC, "rope_f32.cu", "rope_f32")
 		_dispatch(_rope_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
 		fmt.assertf(head_size % 2 == 0, "rope bf16 requires even head_size (got %v)", head_size, loc=loc)
-		_rope_bf16_pipeline := _compile_pipeline(ROPE_BF16_SRC,         "rope_bf16.cu",     "rope_bf16")
+		opts := [?]cstring{"-DDTYPE_BF16"}
+		_rope_bf16_pipeline := _compile_pipeline(ROPE_SRC, "rope_bf16.cu", "rope_bf16", opts[:])
 		_dispatch(_rope_bf16_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1226,7 +1155,8 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 		training := gctx.training
 		if training {
 			fmt.assertf(token_count <= 2048, "attention_train_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
-			_attention_train_bf16_pipeline := _compile_pipeline(ATTENTION_TRAIN_BF16_SRC, "attention_train_bf16.cu", "attention_train_bf16")
+			att_opts := [?]cstring{"-DDTYPE_BF16"}
+			_attention_train_bf16_pipeline := _compile_pipeline(ATTENTION_TRAIN_SRC, "attention_train_bf16.cu", "attention_train_bf16", att_opts[:])
 			sm_ptr := data(v.softmax_outputs).ptr
 			args := [?]rawptr{
 				&qp, &kp, &vp, &op_ptr, &sm_ptr,
@@ -1245,7 +1175,7 @@ _attention_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) 
 
 	case .F32:
 		fmt.assertf(token_count <= 2048, "attention_train_f32 caps token_count at 2048 (got %v)", token_count, loc=loc)
-		_attention_train_f32_pipeline := _compile_pipeline(ATTENTION_TRAIN_F32_SRC, "attention_train_f32.cu", "attention_train_f32")
+		_attention_train_f32_pipeline := _compile_pipeline(ATTENTION_TRAIN_SRC, "attention_train_f32.cu", "attention_train_f32")
 		sm_ptr := data(v.softmax_outputs).ptr
 		args := [?]rawptr{
 			&qp, &kp, &vp, &op_ptr, &sm_ptr,
@@ -1390,18 +1320,17 @@ _select_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	xp := data(x).ptr; yp := data(y).ptr
 	n_idx := i32(builtin.len(indices)); s := i32(size)
+	args := [?]rawptr{&xp, &idx_ptr, &yp, &n_idx, &s}
+	grid_y := u32(min(builtin.len(indices), MAX_GRID_DIM_YZ))
 
 	#partial switch x.type {
 	case .Bf16:
-		fmt.assertf(size % 2 == 0, "bf16 select requires even row size (got %v)", size, loc=loc)
-		_select_bf16_pipeline := _compile_pipeline(SELECT_BF16_SRC, "select_bf16.cu", "select_bf16")
-		pair_count := size / 2
-		args := [?]rawptr{&xp, &idx_ptr, &yp, &n_idx, &s}
-		_dispatch(_select_bf16_pipeline, _div_up(pair_count, 256), u32(min(builtin.len(indices), MAX_GRID_DIM_YZ)), 1, 256, 1, 1, 0, args[:], loc)
+		opts := [?]cstring{"-DDTYPE_BF16"}
+		_select_bf16_pipeline := _compile_pipeline(SELECT_SRC, "select_bf16.cu", "select_bf16", opts[:])
+		_dispatch(_select_bf16_pipeline, _div_up(size, 256), grid_y, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
-		_select_f32_pipeline := _compile_pipeline(SELECT_F32_SRC, "select.cu", "select_f32")
-		args := [?]rawptr{&xp, &idx_ptr, &yp, &n_idx, &s}
-		_dispatch(_select_f32_pipeline, _div_up(size, 256), u32(min(builtin.len(indices), MAX_GRID_DIM_YZ)), 1, 256, 1, 1, 0, args[:], loc)
+		_select_f32_pipeline := _compile_pipeline(SELECT_SRC, "select_f32.cu", "select_f32")
+		_dispatch(_select_f32_pipeline, _div_up(size, 256), grid_y, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
@@ -1418,115 +1347,49 @@ _slice_trailing_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 
 	xp := data(x).ptr; yp := data(y).ptr
 	ld := i32(leading); tr := i32(trailing); nt := i32(new_trailing); st := i32(v.start)
+	args := [?]rawptr{&xp, &yp, &ld, &tr, &nt, &st}
+	grid := _div_up(leading * new_trailing, 256)
 
 	#partial switch x.type {
 	case .Bf16:
-		_slice_trailing_bf16_pipeline := _compile_pipeline(SLICE_TRAILING_BF16_SRC, "slice_trailing_bf16.cu", "slice_trailing_bf16")
-		pair_count := (leading * new_trailing + 1) / 2
-		pc := i32(pair_count)
-		args := [?]rawptr{&xp, &yp, &ld, &tr, &nt, &st, &pc}
-		_dispatch(_slice_trailing_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+		opts := [?]cstring{"-DDTYPE_BF16"}
+		_slice_trailing_bf16_pipeline := _compile_pipeline(SLICE_TRAILING_SRC, "slice_trailing_bf16.cu", "slice_trailing_bf16", opts[:])
+		_dispatch(_slice_trailing_bf16_pipeline, grid, 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .F32:
-		_slice_trailing_f32_pipeline := _compile_pipeline(SLICE_TRAILING_F32_SRC, "slice_trailing.cu", "slice_trailing_f32")
-		args := [?]rawptr{&xp, &yp, &ld, &tr, &nt, &st}
-		_dispatch(_slice_trailing_f32_pipeline, _div_up(leading * new_trailing, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+		_slice_trailing_f32_pipeline := _compile_pipeline(SLICE_TRAILING_SRC, "slice_trailing_f32.cu", "slice_trailing_f32")
+		_dispatch(_slice_trailing_f32_pipeline, grid, 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
 }
 
+GELU_EXPR       :: "-DOP_EXPR=(0.5f*v*(1.0f+tanhf(0.7978845608028654f*(v+0.044715f*v*v*v))))"
+GELU_DERIV      :: "-DOP_DERIV=(0.5f*(1.0f+tanhf(0.7978845608028654f*(xv+0.044715f*xv*xv*xv)))+0.5f*xv*(1.0f-tanhf(0.7978845608028654f*(xv+0.044715f*xv*xv*xv))*tanhf(0.7978845608028654f*(xv+0.044715f*xv*xv*xv)))*0.7978845608028654f*(1.0f+3.0f*0.044715f*xv*xv))"
+SILU_EXPR       :: "-DOP_EXPR=(v*(1.0f/(1.0f+expf(-v))))"
+SILU_DERIV      :: "-DOP_DERIV=((1.0f/(1.0f+expf(-xv)))+xv*(1.0f/(1.0f+expf(-xv)))*(1.0f-(1.0f/(1.0f+expf(-xv)))))"
+
 _silu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	x := op.input
-	y := op.output
-
-	xp := data(x).ptr; yp := data(y).ptr
-	n  := i32(ml.len(x))
-
-	#partial switch x.type {
-	case .F32:
-		_silu_f32_pipeline := _compile_pipeline(SILU_F32_SRC, "silu_f32.cu", "silu_f32")
-		args := [?]rawptr{&xp, &yp, &n}
-		_dispatch(_silu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_silu_bf16_pipeline := _compile_pipeline(SILU_BF16_SRC, "silu_bf16.cu", "silu_bf16")
-		pair_count := (ml.len(x) + 1) / 2
-		pc := i32(pair_count)
-		args := [?]rawptr{&xp, &yp, &n, &pc}
-		_dispatch(_silu_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
-	}
+	f_opts := [?]cstring{"-DOP_NAME=silu_f32", SILU_EXPR}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=silu_bf16", SILU_EXPR}
+	_unary_ew_dual_forward(op, "silu_f32.cu", "silu_f32", f_opts[:], "silu_bf16.cu", "silu_bf16", b_opts[:], loc)
 }
 
 _gelu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	x := op.input
-	y := op.output
-
-	xp := data(x).ptr; yp := data(y).ptr
-	n  := i32(ml.len(x))
-
-	#partial switch x.type {
-	case .F32:
-		_gelu_f32_pipeline := _compile_pipeline(GELU_F32_SRC, "gelu_f32.cu", "gelu_f32")
-		args := [?]rawptr{&xp, &yp, &n}
-		_dispatch(_gelu_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_gelu_bf16_pipeline := _compile_pipeline(GELU_BF16_SRC, "gelu_bf16.cu", "gelu_bf16")
-		pair_count := (ml.len(x) + 1) / 2
-		pc := i32(pair_count)
-		args := [?]rawptr{&xp, &yp, &n, &pc}
-		_dispatch(_gelu_bf16_pipeline, _div_up(pair_count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
-	}
+	f_opts := [?]cstring{"-DOP_NAME=gelu_f32", GELU_EXPR}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=gelu_bf16", GELU_EXPR}
+	_unary_ew_dual_forward(op, "gelu_f32.cu", "gelu_f32", f_opts[:], "gelu_bf16.cu", "gelu_bf16", b_opts[:], loc)
 }
 
 _gelu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	x := op.input
-	y := op.output
-
-	if gradient(x).ptr == 0 { return }
-
-	xp  := data(x).ptr
-	dyp := gradient(y).ptr
-	dxp := gradient(x).ptr
-	n   := i32(ml.len(x))
-	args := [?]rawptr{&xp, &dyp, &dxp, &n}
-
-	#partial switch x.type {
-	case .F32:
-		_gelu_back_f32_pipeline := _compile_pipeline(GELU_BACK_F32_SRC, "gelu_back_f32.cu", "gelu_back_f32")
-		_dispatch(_gelu_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_gelu_back_bf16_pipeline := _compile_pipeline(GELU_BACK_BF16_SRC, "gelu_back_bf16.cu", "gelu_back_bf16")
-		_dispatch(_gelu_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
-	}
+	f_opts := [?]cstring{"-DOP_NAME=gelu_back_f32", GELU_DERIV}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=gelu_back_bf16", GELU_DERIV}
+	_unary_ew_dual_backward(op, "gelu_back_f32.cu", "gelu_back_f32", f_opts[:], "gelu_back_bf16.cu", "gelu_back_bf16", b_opts[:], loc)
 }
 
 _tanh_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	x := op.input
-	y := op.output
-
-	if gradient(x).ptr == 0 { return }
-
-	yp  := data(y).ptr
-	dyp := gradient(y).ptr
-	dxp := gradient(x).ptr
-	n   := i32(ml.len(x))
-	args := [?]rawptr{&yp, &dyp, &dxp, &n}
-
-	#partial switch x.type {
-	case .F32:
-		_tanh_back_f32_pipeline := _compile_pipeline(TANH_BACK_F32_SRC, "tanh_back_f32.cu", "tanh_back_f32")
-		_dispatch(_tanh_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_tanh_back_bf16_pipeline := _compile_pipeline(TANH_BACK_BF16_SRC, "tanh_back_bf16.cu", "tanh_back_bf16")
-		_dispatch(_tanh_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
-	}
+	f_opts := [?]cstring{"-DOP_NAME=tanh_back_f32", "-DOP_DERIV=(1.0f-yv*yv)"}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=tanh_back_bf16", "-DOP_DERIV=(1.0f-yv*yv)"}
+	_unary_ew_dual_backward(op, "tanh_back_f32.cu", "tanh_back_f32", f_opts[:], "tanh_back_bf16.cu", "tanh_back_bf16", b_opts[:], loc)
 }
 
 _slice_trailing_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -1546,14 +1409,10 @@ _slice_trailing_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	ld := i32(leading); tr := i32(trailing); nt := i32(new_trailing); st := i32(v.start)
 	args := [?]rawptr{&dyp, &dxp, &ld, &tr, &nt, &st}
 
-	// F32 grads everywhere now -> bf16 and f32 paths are byte-identical.
 	#partial switch x.type {
-	case .F32:
-		_slice_trailing_back_f32_pipeline := _compile_pipeline(SLICE_TRAILING_BACK_F32_SRC, "slice_trailing_back_f32.cu", "slice_trailing_back_f32")
-		_dispatch(_slice_trailing_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_slice_trailing_back_bf16_pipeline := _compile_pipeline(SLICE_TRAILING_BACK_BF16_SRC, "slice_trailing_back_bf16.cu", "slice_trailing_back_bf16")
-		_dispatch(_slice_trailing_back_bf16_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .F32, .Bf16:
+		p := _compile_pipeline(SLICE_TRAILING_BACK_SRC, "slice_trailing_back.cu", "slice_trailing_back")
+		_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
@@ -1596,27 +1455,9 @@ _slice_leading_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locat
 }
 
 _silu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
-	x := op.input
-	y := op.output
-
-	if gradient(x).ptr == 0 { return }
-
-	xp  := data(x).ptr
-	dyp := gradient(y).ptr
-	dxp := gradient(x).ptr
-	n   := i32(ml.len(x))
-	args := [?]rawptr{&xp, &dyp, &dxp, &n}
-
-	#partial switch x.type {
-	case .F32:
-		_silu_back_f32_pipeline := _compile_pipeline(SILU_BACK_F32_SRC, "silu_back_f32.cu", "silu_back_f32")
-		_dispatch(_silu_back_f32_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_silu_back_bf16_pipeline := _compile_pipeline(SILU_BACK_BF16_SRC, "silu_back_bf16.cu", "silu_back_bf16")
-		_dispatch(_silu_back_bf16_pipeline, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
-	}
+	f_opts := [?]cstring{"-DOP_NAME=silu_back_f32", SILU_DERIV}
+	b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=silu_back_bf16", SILU_DERIV}
+	_unary_ew_dual_backward(op, "silu_back_f32.cu", "silu_back_f32", f_opts[:], "silu_back_bf16.cu", "silu_back_bf16", b_opts[:], loc)
 }
 
 _cross_entropy_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -1673,39 +1514,35 @@ _mul_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	dyp := gradient(c).ptr
 	dap := gradient(a).ptr
 	dbp := gradient(b).ptr
-	n_a := i32(ml.len(a))
+	n   := i32(ml.len(a))
 	n_b := i32(ml.len(b))
+	stride := i32(ml.len(a) / ml.len(b))
 
-	// Skip the b-side accumulation when b has no gradient buffer (frozen
-	// constant scalar). Saves the slow bf16 CAS path in the typical broadcast
-	// case where many a-elements target one b cell.
-	have_a_grad := dap != 0
-	have_b_grad := dbp != 0
-
-	args_a := [?]rawptr{&bp, &dyp, &dap, &n_a, &n_b}
-	args_b := [?]rawptr{&ap, &dyp, &dbp, &n_a, &n_b}
-
+	is_bf16 := a.type == .Bf16
 	#partial switch a.type {
-	case .F32:
-		if have_a_grad {
-			_mul_back_a_f32_pipeline := _compile_pipeline(MUL_BACK_A_F32_SRC, "mul_back_a_f32.cu", "mul_back_a_f32")
-			_dispatch(_mul_back_a_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
-		}
-		if have_b_grad {
-			_mul_back_b_f32_pipeline := _compile_pipeline(MUL_BACK_B_F32_SRC, "mul_back_b_f32.cu", "mul_back_b_f32")
-			_dispatch(_mul_back_b_f32_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
-		}
-	case .Bf16:
-		if have_a_grad {
-			_mul_back_a_bf16_pipeline := _compile_pipeline(MUL_BACK_A_BF16_SRC, "mul_back_a_bf16.cu", "mul_back_a_bf16")
-			_dispatch(_mul_back_a_bf16_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
-		}
-		if have_b_grad {
-			_mul_back_b_bf16_pipeline := _compile_pipeline(MUL_BACK_B_BF16_SRC, "mul_back_b_bf16.cu", "mul_back_b_bf16")
-			_dispatch(_mul_back_b_bf16_pipeline, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
-		}
-	case:
-		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
+	case .F32, .Bf16:
+	case: fmt.panicf("unsupported dtype %v", a.type, loc=loc)
+	}
+
+	if dap != 0 {
+		a_src   := is_bf16 ? cstring("mul_back_a_bf16.cu") : cstring("mul_back_a_f32.cu")
+		a_entry := is_bf16 ? cstring("mul_back_a_bf16")    : cstring("mul_back_a_f32")
+		f_opts := [?]cstring{"-DOP_NAME=mul_back_a_f32", "-DDA_EXPR=bv"}
+		b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=mul_back_a_bf16", "-DDA_EXPR=bv"}
+		opts := is_bf16 ? b_opts[:] : f_opts[:]
+		p := _compile_pipeline(ELEMENTWISE_BINARY_BACK_A_SRC, a_src, a_entry, opts)
+		args_a := [?]rawptr{&ap, &bp, &dyp, &dap, &n, &n_b}
+		_dispatch(p, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args_a[:], loc)
+	}
+	if dbp != 0 {
+		b_src   := is_bf16 ? cstring("mul_back_b_bf16.cu") : cstring("mul_back_b_f32.cu")
+		b_entry := is_bf16 ? cstring("mul_back_b_bf16")    : cstring("mul_back_b_f32")
+		f_opts := [?]cstring{"-DOP_NAME=mul_back_b_f32", "-DDB_EXPR=av"}
+		b_opts := [?]cstring{"-DDTYPE_BF16", "-DOP_NAME=mul_back_b_bf16", "-DDB_EXPR=av"}
+		opts := is_bf16 ? b_opts[:] : f_opts[:]
+		p := _compile_pipeline(ELEMENTWISE_BINARY_BACK_B_SRC, b_src, b_entry, opts)
+		args_b := [?]rawptr{&ap, &bp, &dyp, &dbp, &n_b, &stride}
+		_dispatch(p, _div_up(ml.len(b), 256), 1, 1, 256, 1, 1, 0, args_b[:], loc)
 	}
 }
 
@@ -1733,12 +1570,9 @@ _select_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	args := [?]rawptr{&dyp, &idx_ptr, &dwp, &n_idx, &rs}
 
 	#partial switch w.type {
-	case .F32:
-		_select_back_f32_pipeline := _compile_pipeline(SELECT_BACK_F32_SRC, "select_back_f32.cu", "select_back_f32")
-		_dispatch(_select_back_f32_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		_select_back_bf16_pipeline := _compile_pipeline(SELECT_BACK_BF16_SRC, "select_back_bf16.cu", "select_back_bf16")
-		_dispatch(_select_back_bf16_pipeline, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .F32, .Bf16:
+		p := _compile_pipeline(SELECT_BACK_SRC, "select_back.cu", "select_back")
+		_dispatch(p, _div_up(total, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", w.type, loc=loc)
 	}
@@ -1767,11 +1601,12 @@ _rmsnorm_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 
 	#partial switch x.type {
 	case .F32:
-		_rmsnorm_back_f32_pipeline := _compile_pipeline(RMSNORM_BACK_F32_SRC, "rmsnorm_back_f32.cu", "rmsnorm_back_f32")
+		_rmsnorm_back_f32_pipeline := _compile_pipeline(RMSNORM_BACK_SRC, "rmsnorm_back_f32.cu", "rmsnorm_back_f32")
 		_dispatch(_rmsnorm_back_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case .Bf16:
 		fmt.assertf(size % 2 == 0, "rmsnorm backward bf16 requires even trailing dim (got %v)", size, loc=loc)
-		_rmsnorm_back_bf16_pipeline := _compile_pipeline(RMSNORM_BACK_BF16_SRC, "rmsnorm_back_bf16.cu", "rmsnorm_back_bf16")
+		opts := [?]cstring{"-DDTYPE_BF16"}
+		_rmsnorm_back_bf16_pipeline := _compile_pipeline(RMSNORM_BACK_SRC, "rmsnorm_back_bf16.cu", "rmsnorm_back_bf16", opts[:])
 		_dispatch(_rmsnorm_back_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
@@ -1799,13 +1634,9 @@ _rope_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	args := [?]rawptr{&dyp, &dxp, &tc, &hc, &hs, &base, &pos_dev, &rpc}
 
 	#partial switch x.type {
-	case .F32:
-		_rope_back_f32_pipeline := _compile_pipeline(ROPE_BACK_F32_SRC, "rope_back_f32.cu", "rope_back_f32")
-		_dispatch(_rope_back_f32_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .Bf16:
-		fmt.assertf(head_size % 2 == 0, "rope backward bf16 requires even head_size (got %v)", head_size, loc=loc)
-		_rope_back_bf16_pipeline := _compile_pipeline(ROPE_BACK_BF16_SRC, "rope_back_bf16.cu", "rope_back_bf16")
-		_dispatch(_rope_back_bf16_pipeline, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+	case .F32, .Bf16:
+		p := _compile_pipeline(ROPE_BACK_SRC, "rope_back.cu", "rope_back")
+		_dispatch(p, _div_up(total_pairs, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
@@ -1848,7 +1679,7 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 
 	#partial switch q.type {
 	case .F32:
-		_attention_train_back_f32_pipeline := _compile_pipeline(ATTENTION_TRAIN_BACK_F32_SRC, "attention_train_back_f32.cu", "attention_train_back_f32")
+		_attention_train_back_f32_pipeline := _compile_pipeline(ATTENTION_TRAIN_BACK_SRC, "attention_train_back_f32.cu", "attention_train_back_f32")
 		_dispatch(_attention_train_back_f32_pipeline,
 			u32(v.n_kv_heads), u32(gqa), u32(token_count),
 			256, 1, 1,
@@ -1857,7 +1688,8 @@ _attention_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location)
 	case .Bf16:
 		fmt.assertf(token_count <= 2048, "attention_train_back_bf16 caps token_count at 2048 (got %v)", token_count, loc=loc)
 		fmt.assertf(head_size % 2 == 0, "attention backward bf16 requires even head_size (got %v)", head_size, loc=loc)
-		_attention_train_back_bf16_pipeline := _compile_pipeline(ATTENTION_TRAIN_BACK_BF16_SRC, "attention_train_back_bf16.cu", "attention_train_back_bf16")
+		att_opts := [?]cstring{"-DDTYPE_BF16"}
+		_attention_train_back_bf16_pipeline := _compile_pipeline(ATTENTION_TRAIN_BACK_SRC, "attention_train_back_bf16.cu", "attention_train_back_bf16", att_opts[:])
 		_dispatch(_attention_train_back_bf16_pipeline,
 			u32(v.n_kv_heads), u32(gqa), u32(token_count),
 			256, 1, 1,
@@ -1889,6 +1721,71 @@ _unary_ew_backward :: proc(op: ml.Operation, source_name, entry: cstring, opts: 
 	xp := data(x).ptr; yp := data(y).ptr; dyp := gradient(y).ptr; dxp := gradient(x).ptr; n := i32(ml.len(x))
 	args := [?]rawptr{&xp, &yp, &dyp, &dxp, &n}
 	_dispatch(p, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_unary_ew_dual_forward :: proc(
+	op: ml.Operation,
+	f32_src, f32_entry: cstring, f32_opts: []cstring,
+	bf16_src, bf16_entry: cstring, bf16_opts: []cstring,
+	loc: runtime.Source_Code_Location,
+) {
+	x := op.input
+	y := op.output
+	xp := data(x).ptr; yp := data(y).ptr; n := i32(ml.len(x))
+	args := [?]rawptr{&xp, &yp, &n}
+	src, entry: cstring
+	opts: []cstring
+	#partial switch x.type {
+	case .F32:  src = f32_src;  entry = f32_entry;  opts = f32_opts
+	case .Bf16: src = bf16_src; entry = bf16_entry; opts = bf16_opts
+	case:       fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+	p := _compile_pipeline(ELEMENTWISE_UNARY_SRC, src, entry, opts)
+	_dispatch(p, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_unary_ew_dual_backward :: proc(
+	op: ml.Operation,
+	f32_src, f32_entry: cstring, f32_opts: []cstring,
+	bf16_src, bf16_entry: cstring, bf16_opts: []cstring,
+	loc: runtime.Source_Code_Location,
+) {
+	x := op.input
+	y := op.output
+	if gradient(x).ptr == 0 { return }
+	xp := data(x).ptr; yp := data(y).ptr; dyp := gradient(y).ptr; dxp := gradient(x).ptr; n := i32(ml.len(x))
+	args := [?]rawptr{&xp, &yp, &dyp, &dxp, &n}
+	src, entry: cstring
+	opts: []cstring
+	#partial switch x.type {
+	case .F32:  src = f32_src;  entry = f32_entry;  opts = f32_opts
+	case .Bf16: src = bf16_src; entry = bf16_entry; opts = bf16_opts
+	case:       fmt.panicf("unsupported dtype %v", x.type, loc=loc)
+	}
+	p := _compile_pipeline(ELEMENTWISE_UNARY_BACK_SRC, src, entry, opts)
+	_dispatch(p, _div_up(ml.len(x), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
+}
+
+_binary_ew_dual_forward :: proc(
+	op: ml.Operation, b: ml.Tensor,
+	f32_src, f32_entry: cstring, f32_opts: []cstring,
+	bf16_src, bf16_entry: cstring, bf16_opts: []cstring,
+	loc: runtime.Source_Code_Location,
+) {
+	a := op.input
+	c := op.output
+	ap := data(a).ptr; bp := data(b).ptr; cp := data(c).ptr
+	n := i32(ml.len(a)); n_b := i32(ml.len(b))
+	args := [?]rawptr{&ap, &bp, &cp, &n, &n_b}
+	src, entry: cstring
+	opts: []cstring
+	#partial switch a.type {
+	case .F32:  src = f32_src;  entry = f32_entry;  opts = f32_opts
+	case .Bf16: src = bf16_src; entry = bf16_entry; opts = bf16_opts
+	case:       fmt.panicf("unsupported dtype %v", a.type, loc=loc)
+	}
+	p := _compile_pipeline(ELEMENTWISE_BINARY_SRC, src, entry, opts)
+	_dispatch(p, _div_up(ml.len(a), 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 }
 
 _relu_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {

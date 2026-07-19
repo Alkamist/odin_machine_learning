@@ -269,9 +269,18 @@ Re-verification against source narrowed the finding: mul's bf16 backward kernels
 - **5.7 hygiene:** `_adam_grad` deduped into `cases.adam_grad`; `cases.get()` uses `sync.Once`; `test_adam_accumulation` covers `accumulation_steps=2` (asserts step gating, gradient zeroing on update, iteration counting, and parameter values vs an analytic reference over 3 windows); `tests/README.md` records how to run all three packages and the known parity-suite leak-warning noise. Determinism test still deferred behind Phase 6.2 RNG.
 - Suite state: 27 tests in `tests`, 4 in `tests/golden`, 3 in `tests/parity` — all green on RTX 3090 Ti.
 
-### Remaining
+### 4.1b CUDA bf16 kernel collapse — DONE (2026-07-19)
 
-- 4.1b CUDA bf16 kernel collapse — unblocked by 5.2 and the add/mul backward fix; next work item.
+All f32/bf16 kernel pairs collapsed; none left split. Net −1,684 lines. Design: a shared `kernels/common/bf16.cuh` (`ld_bf16`/`st_bf16` scalar helpers on `unsigned short*`, wired as a second NVRTC header in `_compile_pipeline`), and `#ifdef DTYPE_BF16` in each source selecting `DATA_T`/load/store macros — compute stays f32 everywhere, gradients stay `float*` everywhere. Instantiated per dtype via `-DDTYPE_BF16` + distinct entry names (the pipeline cache keys by source_name + options).
+
+- gelu/silu/tanh (fwd+back), add/mul/gelu_mul fwd, and mul backward now route through the five dtype-generic elementwise templates; their 18 bespoke kernel files are deleted. Bf16 arms dispatch scalar-per-element exactly like f32 (packed-pair indexing and the pair_count args are gone).
+- Collapsed in place: select (+back), slice_trailing (+back), rope (+back), rmsnorm (+back), add_rmsnorm, rmsnorm_rope, attention_train (+back), adam. select/slice/rope backward are single dtype-independent kernels (they touch only F32 gradients). add_rmsnorm needed a `ROUND_STORE` macro so the reduction sums the stored (bf16-rounded) residual, matching both originals; its bf16-packed weight pointer was already dtype-independent in the f32 original. attention_train's bf16 output uses native 16-bit stores, which soundly replaces the old pair-packing (that existed to avoid read-modify-write races on packed 32-bit words). adam's bf16 original was already scalar — collapse is exactly equivalent.
+- `_mul_backward`'s b-side moved from the old per-a-element `atomicAdd` scatter to the gather-based `binary_back_b` template — deterministic accumulation matching the CPU loop order.
+- Untouched: cast kernels, the bf16-only inference kernels (attention_bf16/cache/vec, cache_write, rmsnorm_rope_cache, quant/dequant/mmvq/gate_up_geglu), and all F32-only singletons.
+- Net extended after review: the Bf16 backward parity sweep now also covers rmsnorm, rope, select, slice_trailing, slice_leading, cast, and attention — exactly the collapsed backward kernels (previously untested in Bf16 on CUDA). Green.
+- Verified: all packages check clean, `tests` 27/27 (also under ML_CPU_POISON), `tests\parity` 3/3 across repeated runs on the RTX 3090 Ti (one flaky failure observed under the multi-threaded runner traced to the known pre-existing GPU device-teardown race, Phase 7 work).
+
+Phases 1–5 are now fully complete. Next: Phase 6 (breadth) and Phase 7 (threading contract).
 
 Current state: idiomatic `@(test)` suites; good shared case registry (tests/cases/cases.odin:56–91) driving both grad-check (central difference, careful `h` selection) and CPU↔CUDA parity; Adam and clip checks against analytic references. But coverage stops exactly where risk starts.
 
