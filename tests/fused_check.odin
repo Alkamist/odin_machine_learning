@@ -27,14 +27,14 @@ _fused_make_bf16 :: proc(shape: []int, src: []f32) -> ml.Tensor {
 	for v, i in src {
 		buf[i] = ml.bf16_from_f32(v)
 	}
-	ml.set_data_bytes(t, mem.slice_to_bytes(buf))
+	ml.set_bytes(t, .Data, mem.slice_to_bytes(buf))
 	return t
 }
 
 _fused_read_bf16 :: proc(t: ml.Tensor, dst: []f32) {
 	buf := make([]ml.Bf16, t.count)
 	defer delete(buf)
-	ml.get_data_bytes(t, mem.slice_to_bytes(buf))
+	ml.get_bytes(t, .Data, mem.slice_to_bytes(buf))
 	for v, i in buf {
 		dst[i] = ml.bf16_to_f32(v)
 	}
@@ -61,11 +61,8 @@ _fused_compare :: proc(t: ^testing.T, name: string, oracle, actual: []f32, tol: 
 @(test)
 test_fused_gelu_mul :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(FUSED_CPU_CTX_SIZE)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	shape := []int{3, 8}
 	n     := 24
@@ -104,11 +101,8 @@ test_fused_gelu_mul :: proc(t: ^testing.T) {
 @(test)
 test_fused_add_rmsnorm :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(FUSED_CPU_CTX_SIZE)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	shape  := []int{3, 8}
 	wshape := []int{8}
@@ -157,11 +151,8 @@ test_fused_add_rmsnorm :: proc(t: ^testing.T) {
 @(test)
 test_fused_rmsnorm_rope :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(FUSED_CPU_CTX_SIZE)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	head_count := 2
 	head_size  := 4
@@ -187,7 +178,7 @@ test_fused_rmsnorm_rope :: proc(t: ^testing.T) {
 	{
 		x   := _fused_make_bf16(shape, x_src)
 		w   := _fused_make_bf16(wshape, w_src)
-		out := ml.rmsnorm_rope(x, w, head_count, 1e-5, 10000, 0, 1.0)
+		out := ml.rmsnorm_rope(x, w, head_count, eps=1e-5, base=10000, position_offset=0, rope_fraction=1.0)
 		_fused_read_bf16(out, oracle)
 	}
 	ctx.backend = saved
@@ -196,7 +187,7 @@ test_fused_rmsnorm_rope :: proc(t: ^testing.T) {
 	{
 		x   := _fused_make_bf16(shape, x_src)
 		w   := _fused_make_bf16(wshape, w_src)
-		out := ml.rmsnorm_rope(x, w, head_count, 1e-5, 10000, 0, 1.0)
+		out := ml.rmsnorm_rope(x, w, head_count, eps=1e-5, base=10000, position_offset=0, rope_fraction=1.0)
 		_fused_read_bf16(out, actual)
 	}
 
@@ -206,11 +197,8 @@ test_fused_rmsnorm_rope :: proc(t: ^testing.T) {
 @(test)
 test_fused_cast_round_trip :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(FUSED_CPU_CTX_SIZE)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	shape := []int{4, 5}
 	n     := 20
@@ -239,11 +227,8 @@ test_fused_cast_round_trip :: proc(t: ^testing.T) {
 @(test)
 test_fused_lerp_assign :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(FUSED_CPU_CTX_SIZE)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	shape := []int{2, 3}
 	n     := 6
@@ -275,11 +260,8 @@ test_fused_lerp_assign :: proc(t: ^testing.T) {
 @(test)
 test_fused_accumulate_mean :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(FUSED_CPU_CTX_SIZE)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	shape := []int{3, 4}
 	n     := 12
@@ -358,11 +340,8 @@ _fused_synth_q6k :: proc(dst: []byte, rows, blocks_per_row: int) {
 @(test)
 test_fused_linear_q4_k :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(FUSED_CPU_CTX_SIZE)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	output_size := 8
 	input_size  := ml.K_QUANT_BLOCK_SIZE
@@ -376,7 +355,7 @@ test_fused_linear_q4_k :: proc(t: ^testing.T) {
 	_fused_synth_q4k(weight_bytes, output_size, blocks)
 
 	w_q := ml.zeros(.Q4_K, {output_size, input_size})
-	ml.set_data_bytes(w_q, weight_bytes)
+	ml.set_bytes(w_q, .Data, weight_bytes)
 
 	w_f32_host := make([]f32, output_size * input_size); defer delete(w_f32_host)
 	row_bytes  := blocks * ml.Q4_K_BLOCK_BYTES
@@ -395,7 +374,7 @@ test_fused_linear_q4_k :: proc(t: ^testing.T) {
 	x_f32 := ml.zeros(.F32, {tokens, input_size})
 	ml.set_data(x_f32, x_round)
 
-	fused_out  := ml.linear_q4_k(x_bf, w_q)
+	fused_out  := ml.linear(x_bf, w_q)
 	oracle_out := ml.linear(x_f32, w_f32)
 
 	fused  := make([]f32, tokens * output_size); defer delete(fused)
@@ -409,11 +388,8 @@ test_fused_linear_q4_k :: proc(t: ^testing.T) {
 @(test)
 test_fused_linear_q6_k :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(FUSED_CPU_CTX_SIZE)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	output_size := 8
 	input_size  := ml.K_QUANT_BLOCK_SIZE
@@ -427,7 +403,7 @@ test_fused_linear_q6_k :: proc(t: ^testing.T) {
 	_fused_synth_q6k(weight_bytes, output_size, blocks)
 
 	w_q := ml.zeros(.Q6_K, {output_size, input_size})
-	ml.set_data_bytes(w_q, weight_bytes)
+	ml.set_bytes(w_q, .Data, weight_bytes)
 
 	w_f32_host := make([]f32, output_size * input_size); defer delete(w_f32_host)
 	row_bytes  := blocks * ml.Q6_K_BLOCK_BYTES
@@ -446,7 +422,7 @@ test_fused_linear_q6_k :: proc(t: ^testing.T) {
 	x_f32 := ml.zeros(.F32, {tokens, input_size})
 	ml.set_data(x_f32, x_round)
 
-	fused_out  := ml.linear_q6_k(x_bf, w_q)
+	fused_out  := ml.linear(x_bf, w_q)
 	oracle_out := ml.linear(x_f32, w_f32)
 
 	fused  := make([]f32, tokens * output_size); defer delete(fused)

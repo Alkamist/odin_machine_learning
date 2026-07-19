@@ -9,11 +9,8 @@ import cpu "../backends/cpu"
 @(test)
 test_backward_skips_gradient_sinks :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	ml.clear(training=true)
 

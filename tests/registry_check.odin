@@ -15,7 +15,8 @@ test_registry_mlp_names :: proc(t: ^testing.T) {
 
 	{
 		ctx := cpu.context_create(1 * 1024 * 1024)
-		ml.context_begin(ctx)
+		defer cpu.context_destroy(ctx)
+		ml.context_scope(ctx)
 
 		model := mlp.make(4, 8, 2)
 
@@ -39,9 +40,6 @@ test_registry_mlp_names :: proc(t: ^testing.T) {
 		ml.registry_destroy(&gathered)
 
 		mlp.destroy(model)
-
-		ml.context_end()
-		cpu.context_destroy(ctx)
 	}
 
 	testing.expectf(t, len(track.allocation_map) == 0, "expected no leaks, got %d live allocations", len(track.allocation_map))

@@ -50,7 +50,7 @@ _bf16p_make :: proc(shape: []int, src: []f32) -> ml.Tensor {
 	for v, i in src {
 		buf[i] = ml.bf16_from_f32(v)
 	}
-	ml.set_data_bytes(t, mem.slice_to_bytes(buf))
+	ml.set_bytes(t, .Data, mem.slice_to_bytes(buf))
 	return t
 }
 
@@ -65,7 +65,7 @@ _bf16p_read :: proc(t: ml.Tensor, dst: []f32) {
 	}
 	buf := make([]ml.Bf16, t.count)
 	defer delete(buf)
-	ml.get_data_bytes(t, mem.slice_to_bytes(buf))
+	ml.get_bytes(t, .Data, mem.slice_to_bytes(buf))
 	for v, i in buf {
 		dst[i] = ml.bf16_to_f32(v)
 	}
@@ -147,13 +147,13 @@ _bf16p_run :: proc(t: ^testing.T, tc: Bf16p_Case, cpu_ctx, cuda_ctx: ^ml.Context
 	defer delete(cpu_out)
 	defer delete(cuda_out)
 
-	ml.context_begin(cpu_ctx)
+	previous := ml.context_begin(cpu_ctx)
 	_bf16p_forward_eval(tc, inputs[:tc.input_count], &cpu_out)
-	ml.context_end()
+	ml.context_end(previous)
 
-	ml.context_begin(cuda_ctx)
+	previous = ml.context_begin(cuda_ctx)
 	_bf16p_forward_eval(tc, inputs[:tc.input_count], &cuda_out)
-	ml.context_end()
+	ml.context_end(previous)
 
 	_bf16p_compare(t, tc.name, "output", cpu_out, cuda_out, BF16P_TOL)
 
@@ -164,13 +164,13 @@ _bf16p_run :: proc(t: ^testing.T, tc: Bf16p_Case, cpu_ctx, cuda_ctx: ^ml.Context
 			weights[i] = math.cos(f32(i) * 0.53) + 0.5
 		}
 
-		ml.context_begin(cpu_ctx)
+		previous = ml.context_begin(cpu_ctx)
 		_bf16p_backward_eval(tc, inputs[:tc.input_count], weights, cpu_grads[:tc.input_count])
-		ml.context_end()
+		ml.context_end(previous)
 
-		ml.context_begin(cuda_ctx)
+		previous = ml.context_begin(cuda_ctx)
 		_bf16p_backward_eval(tc, inputs[:tc.input_count], weights, cuda_grads[:tc.input_count])
-		ml.context_end()
+		ml.context_end(previous)
 
 		for i in 0 ..< tc.input_count {
 			label := fmt.tprintf("grad[input %d]", i)

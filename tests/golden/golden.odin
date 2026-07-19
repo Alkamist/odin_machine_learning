@@ -137,11 +137,8 @@ test_q6_k_dequant_golden :: proc(t: ^testing.T) {
 @(test)
 test_fixed_mlp_forward :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	model := mlp.make(2, 2, 1)
 	defer mlp.destroy(model)

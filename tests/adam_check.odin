@@ -22,7 +22,8 @@ _adam_grad :: cases.adam_grad
 @(test)
 test_adam_update :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
-	ml.context_begin(ctx)
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	param := ml.alloc(.F32, {ADAM_SIZE}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 
@@ -74,8 +75,6 @@ test_adam_update :: proc(t: ^testing.T) {
 
 	ml.optimizer_destroy(&opt)
 	ml.destroy(param)
-	ml.context_end()
-	cpu.context_destroy(ctx)
 }
 
 ADAM_ACCUM_STEPS   :: 2
@@ -84,7 +83,8 @@ ADAM_ACCUM_WINDOWS :: 3
 @(test)
 test_adam_accumulation :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
-	ml.context_begin(ctx)
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	param := ml.alloc(.F32, {ADAM_SIZE}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 
@@ -148,6 +148,4 @@ test_adam_accumulation :: proc(t: ^testing.T) {
 
 	ml.optimizer_destroy(&opt)
 	ml.destroy(param)
-	ml.context_end()
-	cpu.context_destroy(ctx)
 }

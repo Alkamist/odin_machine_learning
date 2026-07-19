@@ -140,7 +140,7 @@ _write_quant :: proc(target: ^ml.Tensor, dtype: Data_Type, raw: []byte, name: st
 
 	ml.destroy(target^, loc)
 	new_target := ml.alloc(ml_dtype, target_shape, persistent=true, buffers=ml.Buffer_Set{.Data}, loc=loc)
-	ml.set_data_bytes(new_target, data, loc)
+	ml.set_bytes(new_target, .Data, data, loc)
 	target^ = new_target
 	return true
 }
@@ -193,7 +193,7 @@ set_floats :: proc(target: ml.Tensor, floats: []f32, loc := #caller_location) {
 		for value, index in floats {
 			bf[index] = ml.bf16_from_f32(value)
 		}
-		ml.set_data_bytes(target, bytes, loc=loc)
+		ml.set_bytes(target, .Data, bytes, loc=loc)
 	case:
 		fmt.panicf("unsupported target dtype %v", target.type, loc=loc)
 	}

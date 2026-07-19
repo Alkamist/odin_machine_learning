@@ -8,11 +8,8 @@ import cpu "../backends/cpu"
 @(test)
 test_conv2d_forward :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(4 * 1024 * 1024)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	ml.clear()
 
@@ -42,11 +39,8 @@ test_conv2d_forward :: proc(t: ^testing.T) {
 @(test)
 test_conv2d_bias_shape :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(4 * 1024 * 1024)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	ml.clear()
 
@@ -66,11 +60,8 @@ test_conv2d_bias_shape :: proc(t: ^testing.T) {
 @(test)
 test_conv1d_shape :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(4 * 1024 * 1024)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	ml.clear()
 

@@ -56,7 +56,7 @@ _fusedgpu_make_q4k :: proc(output_size, input_size, salt: int) -> ml.Tensor {
 	defer delete(bytes)
 	_fusedgpu_synth_q4k(bytes, output_size, blocks, salt)
 	w := ml.alloc(.Q4_K, {output_size, input_size}, persistent=false, buffers={.Data})
-	ml.set_data_bytes(w, bytes)
+	ml.set_bytes(w, .Data, bytes)
 	return w
 }
 
@@ -66,7 +66,7 @@ _fusedgpu_make_q6k :: proc(output_size, input_size, salt: int) -> ml.Tensor {
 	defer delete(bytes)
 	_fusedgpu_synth_q6k(bytes, output_size, blocks, salt)
 	w := ml.alloc(.Q6_K, {output_size, input_size}, persistent=false, buffers={.Data})
-	ml.set_data_bytes(w, bytes)
+	ml.set_bytes(w, .Data, bytes)
 	return w
 }
 
@@ -108,8 +108,7 @@ _fusedgpu_reduce_and_backward :: proc(out: ml.Tensor, weights: []f32) {
 }
 
 _fusedgpu_check_attention_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
-	ml.context_begin(cuda_ctx)
-	defer ml.context_end()
+	ml.context_scope(cuda_ctx)
 
 	n_q_heads := 2
 	head_size := 4
@@ -167,8 +166,7 @@ _fusedgpu_check_attention_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
 }
 
 _fusedgpu_check_rmsnorm_rope_write_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
-	ml.context_begin(cuda_ctx)
-	defer ml.context_end()
+	ml.context_scope(cuda_ctx)
 
 	head_count := 2
 	head_size  := 4
@@ -196,7 +194,7 @@ _fusedgpu_check_rmsnorm_rope_write_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Co
 	{
 		x := _bf16p_make({tokens, trailing}, x_src)
 		w := _bf16p_make({head_size}, w_src)
-		out := ml.rmsnorm_rope(x, w, head_count, 1e-5, 10000, 0, 1.0)
+		out := ml.rmsnorm_rope(x, w, head_count, eps=1e-5, base=10000, position_offset=0, rope_fraction=1.0)
 		_bf16p_read(out, oracle)
 	}
 	cuda_ctx.backend = saved
@@ -206,7 +204,7 @@ _fusedgpu_check_rmsnorm_rope_write_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Co
 		x     := _bf16p_make({tokens, trailing}, x_src)
 		w     := _bf16p_make({head_size}, w_src)
 		cache := ml.alloc(.Bf16, {tokens, trailing}, persistent=false, buffers={.Data})
-		_ = ml.rmsnorm_rope_write_cache(x, w, head_count, 1e-5, 10000, 0, 1.0, cache, tokens)
+		_ = ml.rmsnorm_rope_write_cache(x, w, cache, tokens, head_count, eps=1e-5, base=10000, position_offset=0, rope_fraction=1.0)
 		_bf16p_read(cache, actual)
 	}
 
@@ -214,8 +212,7 @@ _fusedgpu_check_rmsnorm_rope_write_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Co
 }
 
 _fusedgpu_check_gate_up_geglu :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
-	ml.context_begin(cuda_ctx)
-	defer ml.context_end()
+	ml.context_scope(cuda_ctx)
 
 	output_size := 8
 	input_size  := ml.K_QUANT_BLOCK_SIZE
@@ -255,8 +252,7 @@ _fusedgpu_check_gate_up_geglu :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
 }
 
 _fusedgpu_check_quant_backward_dx :: proc(t: ^testing.T, cuda_ctx: ^ml.Context, name: string, q6: bool) {
-	ml.context_begin(cuda_ctx)
-	defer ml.context_end()
+	ml.context_scope(cuda_ctx)
 
 	output_size := 8
 	input_size  := ml.K_QUANT_BLOCK_SIZE
@@ -279,7 +275,7 @@ _fusedgpu_check_quant_backward_dx :: proc(t: ^testing.T, cuda_ctx: ^ml.Context, 
 	{
 		x   := _bf16p_make({tokens, input_size}, x_src)
 		wq  := q6 ? _fusedgpu_make_q6k(output_size, input_size, salt) : _fusedgpu_make_q4k(output_size, input_size, salt)
-		out := q6 ? ml.linear_q6_k(x, wq) : ml.linear_q4_k(x, wq)
+		out := ml.linear(x, wq)
 		_fusedgpu_reduce_and_backward(out, weights)
 		_bf16p_read_grad(x, dx_quant)
 	}

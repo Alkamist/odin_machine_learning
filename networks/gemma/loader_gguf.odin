@@ -134,7 +134,7 @@ _load_norm_f32_to_dtype :: proc(loader: gguf.Loader, target: ml.Tensor, name: st
 	#partial switch target.type {
 	case .F32:
 		if extra_scale == 1.0 {
-			ml.set_data_bytes(target, bytes)
+			ml.set_bytes(target, .Data, bytes)
 		} else {
 			scaled := builtin.make([]f32, count, context.temp_allocator)
 			for v, i in src {
@@ -148,7 +148,7 @@ _load_norm_f32_to_dtype :: proc(loader: gguf.Loader, target: ml.Tensor, name: st
 		for v, i in src {
 			bf[i] = ml.bf16_from_f32(v * extra_scale)
 		}
-		ml.set_data_bytes(target, bytes_out)
+		ml.set_bytes(target, .Data, bytes_out)
 	case:
 		log.errorf("%q unsupported target dtype %v", name, target.type)
 		return false
@@ -194,7 +194,7 @@ _load_dequant_to_bf16 :: proc(loader: gguf.Loader, target: ml.Tensor, name: stri
 		for v, i in floats {
 			bf[i] = ml.bf16_from_f32(v)
 		}
-		ml.set_data_bytes(target, bytes_out)
+		ml.set_bytes(target, .Data, bytes_out)
 	case:
 		log.errorf("%q unsupported embed target dtype %v", name, target.type)
 		return false

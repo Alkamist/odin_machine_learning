@@ -56,7 +56,8 @@ _clip_case :: proc(t: ^testing.T, name: string, grads: [][]f32, max_norm: f32) {
 @(test)
 test_clip_gradient_norm :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
-	ml.context_begin(ctx)
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	clip_grads := [][]f32{{3, 4}, {0, 12}}
 	_clip_case(t, "clip_triggered", clip_grads, 5.0)
@@ -66,7 +67,4 @@ test_clip_gradient_norm :: proc(t: ^testing.T) {
 
 	zero_grads := [][]f32{{0, 0, 0}, {0, 0}}
 	_clip_case(t, "zero_norm", zero_grads, 1.0)
-
-	ml.context_end()
-	cpu.context_destroy(ctx)
 }

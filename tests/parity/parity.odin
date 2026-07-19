@@ -128,9 +128,9 @@ _run_parity :: proc(t: ^testing.T, tc: cases.Op_Test, cpu_ctx, cuda_ctx: ^ml.Con
 
 	tc.prepare(inputs_data[:n])
 
-	ml.context_begin(cpu_ctx)
+	previous := ml.context_begin(cpu_ctx)
 	output_count := _output_count(tc, inputs_data[:n])
-	ml.context_end()
+	ml.context_end(previous)
 
 	w := make([]f32, output_count)
 	defer delete(w)
@@ -144,13 +144,13 @@ _run_parity :: proc(t: ^testing.T, tc: cases.Op_Test, cpu_ctx, cuda_ctx: ^ml.Con
 	defer delete(cpu_out)
 	defer delete(cuda_out)
 
-	ml.context_begin(cpu_ctx)
+	previous = ml.context_begin(cpu_ctx)
 	_parity_eval(tc, inputs_data[:n], w, do_backward, cpu_out, cpu_grads[:n])
-	ml.context_end()
+	ml.context_end(previous)
 
-	ml.context_begin(cuda_ctx)
+	previous = ml.context_begin(cuda_ctx)
 	_parity_eval(tc, inputs_data[:n], w, do_backward, cuda_out, cuda_grads[:n])
-	ml.context_end()
+	ml.context_end(previous)
 
 	_compare(t, tc, "output", cpu_out, cuda_out)
 
@@ -191,13 +191,13 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 	adam_cpu_w,  adam_cpu_m,  adam_cpu_v:  [ADAM_SIZE]f32
 	adam_cuda_w, adam_cuda_m, adam_cuda_v: [ADAM_SIZE]f32
 
-	ml.context_begin(cpu_ctx)
+	previous := ml.context_begin(cpu_ctx)
 	_run_adam(adam_cpu_w[:], adam_cpu_m[:], adam_cpu_v[:])
-	ml.context_end()
+	ml.context_end(previous)
 
-	ml.context_begin(cuda_ctx)
+	previous = ml.context_begin(cuda_ctx)
 	_run_adam(adam_cuda_w[:], adam_cuda_m[:], adam_cuda_v[:])
-	ml.context_end()
+	ml.context_end(previous)
 
 	_adam_compare(t, "param",    adam_cpu_w[:],  adam_cuda_w[:])
 	_adam_compare(t, "moment_m", adam_cpu_m[:],  adam_cuda_m[:])
@@ -209,13 +209,13 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 	defer delete(clip_cuda_grad)
 	clip_cpu_norm, clip_cuda_norm: f32
 
-	ml.context_begin(cpu_ctx)
+	previous = ml.context_begin(cpu_ctx)
 	clip_cpu_norm = _run_clip(clip_cpu_grad)
-	ml.context_end()
+	ml.context_end(previous)
 
-	ml.context_begin(cuda_ctx)
+	previous = ml.context_begin(cuda_ctx)
 	clip_cuda_norm = _run_clip(clip_cuda_grad)
-	ml.context_end()
+	ml.context_end(previous)
 
 	_adam_compare(t, "clip_grad", clip_cpu_grad, clip_cuda_grad)
 	{
@@ -281,7 +281,9 @@ test_cuda_lifecycle :: proc(t: ^testing.T) {
 
 	for cycle in 0 ..< 2 {
 		ctx := cuda.context_create()
-		ml.context_begin(ctx)
+		defer cuda.device_destroy()
+		defer cuda.context_destroy(ctx)
+		ml.context_scope(ctx)
 
 		param := ml.alloc(.F32, {4}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 		src := [4]f32{1, 2, 3, 4}
@@ -292,10 +294,6 @@ test_cuda_lifecycle :: proc(t: ^testing.T) {
 			testing.expectf(t, got[i] == src[i], "lifecycle cycle %d elem %d got=%v want=%v", cycle, i, got[i], src[i])
 		}
 		ml.destroy(param)
-
-		ml.context_end()
-		cuda.context_destroy(ctx)
-		cuda.device_destroy()
 	}
 }
 

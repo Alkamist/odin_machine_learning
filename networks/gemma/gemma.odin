@@ -471,21 +471,12 @@ parameters :: proc(model: Gemma, dst: ^ml.Registry) {
 	}
 }
 
-@(require_results)
-_linear :: proc(input, weight: ml.Tensor) -> ml.Tensor {
-	#partial switch weight.type {
-	case .Q4_K: return ml.linear_q4_k(input, weight)
-	case .Q6_K: return ml.linear_q6_k(input, weight)
-	}
-	return ml.linear(input, weight)
-}
-
 _gate_up_geglu :: proc(input, w_gate, w_up: ml.Tensor) -> ml.Tensor {
 	if w_gate.type == .Q4_K && w_up.type == .Q4_K {
 		return ml.linear_q4_k_gate_up_geglu(input, w_gate, w_up)
 	}
-	gate := _linear(input, w_gate)
-	up   := _linear(input, w_up)
+	gate := ml.linear(input, w_gate)
+	up   := ml.linear(input, w_up)
 	return ml.gelu_mul(gate, up)
 }
 
@@ -505,15 +496,15 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	// `zeros` allocates the gradient buffer too (unless the pass was cleared
 	// with training=false), which the training backward pass needs.
 	token_identity := ml.zeros(model.dtype, {token_count, ple_total})
-	ml.set_data_bytes(token_identity, lookup_buf)
+	ml.set_bytes(token_identity, .Data, lookup_buf)
 	token_identity = ml.mul(token_identity, model.ple_token_scale)
 
-	ctx_proj := _linear(inputs_embeds, model.per_layer_model_projection_weight)
+	ctx_proj := ml.linear(inputs_embeds, model.per_layer_model_projection_weight)
 	ctx_proj  = ml.mul(ctx_proj, model.ple_ctx_scale)
 
 	flat_shape := []int{token_count * cfg.num_hidden_layers, ple_dim}
 	ctx_proj    = ml.reshape(ctx_proj, flat_shape)
-	ctx_proj    = ml.rmsnorm(ctx_proj, model.per_layer_projection_norm_weight, cfg.rms_norm_eps)
+	ctx_proj    = ml.rmsnorm(ctx_proj, model.per_layer_projection_norm_weight, eps=cfg.rms_norm_eps)
 	ctx_proj    = ml.reshape(ctx_proj, []int{token_count, ple_total})
 
 	combined := ml.add(ctx_proj, token_identity)
@@ -602,13 +593,13 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 		is_sliding    := cfg.layer_types[layer_idx] == .Sliding
 		window        := cfg.sliding_window if is_sliding else 0
 
-		hidden := ml.rmsnorm(residual, layer.input_norm_weight, cfg.rms_norm_eps)
+		hidden := ml.rmsnorm(residual, layer.input_norm_weight, eps=cfg.rms_norm_eps)
 
-		q := _linear(hidden, layer.q_proj_weight)
+		q := ml.linear(hidden, layer.q_proj_weight)
 		if layer.q_lora.rank > 0 {
 			q = lora.apply(hidden, q, layer.q_lora)
 		}
-		q = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
+		q = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 
 		k, v: ml.Tensor
 		if is_kv_shared_layer(cfg, layer_idx) {
@@ -616,19 +607,19 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 			k = shared_keys  [source]
 			v = shared_values[source]
 		} else {
-			k = _linear(hidden, layer.k_proj_weight)
+			k = ml.linear(hidden, layer.k_proj_weight)
 			if layer.k_lora.rank > 0 {
 				k = lora.apply(hidden, k, layer.k_lora)
 			}
 			if cache != nil {
 				k_cache := cache.layers[layer_idx].k
-				k = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction, k_cache, k_cache.shape[0])
+				k = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, k_cache, k_cache.shape[0], cfg.num_key_value_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 			} else {
-				k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, cfg.rms_norm_eps, rope_base, cache_position, rope_fraction)
+				k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 			}
 
 			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
-			v = _linear(hidden, layer.v_proj_weight)
+			v = ml.linear(hidden, layer.v_proj_weight)
 			if layer.v_lora.rank > 0 {
 				v = lora.apply(hidden, v, layer.v_lora)
 			}
@@ -649,49 +640,49 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 		}
 
 		attn_pre_o := attn
-		attn  = _linear(attn_pre_o, layer.o_proj_weight)
+		attn  = ml.linear(attn_pre_o, layer.o_proj_weight)
 		if layer.o_lora.rank > 0 {
 			attn = lora.apply(attn_pre_o, attn, layer.o_lora)
 		}
-		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, cfg.rms_norm_eps)
+		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, eps=cfg.rms_norm_eps)
 
 		mlp_in: ml.Tensor
-		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, cfg.rms_norm_eps)
+		residual, mlp_in = ml.add_rmsnorm(residual, attn, layer.pre_feedforward_norm_weight, eps=cfg.rms_norm_eps)
 
 		mlp_act: ml.Tensor
 		if cache != nil && layer.gate_lora.rank == 0 && layer.up_lora.rank == 0 {
 			mlp_act = _gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight)
 		} else {
-			gate := _linear(mlp_in, layer.gate_proj_weight)
+			gate := ml.linear(mlp_in, layer.gate_proj_weight)
 			if layer.gate_lora.rank > 0 {
 				gate = lora.apply(mlp_in, gate, layer.gate_lora)
 			}
-			up := _linear(mlp_in, layer.up_proj_weight)
+			up := ml.linear(mlp_in, layer.up_proj_weight)
 			if layer.up_lora.rank > 0 {
 				up = lora.apply(mlp_in, up, layer.up_lora)
 			}
 			mlp_act = ml.gelu_mul(gate, up)
 		}
-		mlp := _linear(mlp_act, layer.down_proj_weight)
+		mlp := ml.linear(mlp_act, layer.down_proj_weight)
 		if layer.down_lora.rank > 0 {
 			mlp = lora.apply(mlp_act, mlp, layer.down_lora)
 		}
-		mlp  = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, cfg.rms_norm_eps)
+		mlp  = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, eps=cfg.rms_norm_eps)
 
 		residual = ml.add(residual, mlp)
 
 		ple_input := ml.slice_trailing(per_layer_inputs, layer_idx * ple_dim, (layer_idx + 1) * ple_dim)
-		ple       := _linear(residual, layer.per_layer_input_gate_weight)
+		ple       := ml.linear(residual, layer.per_layer_input_gate_weight)
 		ple        = ml.gelu_mul(ple, ple_input)
-		ple        = _linear(ple, layer.per_layer_projection_weight)
-		ple        = ml.rmsnorm(ple, layer.post_per_layer_input_norm_weight, cfg.rms_norm_eps)
+		ple        = ml.linear(ple, layer.per_layer_projection_weight)
+		ple        = ml.rmsnorm(ple, layer.post_per_layer_input_norm_weight, eps=cfg.rms_norm_eps)
 		residual   = ml.add(residual, ple)
 
 		residual = ml.mul(residual, layer.layer_scalar)
 	}
 
-	final_hidden = ml.rmsnorm(residual, model.output_norm_weight, cfg.rms_norm_eps)
-	logits = _linear(final_hidden, model.lm_head_weight)
+	final_hidden = ml.rmsnorm(residual, model.output_norm_weight, eps=cfg.rms_norm_eps)
+	logits = ml.linear(final_hidden, model.lm_head_weight)
 	if cfg.final_logit_softcapping > 0 {
 		logits = ml.mul(logits, model.softcap_inv)
 		logits = ml.tanh(logits)

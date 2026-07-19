@@ -114,8 +114,6 @@ Context :: struct {
 	training: bool,
 
 	grad_norm_accumulator: Backend_Buffer,
-
-	previous_ctx: ^Context,
 }
 
 @(thread_local)
@@ -138,19 +136,20 @@ _context_destroy :: proc(ctx: ^Context, loc: runtime.Source_Code_Location) {
 	builtin.delete(ctx._op_arena_buf, loc=loc)
 }
 
-context_begin :: proc(ctx: ^Context) {
-	ctx.previous_ctx = _current_ctx
-	_current_ctx     = ctx
+@(require_results)
+context_begin :: proc(ctx: ^Context) -> (previous: ^Context) {
+	previous     = _current_ctx
+	_current_ctx = ctx
+	return
 }
 
-context_end :: proc() {
-	assert(_current_ctx != nil, "no active context")
-	_current_ctx = _current_ctx.previous_ctx
+context_end :: proc(previous: ^Context) {
+	_current_ctx = previous
 }
 
-@(deferred_none=context_end)
-context_scope :: proc(ctx: ^Context) {
-	context_begin(ctx)
+@(deferred_out=context_end)
+context_scope :: proc(ctx: ^Context) -> ^Context {
+	return context_begin(ctx)
 }
 
 @(require_results)
@@ -160,7 +159,7 @@ current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
 }
 
 clear :: proc(training := false, loc := #caller_location) {
-	assert(_current_ctx != nil, "Did you forget to call context_create or context_scope?", loc=loc)
+	assert(_current_ctx != nil, "Did you forget to call context_create / context_scope?", loc=loc)
 
 	_current_ctx.training = training
 	_current_ctx.backend.clear(loc)
@@ -416,14 +415,6 @@ get_bytes :: proc(t: Tensor, kind: Buffer_Kind, dst: []byte, loc := #caller_loca
 
 set_bytes :: proc(t: Tensor, kind: Buffer_Kind, src: []byte, loc := #caller_location) {
 	t.backend.buffer_set(t.buffers[kind], src, loc)
-}
-
-get_data_bytes :: proc(t: Tensor, dst: []byte, loc := #caller_location) {
-	get_bytes(t, .Data, dst, loc)
-}
-
-set_data_bytes :: proc(t: Tensor, src: []byte, loc := #caller_location) {
-	set_bytes(t, .Data, src, loc)
 }
 
 @(require_results)
@@ -1534,6 +1525,13 @@ linear :: proc(input, weight: Tensor, bias: Maybe(Tensor) = nil, loc := #caller_
 	input_size  := weight.shape[1]
 	assert(input.shape[input.rank - 1] == input_size, "Input trailing dim must equal weight's input dim", loc=loc)
 
+	#partial switch weight.type {
+	case .Q4_K, .Q6_K:
+		assert(bias == nil, "quantized linear does not support bias", loc=loc)
+		assert(input.type == .Bf16, "quantized linear input must be Bf16", loc=loc)
+		assert(input_size % K_QUANT_BLOCK_SIZE == 0, "quantized linear input dim must be a multiple of 256", loc=loc)
+	}
+
 	new_shape                := input.shape
 	new_shape[input.rank - 1] = output_size
 	output = zeros(input.type, new_shape[:input.rank], loc=loc)
@@ -1544,6 +1542,10 @@ linear :: proc(input, weight: Tensor, bias: Maybe(Tensor) = nil, loc := #caller_
 		variant = Linear{
 			weight = weight,
 		}
+	}
+	#partial switch weight.type {
+	case .Q4_K: op.variant = Linear_Q4_K{weight=weight}
+	case .Q6_K: op.variant = Linear_Q6_K{weight=weight}
 	}
 	_record_forward(op, loc=loc)
 
@@ -1587,32 +1589,6 @@ Linear_Q4_K :: struct {
 	weight: Tensor, // .Q4_K logical shape [output_size, input_size]; input_size % 256 == 0
 }
 
-@(require_results)
-linear_q4_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank >= 1, "linear_q4_k input must have rank >= 1", loc=loc)
-	assert(weight.rank == 2, "linear_q4_k weight must be a 2-D tensor [output_size, input_size]", loc=loc)
-	assert(weight.type == .Q4_K, "linear_q4_k weight must be Q4_K", loc=loc)
-	assert(input.type == .Bf16, "linear_q4_k input must be Bf16", loc=loc)
-
-	output_size := weight.shape[0]
-	input_size  := weight.shape[1]
-	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "linear_q4_k input dim must be a multiple of 256", loc=loc)
-	assert(input.shape[input.rank - 1] == input_size, "linear_q4_k input trailing dim must equal weight's input dim", loc=loc)
-
-	new_shape: [MAX_TENSOR_RANK]int = input.shape
-	new_shape[input.rank - 1] = output_size
-	output = zeros(.Bf16, new_shape[:input.rank], loc=loc)
-
-	op := Operation{
-		input   = input,
-		output  = output,
-		variant = Linear_Q4_K{weight=weight},
-	}
-	_record_forward(op, loc=loc)
-
-	return
-}
-
 Linear_Q4_K_Gate_Up_Geglu :: struct {
 	w_gate: Tensor,
 	w_up:   Tensor,
@@ -1646,8 +1622,8 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 		return
 	}
 
-	gate  := linear_q4_k(input, w_gate, loc=loc)
-	up    := linear_q4_k(input, w_up,   loc=loc)
+	gate  := linear(input, w_gate, loc=loc)
+	up    := linear(input, w_up,   loc=loc)
 	output = gelu_mul(gate, up, loc=loc)
 
 	return
@@ -1655,32 +1631,6 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 
 Linear_Q6_K :: struct {
 	weight: Tensor, // .Q6_K logical shape [output_size, input_size]; input_size % 256 == 0
-}
-
-@(require_results)
-linear_q6_k :: proc(input, weight: Tensor, loc := #caller_location) -> (output: Tensor) {
-	assert(input.rank  >= 1, "linear_q6_k input must have rank >= 1", loc=loc)
-	assert(weight.rank == 2, "linear_q6_k weight must be a 2-D tensor [output_size, input_size]", loc=loc)
-	assert(weight.type == .Q6_K, "linear_q6_k weight must be Q6_K", loc=loc)
-	assert(input.type == .Bf16, "linear_q6_k input must be Bf16", loc=loc)
-
-	output_size := weight.shape[0]
-	input_size  := weight.shape[1]
-	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "linear_q6_k input dim must be a multiple of 256", loc=loc)
-	assert(input.shape[input.rank - 1] == input_size, "linear_q6_k input trailing dim must equal weight's input dim", loc=loc)
-
-	new_shape                := input.shape
-	new_shape[input.rank - 1] = output_size
-	output = zeros(.Bf16, new_shape[:input.rank], loc=loc)
-
-	op := Operation{
-		input   = input,
-		output  = output,
-		variant = Linear_Q6_K{weight=weight},
-	}
-	_record_forward(op, loc=loc)
-
-	return
 }
 
 Rope :: struct {
@@ -1815,7 +1765,7 @@ Rmsnorm_Rope_Write_Cache :: struct {
 }
 
 @(require_results)
-rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32, position_offset: int, rope_fraction: f32, loc := #caller_location) -> (output: Tensor) {
+rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32 = RMSNORM_DEFAULT_EPS, base: f32 = 10000, position_offset := 0, rope_fraction: f32 = 1.0, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank == 2, "rmsnorm_rope requires rank-2 input [tokens, head_count*head_size]", loc=loc)
 	assert(weight.rank == 1, "rmsnorm_rope weight must be 1-D", loc=loc)
 	assert(eps > 0, "rmsnorm_rope eps must be positive", loc=loc)
@@ -1833,9 +1783,9 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 
 	if input.type == .F32 || _current_ctx.training || .Rmsnorm_Rope not_in _current_ctx.backend.forward_ops {
 		view   := reshape(input, []int{input.shape[0] * head_count, head_size}, loc=loc)
-		normed := rmsnorm(view, weight, eps, loc=loc)
+		normed := rmsnorm(view, weight, eps=eps, loc=loc)
 		normed  = reshape(normed, []int{input.shape[0], head_count * head_size}, loc=loc)
-		return rope(normed, head_count, base, position_offset, rope_fraction, loc=loc)
+		return rope(normed, head_count, base=base, position_offset=position_offset, rope_fraction=rope_fraction, loc=loc)
 	}
 
 	output = zeros_like(input, loc=loc)
@@ -1859,10 +1809,11 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32, base: f32
 
 @(require_results)
 rmsnorm_rope_write_cache :: proc(
-	input, weight: Tensor,
-	head_count: int, eps, base: f32,
-	position_offset: int, rope_fraction: f32,
-	cache: Tensor, cache_capacity: int,
+	input, weight, cache: Tensor,
+	cache_capacity: int,
+	head_count: int,
+	eps: f32 = RMSNORM_DEFAULT_EPS, base: f32 = 10000,
+	position_offset := 0, rope_fraction: f32 = 1.0,
 	loc := #caller_location,
 ) -> (output: Tensor) {
 	assert(input.rank == 2, "rmsnorm_rope_write_cache requires rank-2 input", loc=loc)
@@ -1903,7 +1854,7 @@ rmsnorm_rope_write_cache :: proc(
 		return
 	}
 
-	output = rmsnorm_rope(input, weight, head_count, eps, base, position_offset, rope_fraction, loc=loc)
+	output = rmsnorm_rope(input, weight, head_count, eps=eps, base=base, position_offset=position_offset, rope_fraction=rope_fraction, loc=loc)
 	return
 }
 

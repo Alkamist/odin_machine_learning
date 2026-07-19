@@ -46,7 +46,8 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 
 	{
 		ctx := cpu.context_create(64 * 1024 * 1024)
-		ml.context_begin(ctx)
+		defer cpu.context_destroy(ctx)
+		ml.context_scope(ctx)
 
 		cfg := _tiny_gemma_config()
 		lora_cfg := gemma.LoRA_Config{rank=2, alpha=4, targets={.Q, .V}}
@@ -108,8 +109,6 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		gemma.destroy(model)
 		gemma.destroy(restored)
 		gemma.config_destroy(cfg)
-		ml.context_end()
-		cpu.context_destroy(ctx)
 	}
 
 	testing.expectf(t, len(track.allocation_map) == 0, "expected no leaks, got %d live allocations", len(track.allocation_map))

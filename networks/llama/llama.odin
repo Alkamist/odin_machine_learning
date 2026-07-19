@@ -183,8 +183,8 @@ _forward :: proc(model: Llama, tokens: []int, cache: ^Cache = nil, loc := #calle
 			k = ml.per_head_rmsnorm(k, layer.k_norm_weight, model.config.n_kv_heads)
 		}
 
-		q = ml.rope(q, model.config.n_q_heads,  model.config.rope_base, position_offset)
-		k = ml.rope(k, model.config.n_kv_heads, model.config.rope_base, position_offset)
+		q = ml.rope(q, model.config.n_q_heads,  base=model.config.rope_base, position_offset=position_offset)
+		k = ml.rope(k, model.config.n_kv_heads, base=model.config.rope_base, position_offset=position_offset)
 
 		attn_output: ml.Tensor
 		if cache != nil {

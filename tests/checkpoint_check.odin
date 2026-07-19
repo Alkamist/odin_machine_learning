@@ -14,7 +14,8 @@ CHECKPOINT_TEST_STEPS :: 5
 @(test)
 test_checkpoint_optimizer_iteration_roundtrip :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
-	ml.context_begin(ctx)
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	param := ml.alloc(.F32, {CHECKPOINT_TEST_SIZE}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	init_w: [CHECKPOINT_TEST_SIZE]f32
@@ -68,6 +69,4 @@ test_checkpoint_optimizer_iteration_roundtrip :: proc(t: ^testing.T) {
 	ml.optimizer_destroy(&restored_opt)
 	ml.registry_destroy(&registry)
 	ml.registry_destroy(&restored_registry)
-	ml.context_end()
-	cpu.context_destroy(ctx)
 }

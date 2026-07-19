@@ -8,11 +8,8 @@ import cpu "../backends/cpu"
 @(test)
 test_dropout :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
-	ml.context_begin(ctx)
-	defer {
-		ml.context_end()
-		cpu.context_destroy(ctx)
-	}
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	DROPOUT_SIZE :: 1024
 	RATE         :: f32(0.5)

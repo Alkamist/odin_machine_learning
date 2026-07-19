@@ -91,7 +91,8 @@ _run_check :: proc(t: ^testing.T, tc: cases.Op_Test) {
 	tc.prepare(inputs_data[:n])
 
 	ctx := cpu.context_create(CTX_SIZE)
-	ml.context_begin(ctx)
+	defer cpu.context_destroy(ctx)
+	ml.context_scope(ctx)
 
 	output_count := _forward_output_count(tc, inputs_data[:n])
 
@@ -135,9 +136,6 @@ _run_check :: proc(t: ^testing.T, tc: cases.Op_Test) {
 				tc.name, i, e, analytic, numeric, rel, tc.tol)
 		}
 	}
-
-	ml.context_end()
-	cpu.context_destroy(ctx)
 }
 
 @(test)

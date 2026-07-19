@@ -19,7 +19,8 @@ test_jepa_checkpoint_roundtrip :: proc(t: ^testing.T) {
 
 	{
 		ctx := cpu.context_create(8 * 1024 * 1024)
-		ml.context_begin(ctx)
+		defer cpu.context_destroy(ctx)
+		ml.context_scope(ctx)
 
 		cfg := jepa.DEFAULT_CONFIG
 		cfg.state_size  = 3
@@ -101,8 +102,6 @@ test_jepa_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		ml.optimizer_destroy(&restored_opt)
 		jepa.destroy(model)
 		jepa.destroy(restored)
-		ml.context_end()
-		cpu.context_destroy(ctx)
 	}
 
 	testing.expectf(t, len(track.allocation_map) == 0, "expected no leaks, got %d live allocations", len(track.allocation_map))

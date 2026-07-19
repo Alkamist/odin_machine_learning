@@ -101,10 +101,6 @@ when thread.IS_SUPPORTED {
 		_workers = nil
 	}
 
-	thread_count :: #force_inline proc() -> int {
-		return _thread_count
-	}
-
 	set_thread_count :: proc(count: int, loc := #caller_location) {
 		assert(count > 0, "Thread count must be at least 1", loc=loc)
 
@@ -129,7 +125,7 @@ when thread.IS_SUPPORTED {
 	}
 
 	@(fini)
-	thread_pool_fini :: proc "contextless" () {
+	_thread_pool_fini :: proc "contextless" () {
 		if _thread_count <= 1 {
 			return
 		}
@@ -140,7 +136,7 @@ when thread.IS_SUPPORTED {
 
 	PARALLELIZE_MIN_WORK :: 24 * 1024
 
-	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data), work := max(int)) {
+	_parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data), work := max(int)) {
 		Thunk_Data :: struct {
 			data: Data,
 			job:  proc(index: int, data: Data),
@@ -210,14 +206,10 @@ when thread.IS_SUPPORTED {
 		sync.wait_group_wait(&_done_wg)
 	}
 } else {
-	thread_count :: #force_inline proc() -> int {
-		return 1
-	}
-
 	set_thread_count :: proc(count: int, loc := #caller_location) {
 	}
 
-	parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data), work := max(int)) {
+	_parallelize :: proc(job_count, task_count: int, data: $Data, job: proc(index: int, data: Data), work := max(int)) {
 		for i in 0 ..< job_count {
 			job(i, data)
 		}
@@ -331,18 +323,18 @@ Context :: struct {
 POISON_TRANSIENT :: #config(ML_CPU_POISON, false)
 
 _backend := ml.Backend{
-	clear        = clear,
-	forward      = forward,
-	backward     = backward,
-	update       = update,
-	buffer_alloc = buffer_alloc,
-	buffer_free  = buffer_free,
-	buffer_get   = buffer_get,
-	buffer_set   = buffer_set,
-	buffer_copy  = buffer_copy,
+	clear        = _clear,
+	forward      = _forward,
+	backward     = _backward,
+	update       = _update,
+	buffer_alloc = _buffer_alloc,
+	buffer_free  = _buffer_free,
+	buffer_get   = _buffer_get,
+	buffer_set   = _buffer_set,
+	buffer_copy  = _buffer_copy,
 
-	buffer_sq_sum_accumulate = buffer_sq_sum_accumulate,
-	buffer_scale             = buffer_scale,
+	buffer_sq_sum_accumulate = _buffer_sq_sum_accumulate,
+	buffer_scale             = _buffer_scale,
 
 	forward_ops  = ml.OPERATION_SET_ALL - {.Linear_Q4_K_Gate_Up_Geglu, .Rmsnorm_Rope_Write_Cache},
 	backward_ops = ml.OPERATION_SET_ALL - {
@@ -382,30 +374,25 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	builtin.free(ctx, allocator=allocator, loc=loc)
 }
 
-clear :: proc(loc: runtime.Source_Code_Location) {
+_clear :: proc(loc: runtime.Source_Code_Location) {
 	ctx := cast(^Context)ml.current_context(loc=loc)
 	mem.arena_free_all(&ctx.arena)
 }
 
-_buffer_get :: #force_inline proc(t: ml.Tensor, kind: ml.Buffer_Kind) -> []f32 {
-	bytes := transmute([]byte)t.buffers[kind]
-	return ([^]f32)(raw_data(bytes))[:t.count]
-}
-
 @(require_results)
-data :: #force_inline proc(t: ml.Tensor) -> []f32 {
+_data :: #force_inline proc(t: ml.Tensor) -> []f32 {
 	bytes := transmute([]byte)t.buffers[.Data]
 	return ([^]f32)(raw_data(bytes))[:t.count]
 }
 
 @(require_results)
-gradient :: #force_inline proc(t: ml.Tensor) -> []f32 {
+_gradient :: #force_inline proc(t: ml.Tensor) -> []f32 {
 	bytes := transmute([]byte)t.buffers[.Gradient]
 	return ([^]f32)(raw_data(bytes))[:t.count]
 }
 
 @(require_results)
-data_bf16 :: #force_inline proc(t: ml.Tensor) -> []ml.Bf16 {
+_data_bf16 :: #force_inline proc(t: ml.Tensor) -> []ml.Bf16 {
 	bytes := transmute([]byte)t.buffers[.Data]
 	return ([^]ml.Bf16)(raw_data(bytes))[:t.count]
 }
@@ -416,7 +403,7 @@ _moment :: #force_inline proc(buffer: ml.Backend_Buffer, count: int) -> []f32 {
 	return ([^]f32)(raw_data(bytes))[:count]
 }
 
-buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
+_buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
 	ctx       := cast(^Context)ml.current_context(loc=loc)
 	allocator := persist ? context.allocator : mem.arena_allocator(&ctx.arena)
 
@@ -438,7 +425,7 @@ buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: 
 	return transmute([ml.BACKEND_BUFFER_MAX_SIZE]byte)bytes
 }
 
-buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
+_buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
 	bytes := transmute([]byte)buffer
 	if raw_data(bytes) == nil {
 		return
@@ -451,19 +438,19 @@ buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location
 	builtin.delete(bytes, loc=loc)
 }
 
-buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location) {
+_buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location) {
 	builtin.copy(dst, transmute([]byte)buffer)
 }
 
-buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location) {
+_buffer_set :: proc(buffer: ml.Backend_Buffer, src: []byte, loc: runtime.Source_Code_Location) {
 	builtin.copy(transmute([]byte)buffer, src)
 }
 
-buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
+_buffer_copy :: proc(dst, src: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
 	builtin.copy(transmute([]byte)dst, transmute([]byte)src)
 }
 
-buffer_sq_sum_accumulate :: proc(buffer: ml.Backend_Buffer, count: int, accumulator: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
+_buffer_sq_sum_accumulate :: proc(buffer: ml.Backend_Buffer, count: int, accumulator: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
 	g   := ([^]f32)(raw_data(transmute([]byte)buffer))[:count]
 	acc := (^f64)(raw_data(transmute([]byte)accumulator))
 
@@ -474,15 +461,15 @@ buffer_sq_sum_accumulate :: proc(buffer: ml.Backend_Buffer, count: int, accumula
 	acc^ += total
 }
 
-buffer_scale :: proc(buffer: ml.Backend_Buffer, count: int, scale: f32, loc: runtime.Source_Code_Location) {
+_buffer_scale :: proc(buffer: ml.Backend_Buffer, count: int, scale: f32, loc: runtime.Source_Code_Location) {
 	g := ([^]f32)(raw_data(transmute([]byte)buffer))[:count]
 	for i in 0 ..< count {
 		g[i] *= scale
 	}
 }
 
-update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
-	g := gradient(t)
+_update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer, loc: runtime.Source_Code_Location) {
+	g := _gradient(t)
 	m := _moment(m_buf, t.count)
 	v := _moment(v_buf, t.count)
 
@@ -493,7 +480,7 @@ update :: proc(opt: ml.Optimizer, t: ml.Tensor, m_buf, v_buf: ml.Backend_Buffer,
 	d_bf: [^]ml.Bf16
 	d_f32: []f32
 	#partial switch t.type {
-	case .F32:  d_f32 = data(t)
+	case .F32:  d_f32 = _data(t)
 	case .Bf16: d_bf  = ([^]ml.Bf16)(raw_data(transmute([]byte)t.buffers[.Data]))
 	case:       panic("only F32 and Bf16 parameters are trainable", loc)
 	}
@@ -546,123 +533,123 @@ _alloc_scratch :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 	}
 }
 
-forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
+_forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 	_alloc_scratch(op, loc)
 	op := op^
 	switch _ in op.variant {
-	case ml.Add:                add_forward                (op)
-	case ml.Sub:                sub_forward                (op)
-	case ml.Mul:                mul_forward                (op)
-	case ml.Div:                div_forward                (op)
-	case ml.Exp:                exp_forward                (op)
-	case ml.Sqrt:               sqrt_forward               (op, loc)
-	case ml.Clamp:              clamp_forward              (op)
-	case ml.Min:                min_forward                (op)
-	case ml.Max:                max_forward                (op)
-	case ml.Mean:               mean_forward               (op)
-	case ml.Sum:                sum_forward                (op)
-	case ml.Max_Reduce:         max_reduce_forward         (op)
-	case ml.Im2col:             im2col_forward             (op)
-	case ml.Max_Pool2d:         max_pool2d_forward         (op)
-	case ml.Avg_Pool2d:         avg_pool2d_forward         (op)
-	case ml.Transpose:          transpose_forward          (op)
-	case ml.Select:             select_forward             (op)
-	case ml.Slice:              slice_forward              (op)
-	case ml.Slice_Trailing:     slice_trailing_forward     (op)
-	case ml.Slice_Leading:      slice_leading_forward      (op)
-	case ml.Concat:             concat_forward             (op)
-	case ml.Linear:             linear_forward             (op)
-	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
+	case ml.Add:                _add_forward                (op)
+	case ml.Sub:                _sub_forward                (op)
+	case ml.Mul:                _mul_forward                (op)
+	case ml.Div:                _div_forward                (op)
+	case ml.Exp:                _exp_forward                (op)
+	case ml.Sqrt:               _sqrt_forward               (op, loc)
+	case ml.Clamp:              _clamp_forward              (op)
+	case ml.Min:                _min_forward                (op)
+	case ml.Max:                _max_forward                (op)
+	case ml.Mean:               _mean_forward               (op)
+	case ml.Sum:                _sum_forward                (op)
+	case ml.Max_Reduce:         _max_reduce_forward         (op)
+	case ml.Im2col:             _im2col_forward             (op)
+	case ml.Max_Pool2d:         _max_pool2d_forward         (op)
+	case ml.Avg_Pool2d:         _avg_pool2d_forward         (op)
+	case ml.Transpose:          _transpose_forward          (op)
+	case ml.Select:             _select_forward             (op)
+	case ml.Slice:              _slice_forward              (op)
+	case ml.Slice_Trailing:     _slice_trailing_forward     (op)
+	case ml.Slice_Leading:      _slice_leading_forward      (op)
+	case ml.Concat:             _concat_forward             (op)
+	case ml.Linear:             _linear_forward             (op)
+	case ml.Linear_Q4_K:        _linear_q4_k_forward        (op)
 	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu is unreachable (the op decomposes when the capability is absent)", loc)
-	case ml.Linear_Q6_K:        linear_q6_k_forward        (op)
-	case ml.Rope:               rope_forward               (op)
-	case ml.Layernorm:          layernorm_forward          (op)
-	case ml.Rmsnorm:            rmsnorm_forward            (op)
-	case ml.Rmsnorm_Rope:       rmsnorm_rope_forward       (op)
+	case ml.Linear_Q6_K:        _linear_q6_k_forward        (op)
+	case ml.Rope:               _rope_forward               (op)
+	case ml.Layernorm:          _layernorm_forward          (op)
+	case ml.Rmsnorm:            _rmsnorm_forward            (op)
+	case ml.Rmsnorm_Rope:       _rmsnorm_rope_forward       (op)
 	case ml.Rmsnorm_Rope_Write_Cache: panic("backend does not advertise the Rmsnorm_Rope_Write_Cache capability", loc)
-	case ml.Add_Rmsnorm:        add_rmsnorm_forward        (op)
-	case ml.Softmax:            softmax_forward            (op)
-	case ml.Entropy:            entropy_forward            (op)
-	case ml.Log_Softmax:        log_softmax_forward        (op)
-	case ml.Mean_Squared_Error: mean_squared_error_forward (op)
-	case ml.Smooth_L1:          smooth_l1_forward          (op)
-	case ml.Cross_Entropy:      cross_entropy_forward      (op)
-	case ml.Relu:               relu_forward               (op)
-	case ml.Sigmoid:            sigmoid_forward            (op)
-	case ml.Gelu:               gelu_forward               (op)
-	case ml.Gelu_Mul:           gelu_mul_forward           (op)
-	case ml.Silu:               silu_forward               (op)
-	case ml.Tanh:               tanh_forward               (op)
-	case ml.Batched_Matmul:     batched_matmul_forward     (op)
-	case ml.Permute:            permute_forward            (op)
-	case ml.Causal_Mask:        causal_mask_forward        (op)
-	case ml.Attention:          attention_forward          (op)
-	case ml.Attention_Cache:    attention_cache_forward    (op)
-	case ml.Cast:               cast_forward               (op)
-	case ml.Lerp_Assign:        lerp_assign_forward        (op)
-	case ml.Accumulate_Mean:    accumulate_mean_forward    (op)
+	case ml.Add_Rmsnorm:        _add_rmsnorm_forward        (op)
+	case ml.Softmax:            _softmax_forward            (op)
+	case ml.Entropy:            _entropy_forward            (op)
+	case ml.Log_Softmax:        _log_softmax_forward        (op)
+	case ml.Mean_Squared_Error: _mean_squared_error_forward (op)
+	case ml.Smooth_L1:          _smooth_l1_forward          (op)
+	case ml.Cross_Entropy:      _cross_entropy_forward      (op)
+	case ml.Relu:               _relu_forward               (op)
+	case ml.Sigmoid:            _sigmoid_forward            (op)
+	case ml.Gelu:               _gelu_forward               (op)
+	case ml.Gelu_Mul:           _gelu_mul_forward           (op)
+	case ml.Silu:               _silu_forward               (op)
+	case ml.Tanh:               _tanh_forward               (op)
+	case ml.Batched_Matmul:     _batched_matmul_forward     (op)
+	case ml.Permute:            _permute_forward            (op)
+	case ml.Causal_Mask:        _causal_mask_forward        (op)
+	case ml.Attention:          _attention_forward          (op)
+	case ml.Attention_Cache:    _attention_cache_forward    (op)
+	case ml.Cast:               _cast_forward               (op)
+	case ml.Lerp_Assign:        _lerp_assign_forward        (op)
+	case ml.Accumulate_Mean:    _accumulate_mean_forward    (op)
 	}
 }
 
-backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	switch _ in op.variant {
-	case ml.Add:                add_backward               (op)
-	case ml.Sub:                sub_backward               (op)
-	case ml.Mul:                mul_backward               (op)
-	case ml.Div:                div_backward               (op)
-	case ml.Exp:                exp_backward               (op)
-	case ml.Sqrt:               sqrt_backward              (op)
-	case ml.Clamp:              clamp_backward             (op)
-	case ml.Min:                min_backward               (op)
-	case ml.Max:                max_backward               (op)
-	case ml.Mean:               mean_backward              (op)
-	case ml.Sum:                sum_backward               (op)
-	case ml.Max_Reduce:         max_reduce_backward        (op)
-	case ml.Im2col:             im2col_backward            (op)
-	case ml.Max_Pool2d:         max_pool2d_backward        (op)
-	case ml.Avg_Pool2d:         avg_pool2d_backward        (op)
-	case ml.Transpose:          transpose_backward         (op)
-	case ml.Select:             select_backward            (op)
-	case ml.Slice:              slice_backward             (op)
-	case ml.Slice_Trailing:     slice_trailing_backward    (op)
-	case ml.Slice_Leading:      slice_leading_backward     (op)
-	case ml.Concat:             concat_backward            (op)
-	case ml.Linear:             linear_backward            (op)
-	case ml.Linear_Q4_K:        panic("Linear_Q4_K is forward-only", loc)
-	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu is forward-only", loc)
-	case ml.Linear_Q6_K:        panic("Linear_Q6_K is forward-only", loc)
-	case ml.Rope:               rope_backward              (op)
-	case ml.Layernorm:          layernorm_backward         (op)
-	case ml.Rmsnorm:            rmsnorm_backward           (op)
-	case ml.Rmsnorm_Rope:       panic("Rmsnorm_Rope is forward-only", loc)
-	case ml.Rmsnorm_Rope_Write_Cache: panic("Rmsnorm_Rope_Write_Cache is forward-only", loc)
-	case ml.Add_Rmsnorm:        panic("Add_Rmsnorm is forward-only", loc)
-	case ml.Softmax:            softmax_backward           (op)
-	case ml.Entropy:            entropy_backward           (op)
-	case ml.Log_Softmax:        log_softmax_backward       (op)
-	case ml.Mean_Squared_Error: mean_squared_error_backward(op)
-	case ml.Smooth_L1:          smooth_l1_backward         (op)
-	case ml.Cross_Entropy:      cross_entropy_backward     (op)
-	case ml.Relu:               relu_backward              (op)
-	case ml.Sigmoid:            sigmoid_backward           (op)
-	case ml.Gelu:               gelu_backward              (op)
-	case ml.Gelu_Mul:           panic("Gelu_Mul is forward-only", loc)
-	case ml.Silu:               silu_backward              (op)
-	case ml.Tanh:               tanh_backward              (op)
-	case ml.Batched_Matmul:     batched_matmul_backward    (op)
-	case ml.Permute:            permute_backward           (op)
-	case ml.Causal_Mask:        causal_mask_backward       (op)
-	case ml.Attention:          attention_backward         (op)
-	case ml.Attention_Cache:    attention_cache_backward   (op, loc)
-	case ml.Cast:               cast_backward              (op)
-	case ml.Lerp_Assign:        panic("Lerp_Assign is forward-only", loc)
-	case ml.Accumulate_Mean:    panic("Accumulate_Mean is forward-only", loc)
+	case ml.Add:                _add_backward               (op)
+	case ml.Sub:                _sub_backward               (op)
+	case ml.Mul:                _mul_backward               (op)
+	case ml.Div:                _div_backward               (op)
+	case ml.Exp:                _exp_backward               (op)
+	case ml.Sqrt:               _sqrt_backward              (op)
+	case ml.Clamp:              _clamp_backward             (op)
+	case ml.Min:                _min_backward               (op)
+	case ml.Max:                _max_backward               (op)
+	case ml.Mean:               _mean_backward              (op)
+	case ml.Sum:                _sum_backward               (op)
+	case ml.Max_Reduce:         _max_reduce_backward        (op)
+	case ml.Im2col:             _im2col_backward            (op)
+	case ml.Max_Pool2d:         _max_pool2d_backward        (op)
+	case ml.Avg_Pool2d:         _avg_pool2d_backward        (op)
+	case ml.Transpose:          _transpose_backward         (op)
+	case ml.Select:             _select_backward            (op)
+	case ml.Slice:              _slice_backward             (op)
+	case ml.Slice_Trailing:     _slice_trailing_backward    (op)
+	case ml.Slice_Leading:      _slice_leading_backward     (op)
+	case ml.Concat:             _concat_backward            (op)
+	case ml.Linear:             _linear_backward            (op)
+	case ml.Linear_Q4_K:        panic("Linear_Q4_K is _forward-only", loc)
+	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu is _forward-only", loc)
+	case ml.Linear_Q6_K:        panic("Linear_Q6_K is _forward-only", loc)
+	case ml.Rope:               _rope_backward              (op)
+	case ml.Layernorm:          _layernorm_backward         (op)
+	case ml.Rmsnorm:            _rmsnorm_backward           (op)
+	case ml.Rmsnorm_Rope:       panic("Rmsnorm_Rope is _forward-only", loc)
+	case ml.Rmsnorm_Rope_Write_Cache: panic("Rmsnorm_Rope_Write_Cache is _forward-only", loc)
+	case ml.Add_Rmsnorm:        panic("Add_Rmsnorm is _forward-only", loc)
+	case ml.Softmax:            _softmax_backward           (op)
+	case ml.Entropy:            _entropy_backward           (op)
+	case ml.Log_Softmax:        _log_softmax_backward       (op)
+	case ml.Mean_Squared_Error: _mean_squared_error_backward(op)
+	case ml.Smooth_L1:          _smooth_l1_backward         (op)
+	case ml.Cross_Entropy:      _cross_entropy_backward     (op)
+	case ml.Relu:               _relu_backward              (op)
+	case ml.Sigmoid:            _sigmoid_backward           (op)
+	case ml.Gelu:               _gelu_backward              (op)
+	case ml.Gelu_Mul:           panic("Gelu_Mul is _forward-only", loc)
+	case ml.Silu:               _silu_backward              (op)
+	case ml.Tanh:               _tanh_backward              (op)
+	case ml.Batched_Matmul:     _batched_matmul_backward    (op)
+	case ml.Permute:            _permute_backward           (op)
+	case ml.Causal_Mask:        _causal_mask_backward       (op)
+	case ml.Attention:          _attention_backward         (op)
+	case ml.Attention_Cache:    _attention_cache_backward   (op, loc)
+	case ml.Cast:               _cast_backward              (op)
+	case ml.Lerp_Assign:        panic("Lerp_Assign is _forward-only", loc)
+	case ml.Accumulate_Mean:    panic("Accumulate_Mean is _forward-only", loc)
 	}
 }
 
-lerp_assign_forward :: proc(op: ml.Operation) {
-	dst    := data(op.output)
-	source := data(op.variant.(ml.Lerp_Assign).source)
+_lerp_assign_forward :: proc(op: ml.Operation) {
+	dst    := _data(op.output)
+	source := _data(op.variant.(ml.Lerp_Assign).source)
 	alpha  := op.variant.(ml.Lerp_Assign).alpha
 	one_minus := 1 - alpha
 	for i in 0 ..< builtin.len(dst) {
@@ -670,9 +657,9 @@ lerp_assign_forward :: proc(op: ml.Operation) {
 	}
 }
 
-accumulate_mean_forward :: proc(op: ml.Operation) {
-	dst    := data(op.output)
-	source := data(op.input)
+_accumulate_mean_forward :: proc(op: ml.Operation) {
+	dst    := _data(op.output)
+	source := _data(op.input)
 	sum: f32
 	for v in source {
 		sum += v
@@ -680,16 +667,16 @@ accumulate_mean_forward :: proc(op: ml.Operation) {
 	dst[0] += sum / f32(builtin.len(source))
 }
 
-cast_forward :: proc(op: ml.Operation) {
+_cast_forward :: proc(op: ml.Operation) {
 	src_bytes := transmute([]byte)op.input.buffers[.Data]
 	dst_bytes := transmute([]byte)op.output.buffers[.Data]
 	_cast_bytes(src_bytes, op.input.type, dst_bytes, op.output.type, op.input.count)
 }
 
-cast_backward :: proc(op: ml.Operation) {
+_cast_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
-	src_grad := gradient(op.output)
-	dst_grad := gradient(op.input)
+	src_grad := _gradient(op.output)
+	dst_grad := _gradient(op.input)
 	for i in 0 ..< op.input.count {
 		dst_grad[i] += src_grad[i]
 	}
@@ -761,7 +748,7 @@ _store :: #force_inline proc "contextless" (p: [^]$T, i: int, value: f32) {
 	}
 }
 
-add_forward :: proc(op: ml.Operation) {
+_add_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _add_forward_impl(f32,      op)
 	case .Bf16: _add_forward_impl(ml.Bf16, op)
@@ -784,12 +771,12 @@ _add_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-add_backward :: proc(op: ml.Operation) {
+_add_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b      := op.variant.(ml.Add).b
 	stride, width := _broadcast_tiling(a, b)
 
-	da, db, dy := gradient(a), gradient(b), gradient(output)
+	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	#no_bounds_check for i in 0 ..< stride {
 		row_da := da[i * width:]
@@ -801,7 +788,7 @@ add_backward :: proc(op: ml.Operation) {
 	}
 }
 
-sub_forward :: proc(op: ml.Operation) {
+_sub_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _sub_forward_impl(f32,      op)
 	case .Bf16: _sub_forward_impl(ml.Bf16, op)
@@ -824,12 +811,12 @@ _sub_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-sub_backward :: proc(op: ml.Operation) {
+_sub_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b      := op.variant.(ml.Sub).b
 	stride, width := _broadcast_tiling(a, b)
 
-	da, db, dy := gradient(a), gradient(b), gradient(output)
+	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -840,7 +827,7 @@ sub_backward :: proc(op: ml.Operation) {
 	}
 }
 
-mul_forward :: proc(op: ml.Operation) {
+_mul_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _mul_forward_impl(f32,      op)
 	case .Bf16: _mul_forward_impl(ml.Bf16, op)
@@ -863,7 +850,7 @@ _mul_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-mul_backward :: proc(op: ml.Operation) {
+_mul_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _mul_backward_impl(f32,      op)
 	case .Bf16: _mul_backward_impl(ml.Bf16, op)
@@ -875,7 +862,7 @@ _mul_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	b := op.variant.(ml.Mul).b
 	stride, width := _broadcast_tiling(a, b)
 
-	da, db, dy := gradient(a), gradient(b), gradient(output)
+	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	ap := _typed_data(T, a)
 	bp := _typed_data(T, b)
@@ -888,7 +875,7 @@ _mul_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-div_forward :: proc(op: ml.Operation) {
+_div_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _div_forward_impl(f32,      op)
 	case .Bf16: _div_forward_impl(ml.Bf16, op)
@@ -911,7 +898,7 @@ _div_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-div_backward :: proc(op: ml.Operation) {
+_div_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _div_backward_impl(f32,      op)
 	case .Bf16: _div_backward_impl(ml.Bf16, op)
@@ -923,7 +910,7 @@ _div_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	b := op.variant.(ml.Div).b
 	stride, width := _broadcast_tiling(a, b)
 
-	da, db, dy := gradient(a), gradient(b), gradient(output)
+	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	ap := _typed_data(T, a)
 	bp := _typed_data(T, b)
@@ -938,7 +925,7 @@ _div_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-exp_forward :: proc(op: ml.Operation) {
+_exp_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _exp_forward_impl(f32,      op)
 	case .Bf16: _exp_forward_impl(ml.Bf16, op)
@@ -953,7 +940,7 @@ _exp_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-exp_backward :: proc(op: ml.Operation) {
+_exp_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	#partial switch op.input.type {
 	case .F32:  _exp_backward_impl(f32,      op)
@@ -962,30 +949,30 @@ exp_backward :: proc(op: ml.Operation) {
 }
 
 _exp_backward_impl :: proc($T: typeid, op: ml.Operation) {
-	dx, dy := gradient(op.input), gradient(op.output)
+	dx, dy := _gradient(op.input), _gradient(op.output)
 	yp := _typed_data(T, op.output)
 	for i in 0 ..< ml.len(op.input) {
 		dx[i] += _load(yp, i) * dy[i]
 	}
 }
 
-sqrt_forward :: proc(op: ml.Operation, loc := #caller_location) {
+_sqrt_forward :: proc(op: ml.Operation, loc := #caller_location) {
 	input  := op.input
 	output := op.output
 
 	assert(input.type == .F32, "Sqrt is F32-only", loc=loc)
 
 	for i in 0 ..< ml.len(input) {
-		data(output)[i] = math.sqrt(data(input)[i])
+		_data(output)[i] = math.sqrt(_data(input)[i])
 	}
 }
 
-sqrt_backward :: proc(op: ml.Operation) {
+_sqrt_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
-	dx, dy := gradient(input), gradient(output)
-	y := data(output)
+	dx, dy := _gradient(input), _gradient(output)
+	y := _data(output)
 	for i in 0 ..< ml.len(input) {
 		if y[i] > 0 {
 			dx[i] += 0.5 / y[i] * dy[i]
@@ -993,7 +980,7 @@ sqrt_backward :: proc(op: ml.Operation) {
 	}
 }
 
-clamp_forward :: proc(op: ml.Operation) {
+_clamp_forward :: proc(op: ml.Operation) {
 	input   := op.input
 	output  := op.output
 	variant := op.variant.(ml.Clamp)
@@ -1001,11 +988,11 @@ clamp_forward :: proc(op: ml.Operation) {
 	max_val := variant.max_val
 
 	for i in 0 ..< ml.len(input) {
-		data(output)[i] = math.clamp(data(input)[i], min_val, max_val)
+		_data(output)[i] = math.clamp(_data(input)[i], min_val, max_val)
 	}
 }
 
-clamp_backward :: proc(op: ml.Operation) {
+_clamp_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
@@ -1014,18 +1001,18 @@ clamp_backward :: proc(op: ml.Operation) {
 	max_val := variant.max_val
 
 	for i in 0 ..< ml.len(input) {
-		if data(input)[i] >= min_val && data(input)[i] <= max_val {
-			gradient(input)[i] += gradient(output)[i]
+		if _data(input)[i] >= min_val && _data(input)[i] <= max_val {
+			_gradient(input)[i] += _gradient(output)[i]
 		}
 	}
 }
 
-min_forward :: proc(op: ml.Operation) {
+_min_forward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b := op.variant.(ml.Min).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap, bp, op_ := data(a), data(b), data(output)
+	ap, bp, op_ := _data(a), _data(b), _data(output)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
 			o := i * width + j
@@ -1034,13 +1021,13 @@ min_forward :: proc(op: ml.Operation) {
 	}
 }
 
-min_backward :: proc(op: ml.Operation) {
+_min_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b := op.variant.(ml.Min).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap, bp := data(a), data(b)
-	da, db, dy := gradient(a), gradient(b), gradient(output)
+	ap, bp := _data(a), _data(b)
+	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -1054,12 +1041,12 @@ min_backward :: proc(op: ml.Operation) {
 	}
 }
 
-max_forward :: proc(op: ml.Operation) {
+_max_forward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b := op.variant.(ml.Max).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap, bp, op_ := data(a), data(b), data(output)
+	ap, bp, op_ := _data(a), _data(b), _data(output)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
 			o := i * width + j
@@ -1068,13 +1055,13 @@ max_forward :: proc(op: ml.Operation) {
 	}
 }
 
-max_backward :: proc(op: ml.Operation) {
+_max_backward :: proc(op: ml.Operation) {
 	a, output := op.input, op.output
 	b := op.variant.(ml.Max).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap, bp := data(a), data(b)
-	da, db, dy := gradient(a), gradient(b), gradient(output)
+	ap, bp := _data(a), _data(b)
+	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -1088,7 +1075,7 @@ max_backward :: proc(op: ml.Operation) {
 	}
 }
 
-mean_forward :: proc(op: ml.Operation) {
+_mean_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _mean_forward_impl(f32,      op)
 	case .Bf16: _mean_forward_impl(ml.Bf16, op)
@@ -1110,13 +1097,13 @@ _mean_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-mean_backward :: proc(op: ml.Operation) {
+_mean_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 	count := ml.len(output)
 	size  := ml.len(input) / count
 
-	dx, dy := gradient(input), gradient(output)
+	dx, dy := _gradient(input), _gradient(output)
 	for sample in 0 ..< count {
 		gradient_per_element := dy[sample] / f32(size)
 
@@ -1126,7 +1113,7 @@ mean_backward :: proc(op: ml.Operation) {
 	}
 }
 
-sum_forward :: proc(op: ml.Operation) {
+_sum_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _sum_forward_impl(f32,      op)
 	case .Bf16: _sum_forward_impl(ml.Bf16, op)
@@ -1148,13 +1135,13 @@ _sum_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-sum_backward :: proc(op: ml.Operation) {
+_sum_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 	count := ml.len(output)
 	size  := ml.len(input) / count
 
-	dx, dy := gradient(input), gradient(output)
+	dx, dy := _gradient(input), _gradient(output)
 	for sample in 0 ..< count {
 		for i in 0 ..< size {
 			dx[sample * size + i] += dy[sample]
@@ -1162,7 +1149,7 @@ sum_backward :: proc(op: ml.Operation) {
 	}
 }
 
-max_reduce_forward :: proc(op: ml.Operation) {
+_max_reduce_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _max_reduce_forward_impl(f32,      op)
 	case .Bf16: _max_reduce_forward_impl(ml.Bf16, op)
@@ -1187,7 +1174,7 @@ _max_reduce_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-max_reduce_backward :: proc(op: ml.Operation) {
+_max_reduce_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	#partial switch op.input.type {
 	case .F32:  _max_reduce_backward_impl(f32,      op)
@@ -1201,7 +1188,7 @@ _max_reduce_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	size  := ml.len(input) / count
 
 	xp := _typed_data(T, input)
-	dx, dy := gradient(input), gradient(output)
+	dx, dy := _gradient(input), _gradient(output)
 	for sample in 0 ..< count {
 		best_index := 0
 		best_value := _load(xp, sample * size)
@@ -1216,7 +1203,7 @@ _max_reduce_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-im2col_forward :: proc(op: ml.Operation) {
+_im2col_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _im2col_forward_impl(f32,      op)
 	case .Bf16: _im2col_forward_impl(ml.Bf16, op)
@@ -1260,7 +1247,7 @@ _im2col_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-im2col_backward :: proc(op: ml.Operation) {
+_im2col_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	v := op.variant.(ml.Im2col)
 	input := op.input
@@ -1268,7 +1255,7 @@ im2col_backward :: proc(op: ml.Operation) {
 	w := input.shape[2]
 	c := input.shape[3]
 
-	dx, dy := gradient(input), gradient(op.output)
+	dx, dy := _gradient(input), _gradient(op.output)
 
 	patch_size := v.kernel_h * v.kernel_w * c
 	for n in 0 ..< input.shape[0] {
@@ -1293,7 +1280,7 @@ im2col_backward :: proc(op: ml.Operation) {
 	}
 }
 
-max_pool2d_forward :: proc(op: ml.Operation) {
+_max_pool2d_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _max_pool2d_forward_impl(f32,      op)
 	case .Bf16: _max_pool2d_forward_impl(ml.Bf16, op)
@@ -1335,7 +1322,7 @@ _max_pool2d_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-max_pool2d_backward :: proc(op: ml.Operation) {
+_max_pool2d_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	#partial switch op.input.type {
 	case .F32:  _max_pool2d_backward_impl(f32,      op)
@@ -1353,7 +1340,7 @@ _max_pool2d_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	out_w := op.output.shape[2]
 
 	xp := _typed_data(T, input)
-	dx, dy := gradient(input), gradient(op.output)
+	dx, dy := _gradient(input), _gradient(op.output)
 
 	for n in 0 ..< input.shape[0] {
 		for oy in 0 ..< out_h {
@@ -1382,7 +1369,7 @@ _max_pool2d_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-avg_pool2d_forward :: proc(op: ml.Operation) {
+_avg_pool2d_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _avg_pool2d_forward_impl(f32,      op)
 	case .Bf16: _avg_pool2d_forward_impl(ml.Bf16, op)
@@ -1422,7 +1409,7 @@ _avg_pool2d_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-avg_pool2d_backward :: proc(op: ml.Operation) {
+_avg_pool2d_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	#partial switch op.input.type {
 	case .F32:  _avg_pool2d_backward_impl(f32,      op)
@@ -1439,7 +1426,7 @@ _avg_pool2d_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	out_h := op.output.shape[1]
 	out_w := op.output.shape[2]
 
-	dx, dy := gradient(input), gradient(op.output)
+	dx, dy := _gradient(input), _gradient(op.output)
 
 	window := f32(v.kernel_h * v.kernel_w)
 	for n in 0 ..< input.shape[0] {
@@ -1461,7 +1448,7 @@ _avg_pool2d_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-transpose_forward :: proc(op: ml.Operation) {
+_transpose_forward :: proc(op: ml.Operation) {
 	input   := op.input
 	output  := op.output
 	rows    := input.shape[0]
@@ -1469,12 +1456,12 @@ transpose_forward :: proc(op: ml.Operation) {
 
 	for i in 0 ..< rows {
 		for j in 0 ..< columns {
-			data(output)[j * rows + i] = data(input)[i * columns + j]
+			_data(output)[j * rows + i] = _data(input)[i * columns + j]
 		}
 	}
 }
 
-transpose_backward :: proc(op: ml.Operation) {
+_transpose_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 	rows    := input.shape[0]
@@ -1482,12 +1469,12 @@ transpose_backward :: proc(op: ml.Operation) {
 
 	for i in 0 ..< rows {
 		for j in 0 ..< columns {
-			gradient(input)[i * columns + j] += gradient(output)[j * rows + i]
+			_gradient(input)[i * columns + j] += _gradient(output)[j * rows + i]
 		}
 	}
 }
 
-select_forward :: proc(op: ml.Operation) {
+_select_forward :: proc(op: ml.Operation) {
 	input   := op.input
 	output  := op.output
 	indices := op.variant.(ml.Select).indices
@@ -1505,13 +1492,13 @@ select_forward :: proc(op: ml.Operation) {
 	}
 }
 
-select_backward :: proc(op: ml.Operation) {
+_select_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	weight, output := op.input, op.output
 	indices := op.variant.(ml.Select).indices
 	size    := ml.len(output) / builtin.len(indices)
 
-	dw, dy := gradient(weight), gradient(output)
+	dw, dy := _gradient(weight), _gradient(output)
 	for i in 0 ..< builtin.len(indices) {
 		for j in 0 ..< size {
 			dw[indices[i] * size + j] += dy[i * size + j]
@@ -1519,7 +1506,7 @@ select_backward :: proc(op: ml.Operation) {
 	}
 }
 
-slice_forward :: proc(op: ml.Operation) {
+_slice_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _slice_forward_impl(f32,      op)
 	case .Bf16: _slice_forward_impl(ml.Bf16, op)
@@ -1535,20 +1522,20 @@ _slice_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-slice_backward :: proc(op: ml.Operation) {
+_slice_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
 	variant := op.variant.(ml.Slice)
 	start   := variant.start
 
-	dx, dy := gradient(input), gradient(output)
+	dx, dy := _gradient(input), _gradient(output)
 	for i in 0 ..< ml.len(output) {
 		dx[start + i] += dy[i]
 	}
 }
 
-slice_trailing_forward :: proc(op: ml.Operation) {
+_slice_trailing_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _slice_trailing_forward_impl(f32,      op)
 	case .Bf16: _slice_trailing_forward_impl(ml.Bf16, op)
@@ -1574,7 +1561,7 @@ _slice_trailing_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-slice_trailing_backward :: proc(op: ml.Operation) {
+_slice_trailing_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
@@ -1585,7 +1572,7 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 	new_trailing := output.shape[output.rank - 1]
 	leading      := ml._leading_count(input)
 
-	dx, dy := gradient(input), gradient(output)
+	dx, dy := _gradient(input), _gradient(output)
 	for r in 0 ..< leading {
 		in_off  := r * trailing + start
 		out_off := r * new_trailing
@@ -1595,7 +1582,7 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 	}
 }
 
-slice_leading_forward :: proc(op: ml.Operation) {
+_slice_leading_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _slice_leading_forward_impl(f32,      op)
 	case .Bf16: _slice_leading_forward_impl(ml.Bf16, op)
@@ -1618,7 +1605,7 @@ _slice_leading_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-slice_leading_backward :: proc(op: ml.Operation) {
+_slice_leading_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
@@ -1630,13 +1617,13 @@ slice_leading_backward :: proc(op: ml.Operation) {
 	count    := output.shape[0] * row_size
 	in_off   := start * row_size
 
-	dx, dy := gradient(input), gradient(output)
+	dx, dy := _gradient(input), _gradient(output)
 	for i in 0 ..< count {
 		dx[in_off + i] += dy[i]
 	}
 }
 
-concat_forward :: proc(op: ml.Operation) {
+_concat_forward :: proc(op: ml.Operation) {
 	#partial switch op.output.type {
 	case .F32:  _concat_forward_impl(f32,      op)
 	case .Bf16: _concat_forward_impl(ml.Bf16, op)
@@ -1666,7 +1653,7 @@ _concat_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-concat_backward :: proc(op: ml.Operation) {
+_concat_backward :: proc(op: ml.Operation) {
 	output := op.output
 
 	variant := op.variant.(ml.Concat)
@@ -1675,12 +1662,12 @@ concat_backward :: proc(op: ml.Operation) {
 	leading      := ml._leading_count(inputs[0])
 	out_trailing := output.shape[output.rank - 1]
 
-	dy := gradient(output)
+	dy := _gradient(output)
 	src_col := 0
 	for input in inputs {
 		in_trailing := input.shape[input.rank - 1]
 		if ml.has_gradient(input) {
-			dx := gradient(input)
+			dx := _gradient(input)
 			for r in 0 ..< leading {
 				out_off := r * out_trailing + src_col
 				in_off  := r * in_trailing
@@ -1693,14 +1680,14 @@ concat_backward :: proc(op: ml.Operation) {
 	}
 }
 
-linear_forward :: proc(op: ml.Operation) {
+_linear_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  linear_forward_f32 (op)
-	case .Bf16: linear_forward_bf16(op)
+	case .F32:  _linear_forward_f32 (op)
+	case .Bf16: _linear_forward_bf16(op)
 	}
 }
 
-linear_forward_f32 :: proc(op: ml.Operation) {
+_linear_forward_f32 :: proc(op: ml.Operation) {
 	weight      := op.variant.(ml.Linear).weight
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
@@ -1715,16 +1702,16 @@ linear_forward_f32 :: proc(op: ml.Operation) {
 	work := count * output_size * input_size
 
 	if count >= output_size {
-		parallelize(count, count, jd, proc(c: int, jd: Job_Data) {
+		_parallelize(count, count, jd, proc(c: int, jd: Job_Data) {
 			op := jd.op
 			input, output := op.input, op.output
 			weight      := op.variant.(ml.Linear).weight
 			output_size := weight.shape[0]
 			input_size  := weight.shape[1]
 
-			input_ptr  := ([^]f32)(raw_data(data(input)))
-			output_ptr := ([^]f32)(raw_data(data(output)))
-			weight_ptr := ([^]f32)(raw_data(data(weight)))
+			input_ptr  := ([^]f32)(raw_data(_data(input)))
+			output_ptr := ([^]f32)(raw_data(_data(output)))
+			weight_ptr := ([^]f32)(raw_data(_data(weight)))
 
 			x := input_ptr[c * input_size:]
 			y := output_ptr[c * output_size:]
@@ -1736,16 +1723,16 @@ linear_forward_f32 :: proc(op: ml.Operation) {
 		return
 	}
 
-	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+	_parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
 		op := jd.op
 		input, output := op.input, op.output
 		weight      := op.variant.(ml.Linear).weight
 		output_size := weight.shape[0]
 		input_size  := weight.shape[1]
 
-		input_ptr  := ([^]f32)(raw_data(data(input)))
-		output_ptr := ([^]f32)(raw_data(data(output)))
-		weight_ptr := ([^]f32)(raw_data(data(weight)))
+		input_ptr  := ([^]f32)(raw_data(_data(input)))
+		output_ptr := ([^]f32)(raw_data(_data(output)))
+		weight_ptr := ([^]f32)(raw_data(_data(weight)))
 
 		w_row := weight_ptr[o * input_size:]
 		for c in 0 ..< jd.count {
@@ -1755,7 +1742,7 @@ linear_forward_f32 :: proc(op: ml.Operation) {
 	}, work=work)
 }
 
-linear_forward_bf16 :: proc(op: ml.Operation) {
+_linear_forward_bf16 :: proc(op: ml.Operation) {
 	weight      := op.variant.(ml.Linear).weight
 	output_size := weight.shape[0]
 	count       := ml.len(op.input) / weight.shape[1]
@@ -1766,7 +1753,7 @@ linear_forward_bf16 :: proc(op: ml.Operation) {
 	}
 	jd := Job_Data{op = op, count = count}
 
-	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+	_parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
 		op := jd.op
 		input, output := op.input, op.output
 		weight      := op.variant.(ml.Linear).weight
@@ -1785,7 +1772,7 @@ linear_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-linear_q4_k_forward :: proc(op: ml.Operation) {
+_linear_q4_k_forward :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Linear_Q4_K)
 	output_size := v.weight.shape[0]
 	input_size  := v.weight.shape[1]
@@ -1797,7 +1784,7 @@ linear_q4_k_forward :: proc(op: ml.Operation) {
 	}
 	jd := Job_Data{op = op, count = count}
 
-	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+	_parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
 		op := jd.op
 		v := op.variant.(ml.Linear_Q4_K)
 		output_size := v.weight.shape[0]
@@ -1825,7 +1812,7 @@ linear_q4_k_forward :: proc(op: ml.Operation) {
 	})
 }
 
-linear_q6_k_forward :: proc(op: ml.Operation) {
+_linear_q6_k_forward :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Linear_Q6_K)
 	output_size := v.weight.shape[0]
 	input_size  := v.weight.shape[1]
@@ -1837,7 +1824,7 @@ linear_q6_k_forward :: proc(op: ml.Operation) {
 	}
 	jd := Job_Data{op = op, count = count}
 
-	parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
+	_parallelize(output_size, output_size, jd, proc(o: int, jd: Job_Data) {
 		op := jd.op
 		v := op.variant.(ml.Linear_Q6_K)
 		output_size := v.weight.shape[0]
@@ -1865,28 +1852,28 @@ linear_q6_k_forward :: proc(op: ml.Operation) {
 	})
 }
 
-linear_backward :: proc(op: ml.Operation) {
+_linear_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  linear_backward_f32 (op)
-	case .Bf16: linear_backward_bf16(op)
+	case .F32:  _linear_backward_f32 (op)
+	case .Bf16: _linear_backward_bf16(op)
 	}
 }
 
-linear_backward_bf16 :: proc(op: ml.Operation) {
+_linear_backward_bf16 :: proc(op: ml.Operation) {
 	weight      := op.variant.(ml.Linear).weight
 	output_size := weight.shape[0]
 	count       := ml.len(op.input) / weight.shape[1]
 
 	if ml.has_gradient(weight) {
-		parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
+		_parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
 			weight      := op.variant.(ml.Linear).weight
 			input_size  := weight.shape[1]
 			output_size := weight.shape[0]
 			count       := ml.len(op.input) / input_size
 
-			x_bf := data_bf16(op.input)
-			dy   := gradient(op.output)
-			dw   := gradient(weight)
+			x_bf := _data_bf16(op.input)
+			dy   := _gradient(op.output)
+			dw   := _gradient(weight)
 
 			dw_row := dw[o * input_size:]
 			for k in 0 ..< input_size {
@@ -1900,14 +1887,14 @@ linear_backward_bf16 :: proc(op: ml.Operation) {
 	}
 
 	if ml.has_gradient(op.input) {
-		parallelize(count, count, op, proc(c: int, op: ml.Operation) {
+		_parallelize(count, count, op, proc(c: int, op: ml.Operation) {
 			weight      := op.variant.(ml.Linear).weight
 			input_size  := weight.shape[1]
 			output_size := weight.shape[0]
 
-			w_bf := data_bf16(weight)
-			dy   := gradient(op.output)
-			dx   := gradient(op.input)
+			w_bf := _data_bf16(weight)
+			dy   := _gradient(op.output)
+			dx   := _gradient(op.input)
 
 			dx_row := dx[c * input_size:]
 			dy_row := dy[c * output_size:]
@@ -1922,7 +1909,7 @@ linear_backward_bf16 :: proc(op: ml.Operation) {
 	}
 }
 
-linear_backward_f32 :: proc(op: ml.Operation) {
+_linear_backward_f32 :: proc(op: ml.Operation) {
 	weight      := op.variant.(ml.Linear).weight
 	output_size := weight.shape[0]
 	input_size  := weight.shape[1]
@@ -1931,16 +1918,16 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 	work := count * output_size * input_size
 
 	if ml.has_gradient(weight) {
-		parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
+		_parallelize(output_size, output_size, op, proc(o: int, op: ml.Operation) {
 			input, output := op.input, op.output
 			weight      := op.variant.(ml.Linear).weight
 			output_size := weight.shape[0]
 			input_size  := weight.shape[1]
 			count       := ml.len(input) / input_size
 
-			input_data_ptr  := ([^]f32)(raw_data(data(input)))
-			output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
-			weight_grad_ptr := ([^]f32)(raw_data(gradient(weight)))
+			input_data_ptr  := ([^]f32)(raw_data(_data(input)))
+			output_grad_ptr := ([^]f32)(raw_data(_gradient(output)))
+			weight_grad_ptr := ([^]f32)(raw_data(_gradient(weight)))
 
 			w_grad := weight_grad_ptr[o * input_size:]
 
@@ -1956,15 +1943,15 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 	}
 
 	if ml.has_gradient(op.input) {
-		parallelize(count, count, op, proc(b: int, op: ml.Operation) {
+		_parallelize(count, count, op, proc(b: int, op: ml.Operation) {
 			input, output := op.input, op.output
 			weight      := op.variant.(ml.Linear).weight
 			output_size := weight.shape[0]
 			input_size  := weight.shape[1]
 
-			input_grad_ptr  := ([^]f32)(raw_data(gradient(input)))
-			output_grad_ptr := ([^]f32)(raw_data(gradient(output)))
-			weight_data_ptr := ([^]f32)(raw_data(data(weight)))
+			input_grad_ptr  := ([^]f32)(raw_data(_gradient(input)))
+			output_grad_ptr := ([^]f32)(raw_data(_gradient(output)))
+			weight_data_ptr := ([^]f32)(raw_data(_data(weight)))
 
 			dx := input_grad_ptr [b * input_size:]
 			dy := output_grad_ptr[b * output_size:]
@@ -1981,7 +1968,7 @@ linear_backward_f32 :: proc(op: ml.Operation) {
 	}
 }
 
-rope_forward :: proc(op: ml.Operation) {
+_rope_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _rope_forward_impl(f32,      op)
 	case .Bf16: _rope_forward_impl(ml.Bf16, op)
@@ -2006,8 +1993,8 @@ _rope_forward_impl :: proc($T: typeid, op: ml.Operation) {
 		for i in 0 ..< rotate_pair_count {
 			theta := f32(pos + pos_offset) / math.pow(base, f32(i * 2) / f32(head_size))
 			cache_idx := pos * half_head + i
-			data(cos_cache)[cache_idx] = math.cos(theta)
-			data(sin_cache)[cache_idx] = math.sin(theta)
+			_data(cos_cache)[cache_idx] = math.cos(theta)
+			_data(sin_cache)[cache_idx] = math.sin(theta)
 		}
 	}
 
@@ -2020,8 +2007,8 @@ _rope_forward_impl :: proc($T: typeid, op: ml.Operation) {
 
 			for i in 0 ..< rotate_pair_count {
 				cache_idx := t * half_head + i
-				cos_val := data(cos_cache)[cache_idx]
-				sin_val := data(sin_cache)[cache_idx]
+				cos_val := _data(cos_cache)[cache_idx]
+				sin_val := _data(sin_cache)[cache_idx]
 
 				x := _load(xp, head_offset + i * 2)
 				y := _load(xp, head_offset + i * 2 + 1)
@@ -2037,7 +2024,7 @@ _rope_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-rope_backward :: proc(op: ml.Operation) {
+_rope_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
@@ -2056,18 +2043,18 @@ rope_backward :: proc(op: ml.Operation) {
 
 			for i in 0 ..< rotate_pair_count {
 				cache_idx := t * half_head + i
-				cos_val := data(cos_cache)[cache_idx]
-				sin_val := data(sin_cache)[cache_idx]
+				cos_val := _data(cos_cache)[cache_idx]
+				sin_val := _data(sin_cache)[cache_idx]
 
-				grad_x := gradient(output)[head_offset + i * 2]
-				grad_y := gradient(output)[head_offset + i * 2 + 1]
+				grad_x := _gradient(output)[head_offset + i * 2]
+				grad_y := _gradient(output)[head_offset + i * 2 + 1]
 
-				gradient(input)[head_offset + i * 2]     +=  grad_x * cos_val + grad_y * sin_val
-				gradient(input)[head_offset + i * 2 + 1] += -grad_x * sin_val + grad_y * cos_val
+				_gradient(input)[head_offset + i * 2]     +=  grad_x * cos_val + grad_y * sin_val
+				_gradient(input)[head_offset + i * 2 + 1] += -grad_x * sin_val + grad_y * cos_val
 			}
 			for i in rotate_pair_count ..< half_head {
-				gradient(input)[head_offset + i * 2]     += gradient(output)[head_offset + i * 2]
-				gradient(input)[head_offset + i * 2 + 1] += gradient(output)[head_offset + i * 2 + 1]
+				_gradient(input)[head_offset + i * 2]     += _gradient(output)[head_offset + i * 2]
+				_gradient(input)[head_offset + i * 2 + 1] += _gradient(output)[head_offset + i * 2 + 1]
 			}
 		}
 	}
@@ -2075,7 +2062,7 @@ rope_backward :: proc(op: ml.Operation) {
 
 LAYERNORM_EPSILON :: 1e-5
 
-layernorm_forward :: proc(op: ml.Operation) {
+_layernorm_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _layernorm_forward_impl(f32,      op)
 	case .Bf16: _layernorm_forward_impl(ml.Bf16, op)
@@ -2087,8 +2074,8 @@ _layernorm_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	output  := op.output
 	variant := op.variant.(ml.Layernorm)
 	weight  := variant.weight
-	mean    := data(variant.mean)
-	rstd    := data(variant.rstd)
+	mean    := _data(variant.mean)
+	rstd    := _data(variant.rstd)
 	size    := input.shape[input.rank - 1]
 	count   := ml.len(input) / size
 
@@ -2123,7 +2110,7 @@ _layernorm_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-layernorm_backward :: proc(op: ml.Operation) {
+_layernorm_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _layernorm_backward_impl(f32,      op)
 	case .Bf16: _layernorm_backward_impl(ml.Bf16, op)
@@ -2135,8 +2122,8 @@ _layernorm_backward_impl :: proc($T: typeid, op: ml.Operation) {
 
 	variant := op.variant.(ml.Layernorm)
 	weight  := variant.weight
-	mean    := data(variant.mean)
-	rstd    := data(variant.rstd)
+	mean    := _data(variant.mean)
+	rstd    := _data(variant.rstd)
 	size    := input.shape[input.rank - 1]
 	count   := ml.len(input) / size
 
@@ -2145,9 +2132,9 @@ _layernorm_backward_impl :: proc($T: typeid, op: ml.Operation) {
 
 	xp := _typed_data(T, input)
 	wp := _typed_data(T, weight)
-	dx := gradient(input)
-	dw := gradient(weight)
-	dy := gradient(output)
+	dx := _gradient(input)
+	dw := _gradient(weight)
+	dy := _gradient(output)
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -2184,7 +2171,7 @@ _layernorm_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-rmsnorm_forward :: proc(op: ml.Operation) {
+_rmsnorm_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _rmsnorm_forward_impl(f32,      op)
 	case .Bf16: _rmsnorm_forward_impl(ml.Bf16, op)
@@ -2196,7 +2183,7 @@ _rmsnorm_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	output  := op.output
 	variant := op.variant.(ml.Rmsnorm)
 	weight  := variant.weight
-	rstd    := data(variant.rstd)
+	rstd    := _data(variant.rstd)
 	eps     := variant.eps
 	size    := input.shape[input.rank - 1]
 	count   := ml.len(input) / size
@@ -2224,7 +2211,7 @@ _rmsnorm_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-rmsnorm_rope_forward :: proc(op: ml.Operation) {
+_rmsnorm_rope_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _rmsnorm_rope_forward_impl(f32,      op)
 	case .Bf16: _rmsnorm_rope_forward_impl(ml.Bf16, op)
@@ -2277,7 +2264,7 @@ _rmsnorm_rope_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-add_rmsnorm_forward :: proc(op: ml.Operation) {
+_add_rmsnorm_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _add_rmsnorm_forward_impl(f32,      op)
 	case .Bf16: _add_rmsnorm_forward_impl(ml.Bf16, op)
@@ -2317,7 +2304,7 @@ _add_rmsnorm_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-rmsnorm_backward :: proc(op: ml.Operation) {
+_rmsnorm_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _rmsnorm_backward_impl(f32,      op)
 	case .Bf16: _rmsnorm_backward_impl(ml.Bf16, op)
@@ -2329,7 +2316,7 @@ _rmsnorm_backward_impl :: proc($T: typeid, op: ml.Operation) {
 
 	variant := op.variant.(ml.Rmsnorm)
 	weight  := variant.weight
-	rstd    := data(variant.rstd)
+	rstd    := _data(variant.rstd)
 	size    := input.shape[input.rank - 1]
 	count   := ml.len(input) / size
 
@@ -2338,9 +2325,9 @@ _rmsnorm_backward_impl :: proc($T: typeid, op: ml.Operation) {
 
 	xp := _typed_data(T, input)
 	wp := _typed_data(T, weight)
-	dx := gradient(input)
-	dw := gradient(weight)
-	dy := gradient(output)
+	dx := _gradient(input)
+	dw := _gradient(weight)
+	dy := _gradient(output)
 
 	for c in 0 ..< count {
 		offset := c * size
@@ -2371,7 +2358,7 @@ _rmsnorm_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-softmax_forward :: proc(op: ml.Operation) {
+_softmax_forward :: proc(op: ml.Operation) {
 	input  := op.input
 	output := op.output
 	size   := input.shape[input.rank - 1]
@@ -2383,18 +2370,18 @@ softmax_forward :: proc(op: ml.Operation) {
 			max_value := math.NEG_INF_F32
 			for i in 0 ..< size {
 				index := sample * size + i
-				max_value = math.max(max_value, data(input)[index])
+				max_value = math.max(max_value, _data(input)[index])
 			}
 			sum: f32
 			for i in 0 ..< size {
 				index := sample * size + i
-				exp_val := math.exp(data(input)[index] - max_value)
-				data(output)[index] = exp_val
+				exp_val := math.exp(_data(input)[index] - max_value)
+				_data(output)[index] = exp_val
 				sum += exp_val
 			}
 			for i in 0 ..< size {
 				index := sample * size + i
-				data(output)[index] /= sum
+				_data(output)[index] /= sum
 			}
 		}
 	case .Bf16:
@@ -2423,21 +2410,21 @@ softmax_forward :: proc(op: ml.Operation) {
 	}
 }
 
-softmax_backward :: proc(op: ml.Operation) {
+_softmax_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	size  := op.input.shape[op.input.rank - 1]
 	count := ml.len(op.input) / size
 
 	#partial switch op.input.type {
 	case .F32:
-		parallelize(count, count, op, proc(index: int, op: ml.Operation) {
+		_parallelize(count, count, op, proc(index: int, op: ml.Operation) {
 			input, output := op.input, op.output
 			size  := input.shape[input.rank - 1]
 			base  := index * size
 
-			out_data := data(output)    [base:base + size]
-			out_grad := gradient(output)[base:base + size]
-			in_grad  := gradient(input) [base:base + size]
+			out_data := _data(output)    [base:base + size]
+			out_grad := _gradient(output)[base:base + size]
+			in_grad  := _gradient(input) [base:base + size]
 
 			dot: f32
 			for i in 0 ..< size {
@@ -2449,9 +2436,9 @@ softmax_backward :: proc(op: ml.Operation) {
 			}
 		})
 	case .Bf16:
-		y_bf := data_bf16(op.output)
-		dy   := gradient(op.output)
-		dx   := gradient(op.input)
+		y_bf := _data_bf16(op.output)
+		dy   := _gradient(op.output)
+		dx   := _gradient(op.input)
 		for sample in 0 ..< count {
 			base := sample * size
 			dot:  f32
@@ -2466,7 +2453,7 @@ softmax_backward :: proc(op: ml.Operation) {
 	}
 }
 
-log_softmax_forward :: proc(op: ml.Operation) {
+_log_softmax_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _log_softmax_forward_impl(f32,      op)
 	case .Bf16: _log_softmax_forward_impl(ml.Bf16, op)
@@ -2498,7 +2485,7 @@ _log_softmax_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-log_softmax_backward :: proc(op: ml.Operation) {
+_log_softmax_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	#partial switch op.input.type {
 	case .F32:  _log_softmax_backward_impl(f32,      op)
@@ -2512,8 +2499,8 @@ _log_softmax_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	count := ml.len(input) / size
 
 	yp := _typed_data(T, output)
-	dy := gradient(output)
-	dx := gradient(input)
+	dy := _gradient(output)
+	dx := _gradient(input)
 	for sample in 0 ..< count {
 		base := sample * size
 		grad_sum: f32
@@ -2526,7 +2513,7 @@ _log_softmax_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-entropy_forward :: proc(op: ml.Operation) {
+_entropy_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _entropy_forward_impl(f32,      op)
 	case .Bf16: _entropy_forward_impl(ml.Bf16, op)
@@ -2552,7 +2539,7 @@ _entropy_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-entropy_backward :: proc(op: ml.Operation) {
+_entropy_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	#partial switch op.input.type {
 	case .F32:  _entropy_backward_impl(f32,      op)
@@ -2566,8 +2553,8 @@ _entropy_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	count := ml.len(probabilities) / size
 
 	pp    := _typed_data(T, probabilities)
-	dp    := gradient(probabilities)
-	d_out := gradient(op.output)
+	dp    := _gradient(probabilities)
+	d_out := _gradient(op.output)
 	for sample in 0 ..< count {
 		base   := sample * size
 		dout_v := d_out[sample]
@@ -2580,7 +2567,7 @@ _entropy_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-mean_squared_error_forward :: proc(op: ml.Operation) {
+_mean_squared_error_forward :: proc(op: ml.Operation) {
 	predictions := op.input
 	output      := op.output
 	targets     := op.variant.(ml.Mean_Squared_Error).targets
@@ -2592,15 +2579,15 @@ mean_squared_error_forward :: proc(op: ml.Operation) {
 
 		for i in 0 ..< sample_size {
 			index := sample * sample_size + i
-			diff  := data(predictions)[index] - data(targets)[index]
+			diff  := _data(predictions)[index] - _data(targets)[index]
 			sum_squared_error += diff * diff
 		}
 
-		data(output)[sample] = sum_squared_error / f32(sample_size)
+		_data(output)[sample] = sum_squared_error / f32(sample_size)
 	}
 }
 
-mean_squared_error_backward :: proc(op: ml.Operation) {
+_mean_squared_error_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	predictions, output := op.input, op.output
 	targets := op.variant.(ml.Mean_Squared_Error).targets
@@ -2610,17 +2597,17 @@ mean_squared_error_backward :: proc(op: ml.Operation) {
 	for sample in 0 ..< count {
 		scale := 2.0 / f32(sample_size)
 
-		upstream_gradient := gradient(output)[sample]
+		upstream_gradient := _gradient(output)[sample]
 
 		for i in 0 ..< sample_size {
 			index := sample * sample_size + i
-			grad := scale * (data(predictions)[index] - data(targets)[index])
-			gradient(predictions)[index] += grad * upstream_gradient
+			grad := scale * (_data(predictions)[index] - _data(targets)[index])
+			_gradient(predictions)[index] += grad * upstream_gradient
 		}
 	}
 }
 
-smooth_l1_forward :: proc(op: ml.Operation) {
+_smooth_l1_forward :: proc(op: ml.Operation) {
 	predictions := op.input
 	output      := op.output
 	variant     := op.variant.(ml.Smooth_L1)
@@ -2634,7 +2621,7 @@ smooth_l1_forward :: proc(op: ml.Operation) {
 
 		for i in 0 ..< sample_size {
 			index := sample * sample_size + i
-			diff  := data(predictions)[index] - data(targets)[index]
+			diff  := _data(predictions)[index] - _data(targets)[index]
 			if abs(diff) < beta {
 				sum += 0.5 * diff * diff / beta
 			} else {
@@ -2642,11 +2629,11 @@ smooth_l1_forward :: proc(op: ml.Operation) {
 			}
 		}
 
-		data(output)[sample] = sum / f32(sample_size)
+		_data(output)[sample] = sum / f32(sample_size)
 	}
 }
 
-smooth_l1_backward :: proc(op: ml.Operation) {
+_smooth_l1_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	predictions, output := op.input, op.output
 	variant     := op.variant.(ml.Smooth_L1)
@@ -2658,18 +2645,18 @@ smooth_l1_backward :: proc(op: ml.Operation) {
 	for sample in 0 ..< count {
 		scale := 1.0 / f32(sample_size)
 
-		upstream_gradient := gradient(output)[sample]
+		upstream_gradient := _gradient(output)[sample]
 
 		for i in 0 ..< sample_size {
 			index := sample * sample_size + i
-			diff  := data(predictions)[index] - data(targets)[index]
+			diff  := _data(predictions)[index] - _data(targets)[index]
 			grad  := math.clamp(diff / beta, -1, 1) * scale
-			gradient(predictions)[index] += grad * upstream_gradient
+			_gradient(predictions)[index] += grad * upstream_gradient
 		}
 	}
 }
 
-cross_entropy_forward :: proc(op: ml.Operation) {
+_cross_entropy_forward :: proc(op: ml.Operation) {
 	input         := op.input
 	output        := op.output
 	variant       := op.variant.(ml.Cross_Entropy)
@@ -2684,28 +2671,28 @@ cross_entropy_forward :: proc(op: ml.Operation) {
 		max_value := math.NEG_INF_F32
 		for i in 0 ..< class_size {
 			index := offset + i
-			max_value = math.max(max_value, data(input)[index])
+			max_value = math.max(max_value, _data(input)[index])
 		}
 
 		sum: f32
 		for i in 0 ..< class_size {
 			index := offset + i
-			exp_val := math.exp(data(input)[index] - max_value)
-			data(probabilities)[index] = exp_val
+			exp_val := math.exp(_data(input)[index] - max_value)
+			_data(probabilities)[index] = exp_val
 			sum += exp_val
 		}
 
 		for i in 0 ..< class_size {
 			index := offset + i
-			data(probabilities)[index] /= sum
+			_data(probabilities)[index] /= sum
 		}
 
 		target_index := offset + target
-		data(output)[sample] = -data(input)[target_index] + max_value + math.ln(sum)
+		_data(output)[sample] = -_data(input)[target_index] + max_value + math.ln(sum)
 	}
 }
 
-cross_entropy_backward :: proc(op: ml.Operation) {
+_cross_entropy_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input, output := op.input, op.output
 
@@ -2718,15 +2705,15 @@ cross_entropy_backward :: proc(op: ml.Operation) {
 		offset := sample * class_size
 		target := targets[sample]
 
-		upstream_gradient := gradient(output)[sample]
+		upstream_gradient := _gradient(output)[sample]
 
 		for i in 0 ..< class_size {
 			index := offset + i
 			target_value: f32 = i == target ? 1 : 0
 
-			grad := (data(probabilities)[index] - target_value) * upstream_gradient
+			grad := (_data(probabilities)[index] - target_value) * upstream_gradient
 
-			gradient(input)[index] += grad
+			_gradient(input)[index] += grad
 		}
 	}
 }
@@ -2735,8 +2722,8 @@ _unary_forward_dispatch :: proc(op: ml.Operation, fwd_f32: proc(x: f32) -> f32) 
 	input, output := op.input, op.output
 	#partial switch input.type {
 	case .F32:
-		x := data(input)
-		y := data(output)
+		x := _data(input)
+		y := _data(output)
 		#no_bounds_check for i in 0 ..< ml.len(input) {
 			y[i] = fwd_f32(x[i])
 		}
@@ -2754,16 +2741,16 @@ _unary_backward_dispatch :: proc(op: ml.Operation, local_grad_from_input: proc(x
 	input, output := op.input, op.output
 	#partial switch input.type {
 	case .F32:
-		x  := data(input)
-		dx := gradient(input)
-		dy := gradient(output)
+		x  := _data(input)
+		dx := _gradient(input)
+		dy := _gradient(output)
 		#no_bounds_check for i in 0 ..< ml.len(input) {
 			dx[i] += dy[i] * local_grad_from_input(x[i])
 		}
 	case .Bf16:
-		x_bf := data_bf16(input)
-		dy   := gradient(output)
-		dx   := gradient(input)
+		x_bf := _data_bf16(input)
+		dy   := _gradient(output)
+		dx   := _gradient(input)
 		for i in 0 ..< ml.len(input) {
 			x_v := ml.bf16_to_f32(x_bf[i])
 			dx[i] += dy[i] * local_grad_from_input(x_v)
@@ -2771,39 +2758,39 @@ _unary_backward_dispatch :: proc(op: ml.Operation, local_grad_from_input: proc(x
 	}
 }
 
-relu_forward :: proc(op: ml.Operation) {
+_relu_forward :: proc(op: ml.Operation) {
 	if op.input.type != .F32 {
 		_unary_forward_dispatch(op, proc(x: f32) -> f32 { return x < 0 ? 0 : x })
 		return
 	}
 
-	x := data(op.input)
-	y := data(op.output)
+	x := _data(op.input)
+	y := _data(op.output)
 	#no_bounds_check for i in 0 ..< ml.len(op.input) {
 		y[i] = x[i] < 0 ? 0 : x[i]
 	}
 }
 
-relu_backward :: proc(op: ml.Operation) {
+_relu_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	if op.input.type != .F32 {
 		_unary_backward_dispatch(op, proc(x: f32) -> f32 { return x > 0 ? 1 : 0 })
 		return
 	}
 
-	x  := data(op.input)
-	dx := gradient(op.input)
-	dy := gradient(op.output)
+	x  := _data(op.input)
+	dx := _gradient(op.input)
+	dy := _gradient(op.output)
 	#no_bounds_check for i in 0 ..< ml.len(op.input) {
 		dx[i] += x[i] > 0 ? dy[i] : 0
 	}
 }
 
-sigmoid_forward :: proc(op: ml.Operation) {
+_sigmoid_forward :: proc(op: ml.Operation) {
 	_unary_forward_dispatch(op, proc(x: f32) -> f32 { return 1.0 / (1.0 + math.exp(-x)) })
 }
 
-sigmoid_backward :: proc(op: ml.Operation) {
+_sigmoid_backward :: proc(op: ml.Operation) {
 	_unary_backward_dispatch(op, proc(x: f32) -> f32 {
 		s := f32(1.0 / (1.0 + math.exp(-x)))
 		return s * (1.0 - s)
@@ -2812,14 +2799,14 @@ sigmoid_backward :: proc(op: ml.Operation) {
 
 GELU_SCALING_FACTOR :: 0.7978845608028654 // math.sqrt(f32(2) / math.PI)
 
-gelu_forward :: proc(op: ml.Operation) {
+_gelu_forward :: proc(op: ml.Operation) {
 	_unary_forward_dispatch(op, proc(x: f32) -> f32 {
 		cube := f32(0.044715) * x * x * x
 		return 0.5 * x * (1.0 + math.tanh(f32(GELU_SCALING_FACTOR) * (x + cube)))
 	})
 }
 
-gelu_backward :: proc(op: ml.Operation) {
+_gelu_backward :: proc(op: ml.Operation) {
 	_unary_backward_dispatch(op, proc(x: f32) -> f32 {
 		cube     := f32(0.044715) * x * x * x
 		tanh_arg := f32(GELU_SCALING_FACTOR) * (x + cube)
@@ -2830,7 +2817,7 @@ gelu_backward :: proc(op: ml.Operation) {
 	})
 }
 
-gelu_mul_forward :: proc(op: ml.Operation) {
+_gelu_mul_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _gelu_mul_forward_impl(f32,      op)
 	case .Bf16: _gelu_mul_forward_impl(ml.Bf16, op)
@@ -2858,44 +2845,44 @@ _gelu_mul_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-silu_forward :: proc(op: ml.Operation) {
+_silu_forward :: proc(op: ml.Operation) {
 	_unary_forward_dispatch(op, proc(x: f32) -> f32 {
 		s := f32(1.0 / (1.0 + math.exp(-x)))
 		return x * s
 	})
 }
 
-silu_backward :: proc(op: ml.Operation) {
+_silu_backward :: proc(op: ml.Operation) {
 	_unary_backward_dispatch(op, proc(x: f32) -> f32 {
 		s := f32(1.0 / (1.0 + math.exp(-x)))
 		return s + x * s * (1.0 - s)
 	})
 }
 
-tanh_forward :: proc(op: ml.Operation) {
+_tanh_forward :: proc(op: ml.Operation) {
 	_unary_forward_dispatch(op, proc(x: f32) -> f32 { return math.tanh(x) })
 }
 
-tanh_backward :: proc(op: ml.Operation) {
+_tanh_backward :: proc(op: ml.Operation) {
 	_unary_backward_dispatch(op, proc(x: f32) -> f32 {
 		t := math.tanh(x)
 		return 1.0 - t * t
 	})
 }
 
-batched_matmul_forward :: proc(op: ml.Operation) {
+_batched_matmul_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  batched_matmul_forward_f32 (op)
-	case .Bf16: batched_matmul_forward_bf16(op)
+	case .F32:  _batched_matmul_forward_f32 (op)
+	case .Bf16: _batched_matmul_forward_bf16(op)
 	}
 }
 
-batched_matmul_forward_bf16 :: proc(op: ml.Operation) {
+_batched_matmul_forward_bf16 :: proc(op: ml.Operation) {
 	a           := op.input
 	batch_count := a.shape[0]
 	m           := a.shape[1]
 
-	parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
+	_parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
 		a       := op.input
 		output  := op.output
 		bt      := op.variant.(ml.Batched_Matmul).b
@@ -2924,12 +2911,12 @@ batched_matmul_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-batched_matmul_forward_f32 :: proc(op: ml.Operation) {
+_batched_matmul_forward_f32 :: proc(op: ml.Operation) {
 	a := op.input
 	batch_count := a.shape[0]
 	m := a.shape[1]
 
-	parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
+	_parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
 		a       := op.input
 		output  := op.output
 		bt      := op.variant.(ml.Batched_Matmul).b
@@ -2941,9 +2928,9 @@ batched_matmul_forward_f32 :: proc(op: ml.Operation) {
 		bi := idx / m
 		i  := idx % m
 
-		a_ptr := ([^]f32)(raw_data(data(a)))
-		b_ptr := ([^]f32)(raw_data(data(bt)))
-		c_ptr := ([^]f32)(raw_data(data(output)))
+		a_ptr := ([^]f32)(raw_data(_data(a)))
+		b_ptr := ([^]f32)(raw_data(_data(bt)))
+		c_ptr := ([^]f32)(raw_data(_data(output)))
 
 		a_row := a_ptr[bi * m * kk_count + i * kk_count:]
 		c_row := c_ptr[bi * m * n + i * n:]
@@ -2958,14 +2945,14 @@ batched_matmul_forward_f32 :: proc(op: ml.Operation) {
 	})
 }
 
-batched_matmul_backward :: proc(op: ml.Operation) {
+_batched_matmul_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  batched_matmul_backward_f32 (op)
-	case .Bf16: batched_matmul_backward_bf16(op)
+	case .F32:  _batched_matmul_backward_f32 (op)
+	case .Bf16: _batched_matmul_backward_bf16(op)
 	}
 }
 
-batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
+_batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 	a           := op.input
 	bt          := op.variant.(ml.Batched_Matmul).b
 	batch_count := a.shape[0]
@@ -2973,7 +2960,7 @@ batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 	k           := a.shape[2]
 
 	if ml.has_gradient(a) {
-		parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
+		_parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
 			a       := op.input
 			output  := op.output
 			bt      := op.variant.(ml.Batched_Matmul).b
@@ -2984,9 +2971,9 @@ batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 			bi := idx / m
 			i  := idx % m
 
-			b_bf := data_bf16(bt)
-			dc   := gradient(output)
-			da   := gradient(a)
+			b_bf := _data_bf16(bt)
+			dc   := _gradient(output)
+			da   := _gradient(a)
 
 			dc_row := dc[bi * m * n + i * n:]
 			da_row := da[bi * m * k_count + i * k_count:]
@@ -3002,7 +2989,7 @@ batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 	}
 
 	if ml.has_gradient(bt) {
-		parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
+		_parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
 			a       := op.input
 			output  := op.output
 			bt      := op.variant.(ml.Batched_Matmul).b
@@ -3013,9 +3000,9 @@ batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 			bi := idx / k_count
 			kk := idx % k_count
 
-			a_bf := data_bf16(a)
-			dc   := gradient(output)
-			db   := gradient(bt)
+			a_bf := _data_bf16(a)
+			dc   := _gradient(output)
+			db   := _gradient(bt)
 
 			db_row := db[bi * k_count * n + kk * n:]
 			for j in 0 ..< n {
@@ -3030,7 +3017,7 @@ batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 	}
 }
 
-batched_matmul_backward_f32 :: proc(op: ml.Operation) {
+_batched_matmul_backward_f32 :: proc(op: ml.Operation) {
 	a := op.input
 	bt := op.variant.(ml.Batched_Matmul).b
 	batch_count := a.shape[0]
@@ -3038,7 +3025,7 @@ batched_matmul_backward_f32 :: proc(op: ml.Operation) {
 	k := a.shape[2]
 
 	if ml.has_gradient(a) {
-		parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
+		_parallelize(batch_count * m, batch_count * m, op, proc(idx: int, op: ml.Operation) {
 			a       := op.input
 			output  := op.output
 			bt      := op.variant.(ml.Batched_Matmul).b
@@ -3050,9 +3037,9 @@ batched_matmul_backward_f32 :: proc(op: ml.Operation) {
 			bi := idx / m
 			i  := idx % m
 
-			a_grad_ptr := ([^]f32)(raw_data(gradient(a)))
-			b_data_ptr := ([^]f32)(raw_data(data(bt)))
-			c_grad_ptr := ([^]f32)(raw_data(gradient(output)))
+			a_grad_ptr := ([^]f32)(raw_data(_gradient(a)))
+			b_data_ptr := ([^]f32)(raw_data(_data(bt)))
+			c_grad_ptr := ([^]f32)(raw_data(_gradient(output)))
 
 			dc_row := c_grad_ptr[bi * m * n + i * n:]
 			da_row := a_grad_ptr[bi * m * kk_count + i * kk_count:]
@@ -3065,7 +3052,7 @@ batched_matmul_backward_f32 :: proc(op: ml.Operation) {
 	}
 
 	if ml.has_gradient(bt) {
-		parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
+		_parallelize(batch_count * k, batch_count * k, op, proc(idx: int, op: ml.Operation) {
 			a       := op.input
 			output  := op.output
 			bt      := op.variant.(ml.Batched_Matmul).b
@@ -3077,9 +3064,9 @@ batched_matmul_backward_f32 :: proc(op: ml.Operation) {
 			bi := idx / kk_count
 			kk := idx % kk_count
 
-			a_data_ptr := ([^]f32)(raw_data(data(a)))
-			b_grad_ptr := ([^]f32)(raw_data(gradient(bt)))
-			c_grad_ptr := ([^]f32)(raw_data(gradient(output)))
+			a_data_ptr := ([^]f32)(raw_data(_data(a)))
+			b_grad_ptr := ([^]f32)(raw_data(_gradient(bt)))
+			c_grad_ptr := ([^]f32)(raw_data(_gradient(output)))
 
 			db_row := b_grad_ptr[bi * kk_count * n + kk * n:]
 
@@ -3092,7 +3079,7 @@ batched_matmul_backward_f32 :: proc(op: ml.Operation) {
 	}
 }
 
-permute_forward :: proc(op: ml.Operation) {
+_permute_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _permute_forward_impl(f32,      op)
 	case .Bf16: _permute_forward_impl(ml.Bf16, op)
@@ -3127,7 +3114,7 @@ _permute_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-permute_backward :: proc(op: ml.Operation) {
+_permute_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input   := op.input
 	output  := op.output
@@ -3137,7 +3124,7 @@ permute_backward :: proc(op: ml.Operation) {
 	out_shape  := [3]int{output.shape[0],           output.shape[1], output.shape[2]}
 	in_strides := [3]int{in_shape[1] * in_shape[2], in_shape[2],     1              }
 
-	dx, dy := gradient(input), gradient(output)
+	dx, dy := _gradient(input), _gradient(output)
 	for i0 in 0 ..< out_shape[0] {
 		for i1 in 0 ..< out_shape[1] {
 			for i2 in 0 ..< out_shape[2] {
@@ -3155,7 +3142,7 @@ permute_backward :: proc(op: ml.Operation) {
 	}
 }
 
-causal_mask_forward :: proc(op: ml.Operation) {
+_causal_mask_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
 	case .F32:  _causal_mask_forward_impl(f32,      op)
 	case .Bf16: _causal_mask_forward_impl(ml.Bf16, op)
@@ -3194,7 +3181,7 @@ _causal_mask_forward_impl :: proc($T: typeid, op: ml.Operation) {
 	}
 }
 
-causal_mask_backward :: proc(op: ml.Operation) {
+_causal_mask_backward :: proc(op: ml.Operation) {
 	if !ml.has_gradient(op.input) { return }
 	input  := op.input
 	output := op.output
@@ -3203,7 +3190,7 @@ causal_mask_backward :: proc(op: ml.Operation) {
 	block_size := T * T
 	n_blocks   := ml.len(input) / block_size
 
-	dx, dy := gradient(input), gradient(output)
+	dx, dy := _gradient(input), _gradient(output)
 	for blk in 0 ..< n_blocks {
 		offset := blk * block_size
 		for t1 in 0 ..< T {
@@ -3215,17 +3202,17 @@ causal_mask_backward :: proc(op: ml.Operation) {
 	}
 }
 
-attention_forward :: proc(op: ml.Operation) {
+_attention_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  attention_forward_f32 (op)
-	case .Bf16: attention_forward_bf16(op)
+	case .F32:  _attention_forward_f32 (op)
+	case .Bf16: _attention_forward_bf16(op)
 	}
 }
 
-attention_forward_f32 :: proc(op: ml.Operation) {
+_attention_forward_f32 :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Attention)
 
-	parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
+	_parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
 		token_count := op.input.shape[0]
@@ -3238,11 +3225,11 @@ attention_forward_f32 :: proc(op: ml.Operation) {
 		window      := v.window
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		q_ptr   := ([^]f32)(raw_data(data(op.input)))
-		k_ptr   := ([^]f32)(raw_data(data(v.key)))
-		v_ptr   := ([^]f32)(raw_data(data(v.value)))
-		out_ptr := ([^]f32)(raw_data(data(op.output)))
-		sm_ptr  := ([^]f32)(raw_data(data(v.softmax_outputs)))
+		q_ptr   := ([^]f32)(raw_data(_data(op.input)))
+		k_ptr   := ([^]f32)(raw_data(_data(v.key)))
+		v_ptr   := ([^]f32)(raw_data(_data(v.value)))
+		out_ptr := ([^]f32)(raw_data(_data(op.output)))
+		sm_ptr  := ([^]f32)(raw_data(_data(v.softmax_outputs)))
 
 		for t_q in 0 ..< token_count {
 			q_offset := t_q * q_size + h * head_size
@@ -3293,10 +3280,10 @@ attention_forward_f32 :: proc(op: ml.Operation) {
 	})
 }
 
-attention_forward_bf16 :: proc(op: ml.Operation) {
+_attention_forward_bf16 :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Attention)
 
-	parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
+	_parallelize(v.n_q_heads, v.n_q_heads, op, proc(h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
 		token_count := op.input.shape[0]
@@ -3313,7 +3300,7 @@ attention_forward_bf16 :: proc(op: ml.Operation) {
 		k_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.key.buffers   [.Data]))
 		v_ptr   := ([^]ml.Bf16)(raw_data(transmute([]byte)v.value.buffers [.Data]))
 		out_ptr := ([^]ml.Bf16)(raw_data(transmute([]byte)op.output.buffers[.Data]))
-		sm_ptr  := ([^]f32)(raw_data(data(v.softmax_outputs)))
+		sm_ptr  := ([^]f32)(raw_data(_data(v.softmax_outputs)))
 
 		for t_q in 0 ..< token_count {
 			q_offset := t_q * q_size + h * head_size
@@ -3368,17 +3355,17 @@ attention_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-attention_backward :: proc(op: ml.Operation) {
+_attention_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  attention_backward_f32 (op)
-	case .Bf16: attention_backward_bf16(op)
+	case .F32:  _attention_backward_f32 (op)
+	case .Bf16: _attention_backward_bf16(op)
 	}
 }
 
-attention_backward_f32 :: proc(op: ml.Operation) {
+_attention_backward_f32 :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Attention)
 
-	parallelize(v.n_kv_heads, v.n_kv_heads, op, proc(kv_h: int, op: ml.Operation) {
+	_parallelize(v.n_kv_heads, v.n_kv_heads, op, proc(kv_h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
 		token_count := op.input.shape[0]
@@ -3390,15 +3377,15 @@ attention_backward_f32 :: proc(op: ml.Operation) {
 		window      := v.window
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		q_data    := ([^]f32)(raw_data(data(op.input)))
-		q_grad    := ([^]f32)(raw_data(gradient(op.input)))
-		k_data    := ([^]f32)(raw_data(data(v.key)))
-		k_grad    := ([^]f32)(raw_data(gradient(v.key)))
-		v_data    := ([^]f32)(raw_data(data(v.value)))
-		v_grad    := ([^]f32)(raw_data(gradient(v.value)))
-		out_grad  := ([^]f32)(raw_data(gradient(op.output)))
-		sm_ptr    := ([^]f32)(raw_data(data(v.softmax_outputs)))
-		dp_ptr    := ([^]f32)(raw_data(data(v.d_p_scratch)))
+		q_data    := ([^]f32)(raw_data(_data(op.input)))
+		q_grad    := ([^]f32)(raw_data(_gradient(op.input)))
+		k_data    := ([^]f32)(raw_data(_data(v.key)))
+		k_grad    := ([^]f32)(raw_data(_gradient(v.key)))
+		v_data    := ([^]f32)(raw_data(_data(v.value)))
+		v_grad    := ([^]f32)(raw_data(_gradient(v.value)))
+		out_grad  := ([^]f32)(raw_data(_gradient(op.output)))
+		sm_ptr    := ([^]f32)(raw_data(_data(v.softmax_outputs)))
+		dp_ptr    := ([^]f32)(raw_data(_data(v.d_p_scratch)))
 
 		have_dq := ml.has_gradient(op.input)
 		have_dk := ml.has_gradient(v.key)
@@ -3450,10 +3437,10 @@ attention_backward_f32 :: proc(op: ml.Operation) {
 	})
 }
 
-attention_backward_bf16 :: proc(op: ml.Operation) {
+_attention_backward_bf16 :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Attention)
 
-	parallelize(v.n_kv_heads, v.n_kv_heads, op, proc(kv_h: int, op: ml.Operation) {
+	_parallelize(v.n_kv_heads, v.n_kv_heads, op, proc(kv_h: int, op: ml.Operation) {
 		v := op.variant.(ml.Attention)
 
 		token_count := op.input.shape[0]
@@ -3465,15 +3452,15 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 		window      := v.window
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		q_data   := data_bf16(op.input)
-		q_grad   := gradient(op.input)
-		k_data   := data_bf16(v.key)
-		k_grad   := gradient(v.key)
-		v_data   := data_bf16(v.value)
-		v_grad   := gradient(v.value)
-		out_grad := gradient(op.output)
-		sm_ptr   := ([^]f32)(raw_data(data(v.softmax_outputs)))
-		dp_ptr   := ([^]f32)(raw_data(data(v.d_p_scratch)))
+		q_data   := _data_bf16(op.input)
+		q_grad   := _gradient(op.input)
+		k_data   := _data_bf16(v.key)
+		k_grad   := _gradient(v.key)
+		v_data   := _data_bf16(v.value)
+		v_grad   := _gradient(v.value)
+		out_grad := _gradient(op.output)
+		sm_ptr   := ([^]f32)(raw_data(_data(v.softmax_outputs)))
+		dp_ptr   := ([^]f32)(raw_data(_data(v.d_p_scratch)))
 
 		have_dq := ml.has_gradient(op.input)
 		have_dk := ml.has_gradient(v.key)
@@ -3536,7 +3523,7 @@ attention_backward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-attention_cache_forward :: proc(op: ml.Operation) {
+_attention_cache_forward :: proc(op: ml.Operation) {
 	v := op.variant.(ml.Attention_Cache)
 
 	token_count := op.input.shape[0]
@@ -3565,12 +3552,12 @@ attention_cache_forward :: proc(op: ml.Operation) {
 	}
 
 	#partial switch op.input.type {
-	case .F32:  attention_cache_forward_f32 (op)
-	case .Bf16: attention_cache_forward_bf16(op)
+	case .F32:  _attention_cache_forward_f32 (op)
+	case .Bf16: _attention_cache_forward_bf16(op)
 	}
 }
 
-attention_cache_forward_f32 :: proc(op: ml.Operation) {
+_attention_cache_forward_f32 :: proc(op: ml.Operation) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	v := op.variant.(ml.Attention_Cache)
@@ -3589,7 +3576,7 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 		k_total = k_total,
 	}
 
-	parallelize(v.n_q_heads, v.n_q_heads, jd, proc(h: int, jd: Job_Data) {
+	_parallelize(v.n_q_heads, v.n_q_heads, jd, proc(h: int, jd: Job_Data) {
 		op := jd.op
 		v := op.variant.(ml.Attention_Cache)
 
@@ -3605,10 +3592,10 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 		k_total     := jd.k_total
 		inv_sqrt_d  := 1.0 / math.sqrt(f32(head_size))
 
-		q_ptr   := ([^]f32)(raw_data(data(op.input)))
-		k_ptr   := ([^]f32)(raw_data(data(v.k_cache)))
-		v_ptr   := ([^]f32)(raw_data(data(v.v_cache)))
-		out_ptr := ([^]f32)(raw_data(data(op.output)))
+		q_ptr   := ([^]f32)(raw_data(_data(op.input)))
+		k_ptr   := ([^]f32)(raw_data(_data(v.k_cache)))
+		v_ptr   := ([^]f32)(raw_data(_data(v.v_cache)))
+		out_ptr := ([^]f32)(raw_data(_data(op.output)))
 
 		scores := jd.scratch[h * k_total : (h + 1) * k_total]
 
@@ -3648,7 +3635,7 @@ attention_cache_forward_f32 :: proc(op: ml.Operation) {
 	})
 }
 
-attention_cache_forward_bf16 :: proc(op: ml.Operation) {
+_attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	v := op.variant.(ml.Attention_Cache)
@@ -3667,7 +3654,7 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 		k_total = k_total,
 	}
 
-	parallelize(v.n_q_heads, v.n_q_heads, jd, proc(h: int, jd: Job_Data) {
+	_parallelize(v.n_q_heads, v.n_q_heads, jd, proc(h: int, jd: Job_Data) {
 		op := jd.op
 		v := op.variant.(ml.Attention_Cache)
 
@@ -3726,6 +3713,6 @@ attention_cache_forward_bf16 :: proc(op: ml.Operation) {
 	})
 }
 
-attention_cache_backward :: proc(op: ml.Operation, loc := #caller_location) {
-	panic("Attention_Cache is forward-only", loc)
+_attention_cache_backward :: proc(op: ml.Operation, loc := #caller_location) {
+	panic("Attention_Cache is _forward-only", loc)
 }
