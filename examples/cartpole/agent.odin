@@ -98,8 +98,10 @@ agent_make :: proc(allocator := context.allocator) -> (agent: ^Agent) {
 
 	for m in 0 ..< ENSEMBLE_SIZE {
 		agent.models[m] = mlp.make(MODEL_INPUT, HIDDEN_SIZE, OBS_SIZE, allocator=allocator)
+		agent.opts[m]   = ml.optimizer_make(learning_rate=LEARNING_RATE)
 	}
-	agent.policy = mlp.make(OBS_SIZE, HIDDEN_SIZE, ACTION_COUNT, allocator=allocator)
+	agent.policy     = mlp.make(OBS_SIZE, HIDDEN_SIZE, ACTION_COUNT, allocator=allocator)
+	agent.policy_opt = ml.optimizer_make(learning_rate=POLICY_RATE)
 
 	agent_forget_episode(agent)
 	return
@@ -217,7 +219,7 @@ agent_policy_action :: proc(agent: ^Agent, observation: Observation) -> Action {
 
 	ml.clear()
 
-	x      := ml.reshape(ml.tensor(input), {1, OBS_SIZE})
+	x      := ml.tensor(input, []int{1, OBS_SIZE})
 	output := mlp.forward(agent.policy, x)
 	ml.get_data(output, logits)
 
@@ -250,13 +252,13 @@ agent_train_policy :: proc(agent: ^Agent, steps: int) {
 			targets[b] = int(sample.action)
 		}
 
-		x      := ml.reshape(ml.tensor(inputs), {TRAIN_BATCH_SIZE, OBS_SIZE})
+		x      := ml.tensor(inputs, []int{TRAIN_BATCH_SIZE, OBS_SIZE})
 		logits := mlp.forward(agent.policy, x)
 		loss   := ml.mean(ml.cross_entropy(logits, targets))
 
 		ml.backward(loss)
 
-		if ml.optimizer_step(&agent.policy_opt, period=1, learning_rate=POLICY_RATE) {
+		if ml.optimizer_step(&agent.policy_opt) {
 			mlp.update(&agent.policy_opt, agent.policy)
 		}
 	}
@@ -328,8 +330,8 @@ agent_train :: proc(agent: ^Agent, steps: int) {
 				}
 			}
 
-			x          := ml.reshape(ml.tensor(inputs),  {TRAIN_BATCH_SIZE, MODEL_INPUT})
-			y          := ml.reshape(ml.tensor(targets), {TRAIN_BATCH_SIZE, OBS_SIZE})
+			x          := ml.tensor(inputs,  []int{TRAIN_BATCH_SIZE, MODEL_INPUT})
+			y          := ml.tensor(targets, []int{TRAIN_BATCH_SIZE, OBS_SIZE})
 			prediction := mlp.forward(agent.models[m], x)
 			loss       := ml.mean(ml.mean_squared_error(prediction, y))
 
@@ -339,7 +341,7 @@ agent_train :: proc(agent: ^Agent, steps: int) {
 		ml.backward(total)
 
 		for m in 0 ..< ENSEMBLE_SIZE {
-			if ml.optimizer_step(&agent.opts[m], period=1, learning_rate=LEARNING_RATE) {
+			if ml.optimizer_step(&agent.opts[m]) {
 				mlp.update(&agent.opts[m], agent.models[m])
 			}
 		}
@@ -429,7 +431,7 @@ agent_rollout :: proc(agent: ^Agent, observation: Observation, sequences: [][PLA
 				encode(states[n * ENSEMBLE_SIZE + m], sequences[n][h], inputs[n * MODEL_INPUT:][:MODEL_INPUT])
 			}
 
-			x          := ml.reshape(ml.tensor(inputs), {PLAN_SAMPLES, MODEL_INPUT})
+			x          := ml.tensor(inputs, []int{PLAN_SAMPLES, MODEL_INPUT})
 			prediction := mlp.forward(agent.models[m], x)
 			ml.get_data(prediction, deltas)
 

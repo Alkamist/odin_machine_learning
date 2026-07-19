@@ -168,7 +168,17 @@ Acceptance: llama and gemma expose `parameters`; `checkpoint_save`/`checkpoint_l
 
 ---
 
-## Phase 3 — Core API cleanups
+## Phase 3 — Core API cleanups — DONE (2026-07-18)
+
+- **3.1 Optimizer:** hyperparameters moved into `Optimizer`, set once via `optimizer_make(learning_rate=…, beta1=…, …, accumulation_steps=1, kind=.Adam_W)`; `optimizer_step(opt)` takes no per-call config. `period` renamed to `accumulation_steps`, default 1 (the old 128 default was a trap — every caller passed 1). LR schedules write `opt.learning_rate` directly. `Optimizer_Kind` enum added (only `.Adam_W`) so an SGD variant extends rather than redesigns. All callers updated (mnist, cartpole, four test files). Verified contract: `Backend.update` zeroes the gradient as a side effect on BOTH backends (CPU cpu.odin update; CUDA adam_f32.cu/adam_bf16.cu `g[i] = 0.0f`) — one accumulation window ends exactly at `update`.
+- **3.2 Loss reduction:** option (a) adopted — `backward` asserts `loss.count == 1`. mnist's silent sum-reduction fixed with an explicit `ml.mean` (its effective LR therefore drops by the batch factor; mean + Adam lr=1e-3 is the standard configuration). The parity harness previously backprop'd a non-scalar deliberately (CUDA lacks a Mean backward kernel); it now reduces via `linear` against a frozen 1/count vector — supported on both backends, gradient-sink contract keeps the weight frozen.
+- **3.4 Op-list boilerplate:** four hand-maintained lists are now two. `OPERATION_SET_ALL :: ~Operation_Set{}`; `operation_kind` reads the union raw tag (variant index − 1); `_context_init` verifies name-for-name order correspondence of `Operation_Variant` vs `Operation_Kind` via runtime type info. Adding an op is now: union variant + enum value (same position), and any order mistake fails loudly at startup.
+- **3.3 Ergonomics:** `tensor` is a proc group (`tensor(data)` 1-D, `tensor(data, shape)` — call sites need an explicit `[]int{...}` literal for overload resolution); all `reshape(tensor(x), {...})` call sites converted. New `slice_leading(input, start, end)` op on both backends (CUDA forward is a contiguous `MemcpyDtoDAsync`, no kernel; backward is a small accumulate kernel), with a cases-registry entry covered by grad-check and parity. Host-side `argmax(t, results)` over the trailing dim; mnist's predict uses it (softmax dropped — monotonic). llm_chat `_copy_last_row` now slices the last logits row on-device instead of copying the whole [tokens, vocab] matrix to host.
+- **3.5 Dtype asserts:** with the Phase 1.1 asserts in place, the only remaining both-backends-F32-only op missing a front-end assert was `sqrt` — added. Per-backend dtype limits (e.g. CUDA F32-only Exp/Softmax) stay as clean backend panics; the exhaustive op × dtype × backend support-table test remains Phase 5 work.
+
+Original plan below.
+
+## Phase 3 (original) — Core API cleanups
 
 ### 3.1 Optimizer
 

@@ -23,14 +23,14 @@ test_checkpoint_optimizer_iteration_roundtrip :: proc(t: ^testing.T) {
 	}
 	ml.set_data(param, init_w[:])
 
-	opt:  ml.Optimizer
+	opt := ml.optimizer_make(learning_rate=ADAM_LR, beta1=ADAM_B1, beta2=ADAM_B2, epsilon=ADAM_EPS, weight_decay=ADAM_WD)
 	grad: [CHECKPOINT_TEST_SIZE]f32
 	for step in 1 ..= CHECKPOINT_TEST_STEPS {
 		for i in 0 ..< CHECKPOINT_TEST_SIZE {
 			grad[i] = _adam_grad(step, i)
 		}
 		ml.set_bytes(param, .Gradient, mem.slice_to_bytes(grad[:]))
-		_ = ml.optimizer_step(&opt, period=1, learning_rate=ADAM_LR, beta1=ADAM_B1, beta2=ADAM_B2, epsilon=ADAM_EPS, weight_decay=ADAM_WD)
+		_ = ml.optimizer_step(&opt)
 		ml.update(&opt, param)
 	}
 	testing.expect_value(t, opt.iteration, u64(CHECKPOINT_TEST_STEPS))
@@ -43,7 +43,7 @@ test_checkpoint_optimizer_iteration_roundtrip :: proc(t: ^testing.T) {
 
 	restored_param := ml.make(.F32, {CHECKPOINT_TEST_SIZE})
 	restored_params := []ml.Parameter{{name="weight", tensor=restored_param}}
-	restored_opt: ml.Optimizer
+	restored_opt := ml.optimizer_make(learning_rate=ADAM_LR, beta1=ADAM_B1, beta2=ADAM_B2, epsilon=ADAM_EPS, weight_decay=ADAM_WD)
 	loaded_metadata, loaded := ml.checkpoint_load(CHECKPOINT_TEST_PATH, restored_params, &restored_opt)
 	testing.expect(t, loaded, "checkpoint_load should succeed")
 	defer ml.checkpoint_metadata_destroy(loaded_metadata)
@@ -58,8 +58,8 @@ test_checkpoint_optimizer_iteration_roundtrip :: proc(t: ^testing.T) {
 		testing.expect_value(t, restored_w[i], saved_w[i])
 	}
 
-	stepped := ml.optimizer_step(&restored_opt, period=1, learning_rate=ADAM_LR, beta1=ADAM_B1, beta2=ADAM_B2, epsilon=ADAM_EPS, weight_decay=ADAM_WD)
-	testing.expect(t, stepped, "optimizer_step should fire with period=1")
+	stepped := ml.optimizer_step(&restored_opt)
+	testing.expect(t, stepped, "optimizer_step should fire every step by default")
 	testing.expect_value(t, restored_opt.iteration, u64(CHECKPOINT_TEST_STEPS + 1))
 
 	ml.optimizer_destroy(&opt)

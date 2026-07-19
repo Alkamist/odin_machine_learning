@@ -65,9 +65,9 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		loss   := ml.mean(ml.cross_entropy(logits, []int{2, 3, 4}))
 		ml.backward(loss)
 
-		opt: ml.Optimizer
-		stepped := ml.optimizer_step(&opt, period=1, learning_rate=1e-3, beta1=0.9, beta2=0.999, epsilon=1e-8, weight_decay=0)
-		testing.expect(t, stepped, "optimizer_step should fire with period=1")
+		opt := ml.optimizer_make(learning_rate=1e-3)
+		stepped := ml.optimizer_step(&opt)
+		testing.expect(t, stepped, "optimizer_step should fire every step by default")
 		gemma.update(&opt, model)
 		ml.clear()
 

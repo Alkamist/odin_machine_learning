@@ -84,6 +84,7 @@ SLICE_TRAILING_F32_SRC       :: #load("kernels/slice_trailing/slice_trailing.cu"
 SLICE_TRAILING_BF16_SRC      :: #load("kernels/slice_trailing/slice_trailing_bf16.cu",     []u8)
 SLICE_TRAILING_BACK_F32_SRC  :: #load("kernels/slice_trailing/slice_trailing_back_f32.cu",  []u8)
 SLICE_TRAILING_BACK_BF16_SRC :: #load("kernels/slice_trailing/slice_trailing_back_bf16.cu", []u8)
+SLICE_LEADING_BACK_F32_SRC   :: #load("kernels/slice_leading/slice_leading_back_f32.cu",    []u8)
 
 ADAM_F32_SRC  :: #load("kernels/optimizer/adam_f32.cu",  []u8)
 ADAM_BF16_SRC :: #load("kernels/optimizer/adam_bf16.cu", []u8)

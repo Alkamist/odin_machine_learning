@@ -234,11 +234,11 @@ _backend := ml.Backend{
 		.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K,
 		.Rmsnorm, .Add_Rmsnorm, .Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache,
 		.Rope, .Attention, .Attention_Cache, .Cross_Entropy,
-		.Select, .Slice_Trailing, .Exp, .Clamp, .Min, .Softmax, .Entropy,
+		.Select, .Slice_Trailing, .Slice_Leading, .Exp, .Clamp, .Min, .Softmax, .Entropy,
 	},
 	backward_ops = {
 		.Add, .Mul, .Linear, .Linear_Q4_K, .Linear_Q6_K, .Silu, .Gelu,
-		.Tanh, .Select, .Slice_Trailing, .Rmsnorm, .Rope, .Attention,
+		.Tanh, .Select, .Slice_Trailing, .Slice_Leading, .Rmsnorm, .Rope, .Attention,
 		.Cross_Entropy, .Cast, .Exp, .Clamp, .Min, .Softmax, .Entropy,
 	},
 }

@@ -564,6 +564,7 @@ forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Select:             select_forward             (op)
 	case ml.Slice:              slice_forward              (op)
 	case ml.Slice_Trailing:     slice_trailing_forward     (op)
+	case ml.Slice_Leading:      slice_leading_forward      (op)
 	case ml.Concat:             concat_forward             (op)
 	case ml.Linear:             linear_forward             (op)
 	case ml.Linear_Q4_K:        linear_q4_k_forward        (op)
@@ -614,6 +615,7 @@ backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Select:             select_backward            (op)
 	case ml.Slice:              slice_backward             (op)
 	case ml.Slice_Trailing:     slice_trailing_backward    (op)
+	case ml.Slice_Leading:      slice_leading_backward     (op)
 	case ml.Concat:             concat_backward            (op)
 	case ml.Linear:             linear_backward            (op)
 	case ml.Linear_Q4_K:        panic("Linear_Q4_K is forward-only", loc)
@@ -1273,6 +1275,49 @@ slice_trailing_backward :: proc(op: ml.Operation) {
 		for i in 0 ..< new_trailing {
 			dx[in_off + i] += dy[out_off + i]
 		}
+	}
+}
+
+slice_leading_forward :: proc(op: ml.Operation) {
+	input   := op.input
+	output  := op.output
+	variant := op.variant.(ml.Slice_Leading)
+	start   := variant.start
+
+	leading  := input.shape[0]
+	row_size := ml.len(input) / leading
+	count    := output.shape[0] * row_size
+	in_off   := start * row_size
+
+	#partial switch input.type {
+	case .F32:
+		for i in 0 ..< count {
+			data(output)[i] = data(input)[in_off + i]
+		}
+	case .Bf16:
+		in_bf  := ([^]ml.Bf16)(raw_data(transmute([]byte)input.buffers [.Data]))
+		out_bf := ([^]ml.Bf16)(raw_data(transmute([]byte)output.buffers[.Data]))
+		for i in 0 ..< count {
+			out_bf[i] = in_bf[in_off + i]
+		}
+	}
+}
+
+slice_leading_backward :: proc(op: ml.Operation) {
+	if !ml.has_gradient(op.input) { return }
+	input, output := op.input, op.output
+
+	variant := op.variant.(ml.Slice_Leading)
+	start   := variant.start
+
+	leading  := input.shape[0]
+	row_size := ml.len(input) / leading
+	count    := output.shape[0] * row_size
+	in_off   := start * row_size
+
+	dx, dy := gradient(input), gradient(output)
+	for i in 0 ..< count {
+		dx[in_off + i] += dy[i]
 	}
 }
 

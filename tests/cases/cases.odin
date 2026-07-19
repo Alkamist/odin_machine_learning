@@ -68,6 +68,7 @@ _build :: proc() {
 	_add({name = "select",             kind = .Select,             input_count = 1, inputs = {0 = sp(true, 4, 3)},                    run = run_select,         prepare = prep_normal,  tol = 0.01,  seed = 12})
 	_add({name = "slice",              kind = .Slice,              input_count = 1, inputs = {0 = sp(true, 8)},                       run = run_slice,          prepare = prep_normal,  tol = 0.01,  seed = 13})
 	_add({name = "slice_trailing",     kind = .Slice_Trailing,     input_count = 1, inputs = {0 = sp(true, 3, 5)},                    run = run_slice_trailing, prepare = prep_normal,  tol = 0.01,  seed = 14})
+	_add({name = "slice_leading",      kind = .Slice_Leading,      input_count = 1, inputs = {0 = sp(true, 5, 3)},                    run = run_slice_leading,  prepare = prep_normal,  tol = 0.01,  seed = 14})
 	_add({name = "concat",             kind = .Concat,             input_count = 2, inputs = {0 = sp(true, 2, 3), 1 = sp(true, 2, 2)},    run = run_concat,         prepare = prep_normal,  tol = 0.01,  seed = 15})
 	_add({name = "linear",             kind = .Linear,             input_count = 2, inputs = {0 = sp(true, 3, 4), 1 = sp(true, 5, 4)},    run = run_linear,         prepare = prep_normal,  tol = 0.015, seed = 16})
 	_add({name = "rope",               kind = .Rope,               input_count = 1, inputs = {0 = sp(true, 2, 8)},                    run = run_rope,           prepare = prep_normal,  tol = 0.01,  seed = 17})
@@ -199,6 +200,7 @@ run_transpose      :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.transpose(t[
 run_select         :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.select(t[0], {2, 0, 2, 1}) }
 run_slice          :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice(t[0], 2, 6) }
 run_slice_trailing :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice_trailing(t[0], 1, 4) }
+run_slice_leading  :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.slice_leading(t[0], 1, 4) }
 run_concat         :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.concat(t[0], t[1]) }
 run_linear         :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.linear(t[0], t[1]) }
 run_rope           :: proc(t: []ml.Tensor) -> ml.Tensor { return ml.rope(t[0], 2) }

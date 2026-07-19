@@ -37,7 +37,7 @@ test_adam_update :: proc(t: ^testing.T) {
 	ref_m: [ADAM_SIZE]f32
 	ref_v: [ADAM_SIZE]f32
 
-	opt:  ml.Optimizer
+	opt := ml.optimizer_make(learning_rate=ADAM_LR, beta1=ADAM_B1, beta2=ADAM_B2, epsilon=ADAM_EPS, weight_decay=ADAM_WD)
 	grad: [ADAM_SIZE]f32
 	for step in 1 ..= ADAM_STEPS {
 		for i in 0 ..< ADAM_SIZE {
@@ -45,8 +45,8 @@ test_adam_update :: proc(t: ^testing.T) {
 		}
 		ml.set_bytes(param, .Gradient, mem.slice_to_bytes(grad[:]))
 
-		stepped := ml.optimizer_step(&opt, period=1, learning_rate=ADAM_LR, beta1=ADAM_B1, beta2=ADAM_B2, epsilon=ADAM_EPS, weight_decay=ADAM_WD)
-		testing.expect(t, stepped, "optimizer_step should fire with period=1")
+		stepped := ml.optimizer_step(&opt)
+		testing.expect(t, stepped, "optimizer_step should fire every step by default")
 		ml.update(&opt, param)
 
 		bc1 := 1 - math.pow(ADAM_B1, f32(step))

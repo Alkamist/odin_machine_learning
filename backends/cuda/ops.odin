@@ -128,6 +128,7 @@ _forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Cross_Entropy:   _cross_entropy_forward(op, loc)
 	case ml.Select:          _select_forward(op, loc)
 	case ml.Slice_Trailing:  _slice_trailing_forward(op, loc)
+	case ml.Slice_Leading:   _slice_leading_forward(op, loc)
 	case: fmt.panicf("forward not implemented for op variant %T", op.variant, loc=loc)
 	}
 }
@@ -149,6 +150,7 @@ _backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	case ml.Entropy:        _entropy_backward(op, loc)
 	case ml.Select:         _select_backward(op, loc)
 	case ml.Slice_Trailing: _slice_trailing_backward(op, loc)
+	case ml.Slice_Leading:  _slice_leading_backward(op, loc)
 	case ml.Rmsnorm:        _rmsnorm_backward(op, loc)
 	case ml.Rope:           _rope_backward(op, loc)
 	case ml.Attention:      _attention_backward(op, loc)
@@ -1584,6 +1586,42 @@ _slice_trailing_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 	case:
 		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
 	}
+}
+
+_slice_leading_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Slice_Leading)
+
+	leading  := x.shape[0]
+	row_size := ml.len(x) / leading
+	elem     := ml.data_type_size(x.type)
+	bytes    := uint(y.shape[0] * row_size * elem)
+	src_off  := uint(v.start * row_size * elem)
+
+	gctx := _gctx(loc)
+	cuda.check(cuda.MemcpyDtoDAsync(data(y).ptr, data(x).ptr + cuda.DevicePtr(src_off), bytes, gctx.stream), loc=loc)
+}
+
+_slice_leading_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
+	x := op.input
+	y := op.output
+	v := op.variant.(ml.Slice_Leading)
+
+	if gradient(x).ptr == 0 { return }
+
+	leading  := x.shape[0]
+	row_size := ml.len(x) / leading
+	count    := y.shape[0] * row_size
+	offset   := v.start * row_size
+
+	dyp := gradient(y).ptr
+	dxp := gradient(x).ptr
+	cnt := i32(count); off := i32(offset)
+	args := [?]rawptr{&dyp, &dxp, &cnt, &off}
+
+	_slice_leading_back_f32_pipeline := _compile_pipeline(SLICE_LEADING_BACK_F32_SRC, "slice_leading_back_f32.cu", "slice_leading_back_f32")
+	_dispatch(_slice_leading_back_f32_pipeline, _div_up(count, 256), 1, 1, 256, 1, 1, 0, args[:], loc)
 }
 
 _silu_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {

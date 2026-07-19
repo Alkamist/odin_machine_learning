@@ -170,15 +170,9 @@ main :: proc() {
 }
 
 _copy_last_row :: proc(logits: ml.Tensor, out: []f32) {
-	rows  := logits.shape[0]
-	vocab := logits.shape[1]
-	if rows == 1 {
-		ml.get_data(logits, out)
-		return
-	}
-	buffer := make([]f32, ml.len(logits), context.temp_allocator)
-	ml.get_data(logits, buffer)
-	copy(out, buffer[(rows - 1) * vocab:])
+	rows := logits.shape[0]
+	last := ml.slice_leading(logits, rows - 1, rows)
+	ml.get_data(last, out)
 }
 
 sample_next :: proc(logits: []f32, temperature: f32, top_k: int, top_p: f32) -> int {

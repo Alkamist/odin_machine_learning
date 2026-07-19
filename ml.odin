@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:mem"
 import "core:math"
 import "core:math/rand"
+import "core:reflect"
 import "core:strings"
 
 MAX_OPERATIONS               :: 16384
@@ -122,6 +123,8 @@ Context :: struct {
 _current_ctx: ^Context
 
 _context_init :: proc(ctx: ^Context, backend: ^Backend, allocator: mem.Allocator, loc: runtime.Source_Code_Location) {
+	_assert_operation_variant_order()
+
 	ctx.backend  = backend
 	ctx.training = true
 
@@ -262,11 +265,22 @@ scratch :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> Tenso
 	return alloc(type, shape, persistent=false, buffers={.Data}, loc=loc)
 }
 
+tensor :: proc{_tensor_flat, _tensor_shaped}
+
 @(require_results)
-tensor :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
+_tensor_flat :: proc(data: []f32, loc := #caller_location) -> (t: Tensor) {
 	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
 	shape := [1]int{builtin.len(data)}
 	t = zeros(.F32, shape[:], loc=loc)
+	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
+	return
+}
+
+@(require_results)
+_tensor_shaped :: proc(data: []f32, shape: []int, loc := #caller_location) -> (t: Tensor) {
+	assert(builtin.len(data) > 0, "Length must be at least 1", loc=loc)
+	assert(shape_element_count(shape) == builtin.len(data), "tensor shape element count must match data length", loc=loc)
+	t = zeros(.F32, shape, loc=loc)
 	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
 	return
 }
@@ -318,6 +332,13 @@ _zeros_drop_last :: proc(src: Tensor, loc := #caller_location) -> Tensor {
 _zeros_replace_trailing :: proc(src: Tensor, new_trailing: int, loc := #caller_location) -> Tensor {
 	new_shape: [MAX_TENSOR_RANK]int = src.shape
 	new_shape[src.rank - 1] = new_trailing
+	return zeros(src.type, new_shape[:src.rank], loc=loc)
+}
+
+@(require_results)
+_zeros_replace_leading :: proc(src: Tensor, new_leading: int, loc := #caller_location) -> Tensor {
+	new_shape: [MAX_TENSOR_RANK]int = src.shape
+	new_shape[0] = new_leading
 	return zeros(src.type, new_shape[:src.rank], loc=loc)
 }
 
@@ -377,6 +398,30 @@ get_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
 set_data :: proc(t: Tensor, data: []f32, loc := #caller_location) {
 	assert(t.type == .F32, "set_data with []f32 requires an F32 tensor", loc=loc)
 	t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(data), loc)
+}
+
+argmax :: proc(t: Tensor, results: []int, loc := #caller_location) {
+	assert(t.type == .F32, "argmax requires an F32 tensor", loc=loc)
+	assert(t.rank >= 1, "argmax input must have rank >= 1", loc=loc)
+
+	trailing := t.shape[t.rank - 1]
+	leading  := _leading_count(t)
+	assert(builtin.len(results) == leading, "argmax results length must equal the leading-dim product", loc=loc)
+
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	buffer := builtin.make([]f32, len(t), allocator=context.temp_allocator, loc=loc)
+	get_data(t, buffer, loc)
+
+	for row in 0 ..< leading {
+		values := buffer[row * trailing:][:trailing]
+		best   := 0
+		for i in 1 ..< trailing {
+			if values[i] > values[best] {
+				best = i
+			}
+		}
+		results[row] = best
+	}
 }
 
 get_gradient :: proc(t: Tensor, data: []f32, loc := #caller_location) {
@@ -514,21 +559,52 @@ Optimizer_State :: struct {
 	v: Backend_Buffer,
 }
 
-Optimizer :: struct {
-	iteration:      u64,
-	period_counter: int,
+Optimizer_Kind :: enum {
+	Adam_W,
+}
 
-	learning_rate: f32,
-	beta1:         f32,
-	beta2:         f32,
-	epsilon:       f32,
-	weight_decay:  f32,
+Optimizer :: struct {
+	kind: Optimizer_Kind,
+
+	learning_rate:      f32,
+	beta1:              f32,
+	beta2:              f32,
+	epsilon:            f32,
+	weight_decay:       f32,
+	accumulation_steps: int,
+
+	iteration:            u64,
+	accumulation_counter: int,
 
 	bias_correction1: f32,
 	bias_correction2: f32,
 
 	backend: ^Backend,
 	state:   map[Backend_Buffer]Optimizer_State,
+}
+
+@(require_results)
+optimizer_make :: proc(
+	learning_rate:      f32 = 0.001,
+	beta1:              f32 = 0.9,
+	beta2:              f32 = 0.999,
+	epsilon:            f32 = 1e-8,
+	weight_decay:       f32 = 0,
+	accumulation_steps: int = 1,
+	kind:               Optimizer_Kind = .Adam_W,
+	loc := #caller_location,
+) -> (opt: Optimizer) {
+	assert(accumulation_steps >= 1, "accumulation_steps must be at least 1", loc=loc)
+	opt = {
+		kind               = kind,
+		learning_rate      = learning_rate,
+		beta1              = beta1,
+		beta2              = beta2,
+		epsilon            = epsilon,
+		weight_decay       = weight_decay,
+		accumulation_steps = accumulation_steps,
+	}
+	return
 }
 
 @(require_results)
@@ -577,28 +653,14 @@ optimizer_destroy :: proc(opt: ^Optimizer, loc := #caller_location) {
 }
 
 @(require_results)
-optimizer_step :: proc(
-	opt:           ^Optimizer,
-	period:        int = 128,
-	learning_rate: f32 = 0.001,
-	beta1:         f32 = 0.9,
-	beta2:         f32 = 0.999,
-	epsilon:       f32 = 1e-8,
-	weight_decay:  f32 = 0,
-) -> bool {
-	opt.period_counter += 1
-	if opt.period_counter < period {
+optimizer_step :: proc(opt: ^Optimizer) -> bool {
+	opt.accumulation_counter += 1
+	if opt.accumulation_counter < opt.accumulation_steps {
 		return false
 	}
-	opt.period_counter = 0
+	opt.accumulation_counter = 0
 
 	opt.iteration += 1
-
-	opt.learning_rate = learning_rate
-	opt.beta1         = beta1
-	opt.beta2         = beta2
-	opt.epsilon       = epsilon
-	opt.weight_decay  = weight_decay
 
 	opt.bias_correction1 = 1 - math.pow(opt.beta1, f32(opt.iteration))
 	opt.bias_correction2 = 1 - math.pow(opt.beta2, f32(opt.iteration))
@@ -683,6 +745,7 @@ Operation_Variant :: union {
 	Select,
 	Slice,
 	Slice_Trailing,
+	Slice_Leading,
 	Concat,
 	Linear,
 	Linear_Q4_K,
@@ -731,6 +794,7 @@ Operation_Kind :: enum {
 	Select,
 	Slice,
 	Slice_Trailing,
+	Slice_Leading,
 	Concat,
 	Linear,
 	Linear_Q4_K,
@@ -765,69 +829,24 @@ Operation_Kind :: enum {
 }
 Operation_Set :: bit_set[Operation_Kind]
 
-OPERATION_SET_ALL :: Operation_Set{
-	.Add, .Sub, .Mul, .Div, .Exp, .Sqrt, .Clamp, .Min, .Max, .Mean,
-	.Transpose, .Select, .Slice, .Slice_Trailing, .Concat, .Linear,
-	.Linear_Q4_K, .Linear_Q4_K_Gate_Up_Geglu, .Linear_Q6_K, .Rope,
-	.Layernorm, .Rmsnorm, .Rmsnorm_Rope, .Rmsnorm_Rope_Write_Cache,
-	.Add_Rmsnorm, .Softmax, .Entropy, .Log_Softmax, .Mean_Squared_Error,
-	.Smooth_L1, .Cross_Entropy, .Relu, .Sigmoid, .Gelu, .Gelu_Mul,
-	.Silu, .Tanh, .Batched_Matmul, .Permute, .Causal_Mask, .Attention,
-	.Attention_Cache, .Cast, .Lerp_Assign, .Accumulate_Mean,
-}
+OPERATION_SET_ALL :: ~Operation_Set{}
 
 #assert(builtin.len(Operation_Kind) == intrinsics.type_union_variant_count(Operation_Variant))
 
+_assert_operation_variant_order :: proc() {
+	union_info := runtime.type_info_base(type_info_of(Operation_Variant)).variant.(runtime.Type_Info_Union)
+	enum_info  := runtime.type_info_base(type_info_of(Operation_Kind)).variant.(runtime.Type_Info_Enum)
+	for variant_type, i in union_info.variants {
+		named := variant_type.variant.(runtime.Type_Info_Named)
+		fmt.assertf(named.name == enum_info.names[i], "Operation_Variant[%v] is %v but Operation_Kind[%v] is %v; the two lists must be in the same order", i, named.name, i, enum_info.names[i])
+	}
+}
+
 @(require_results)
 operation_kind :: proc(variant: Operation_Variant, loc := #caller_location) -> Operation_Kind {
-	switch _ in variant {
-	case Add:                        return .Add
-	case Sub:                        return .Sub
-	case Mul:                        return .Mul
-	case Div:                        return .Div
-	case Exp:                        return .Exp
-	case Sqrt:                       return .Sqrt
-	case Clamp:                      return .Clamp
-	case Min:                        return .Min
-	case Max:                        return .Max
-	case Mean:                       return .Mean
-	case Transpose:                  return .Transpose
-	case Select:                     return .Select
-	case Slice:                      return .Slice
-	case Slice_Trailing:             return .Slice_Trailing
-	case Concat:                     return .Concat
-	case Linear:                     return .Linear
-	case Linear_Q4_K:                return .Linear_Q4_K
-	case Linear_Q4_K_Gate_Up_Geglu:  return .Linear_Q4_K_Gate_Up_Geglu
-	case Linear_Q6_K:                return .Linear_Q6_K
-	case Rope:                       return .Rope
-	case Layernorm:                  return .Layernorm
-	case Rmsnorm:                    return .Rmsnorm
-	case Rmsnorm_Rope:               return .Rmsnorm_Rope
-	case Rmsnorm_Rope_Write_Cache:   return .Rmsnorm_Rope_Write_Cache
-	case Add_Rmsnorm:                return .Add_Rmsnorm
-	case Softmax:                    return .Softmax
-	case Entropy:                    return .Entropy
-	case Log_Softmax:                return .Log_Softmax
-	case Mean_Squared_Error:         return .Mean_Squared_Error
-	case Smooth_L1:                  return .Smooth_L1
-	case Cross_Entropy:              return .Cross_Entropy
-	case Relu:                       return .Relu
-	case Sigmoid:                    return .Sigmoid
-	case Gelu:                       return .Gelu
-	case Gelu_Mul:                   return .Gelu_Mul
-	case Silu:                       return .Silu
-	case Tanh:                       return .Tanh
-	case Batched_Matmul:             return .Batched_Matmul
-	case Permute:                    return .Permute
-	case Causal_Mask:                return .Causal_Mask
-	case Attention:                  return .Attention
-	case Attention_Cache:            return .Attention_Cache
-	case Cast:                       return .Cast
-	case Lerp_Assign:                return .Lerp_Assign
-	case Accumulate_Mean:            return .Accumulate_Mean
-	}
-	panic("nil or unknown Operation_Variant", loc)
+	tag := reflect.get_union_variant_raw_tag(variant)
+	assert(tag > 0, "nil Operation_Variant", loc=loc)
+	return Operation_Kind(tag - 1)
 }
 
 _run_forward :: proc(op: ^Operation, loc: runtime.Source_Code_Location) {
@@ -862,6 +881,7 @@ backward :: proc(loss: Tensor, loc := #caller_location) {
 	assert(_current_ctx.training, "backward called on an inference pass (did you forget clear(training=true)?)", loc=loc)
 	assert(loss.backend == _current_ctx.backend, "loss tensor is not from the active context", loc=loc)
 	assert(loss.type == .F32, "backward requires an F32 loss tensor", loc=loc)
+	assert(loss.count == 1, "backward requires a scalar loss (reduce with mean first)", loc=loc)
 	assert(loss.buffers[.Gradient] != Backend_Buffer{}, "loss tensor has no gradient buffer", loc=loc)
 
 	unsupported: Operation_Set
@@ -1229,6 +1249,8 @@ Sqrt :: struct {
 
 @(require_results)
 sqrt :: proc(input: Tensor, loc := #caller_location) -> (output: Tensor) {
+	assert(input.type == .F32, "sqrt is F32-only", loc=loc)
+
 	output = zeros_like(input, loc=loc)
 
 	op := Operation{
@@ -1420,6 +1442,32 @@ slice_trailing :: proc(input: Tensor, start, end: int, loc := #caller_location) 
 		input   = input,
 		output  = output,
 		variant = Slice_Trailing{
+			start = start,
+			end   = end,
+		},
+	}
+	_record_forward(op, loc=loc)
+
+	return
+}
+
+Slice_Leading :: struct {
+	start, end: int,
+}
+
+@(require_results)
+slice_leading :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
+	assert(input.rank >= 1, "slice_leading input must have rank >= 1", loc=loc)
+	leading := input.shape[0]
+	fmt.assertf(start >= 0 && start < end && end <= leading, "slice_leading indices out of bounds %v:%v (leading=%v)", start, end, leading, loc=loc)
+
+	new_leading := end - start
+	output = _zeros_replace_leading(input, new_leading, loc=loc)
+
+	op := Operation{
+		input   = input,
+		output  = output,
+		variant = Slice_Leading{
 			start = start,
 			end   = end,
 		},

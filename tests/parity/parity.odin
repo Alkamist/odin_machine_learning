@@ -63,7 +63,12 @@ _parity_eval :: proc(tc: cases.Op_Test, inputs_data: [][]f32, w: []f32, do_backw
 		weights   := ml.zeros(.F32, out_shape[:output.rank])
 		ml.set_data(weights, w[:count])
 		weighted := ml.mul(output, weights)
-		ml.backward(weighted)
+
+		flat       := ml.reshape(weighted, {1, count})
+		sum_weight := ml.scratch(.F32, {1, count})
+		ml.fill_value(sum_weight, 1.0 / f32(count))
+		loss := ml.linear(flat, sum_weight)
+		ml.backward(loss)
 		for i in 0 ..< n {
 			if tc.inputs[i].check {
 				ml.get_gradient(tensors[i], grads_host[i])
@@ -307,13 +312,13 @@ _run_adam :: proc(w_out, m_out, v_out: []f32, loc := #caller_location) {
 	grad := make([]f32, size)
 	defer delete(grad)
 
-	opt: ml.Optimizer
+	opt := ml.optimizer_make(learning_rate=0.01, weight_decay=0.1)
 	for step in 1 ..= ADAM_STEPS {
 		for i in 0 ..< size {
 			grad[i] = _adam_grad(step, i)
 		}
 		ml.set_bytes(param, .Gradient, mem.slice_to_bytes(grad))
-		if ml.optimizer_step(&opt, period=1, learning_rate=0.01, weight_decay=0.1) {
+		if ml.optimizer_step(&opt) {
 			ml.update(&opt, param)
 		}
 	}

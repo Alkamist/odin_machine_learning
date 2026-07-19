@@ -7,7 +7,6 @@ import "core:compress/gzip"
 import "core:fmt"
 import "core:log"
 import "core:math/rand"
-import "core:slice"
 
 import ml  "../../"
 import cpu "../../backends/cpu"
@@ -84,6 +83,7 @@ Model :: struct {
 
 model_make :: proc(allocator := context.allocator) -> (model: Model) {
 	model.mlp = mlp.make(MNIST_IMAGE_SIZE, 128, MNIST_CLASS_COUNT, allocator=allocator)
+	model.opt = ml.optimizer_make()
 	return
 }
 
@@ -94,7 +94,7 @@ model_destroy :: proc(model: Model) {
 }
 
 model_forward :: proc(model: Model, input: []f32, batch_size: int) -> ml.Tensor {
-	x := ml.reshape(ml.tensor(input), {batch_size, MNIST_IMAGE_SIZE})
+	x := ml.tensor(input, []int{batch_size, MNIST_IMAGE_SIZE})
 	return mlp.forward(model.mlp, x)
 }
 
@@ -103,28 +103,19 @@ model_predict :: proc(model: Model, input: []f32, predictions: []int) {
 
 	ml.clear()
 
-	logits             := model_forward(model, input, count)
-	probabilities      := ml.softmax(logits)
-
-	probabilities_data := make([]f32, ml.len(probabilities), allocator=context.temp_allocator)
-	ml.get_data(probabilities, probabilities_data)
-
-	class_size := len(probabilities_data) / count
-
-	for i in 0 ..< count {
-		predictions[i] = slice.max_index(probabilities_data[i * class_size:][:class_size])
-	}
+	logits := model_forward(model, input, count)
+	ml.argmax(logits, predictions)
 }
 
 model_learn :: proc(model: ^Model, input: []f32, targets: []int) {
 	ml.clear(training=true)
 
 	logits := model_forward(model^, input, len(targets))
-	loss   := ml.cross_entropy(logits, targets)
+	loss   := ml.mean(ml.cross_entropy(logits, targets))
 
 	ml.backward(loss)
 
-	if ml.optimizer_step(&model.opt, period=1) {
+	if ml.optimizer_step(&model.opt) {
 		mlp.update(&model.opt, model.mlp)
 	}
 }
