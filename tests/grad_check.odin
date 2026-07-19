@@ -143,6 +143,9 @@ _run_check :: proc(t: ^testing.T, tc: cases.Op_Test) {
 @(test)
 test_op_gradients :: proc(t: ^testing.T) {
 	for tc in cases.get() {
+		if tc.parity_only {
+			continue
+		}
 		_run_check(t, tc)
 	}
 }

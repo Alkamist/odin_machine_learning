@@ -202,8 +202,8 @@ _bf16p_cases :: proc() -> []Bf16p_Case {
 		return _bf16p_case_storage[:_bf16p_case_count]
 	}
 	list := []Bf16p_Case{
-		{name = "add",            kind = .Add,            input_count = 2, inputs = {0 = _bf16p_sp(3, 8), 1 = _bf16p_sp(8)},                          run = _bf16p_run_add},
-		{name = "mul",            kind = .Mul,            input_count = 2, inputs = {0 = _bf16p_sp(3, 8), 1 = _bf16p_sp(8)},                          run = _bf16p_run_mul},
+		{name = "add",            kind = .Add,            input_count = 2, inputs = {0 = _bf16p_sp(3, 8), 1 = _bf16p_sp(8)},                          run = _bf16p_run_add,       backward = true},
+		{name = "mul",            kind = .Mul,            input_count = 2, inputs = {0 = _bf16p_sp(3, 8), 1 = _bf16p_sp(8)},                          run = _bf16p_run_mul,       backward = true},
 		{name = "gelu",           kind = .Gelu,           input_count = 1, inputs = {0 = _bf16p_sp(3, 8)},                                            run = _bf16p_run_gelu,      backward = true},
 		{name = "silu",           kind = .Silu,           input_count = 1, inputs = {0 = _bf16p_sp(3, 8)},                                            run = _bf16p_run_silu,      backward = true},
 		{name = "tanh",           kind = .Tanh,           input_count = 1, inputs = {0 = _bf16p_sp(3, 8)},                                            run = _bf16p_run_tanh,      backward = true},
@@ -226,8 +226,7 @@ _bf16p_cases :: proc() -> []Bf16p_Case {
 
 @(test)
 test_cpu_cuda_bf16_parity :: proc(t: ^testing.T) {
-	if !_cuda_available() {
-		log.info("CUDA device not available; skipping Bf16 parity tests")
+	if !_cuda_ready(t, "Bf16 parity tests") {
 		return
 	}
 

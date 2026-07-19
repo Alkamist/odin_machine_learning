@@ -243,11 +243,11 @@ Do this as a mechanical refactor with parity tests green before and after; it ha
 
 ---
 
-## Phase 5 — Test suite hardening — PARTIAL (2026-07-19); NEXT-SESSION NOTES HERE
+## Phase 5 — Test suite hardening — DONE (2026-07-19) except deferred determinism test; 4.1b still open
 
-### ⚠ FIX FIRST NEXT SESSION — CUDA Bf16 add/mul backward is broken
+### CUDA Bf16 add/mul backward — FIXED (2026-07-19)
 
-Found by the new Bf16 parity sweep: `add_back_a_bf16.cu`, `add_back_b_bf16.cu`, and mul's bf16 backward kernels reinterpret the gradient buffers as bf16-packed PAIRS, but gradients in this library are always F32 — the kernels write only the first half of the F32 gradient buffer and leave the rest zero. Any Bf16 training on CUDA (incl. gemma QLoRA — residual adds are everywhere) silently half-trains through these ops. The unary bf16 backward kernels (gelu/silu/tanh) correctly declare `float*` gradients and are fine. Suggested fix: since add/mul backward touch ONLY F32 gradient buffers (data pointers of `mul` backward are read-only per dtype), route the Bf16 arms of `_add_backward`/`_mul_backward` to the F32 backward pipelines (mul backward reads `data(a)`/`data(b)` — those ARE bf16, so mul needs its bf16 kernels fixed to `float*` grads instead, or a mixed kernel; add can reuse F32 outright), then move add/mul from the excluded list into the Bf16 BACKWARD sweep in tests/parity/parity_bf16.odin and confirm parity.
+Re-verification against source narrowed the finding: mul's bf16 backward kernels (`mul_back_a_bf16.cu`/`mul_back_b_bf16.cu`) already declared `float*` gradients with per-element dispatch and were correct; only `add_back_a_bf16.cu`/`add_back_b_bf16.cu` reinterpreted the always-F32 gradient buffers as bf16-packed pairs. Since add's backward touches ONLY gradient buffers, `_add_backward` now dispatches the F32 pipelines unconditionally (dtype switch removed) and the two broken kernels are deleted. add/mul are in the Bf16 backward parity sweep (`backward = true` in parity_bf16.odin); parity green on RTX 3090 Ti.
 
 ### Done (5.1, 5.2, 5.3)
 
@@ -261,13 +261,17 @@ Found by the new Bf16 parity sweep: `add_back_a_bf16.cu`, `add_back_b_bf16.cu`, 
 - **CUDA device-teardown race**: multiple independent GPU `@(test)`s running under the default multi-threaded test runner segfault in `_gpu` refcount/pipeline-cache teardown — the new GPU checks are consolidated into ONE test as a workaround. Real fix belongs with Phase 7 thread-contract work.
 - **Parity memory-tracker noise**: pipeline-cache entries compiled by one test are freed at device teardown under a different test's tracking allocator → ~50 non-fatal leak/bad-free warnings. Pre-existing global-cache vs per-test-allocator interaction.
 
-### Remaining (5.4–5.7 + deferred 4.1b)
+### Done (5.4–5.7, 2026-07-19)
 
-- 5.4 parity gate: `-define:ML_REQUIRE_CUDA=true` for loud failure without GPU; assert every cases-registry op in CUDA `forward_ops` actually got parity-checked.
-- 5.5 shape sweep: scalar broadcast, rank-3, sizes crossing CUDA block/tile boundaries, attention with T > one block.
-- 5.6 loader robustness: truncated/malformed gguf + safetensors must error cleanly (pairs with the Phase 1.9 overflow fixes).
-- 5.7 hygiene: dedupe `_adam_grad` copies between adam_check/parity; `cases.get()` thread safety (`sync.Once`); Adam `accumulation_steps > 1` test; determinism test (needs Phase 6.2 RNG); tests README.
-- 4.1b CUDA bf16 kernel collapse — now unblocked by 5.2; fold the add/mul backward fix into it.
+- **5.4 parity gate:** `ML_REQUIRE_CUDA` config in tests/parity — when set, `_cuda_ready` fails the test instead of logging a skip banner. The silent per-op skip is now a test failure: every cases-registry op must be in CUDA `forward_ops` (the skip list has been empty since Phase 4), so adding a case guarantees parity coverage.
+- **5.5 shape sweep:** `Op_Test` gained `parity_only` (skipped by grad check — big shapes would cost O(n) central-difference forwards for no CPU signal) and `parity_tol` (per-case parity tolerance; cuBLAS `linear_big`/`batched_matmul_big` need 1e-3 on near-cancelling elements due to accumulation order). New cases: add/mul scalar broadcast, add rank-3, rmsnorm row 300 (crosses the 256-thread row loop), add/mul 17×257, relu 33×130, softmax 300×300, sum/max_reduce 300×270, linear 8×130·70×130, batched_matmul 3×33×40·3×40×70, attention T=272 (crosses the 256-thread ATT_WG stride).
+- **5.6 loader robustness:** `tests/loader_check.odin` synthesizes a minimal valid gguf (hand-built bytes, layout offsets recorded during build) and safetensors, then asserts every strict prefix and targeted corruptions (bad magic/version, hostile string length, huge/zero dims, unsupported type, quant block mismatch, duplicate tensor names; huge header_len, malformed JSON, non-object root, range-vs-shape mismatch, negative/overflow dims, OOB offsets, missing fields) fail cleanly with zero leaks. Found and fixed a real leak: `safetensors.load` leaked `json.parse`'s partial allocations on malformed input — now validates with `json.is_valid` first (core:json drops allocations unreachable from the returned root on parse error, so destroy-on-error alone was insufficient). Expected-failure loads run under `log.nil_logger()` because the test runner fails tests that log at error level.
+- **5.7 hygiene:** `_adam_grad` deduped into `cases.adam_grad`; `cases.get()` uses `sync.Once`; `test_adam_accumulation` covers `accumulation_steps=2` (asserts step gating, gradient zeroing on update, iteration counting, and parameter values vs an analytic reference over 3 windows); `tests/README.md` records how to run all three packages and the known parity-suite leak-warning noise. Determinism test still deferred behind Phase 6.2 RNG.
+- Suite state: 27 tests in `tests`, 4 in `tests/golden`, 3 in `tests/parity` — all green on RTX 3090 Ti.
+
+### Remaining
+
+- 4.1b CUDA bf16 kernel collapse — unblocked by 5.2 and the add/mul backward fix; next work item.
 
 Current state: idiomatic `@(test)` suites; good shared case registry (tests/cases/cases.odin:56–91) driving both grad-check (central difference, careful `h` selection) and CPU↔CUDA parity; Adam and clip checks against analytic references. But coverage stops exactly where risk starts.
 

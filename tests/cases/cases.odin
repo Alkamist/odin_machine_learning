@@ -1,6 +1,7 @@
 package ml_test_cases
 
 import "core:math/rand"
+import "core:sync"
 
 import ml "../.."
 
@@ -25,6 +26,12 @@ Op_Test :: struct {
 	prepare:     Prepare_Proc,
 	tol:         f64,
 	seed:        u64,
+	parity_only: bool,
+	parity_tol:  f64,
+}
+
+adam_grad :: proc(step, index: int) -> f32 {
+	return (f32((step * 7 + index * 3) % 11) - 5) * 0.03
 }
 
 sp :: proc(check: bool, dims: ..int) -> (s: Input_Spec) {
@@ -38,7 +45,7 @@ sp :: proc(check: bool, dims: ..int) -> (s: Input_Spec) {
 
 _cases: [MAX_CASES]Op_Test
 _count: int
-_built: bool
+_build_once: sync.Once
 
 _add :: proc(c: Op_Test) {
 	_cases[_count] = c
@@ -46,10 +53,7 @@ _add :: proc(c: Op_Test) {
 }
 
 get :: proc() -> []Op_Test {
-	if !_built {
-		_build()
-		_built = true
-	}
+	sync.once_do(&_build_once, _build)
 	return _cases[:_count]
 }
 
@@ -99,6 +103,19 @@ _build :: proc() {
 	_add({name = "permute",            kind = .Permute,            input_count = 1, inputs = {0 = sp(true, 2, 3, 4)},                 run = run_permute,        prepare = prep_normal,  tol = 0.01,  seed = 32})
 	_add({name = "causal_mask",        kind = .Causal_Mask,        input_count = 1, inputs = {0 = sp(true, 4, 4)},                    run = run_causal_mask,    prepare = prep_normal,  tol = 0.02,  seed = 33})
 	_add({name = "attention",          kind = .Attention,          input_count = 3, inputs = {0 = sp(true, 3, 4), 1 = sp(true, 3, 4), 2 = sp(true, 3, 4)}, run = run_attention, prepare = prep_small, tol = 0.03, seed = 34})
+	_add({name = "add_scalar",         kind = .Add,                input_count = 2, inputs = {0 = sp(true, 3, 4), 1 = sp(true, 1)},       run = run_add,            prepare = prep_normal,  tol = 0.01,  seed = 45})
+	_add({name = "mul_scalar",         kind = .Mul,                input_count = 2, inputs = {0 = sp(true, 3, 4), 1 = sp(true, 1)},       run = run_mul,            prepare = prep_normal,  tol = 0.015, seed = 46})
+	_add({name = "add_rank3",          kind = .Add,                input_count = 2, inputs = {0 = sp(true, 2, 3, 4), 1 = sp(true, 3, 4)}, run = run_add,            prepare = prep_normal,  tol = 0.01,  seed = 47})
+	_add({name = "rmsnorm_wide",       kind = .Rmsnorm,            input_count = 2, inputs = {0 = sp(true, 3, 300), 1 = sp(true, 300)},   run = run_rmsnorm,        prepare = prep_normal,  tol = 0.03,  seed = 48})
+	_add({name = "add_big",            kind = .Add,                input_count = 2, inputs = {0 = sp(true, 17, 257), 1 = sp(true, 257)},  run = run_add,            prepare = prep_normal,  tol = 0.01,  seed = 49, parity_only = true})
+	_add({name = "mul_big",            kind = .Mul,                input_count = 2, inputs = {0 = sp(true, 17, 257), 1 = sp(true, 257)},  run = run_mul,            prepare = prep_normal,  tol = 0.015, seed = 50, parity_only = true})
+	_add({name = "relu_big",           kind = .Relu,               input_count = 1, inputs = {0 = sp(true, 33, 130)},                     run = run_relu,           prepare = prep_relu,    tol = 0.01,  seed = 51, parity_only = true})
+	_add({name = "softmax_big",        kind = .Softmax,            input_count = 1, inputs = {0 = sp(true, 300, 300)},                    run = run_softmax,        prepare = prep_normal,  tol = 0.02,  seed = 52, parity_only = true})
+	_add({name = "sum_big",            kind = .Sum,                input_count = 1, inputs = {0 = sp(true, 300, 270)},                    run = run_sum,            prepare = prep_normal,  tol = 0.01,  seed = 53, parity_only = true})
+	_add({name = "max_reduce_big",     kind = .Max_Reduce,         input_count = 1, inputs = {0 = sp(true, 300, 270)},                    run = run_max_reduce,     prepare = prep_max_reduce, tol = 0.01, seed = 54, parity_only = true})
+	_add({name = "linear_big",         kind = .Linear,             input_count = 2, inputs = {0 = sp(true, 8, 130), 1 = sp(true, 70, 130)}, run = run_linear,       prepare = prep_normal,  tol = 0.015, seed = 55, parity_only = true, parity_tol = 1e-3})
+	_add({name = "batched_matmul_big", kind = .Batched_Matmul,     input_count = 2, inputs = {0 = sp(true, 3, 33, 40), 1 = sp(true, 3, 40, 70)}, run = run_batched_matmul, prepare = prep_normal, tol = 0.015, seed = 56, parity_only = true, parity_tol = 1e-3})
+	_add({name = "attention_long",     kind = .Attention,          input_count = 3, inputs = {0 = sp(true, 272, 16), 1 = sp(true, 272, 16), 2 = sp(true, 272, 16)}, run = run_attention, prepare = prep_small, tol = 0.03, seed = 57, parity_only = true})
 }
 
 prep_normal :: proc(inputs: [][]f32) {

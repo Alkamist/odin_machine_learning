@@ -17,6 +17,8 @@ CPU_CTX_SIZE :: 8 * 1024 * 1024
 PARITY_TOL :: f64(1e-4)
 REL_FLOOR  :: f64(1e-3)
 
+ML_REQUIRE_CUDA :: #config(ML_REQUIRE_CUDA, false)
+
 _cuda_available :: proc() -> bool {
 	if cudadrv.Init(0) != .SUCCESS {
 		return false
@@ -26,6 +28,18 @@ _cuda_available :: proc() -> bool {
 		return false
 	}
 	return count > 0
+}
+
+_cuda_ready :: proc(t: ^testing.T, what: string) -> bool {
+	if _cuda_available() {
+		return true
+	}
+	when ML_REQUIRE_CUDA {
+		testing.expectf(t, false, "ML_REQUIRE_CUDA is set but no CUDA device is available; %s cannot run", what)
+	} else {
+		log.warnf("============ SKIPPED: %s (no CUDA device available) ============", what)
+	}
+	return false
 }
 
 _output_count :: proc(tc: cases.Op_Test, inputs_data: [][]f32) -> int {
@@ -78,14 +92,15 @@ _parity_eval :: proc(tc: cases.Op_Test, inputs_data: [][]f32, w: []f32, do_backw
 }
 
 _compare :: proc(t: ^testing.T, tc: cases.Op_Test, label: string, cpu_vals, cuda_vals: []f32) {
+	tol := tc.parity_tol > 0 ? tc.parity_tol : PARITY_TOL
 	for e in 0 ..< len(cpu_vals) {
 		a := f64(cpu_vals[e])
 		b := f64(cuda_vals[e])
 		denom := max(max(abs(a), abs(b)), REL_FLOOR)
 		rel   := abs(a - b) / denom
-		testing.expectf(t, rel <= PARITY_TOL,
+		testing.expectf(t, rel <= tol,
 			"%s: %s elem %d cpu=%.6g cuda=%.6g rel_err=%.4g (tol=%.3g)",
-			tc.name, label, e, a, b, rel, PARITY_TOL)
+			tc.name, label, e, a, b, rel, tol)
 	}
 }
 
@@ -152,8 +167,7 @@ _run_parity :: proc(t: ^testing.T, tc: cases.Op_Test, cpu_ctx, cuda_ctx: ^ml.Con
 
 @(test)
 test_cpu_cuda_parity :: proc(t: ^testing.T) {
-	if !_cuda_available() {
-		log.info("CUDA device not available; skipping CPU-vs-CUDA parity tests")
+	if !_cuda_ready(t, "CPU-vs-CUDA parity tests") {
 		return
 	}
 
@@ -164,8 +178,7 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 	backward_ops := cuda_ctx.backend.backward_ops
 
 	for tc in cases.get() {
-		if tc.kind not_in forward_ops {
-			log.infof("parity: skipping %s (op not in CUDA forward_ops)", tc.name)
+		if !testing.expectf(t, tc.kind in forward_ops, "parity: %s has a cases-registry entry but %v is not in CUDA forward_ops — every registry op must stay parity-covered", tc.name, tc.kind) {
 			continue
 		}
 		do_backward := tc.kind in backward_ops
@@ -265,8 +278,7 @@ _run_clip :: proc(grads_out: []f32, loc := #caller_location) -> f32 {
 
 @(test)
 test_cuda_lifecycle :: proc(t: ^testing.T) {
-	if !_cuda_available() {
-		log.info("CUDA device not available; skipping CUDA lifecycle test")
+	if !_cuda_ready(t, "CUDA lifecycle test") {
 		return
 	}
 
@@ -293,9 +305,7 @@ test_cuda_lifecycle :: proc(t: ^testing.T) {
 ADAM_SIZE  :: 8
 ADAM_STEPS :: 12
 
-_adam_grad :: proc(step, index: int) -> f32 {
-	return (f32((step * 7 + index * 3) % 11) - 5) * 0.03
-}
+_adam_grad :: cases.adam_grad
 
 _run_adam :: proc(w_out, m_out, v_out: []f32, loc := #caller_location) {
 	size  := len(w_out)

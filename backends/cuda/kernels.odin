@@ -13,8 +13,6 @@ ADD_F32_SRC         :: #load("kernels/add/add.cu",             []u8)
 ADD_BF16_SRC        :: #load("kernels/add/add_bf16.cu",        []u8)
 ADD_BACK_A_SRC      :: #load("kernels/add/add_back_a.cu",      []u8)
 ADD_BACK_B_SRC      :: #load("kernels/add/add_back_b.cu",      []u8)
-ADD_BACK_A_BF16_SRC :: #load("kernels/add/add_back_a_bf16.cu", []u8)
-ADD_BACK_B_BF16_SRC :: #load("kernels/add/add_back_b_bf16.cu", []u8)
 
 MUL_F32_SRC  :: #load("kernels/mul/mul.cu",      []u8)
 MUL_BF16_SRC :: #load("kernels/mul/mul_bf16.cu", []u8)

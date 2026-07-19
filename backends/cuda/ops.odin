@@ -631,45 +631,20 @@ _add_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	dap := gradient(a).ptr
 	dbp := gradient(b).ptr
 
-	#partial switch a.type {
-	case .F32:
-		if dap != 0 {
-			_add_back_a_pipeline := _compile_pipeline(ADD_BACK_A_SRC, "add_back_a.cu", "add_back_a_f32")
-			n := i32(ml.len(a))
-			args_a := [?]rawptr{&dyp, &dap, &n}
-			grid_a := _div_up(ml.len(a), ADD_LOCAL_SIZE)
-			_dispatch(_add_back_a_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
-		}
+	if dap != 0 {
+		_add_back_a_pipeline := _compile_pipeline(ADD_BACK_A_SRC, "add_back_a.cu", "add_back_a_f32")
+		n := i32(ml.len(a))
+		args_a := [?]rawptr{&dyp, &dap, &n}
+		grid_a := _div_up(ml.len(a), ADD_LOCAL_SIZE)
+		_dispatch(_add_back_a_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
+	}
 
-		if dbp != 0 {
-			_add_back_b_pipeline := _compile_pipeline(ADD_BACK_B_SRC, "add_back_b.cu", "add_back_b_f32")
-			n_b := i32(ml.len(b)); st := i32(stride)
-			args_b := [?]rawptr{&dyp, &dbp, &n_b, &st}
-			grid_b := _div_up(ml.len(b), ADD_LOCAL_SIZE)
-			_dispatch(_add_back_b_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
-		}
-
-	case .Bf16:
-		if dap != 0 {
-			_add_back_a_bf16_pipeline := _compile_pipeline(ADD_BACK_A_BF16_SRC, "add_back_a_bf16.cu", "add_back_a_bf16")
-			a_pairs := (ml.len(a) + 1) / 2
-			n := i32(ml.len(a)); pc := i32(a_pairs)
-			args_a := [?]rawptr{&dyp, &dap, &n, &pc}
-			grid_a := _div_up(a_pairs, ADD_LOCAL_SIZE)
-			_dispatch(_add_back_a_bf16_pipeline, grid_a, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_a[:], loc)
-		}
-
-		if dbp != 0 {
-			_add_back_b_bf16_pipeline := _compile_pipeline(ADD_BACK_B_BF16_SRC, "add_back_b_bf16.cu", "add_back_b_bf16")
-			b_pairs := (ml.len(b) + 1) / 2
-			n_b := i32(ml.len(b)); st := i32(stride); pcb := i32(b_pairs)
-			args_b := [?]rawptr{&dyp, &dbp, &n_b, &st, &pcb}
-			grid_b := _div_up(b_pairs, ADD_LOCAL_SIZE)
-			_dispatch(_add_back_b_bf16_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
-		}
-
-	case:
-		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
+	if dbp != 0 {
+		_add_back_b_pipeline := _compile_pipeline(ADD_BACK_B_SRC, "add_back_b.cu", "add_back_b_f32")
+		n_b := i32(ml.len(b)); st := i32(stride)
+		args_b := [?]rawptr{&dyp, &dbp, &n_b, &st}
+		grid_b := _div_up(ml.len(b), ADD_LOCAL_SIZE)
+		_dispatch(_add_back_b_pipeline, grid_b, 1, 1, ADD_LOCAL_SIZE, 1, 1, 0, args_b[:], loc)
 	}
 }
 

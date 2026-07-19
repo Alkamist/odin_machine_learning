@@ -57,9 +57,16 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	data_start := 8 + header_len
 
 	header_bytes := file_bytes[8:8 + header_len]
+	if !json.is_valid(header_bytes, parse_integers = true) {
+		log.errorf("invalid JSON header in %v", path, location=loc)
+		delete(file_bytes)
+		return {}, false
+	}
+
 	root, parse_err := json.parse(header_bytes, parse_integers = true)
 	if parse_err != .None {
 		log.errorf("JSON parse error %v in %v", parse_err, path, location=loc)
+		json.destroy_value(root)
 		delete(file_bytes)
 		return {}, false
 	}
