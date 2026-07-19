@@ -139,18 +139,15 @@ MNIST_ASSETS := []fetch.Asset {
 		url  = "https://ossci-datasets.s3.amazonaws.com/mnist/train-images-idx3-ubyte.gz",
 		dest = MNIST_DATA_DIR + "/train-images-idx3-ubyte.gz",
 		size = 9_912_422,
-	},
-	{
+	}, {
 		url  = "https://ossci-datasets.s3.amazonaws.com/mnist/train-labels-idx1-ubyte.gz",
 		dest = MNIST_DATA_DIR + "/train-labels-idx1-ubyte.gz",
 		size = 28_881,
-	},
-	{
+	}, {
 		url  = "https://ossci-datasets.s3.amazonaws.com/mnist/t10k-images-idx3-ubyte.gz",
 		dest = MNIST_DATA_DIR + "/t10k-images-idx3-ubyte.gz",
 		size = 1_648_877,
-	},
-	{
+	}, {
 		url  = "https://ossci-datasets.s3.amazonaws.com/mnist/t10k-labels-idx1-ubyte.gz",
 		dest = MNIST_DATA_DIR + "/t10k-labels-idx1-ubyte.gz",
 		size = 4_542,
