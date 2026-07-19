@@ -19,8 +19,8 @@ test_registry_mlp_names :: proc(t: ^testing.T) {
 
 		model := mlp.make(4, 8, 2)
 
-		params := make([dynamic]ml.Parameter)
-		mlp.parameters(model, "encoder", &params)
+		gathered: ml.Registry
+		mlp.parameters(model, &gathered, prefix="encoder")
 
 		expected := []string{
 			"encoder.0.weight",
@@ -28,18 +28,15 @@ test_registry_mlp_names :: proc(t: ^testing.T) {
 			"encoder.1.weight",
 			"encoder.1.bias",
 		}
-		testing.expectf(t, len(params) == len(expected), "expected %d parameters, got %d", len(expected), len(params))
+		testing.expectf(t, len(gathered.parameters) == len(expected), "expected %d parameters, got %d", len(expected), len(gathered.parameters))
 		for name, i in expected {
-			testing.expectf(t, params[i].name == name, "parameter %d expected %q, got %q", i, name, params[i].name)
+			testing.expectf(t, gathered.parameters[i].name == name, "parameter %d expected %q, got %q", i, name, gathered.parameters[i].name)
 		}
 
-		count := ml.registry_parameter_count(model.params[:])
+		count := ml.registry_element_count(&model.params)
 		testing.expectf(t, count == 58, "expected parameter count 58, got %d", count)
 
-		for p in params {
-			delete(p.name)
-		}
-		delete(params)
+		ml.registry_destroy(&gathered)
 
 		mlp.destroy(model)
 

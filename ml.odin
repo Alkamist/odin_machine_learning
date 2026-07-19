@@ -9,7 +9,6 @@ import "core:mem"
 import "core:math"
 import "core:math/rand"
 import "core:reflect"
-import "core:strings"
 
 MAX_OPERATIONS               :: 16384
 MAX_TENSOR_RANK              :: 6
@@ -215,7 +214,7 @@ buffer_dtype :: #force_inline proc(tensor_type: Data_Type, kind: Buffer_Kind) ->
 }
 
 @(require_results)
-alloc :: proc(type: Data_Type, shape: []int, persistent: bool, buffers: Buffer_Set, loc := #caller_location) -> (t: Tensor) {
+alloc :: proc(type: Data_Type, shape: []int, persistent := false, buffers := DEFAULT_ACTIVATION_BUFFERS, loc := #caller_location) -> (t: Tensor) {
 	assert(_current_ctx != nil, "Did you forget to call context_create / context_scope?", loc=loc)
 	assert(builtin.len(shape) > 0, "Tensor must have at least one dimension", loc=loc)
 	assert(builtin.len(shape) <= MAX_TENSOR_RANK, "Tensor rank exceeds MAX_TENSOR_RANK", loc=loc)
@@ -286,9 +285,13 @@ _tensor_shaped :: proc(data: []f32, shape: []int, loc := #caller_location) -> (t
 }
 
 @(require_results)
-scalar :: proc(type: Data_Type, value: f32, loc := #caller_location) -> (t: Tensor) {
-	shape := [1]int{1}
-	t = zeros(type, shape[:], loc=loc)
+scalar :: proc(type: Data_Type, value: f32, persistent := false, loc := #caller_location) -> (t: Tensor) {
+	if persistent {
+		t = alloc(type, {1}, persistent=true, buffers={.Data}, loc=loc)
+	} else {
+		shape := [1]int{1}
+		t = zeros(type, shape[:], loc=loc)
+	}
 	switch type {
 	case .F32:
 		src := [1]f32{value}
@@ -298,22 +301,6 @@ scalar :: proc(type: Data_Type, value: f32, loc := #caller_location) -> (t: Tens
 		t.backend.buffer_set(t.buffers[.Data], mem.slice_to_bytes(src[:]), loc)
 	case .Q4_K, .Q6_K:
 		fmt.panicf("scalar does not support dtype %v", type, loc=loc)
-	}
-	return
-}
-
-@(require_results)
-const_scalar :: proc(type: Data_Type, value: f32, loc := #caller_location) -> (t: Tensor) {
-	t = alloc(type, {1}, persistent=true, buffers={.Data}, loc=loc)
-	switch type {
-	case .F32:
-		src := [1]f32{value}
-		set_data_bytes(t, mem.slice_to_bytes(src[:]), loc=loc)
-	case .Bf16:
-		src := [1]Bf16{bf16_from_f32(value)}
-		set_data_bytes(t, mem.slice_to_bytes(src[:]), loc=loc)
-	case .Q4_K, .Q6_K:
-		fmt.panicf("const_scalar does not support dtype %v", type, loc=loc)
 	}
 	return
 }
@@ -366,12 +353,6 @@ reshape :: proc(src: Tensor, shape: []int, loc := #caller_location) -> (t: Tenso
 		t.shape[i] = d
 	}
 	return
-}
-
-@(require_results)
-make :: proc(type: Data_Type, shape: []int, loc := #caller_location) -> (t: Tensor, err: mem.Allocator_Error) #optional_allocator_error {
-	t = alloc(type, shape, persistent=true, buffers=DEFAULT_PARAMETER_BUFFERS, loc=loc)
-	return t, nil
 }
 
 destroy :: proc(t: Tensor, loc := #caller_location) {
@@ -458,47 +439,6 @@ has_gradient :: #force_inline proc(t: Tensor) -> bool {
 @(require_results)
 buffer_byte_count :: proc(t: Tensor, kind: Buffer_Kind) -> int {
 	return _data_byte_count(buffer_dtype(t.type, kind), t.count)
-}
-
-Parameter :: struct {
-	name:   string,
-	tensor: Tensor,
-}
-
-parameter_append :: proc(list: ^[dynamic]Parameter, prefix, name: string, tensor: Tensor) {
-	full: string
-	if prefix == "" {
-		full = strings.clone(name, allocator=list.allocator)
-	} else {
-		full = fmt.aprintf("%s.%s", prefix, name, allocator=list.allocator)
-	}
-	append(list, Parameter{name=full, tensor=tensor})
-}
-
-@(require_results)
-parameters_len :: proc(params: []Parameter) -> (total: int) {
-	for p in params {
-		total += p.tensor.count
-	}
-	return
-}
-
-parameters_read :: proc(params: []Parameter, dst: []f32, loc := #caller_location) {
-	assert(builtin.len(dst) == parameters_len(params), "dst length must equal parameters_len", loc=loc)
-	index := 0
-	for p in params {
-		get_data(p.tensor, dst[index:index + p.tensor.count], loc=loc)
-		index += p.tensor.count
-	}
-}
-
-parameters_write :: proc(params: []Parameter, src: []f32, loc := #caller_location) {
-	assert(builtin.len(src) == parameters_len(params), "src length must equal parameters_len", loc=loc)
-	index := 0
-	for p in params {
-		set_data(p.tensor, src[index:index + p.tensor.count], loc=loc)
-		index += p.tensor.count
-	}
 }
 
 fill_normal :: proc(t: Tensor, mean, std: f32, loc := #caller_location) {
@@ -673,8 +613,14 @@ update :: proc(opt: ^Optimizer, t: Tensor, loc := #caller_location) {
 	t.backend.update(opt^, t, state.m, state.v, loc)
 }
 
-clip_gradient_norm :: proc(params: []Parameter, max_norm: f32, loc := #caller_location) -> (norm: f32) {
-	if builtin.len(params) == 0 {
+clip_gradient_norm :: proc(r: ^Registry, max_norm: f32, loc := #caller_location) -> (norm: f32) {
+	trainable_count := 0
+	for parameter in r.parameters {
+		if .Train in parameter.flags {
+			trainable_count += 1
+		}
+	}
+	if trainable_count == 0 {
 		return
 	}
 
@@ -689,9 +635,12 @@ clip_gradient_norm :: proc(params: []Parameter, max_norm: f32, loc := #caller_lo
 	zero_bytes: [size_of(f64)]byte
 	backend.buffer_set(accumulator, zero_bytes[:], loc)
 
-	for p in params {
-		assert(p.tensor.buffers[.Gradient] != Backend_Buffer{}, "clip_gradient_norm requires parameters with a gradient buffer", loc=loc)
-		backend.buffer_sq_sum_accumulate(p.tensor.buffers[.Gradient], p.tensor.count, accumulator, loc)
+	for parameter in r.parameters {
+		if .Train not_in parameter.flags {
+			continue
+		}
+		assert(parameter.tensor.buffers[.Gradient] != Backend_Buffer{}, "clip_gradient_norm requires parameters with a gradient buffer", loc=loc)
+		backend.buffer_sq_sum_accumulate(parameter.tensor.buffers[.Gradient], parameter.tensor.count, accumulator, loc)
 	}
 
 	total_sq: [1]f64
@@ -703,8 +652,11 @@ clip_gradient_norm :: proc(params: []Parameter, max_norm: f32, loc := #caller_lo
 	}
 
 	scale := max_norm / norm
-	for p in params {
-		backend.buffer_scale(p.tensor.buffers[.Gradient], p.tensor.count, scale, loc)
+	for parameter in r.parameters {
+		if .Train not_in parameter.flags {
+			continue
+		}
+		backend.buffer_scale(parameter.tensor.buffers[.Gradient], parameter.tensor.count, scale, loc)
 	}
 	return
 }

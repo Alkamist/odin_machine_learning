@@ -244,25 +244,24 @@ _run_clip :: proc(grads_out: []f32, loc := #caller_location) -> f32 {
 	n := len(sizes)
 
 	tensors := make([]ml.Tensor, n)
-	params  := make([]ml.Parameter, n)
 	defer delete(tensors)
-	defer delete(params)
+	r: ml.Registry
 
 	offset := 0
 	for size, i in sizes {
 		shape := [1]int{size}
-		tensors[i] = ml.make(.F32, shape[:])
+		tensors[i] = ml.alloc(.F32, shape[:], persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 		grad := make([]f32, size)
 		for j in 0 ..< size {
 			grad[j] = _clip_grad(offset + j)
 		}
 		ml.set_bytes(tensors[i], .Gradient, mem.slice_to_bytes(grad))
 		delete(grad)
-		params[i] = ml.Parameter{name = "", tensor = tensors[i]}
+		ml.parameter_register(&r, "", "", tensors[i], init=ml.Init_None{})
 		offset += size
 	}
 
-	norm := ml.clip_gradient_norm(params[:], CLIP_MAX_NORM)
+	norm := ml.clip_gradient_norm(&r, CLIP_MAX_NORM)
 
 	offset = 0
 	for size, i in sizes {
@@ -270,9 +269,7 @@ _run_clip :: proc(grads_out: []f32, loc := #caller_location) -> f32 {
 		offset += size
 	}
 
-	for tensor in tensors {
-		ml.destroy(tensor)
-	}
+	ml.registry_destroy(&r)
 	return norm
 }
 
@@ -286,7 +283,7 @@ test_cuda_lifecycle :: proc(t: ^testing.T) {
 		ctx := cuda.context_create()
 		ml.context_begin(ctx)
 
-		param := ml.make(.F32, {4})
+		param := ml.alloc(.F32, {4}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 		src := [4]f32{1, 2, 3, 4}
 		ml.set_data(param, src[:])
 		got: [4]f32
@@ -310,7 +307,7 @@ _adam_grad :: cases.adam_grad
 _run_adam :: proc(w_out, m_out, v_out: []f32, loc := #caller_location) {
 	size  := len(w_out)
 	shape := [1]int{size}
-	param := ml.make(.F32, shape[:])
+	param := ml.alloc(.F32, shape[:], persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 
 	init_w := make([]f32, size)
 	defer delete(init_w)

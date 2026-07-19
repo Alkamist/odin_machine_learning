@@ -13,12 +13,15 @@ import st "loaders/safetensors"
 CHECKPOINT_VERSION :: "1"
 
 @(require_results)
-checkpoint_save :: proc(path: string, params: []Parameter, opt: ^Optimizer, metadata: map[string]string, loc := #caller_location) -> bool {
+checkpoint_save :: proc(path: string, r: ^Registry, opt: ^Optimizer, metadata: map[string]string, loc := #caller_location) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	entries := builtin.make([dynamic]st.Entry, allocator=context.temp_allocator)
 
-	for parameter in params {
+	for parameter in r.parameters {
+		if .Checkpoint not_in parameter.flags {
+			continue
+		}
 		tensor := parameter.tensor
 		assert(
 			tensor.type == .F32 || tensor.type == .Bf16,
@@ -62,14 +65,17 @@ checkpoint_save :: proc(path: string, params: []Parameter, opt: ^Optimizer, meta
 }
 
 @(require_results)
-checkpoint_load :: proc(path: string, params: []Parameter, opt: ^Optimizer, loc := #caller_location) -> (metadata: map[string]string, ok: bool) {
+checkpoint_load :: proc(path: string, r: ^Registry, opt: ^Optimizer, loc := #caller_location) -> (metadata: map[string]string, ok: bool) {
 	loader, load_ok := st.load(path, loc=loc)
 	if !load_ok {
 		return
 	}
 	defer st.destroy(loader)
 
-	for parameter in params {
+	for parameter in r.parameters {
+		if .Checkpoint not_in parameter.flags {
+			continue
+		}
 		tensor := parameter.tensor
 
 		info, present := st.get_info(loader, parameter.name)
@@ -114,7 +120,10 @@ checkpoint_load :: proc(path: string, params: []Parameter, opt: ^Optimizer, loc 
 		}
 	}
 
-	for parameter in params {
+	for parameter in r.parameters {
+		if .Checkpoint not_in parameter.flags {
+			continue
+		}
 		tensor := parameter.tensor
 		file_bytes, _ := st.get_bytes(loader, parameter.name)
 		set_bytes(tensor, .Data, file_bytes, loc=loc)

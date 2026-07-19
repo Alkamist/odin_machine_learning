@@ -19,7 +19,7 @@ Adapter :: struct {
 	in_features:  int,
 	out_features: int,
 
-	params: [dynamic]ml.Parameter_Info,
+	params: ml.Registry,
 }
 
 @(require_results)
@@ -31,10 +31,7 @@ make :: proc(in_features, out_features, rank: int, alpha: f32, dtype: ml.Data_Ty
 	adapter.a = ml.parameter_make(&adapter.params, "", "lora_A.weight", dtype, {rank, in_features}, init=ml.Init_Normal{mean=0, std=0.02})
 	adapter.b = ml.parameter_make(&adapter.params, "", "lora_B.weight", dtype, {out_features, rank}, init=ml.Init_Value{value=0})
 
-	// scale is a frozen constant: persistent Data buffer only, no gradient.
-	// ml.mul backward skips the b-side when b has no gradient buffer.
-	adapter.scale = ml.const_scalar(dtype, alpha / f32(rank), loc=loc)
-	ml.register(&adapter.params, "", "scale", adapter.scale, init=nil, trainable=false)
+	adapter.scale = ml.scalar(dtype, alpha / f32(rank), persistent=true, loc=loc)
 
 	return
 }
@@ -42,6 +39,7 @@ make :: proc(in_features, out_features, rank: int, alpha: f32, dtype: ml.Data_Ty
 destroy :: proc(adapter: Adapter) {
 	adapter := adapter
 	ml.registry_destroy(&adapter.params)
+	ml.destroy(adapter.scale)
 }
 
 // Standard QLoRA init: A ~ N(0, sigma) so the input through A is non-zero,
@@ -64,19 +62,22 @@ apply :: proc(input, base_output: ml.Tensor, adapter: Adapter) -> ml.Tensor {
 }
 
 update :: proc(opt: ^ml.Optimizer, adapter: Adapter) {
-	ml.registry_update(opt, adapter.params[:])
+	adapter := adapter
+	ml.registry_update(opt, &adapter.params)
 }
 
 // Element count for parameter accounting / progress reporting.
 @(require_results)
 parameter_count :: proc(adapter: Adapter) -> int {
-	return ml.registry_parameter_count(adapter.params[:])
+	adapter := adapter
+	return ml.registry_element_count(&adapter.params)
 }
 
 // Enumerates the trainable adapter tensors under PEFT-style names
 // (`{prefix}.lora_A.weight`, `{prefix}.lora_B.weight`) so saved adapters
 // interoperate with the wider ecosystem. `scale` is a frozen constant
 // recomputed from alpha/rank at make time, so it is not a saved parameter.
-parameters :: proc(adapter: Adapter, prefix: string, list: ^[dynamic]ml.Parameter) {
-	ml.registry_parameters(adapter.params[:], list, prefix=prefix)
+parameters :: proc(adapter: Adapter, prefix: string, dst: ^ml.Registry) {
+	adapter := adapter
+	ml.registry_gather(dst, &adapter.params, prefix=prefix)
 }

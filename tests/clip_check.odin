@@ -10,15 +10,14 @@ import cpu "../backends/cpu"
 _clip_case :: proc(t: ^testing.T, name: string, grads: [][]f32, max_norm: f32) {
 	n := len(grads)
 	tensors := make([]ml.Tensor, n)
-	params  := make([]ml.Parameter, n)
 	defer delete(tensors)
-	defer delete(params)
+	r: ml.Registry
 
 	for g, i in grads {
 		shape := [1]int{len(g)}
-		tensors[i] = ml.make(.F32, shape[:])
+		tensors[i] = ml.alloc(.F32, shape[:], persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 		ml.set_bytes(tensors[i], .Gradient, mem.slice_to_bytes(g))
-		params[i] = ml.Parameter{name = "", tensor = tensors[i]}
+		ml.parameter_register(&r, "", "", tensors[i], init=ml.Init_None{})
 	}
 
 	total_sq := f64(0)
@@ -34,7 +33,7 @@ _clip_case :: proc(t: ^testing.T, name: string, grads: [][]f32, max_norm: f32) {
 		scale = max_norm / ref_norm
 	}
 
-	got_norm := ml.clip_gradient_norm(params[:], max_norm)
+	got_norm := ml.clip_gradient_norm(&r, max_norm)
 
 	norm_denom := max(max(abs(f64(ref_norm)), abs(f64(got_norm))), 1e-4)
 	norm_rel   := abs(f64(ref_norm) - f64(got_norm)) / norm_denom
@@ -51,9 +50,7 @@ _clip_case :: proc(t: ^testing.T, name: string, grads: [][]f32, max_norm: f32) {
 		}
 	}
 
-	for tensor in tensors {
-		ml.destroy(tensor)
-	}
+	ml.registry_destroy(&r)
 }
 
 @(test)

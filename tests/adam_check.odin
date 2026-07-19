@@ -24,7 +24,7 @@ test_adam_update :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
 	ml.context_begin(ctx)
 
-	param := ml.make(.F32, {ADAM_SIZE})
+	param := ml.alloc(.F32, {ADAM_SIZE}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 
 	init_w: [ADAM_SIZE]f32
 	for i in 0 ..< ADAM_SIZE {
@@ -86,7 +86,7 @@ test_adam_accumulation :: proc(t: ^testing.T) {
 	ctx := cpu.context_create(1 * 1024 * 1024)
 	ml.context_begin(ctx)
 
-	param := ml.make(.F32, {ADAM_SIZE})
+	param := ml.alloc(.F32, {ADAM_SIZE}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 
 	init_w: [ADAM_SIZE]f32
 	for i in 0 ..< ADAM_SIZE {

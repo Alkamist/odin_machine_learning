@@ -189,7 +189,8 @@ Gemma :: struct {
 	softcap_inv:         ml.Tensor, // 1 / final_logit_softcapping (only if > 0)
 	softcap:             ml.Tensor, // final_logit_softcapping     (only if > 0)
 
-	params: [dynamic]ml.Parameter_Info,
+	params:      ml.Registry,
+	train_flags: ml.Parameter_Flags,
 }
 
 @(require_results)
@@ -220,7 +221,8 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 	case use_lora:
 		base_buffers = frozen_buffers // QLoRA: only adapters train
 	case:
-		base_buffers = trainable_buffers
+		base_buffers      = trainable_buffers
+		model.train_flags = {.Train, .Checkpoint}
 	}
 
 	make_w :: proc(dtype: ml.Data_Type, shape: []int, buffers: ml.Buffer_Set) -> ml.Tensor {
@@ -304,16 +306,16 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 		}
 	}
 
-	model.embed_scale       = ml.const_scalar(dtype, math.sqrt(f32(config.hidden_size)))
-	model.ple_token_scale   = ml.const_scalar(dtype, math.sqrt(f32(config.hidden_size_per_layer_input)))
-	model.ple_ctx_scale     = ml.const_scalar(dtype, 1.0 / math.sqrt(f32(config.hidden_size)))
-	model.ple_combine_scale = ml.const_scalar(dtype, 1.0 / math.sqrt(f32(2)))
+	model.embed_scale       = ml.scalar(dtype, math.sqrt(f32(config.hidden_size)), persistent=true)
+	model.ple_token_scale   = ml.scalar(dtype, math.sqrt(f32(config.hidden_size_per_layer_input)), persistent=true)
+	model.ple_ctx_scale     = ml.scalar(dtype, 1.0 / math.sqrt(f32(config.hidden_size)), persistent=true)
+	model.ple_combine_scale = ml.scalar(dtype, 1.0 / math.sqrt(f32(2)), persistent=true)
 	if config.final_logit_softcapping > 0 {
-		model.softcap_inv = ml.const_scalar(dtype, 1.0 / config.final_logit_softcapping)
-		model.softcap     = ml.const_scalar(dtype, config.final_logit_softcapping)
+		model.softcap_inv = ml.scalar(dtype, 1.0 / config.final_logit_softcapping, persistent=true)
+		model.softcap     = ml.scalar(dtype, config.final_logit_softcapping, persistent=true)
 	}
 
-	reserve(&model.params, 16 * config.num_hidden_layers + 12)
+	reserve(&model.params.parameters, 16 * config.num_hidden_layers + 12)
 	_register_parameters(&model)
 
 	return
@@ -324,7 +326,11 @@ _register_parameters :: proc(model: ^Gemma) {
 	residual_scale := f32(0.02 / math.sqrt(f32(2 * cfg.num_hidden_layers)))
 
 	reg :: proc(model: ^Gemma, prefix, name: string, tensor: ml.Tensor, init: ml.Init) {
-		ml.register(&model.params, prefix, name, tensor, init=init, trainable=ml.has_gradient(tensor))
+		used_init: ml.Init = ml.Init_None{}
+		if .Train in model.train_flags {
+			used_init = init
+		}
+		ml.parameter_register(&model.params, prefix, name, tensor, init=used_init, flags=model.train_flags)
 	}
 
 	reg(model, "", "model.language_model.embed_tokens.weight",            model.embed_tokens_weight,               ml.Init_Normal{mean=0, std=0.02})
@@ -334,17 +340,6 @@ _register_parameters :: proc(model: ^Gemma) {
 	}
 	reg(model, "", "model.language_model.per_layer_model_projection.weight", model.per_layer_model_projection_weight, ml.Init_Normal{mean=0, std=0.02})
 	reg(model, "", "model.language_model.per_layer_projection_norm.weight",  model.per_layer_projection_norm_weight,  ml.Init_Value{value=1})
-
-	reg(model, "", "v_norm_ones_sliding", model.v_norm_ones_sliding, nil)
-	reg(model, "", "v_norm_ones_full",    model.v_norm_ones_full,    nil)
-	reg(model, "", "embed_scale",         model.embed_scale,         nil)
-	reg(model, "", "ple_token_scale",     model.ple_token_scale,     nil)
-	reg(model, "", "ple_ctx_scale",       model.ple_ctx_scale,       nil)
-	reg(model, "", "ple_combine_scale",   model.ple_combine_scale,   nil)
-	if cfg.final_logit_softcapping > 0 {
-		reg(model, "", "softcap_inv", model.softcap_inv, nil)
-		reg(model, "", "softcap",     model.softcap,     nil)
-	}
 
 	for &layer, layer_idx in model.layers {
 		prefix := fmt.tprintf("model.language_model.layers.%v", layer_idx)
@@ -379,6 +374,15 @@ destroy :: proc(model: Gemma) {
 	model := model
 	ml.registry_destroy(&model.params)
 
+	ml.destroy(model.v_norm_ones_sliding)
+	ml.destroy(model.v_norm_ones_full)
+	ml.destroy(model.embed_scale)
+	ml.destroy(model.ple_token_scale)
+	ml.destroy(model.ple_ctx_scale)
+	ml.destroy(model.ple_combine_scale)
+	ml.destroy(model.softcap_inv)
+	ml.destroy(model.softcap)
+
 	delete(model.embed_tokens_per_layer_bytes)
 
 	_destroy_lora :: proc(adapter: lora.Adapter) {
@@ -399,7 +403,8 @@ destroy :: proc(model: Gemma) {
 }
 
 randomize :: proc(model: Gemma) {
-	ml.registry_randomize(model.params[:])
+	model := model
+	ml.registry_randomize(&model.params)
 
 	_fill_per_layer_bytes_normal(model, 0.02)
 
@@ -435,7 +440,8 @@ _fill_per_layer_bytes_normal :: proc(model: Gemma, std: f32) {
 }
 
 update :: proc(opt: ^ml.Optimizer, model: Gemma) {
-	ml.registry_update(opt, model.params[:])
+	model := model
+	ml.registry_update(opt, &model.params)
 
 	for layer in model.layers {
 		if layer.q_lora.rank    > 0 { lora.update(opt, layer.q_lora) }
@@ -448,19 +454,20 @@ update :: proc(opt: ^ml.Optimizer, model: Gemma) {
 	}
 }
 
-parameters :: proc(model: Gemma, list: ^[dynamic]ml.Parameter) {
-	ml.registry_parameters(model.params[:], list)
+parameters :: proc(model: Gemma, dst: ^ml.Registry) {
+	model := model
+	ml.registry_gather(dst, &model.params)
 
 	for layer, layer_idx in model.layers {
 		attn_prefix := fmt.tprintf("model.language_model.layers.%v.self_attn", layer_idx)
 		mlp_prefix  := fmt.tprintf("model.language_model.layers.%v.mlp",       layer_idx)
-		if layer.q_lora.rank    > 0 { lora.parameters(layer.q_lora,    fmt.tprintf("%v.q_proj",    attn_prefix), list) }
-		if layer.k_lora.rank    > 0 { lora.parameters(layer.k_lora,    fmt.tprintf("%v.k_proj",    attn_prefix), list) }
-		if layer.v_lora.rank    > 0 { lora.parameters(layer.v_lora,    fmt.tprintf("%v.v_proj",    attn_prefix), list) }
-		if layer.o_lora.rank    > 0 { lora.parameters(layer.o_lora,    fmt.tprintf("%v.o_proj",    attn_prefix), list) }
-		if layer.gate_lora.rank > 0 { lora.parameters(layer.gate_lora, fmt.tprintf("%v.gate_proj", mlp_prefix),  list) }
-		if layer.up_lora.rank   > 0 { lora.parameters(layer.up_lora,   fmt.tprintf("%v.up_proj",   mlp_prefix),  list) }
-		if layer.down_lora.rank > 0 { lora.parameters(layer.down_lora, fmt.tprintf("%v.down_proj", mlp_prefix),  list) }
+		if layer.q_lora.rank    > 0 { lora.parameters(layer.q_lora,    fmt.tprintf("%v.q_proj",    attn_prefix), dst) }
+		if layer.k_lora.rank    > 0 { lora.parameters(layer.k_lora,    fmt.tprintf("%v.k_proj",    attn_prefix), dst) }
+		if layer.v_lora.rank    > 0 { lora.parameters(layer.v_lora,    fmt.tprintf("%v.v_proj",    attn_prefix), dst) }
+		if layer.o_lora.rank    > 0 { lora.parameters(layer.o_lora,    fmt.tprintf("%v.o_proj",    attn_prefix), dst) }
+		if layer.gate_lora.rank > 0 { lora.parameters(layer.gate_lora, fmt.tprintf("%v.gate_proj", mlp_prefix),  dst) }
+		if layer.up_lora.rank   > 0 { lora.parameters(layer.up_lora,   fmt.tprintf("%v.up_proj",   mlp_prefix),  dst) }
+		if layer.down_lora.rank > 0 { lora.parameters(layer.down_lora, fmt.tprintf("%v.down_proj", mlp_prefix),  dst) }
 	}
 }
 

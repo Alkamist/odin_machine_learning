@@ -13,7 +13,7 @@ Layer :: struct {
 
 Mlp :: struct {
 	layers: []Layer,
-	params: [dynamic]ml.Parameter_Info,
+	params: ml.Registry,
 }
 
 make :: proc(sizes: ..int, allocator := context.allocator) -> (mlp: Mlp) {
@@ -37,16 +37,20 @@ destroy :: proc(mlp: Mlp) {
 	delete(mlp.layers)
 }
 
-parameters :: proc(mlp: Mlp, prefix: string, list: ^[dynamic]ml.Parameter) {
-	ml.registry_parameters(mlp.params[:], list, prefix=prefix)
+parameters :: proc(mlp: Mlp, dst: ^ml.Registry, prefix := "") {
+	mlp := mlp
+	ml.registry_gather(dst, &mlp.params, prefix=prefix)
 }
 
 copy :: proc(dst, src: Mlp) {
-	ml.registry_copy(dst.params[:], src.params[:])
+	dst := dst
+	src := src
+	ml.registry_copy(&dst.params, &src.params)
 }
 
 randomize :: proc(mlp: Mlp) {
-	ml.registry_randomize(mlp.params[:])
+	mlp := mlp
+	ml.registry_randomize(&mlp.params)
 }
 
 @(require_results)
@@ -64,5 +68,6 @@ forward :: proc(mlp: Mlp, input: ml.Tensor) -> (output: ml.Tensor) {
 }
 
 update :: proc(opt: ^ml.Optimizer, mlp: Mlp) {
-	ml.registry_update(opt, mlp.params[:])
+	mlp := mlp
+	ml.registry_update(opt, &mlp.params)
 }

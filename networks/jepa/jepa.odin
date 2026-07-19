@@ -267,22 +267,23 @@ _sample_categorical :: proc(probabilities: []f32) -> int {
 	return builtin.len(probabilities) - 1
 }
 
-parameters :: proc(jepa: Jepa, list: ^[dynamic]ml.Parameter) {
-	mlp.parameters(jepa.encoder,        "encoder",        list)
-	mlp.parameters(jepa.target_encoder, "target_encoder", list)
-	mlp.parameters(jepa.predictor,      "predictor",      list)
+parameters :: proc(jepa: Jepa, dst: ^ml.Registry) {
+	mlp.parameters(jepa.encoder,        dst, prefix="encoder")
+	mlp.parameters(jepa.target_encoder, dst, prefix="target_encoder")
+	mlp.parameters(jepa.predictor,      dst, prefix="predictor")
 }
 
-decoder_parameters :: proc(jepa: Jepa, list: ^[dynamic]ml.Parameter) {
-	mlp.parameters(jepa.decoder, "decoder", list)
+decoder_parameters :: proc(jepa: Jepa, dst: ^ml.Registry) {
+	mlp.parameters(jepa.decoder, dst, prefix="decoder")
 }
 
 save :: proc(jepa: Jepa, path: string, opt: ^ml.Optimizer = nil, iteration: u64 = 0, decoder_iteration: u64 = 0, loc := #caller_location) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
-	params := builtin.make([dynamic]ml.Parameter, allocator=context.temp_allocator)
-	parameters(jepa, &params)
-	decoder_parameters(jepa, &params)
+	gathered: ml.Registry
+	gathered.parameters.allocator = context.temp_allocator
+	parameters(jepa, &gathered)
+	decoder_parameters(jepa, &gathered)
 
 	metadata := builtin.make(map[string]string, allocator=context.temp_allocator)
 	metadata["ml.iteration"]         = fmt.tprintf("%d", iteration)
@@ -292,7 +293,7 @@ save :: proc(jepa: Jepa, path: string, opt: ^ml.Optimizer = nil, iteration: u64 
 	metadata["jepa.hidden_size"]     = fmt.tprintf("%d", jepa.config.hidden_size)
 	metadata["jepa.latent_size"]     = fmt.tprintf("%d", jepa.config.latent_size)
 
-	return ml.checkpoint_save(path, params[:], opt, metadata, loc=loc)
+	return ml.checkpoint_save(path, &gathered, opt, metadata, loc=loc)
 }
 
 @(require_results)
@@ -301,11 +302,12 @@ load :: proc(config: Config, path: string, opt: ^ml.Optimizer = nil, allocator :
 
 	jepa = make(config, allocator=allocator, loc=loc)
 
-	params := builtin.make([dynamic]ml.Parameter, allocator=context.temp_allocator)
-	parameters(jepa, &params)
-	decoder_parameters(jepa, &params)
+	gathered: ml.Registry
+	gathered.parameters.allocator = context.temp_allocator
+	parameters(jepa, &gathered)
+	decoder_parameters(jepa, &gathered)
 
-	metadata, load_ok := ml.checkpoint_load(path, params[:], opt, loc=loc)
+	metadata, load_ok := ml.checkpoint_load(path, &gathered, opt, loc=loc)
 	if !load_ok {
 		destroy(jepa)
 		return {}, 0, 0, false

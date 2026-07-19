@@ -53,12 +53,16 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		model := gemma.make(cfg, dtype=.F32, for_training=true, lora_cfg=lora_cfg)
 		gemma.randomize(model)
 
-		params := make([dynamic]ml.Parameter)
-		gemma.parameters(model, &params)
-		testing.expectf(t, len(params) == 8, "expected 8 LoRA-only parameters under QLoRA, got %d", len(params))
-		for p in params {
-			testing.expectf(t, strings.contains(p.name, "lora_"), "expected LoRA-only parameter, got %q", p.name)
+		gathered: ml.Registry
+		gemma.parameters(model, &gathered)
+		trainable_count := 0
+		for p in gathered.parameters {
+			if .Train in p.flags {
+				trainable_count += 1
+				testing.expectf(t, strings.contains(p.name, "lora_"), "expected trainable LoRA parameter, got %q", p.name)
+			}
 		}
+		testing.expectf(t, trainable_count == 8, "expected 8 trainable LoRA parameters under QLoRA, got %d", trainable_count)
 
 		ml.clear(training=true)
 		logits := gemma.forward(model, []int{1, 2, 3})
@@ -72,24 +76,24 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		ml.clear()
 
 		metadata: map[string]string
-		saved := ml.checkpoint_save(GEMMA_LORA_TEST_PATH, params[:], &opt, metadata)
+		saved := ml.checkpoint_save(GEMMA_LORA_TEST_PATH, &gathered, &opt, metadata)
 		testing.expect(t, saved, "checkpoint_save should succeed")
 		defer os.remove(GEMMA_LORA_TEST_PATH)
 
 		restored := gemma.make(cfg, dtype=.F32, for_training=true, lora_cfg=lora_cfg)
-		restored_params := make([dynamic]ml.Parameter)
-		gemma.parameters(restored, &restored_params)
+		restored_gathered: ml.Registry
+		gemma.parameters(restored, &restored_gathered)
 
 		restored_opt: ml.Optimizer
-		loaded_metadata, loaded := ml.checkpoint_load(GEMMA_LORA_TEST_PATH, restored_params[:], &restored_opt)
+		loaded_metadata, loaded := ml.checkpoint_load(GEMMA_LORA_TEST_PATH, &restored_gathered, &restored_opt)
 		testing.expect(t, loaded, "checkpoint_load should succeed")
 		testing.expect_value(t, restored_opt.iteration, u64(1))
 
-		total := ml.parameters_len(params[:])
+		total := ml.registry_element_count(&gathered)
 		saved_values    := make([]f32, total)
 		restored_values := make([]f32, total)
-		ml.parameters_read(params[:], saved_values)
-		ml.parameters_read(restored_params[:], restored_values)
+		ml.registry_read(&gathered, saved_values)
+		ml.registry_read(&restored_gathered, restored_values)
 		for i in 0 ..< total {
 			testing.expect_value(t, restored_values[i], saved_values[i])
 		}
@@ -97,14 +101,8 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		delete(saved_values)
 		delete(restored_values)
 		ml.checkpoint_metadata_destroy(loaded_metadata)
-		for p in params {
-			delete(p.name)
-		}
-		delete(params)
-		for p in restored_params {
-			delete(p.name)
-		}
-		delete(restored_params)
+		ml.registry_destroy(&gathered)
+		ml.registry_destroy(&restored_gathered)
 		ml.optimizer_destroy(&opt)
 		ml.optimizer_destroy(&restored_opt)
 		gemma.destroy(model)

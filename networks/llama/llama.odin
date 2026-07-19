@@ -55,10 +55,10 @@ Llama :: struct {
 	output_norm_weight: ml.Tensor, // [embedding_size]
 	lm_head_weight:     ml.Tensor, // [vocabulary_size, embedding_size]; aliases token_embeddings when tied.
 
-	params: [dynamic]ml.Parameter_Info,
+	params: ml.Registry,
 }
 
-make :: proc(config: Config, dtype: ml.Data_Type = .F32, allocator := context.allocator) -> (model: Llama) {
+make :: proc(config: Config, dtype: ml.Data_Type = .F32, trainable := true, allocator := context.allocator) -> (model: Llama) {
 	context.allocator = allocator
 
 	q_size  := config.n_q_heads  * config.head_size
@@ -66,38 +66,39 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, allocator := context.al
 
 	residual_scale := 0.02 / math.sqrt(f32(2 * config.layer_count))
 
-	model.config        = config
-	model.layers        = builtin.make([]Layer, config.layer_count)
-	model.params.allocator = allocator
+	flags := ml.PARAMETER_DEFAULT_FLAGS if trainable else ml.Parameter_Flags{}
 
-	model.token_embeddings = ml.parameter_make(&model.params, "", "model.embed_tokens.weight", dtype, {config.vocabulary_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
+	model.config = config
+	model.layers = builtin.make([]Layer, config.layer_count)
+
+	model.token_embeddings = ml.parameter_make(&model.params, "", "model.embed_tokens.weight", dtype, {config.vocabulary_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
 
 	for &layer, i in model.layers {
 		prefix := fmt.tprintf("model.layers.%v", i)
 
-		layer.input_norm_weight = ml.parameter_make(&model.params, prefix, "input_layernorm.weight",  dtype, {config.embedding_size}, init=ml.Init_Value{value=1})
-		layer.q_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.q_proj.weight", dtype, {q_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
-		layer.k_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.k_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
-		layer.v_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.v_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
-		layer.o_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.o_proj.weight", dtype, {config.embedding_size, q_size}, init=ml.Init_Normal{mean=0, std=residual_scale})
+		layer.input_norm_weight = ml.parameter_make(&model.params, prefix, "input_layernorm.weight",  dtype, {config.embedding_size}, init=ml.Init_Value{value=1}, flags=flags)
+		layer.q_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.q_proj.weight", dtype, {q_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.k_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.k_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.v_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.v_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.o_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.o_proj.weight", dtype, {config.embedding_size, q_size}, init=ml.Init_Normal{mean=0, std=residual_scale}, flags=flags)
 
 		if config.use_qk_norm {
-			layer.q_norm_weight = ml.parameter_make(&model.params, prefix, "self_attn.q_norm.weight", dtype, {config.head_size}, init=ml.Init_Value{value=1})
-			layer.k_norm_weight = ml.parameter_make(&model.params, prefix, "self_attn.k_norm.weight", dtype, {config.head_size}, init=ml.Init_Value{value=1})
+			layer.q_norm_weight = ml.parameter_make(&model.params, prefix, "self_attn.q_norm.weight", dtype, {config.head_size}, init=ml.Init_Value{value=1}, flags=flags)
+			layer.k_norm_weight = ml.parameter_make(&model.params, prefix, "self_attn.k_norm.weight", dtype, {config.head_size}, init=ml.Init_Value{value=1}, flags=flags)
 		}
 
-		layer.post_attn_norm_weight = ml.parameter_make(&model.params, prefix, "post_attention_layernorm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1})
-		layer.gate_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.gate_proj.weight", dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
-		layer.up_proj_weight        = ml.parameter_make(&model.params, prefix, "mlp.up_proj.weight",   dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
-		layer.down_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.down_proj.weight", dtype, {config.embedding_size, config.intermediate_size}, init=ml.Init_Normal{mean=0, std=residual_scale})
+		layer.post_attn_norm_weight = ml.parameter_make(&model.params, prefix, "post_attention_layernorm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1}, flags=flags)
+		layer.gate_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.gate_proj.weight", dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.up_proj_weight        = ml.parameter_make(&model.params, prefix, "mlp.up_proj.weight",   dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.down_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.down_proj.weight", dtype, {config.embedding_size, config.intermediate_size}, init=ml.Init_Normal{mean=0, std=residual_scale}, flags=flags)
 	}
 
-	model.output_norm_weight = ml.parameter_make(&model.params, "", "model.norm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1})
+	model.output_norm_weight = ml.parameter_make(&model.params, "", "model.norm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1}, flags=flags)
 
 	if config.tied_embeddings {
 		model.lm_head_weight = model.token_embeddings
 	} else {
-		model.lm_head_weight = ml.parameter_make(&model.params, "", "lm_head.weight", dtype, {config.vocabulary_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02})
+		model.lm_head_weight = ml.parameter_make(&model.params, "", "lm_head.weight", dtype, {config.vocabulary_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
 	}
 
 	randomize(model)
@@ -112,15 +113,19 @@ destroy :: proc(model: Llama) {
 }
 
 copy :: proc(dst, src: Llama) {
-	ml.registry_copy(dst.params[:], src.params[:])
+	dst := dst
+	src := src
+	ml.registry_copy(&dst.params, &src.params)
 }
 
 randomize :: proc(model: Llama) {
-	ml.registry_randomize(model.params[:])
+	model := model
+	ml.registry_randomize(&model.params)
 }
 
-parameters :: proc(model: Llama, list: ^[dynamic]ml.Parameter) {
-	ml.registry_parameters(model.params[:], list)
+parameters :: proc(model: Llama, dst: ^ml.Registry) {
+	model := model
+	ml.registry_gather(dst, &model.params)
 }
 
 Cache :: ml.Kv_Cache
@@ -230,5 +235,6 @@ forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int, loc := #c
 }
 
 update :: proc(opt: ^ml.Optimizer, model: Llama) {
-	ml.registry_update(opt, model.params[:])
+	model := model
+	ml.registry_update(opt, &model.params)
 }
