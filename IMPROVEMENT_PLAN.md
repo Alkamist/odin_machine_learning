@@ -243,7 +243,31 @@ Do this as a mechanical refactor with parity tests green before and after; it ha
 
 ---
 
-## Phase 5 — Test suite hardening
+## Phase 5 — Test suite hardening — PARTIAL (2026-07-19); NEXT-SESSION NOTES HERE
+
+### ⚠ FIX FIRST NEXT SESSION — CUDA Bf16 add/mul backward is broken
+
+Found by the new Bf16 parity sweep: `add_back_a_bf16.cu`, `add_back_b_bf16.cu`, and mul's bf16 backward kernels reinterpret the gradient buffers as bf16-packed PAIRS, but gradients in this library are always F32 — the kernels write only the first half of the F32 gradient buffer and leave the rest zero. Any Bf16 training on CUDA (incl. gemma QLoRA — residual adds are everywhere) silently half-trains through these ops. The unary bf16 backward kernels (gelu/silu/tanh) correctly declare `float*` gradients and are fine. Suggested fix: since add/mul backward touch ONLY F32 gradient buffers (data pointers of `mul` backward are read-only per dtype), route the Bf16 arms of `_add_backward`/`_mul_backward` to the F32 backward pipelines (mul backward reads `data(a)`/`data(b)` — those ARE bf16, so mul needs its bf16 kernels fixed to `float*` grads instead, or a mixed kernel; add can reuse F32 outright), then move add/mul from the excluded list into the Bf16 BACKWARD sweep in tests/parity/parity_bf16.odin and confirm parity.
+
+### Done (5.1, 5.2, 5.3)
+
+- **5.1 Fused/quant coverage** (`tests/fused_check.odin`, `tests/parity/fused_gpu_check.odin`): all 11 previously-untested ops now have oracle tests. Technique: copy the `Backend` struct, remove the fused op from the copy's `forward_ops`, repoint `ctx.backend` to force the front-end decomposition, compare fused vs decomposed. Key discovery: `Gelu_Mul`/`Add_Rmsnorm`/`Rmsnorm_Rope` ALWAYS decompose in F32 (fused kernels are Bf16-inference-only), so those oracles run in Bf16 inference. Quant linears: no quantize helpers exist, so tests synthesize valid Q4_K/Q6_K block bytes and dequantize the same bytes host-side for the oracle. `Rmsnorm_Rope_Write_Cache`'s contract: output tensor stays zero, the result goes into the cache slot — oracle compares cache contents. `Attention_Cache` is prefill-then-decode vs full causal attention (separate `clear()` passes required — the CUDA backend tracks cache writes per forward).
+- **5.2 Bf16 coverage** (`tests/bf16_check.odin`, `tests/parity/parity_bf16.odin`): RNE/NaN/infinity unit tests for `bf16_from_f32`; CPU-vs-CUDA Bf16 forward sweep over 15 ops (rel tol 2e-2) + backward sweep (gelu/silu/tanh; add/mul excluded pending the bug fix above). **This is the net 4.1b was waiting for** — the CUDA f32/bf16 kernel-pair collapse can now proceed against it.
+- **5.3 Goldens** (`tests/golden/`, own package): gemma tokenizer vs HF `tokenizers` 0.22.2 reference (11 strings incl. unicode/emoji/control chars; encode ids exact + decode round-trip — independently confirms the Phase 1.9 no-dummy-prefix finding); Q4_K/Q6_K dequantization vs hand-crafted blocks from the llama.cpp format spec; fixed-weight MLP forward. gpt2/SmolLM2 goldens: fixture generation is trivial via `python -X utf8` + `tokenizers` once examples/llm_chat downloads its tokenizer.json (test logs a loud skip when assets are absent).
+- Suite state: 24 tests in `tests` (green, also under ML_CPU_POISON), 4 in `tests/golden`, 3 in `tests/parity` (green on RTX 3090 Ti).
+
+### Known harness/library interactions found (not yet fixed)
+
+- **CUDA device-teardown race**: multiple independent GPU `@(test)`s running under the default multi-threaded test runner segfault in `_gpu` refcount/pipeline-cache teardown — the new GPU checks are consolidated into ONE test as a workaround. Real fix belongs with Phase 7 thread-contract work.
+- **Parity memory-tracker noise**: pipeline-cache entries compiled by one test are freed at device teardown under a different test's tracking allocator → ~50 non-fatal leak/bad-free warnings. Pre-existing global-cache vs per-test-allocator interaction.
+
+### Remaining (5.4–5.7 + deferred 4.1b)
+
+- 5.4 parity gate: `-define:ML_REQUIRE_CUDA=true` for loud failure without GPU; assert every cases-registry op in CUDA `forward_ops` actually got parity-checked.
+- 5.5 shape sweep: scalar broadcast, rank-3, sizes crossing CUDA block/tile boundaries, attention with T > one block.
+- 5.6 loader robustness: truncated/malformed gguf + safetensors must error cleanly (pairs with the Phase 1.9 overflow fixes).
+- 5.7 hygiene: dedupe `_adam_grad` copies between adam_check/parity; `cases.get()` thread safety (`sync.Once`); Adam `accumulation_steps > 1` test; determinism test (needs Phase 6.2 RNG); tests README.
+- 4.1b CUDA bf16 kernel collapse — now unblocked by 5.2; fold the add/mul backward fix into it.
 
 Current state: idiomatic `@(test)` suites; good shared case registry (tests/cases/cases.odin:56–91) driving both grad-check (central difference, careful `h` selection) and CPU↔CUDA parity; Adam and clip checks against analytic references. But coverage stops exactly where risk starts.
 
