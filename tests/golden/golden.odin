@@ -37,9 +37,13 @@ test_gemma_tokenizer_goldens :: proc(t: ^testing.T) {
 		return
 	}
 
-	tok, ok := gemma_tok.load(GEMMA_TOKENIZER_PATH)
-	testing.expect(t, ok, "gemma tokenizer should load")
-	if !ok {
+	tok, load_err := gemma_tok.load(GEMMA_TOKENIZER_PATH)
+	if load_err == .Not_Found {
+		log.warnf("SKIPPED: gemma tokenizer asset not present at %v (run examples/llm_chat once to fetch it)", GEMMA_TOKENIZER_PATH)
+		return
+	}
+	testing.expectf(t, load_err == .None, "gemma tokenizer should load, got %v", load_err)
+	if load_err != .None {
 		return
 	}
 	defer gemma_tok.destroy(tok)

@@ -1,4 +1,4 @@
-package ml_tests
+﻿package ml_tests
 
 import "core:log"
 import "core:os"
@@ -63,20 +63,29 @@ _gguf_build :: proc(buf: ^[dynamic]u8, duplicate_tensor := false) -> (layout: Gg
 	return
 }
 
-_expect_load_fails :: proc(t: ^testing.T, path: string, bytes: []u8, label: string, is_gguf: bool, loc := #caller_location) {
+_expect_gguf_load_fails :: proc(t: ^testing.T, path: string, bytes: []u8, label: string, expected: gguf.Error, loc := #caller_location) {
 	write_err := os.write_entire_file_from_bytes(path, bytes)
 	testing.expectf(t, write_err == nil, "%s: writing test file failed: %v", label, write_err, loc=loc)
+	real_logger := context.logger
 	context.logger = log.nil_logger()
-	if is_gguf {
-		loader, ok := gguf.load(path)
-		if !testing.expectf(t, !ok, "%s: gguf load should fail", label, loc=loc) {
-			gguf.destroy(loader)
-		}
-	} else {
-		loader, ok := safetensors.load(path)
-		if !testing.expectf(t, !ok, "%s: safetensors load should fail", label, loc=loc) {
-			safetensors.destroy(loader)
-		}
+	loader, err := gguf.load(path)
+	context.logger = real_logger
+	testing.expectf(t, err == expected, "%s: gguf load expected %v, got %v", label, expected, err, loc=loc)
+	if err == .None {
+		gguf.destroy(loader)
+	}
+}
+
+_expect_st_load_fails :: proc(t: ^testing.T, path: string, bytes: []u8, label: string, expected: safetensors.Error, loc := #caller_location) {
+	write_err := os.write_entire_file_from_bytes(path, bytes)
+	testing.expectf(t, write_err == nil, "%s: writing test file failed: %v", label, write_err, loc=loc)
+	real_logger := context.logger
+	context.logger = log.nil_logger()
+	loader, err := safetensors.load(path)
+	context.logger = real_logger
+	testing.expectf(t, err == expected, "%s: safetensors load expected %v, got %v", label, expected, err, loc=loc)
+	if err == .None {
+		safetensors.destroy(loader)
 	}
 }
 
@@ -90,17 +99,23 @@ test_gguf_loader_robustness :: proc(t: ^testing.T) {
 
 	write_err := os.write_entire_file_from_bytes(GGUF_TEST_PATH, valid[:])
 	testing.expectf(t, write_err == nil, "writing valid gguf failed: %v", write_err)
-	loader, ok := gguf.load(GGUF_TEST_PATH)
-	testing.expect(t, ok, "valid gguf should load")
-	if ok {
+	loader, err := gguf.load(GGUF_TEST_PATH)
+	testing.expect_value(t, err, gguf.Error.None)
+	if err == .None {
 		data, data_ok := gguf.get_bytes(loader, "w")
 		testing.expect(t, data_ok, "tensor w should exist")
 		testing.expect_value(t, len(data), 24)
 		gguf.destroy(loader)
 	}
 
+	missing, missing_err := gguf.load("does_not_exist.gguf")
+	testing.expect_value(t, missing_err, gguf.Error.Not_Found)
+	if missing_err == .None {
+		gguf.destroy(missing)
+	}
+
 	for cut in 0 ..< len(valid) {
-		_expect_load_fails(t, GGUF_TEST_PATH, valid[:cut], "gguf truncation", is_gguf=true)
+		_expect_gguf_load_fails(t, GGUF_TEST_PATH, valid[:cut], "gguf truncation", .Malformed)
 	}
 
 	corrupt := make([dynamic]u8, 0, len(valid))
@@ -113,42 +128,42 @@ test_gguf_loader_robustness :: proc(t: ^testing.T) {
 
 	reset(&corrupt, valid[:])
 	corrupt[0] = 'X'
-	_expect_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf bad magic", is_gguf=true)
+	_expect_gguf_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf bad magic", .Malformed)
 
 	reset(&corrupt, valid[:])
 	corrupt[layout.version] = 2
-	_expect_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf unsupported version", is_gguf=true)
+	_expect_gguf_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf unsupported version", .Unsupported)
 
 	reset(&corrupt, valid[:])
 	for i in 0 ..< 8 {
 		corrupt[layout.name_len + i] = 0xFF
 	}
-	_expect_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf hostile name length", is_gguf=true)
+	_expect_gguf_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf hostile name length", .Malformed)
 
 	reset(&corrupt, valid[:])
 	for i in 0 ..< 8 {
 		corrupt[layout.dim0 + i] = 0xFF
 	}
-	_expect_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf huge dimension", is_gguf=true)
+	_expect_gguf_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf huge dimension", .Malformed)
 
 	reset(&corrupt, valid[:])
 	for i in 0 ..< 8 {
 		corrupt[layout.dim0 + i] = 0
 	}
-	_expect_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf zero dimension", is_gguf=true)
+	_expect_gguf_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf zero dimension", .Malformed)
 
 	reset(&corrupt, valid[:])
 	corrupt[layout.type_id] = 99
-	_expect_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf unsupported tensor type", is_gguf=true)
+	_expect_gguf_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf unsupported tensor type", .Unsupported)
 
 	reset(&corrupt, valid[:])
 	corrupt[layout.type_id] = u8(gguf.Tensor_Type.Q4_K)
-	_expect_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf quant block mismatch", is_gguf=true)
+	_expect_gguf_load_fails(t, GGUF_TEST_PATH, corrupt[:], "gguf quant block mismatch", .Malformed)
 
 	duplicate: [dynamic]u8
 	defer delete(duplicate)
 	_gguf_build(&duplicate, duplicate_tensor=true)
-	_expect_load_fails(t, GGUF_TEST_PATH, duplicate[:], "gguf duplicate tensor name", is_gguf=true)
+	_expect_gguf_load_fails(t, GGUF_TEST_PATH, duplicate[:], "gguf duplicate tensor name", .Malformed)
 }
 
 _st_build :: proc(buf: ^[dynamic]u8, header: string, data_bytes: int) {
@@ -171,17 +186,23 @@ test_safetensors_loader_robustness :: proc(t: ^testing.T) {
 
 	write_err := os.write_entire_file_from_bytes(ST_TEST_PATH, valid[:])
 	testing.expectf(t, write_err == nil, "writing valid safetensors failed: %v", write_err)
-	loader, ok := safetensors.load(ST_TEST_PATH)
-	testing.expect(t, ok, "valid safetensors should load")
-	if ok {
+	loader, err := safetensors.load(ST_TEST_PATH)
+	testing.expect_value(t, err, safetensors.Error.None)
+	if err == .None {
 		data, data_ok := safetensors.get_bytes(loader, "w")
 		testing.expect(t, data_ok, "tensor w should exist")
 		testing.expect_value(t, len(data), 24)
 		safetensors.destroy(loader)
 	}
 
+	missing, missing_err := safetensors.load("does_not_exist.safetensors")
+	testing.expect_value(t, missing_err, safetensors.Error.Not_Found)
+	if missing_err == .None {
+		safetensors.destroy(missing)
+	}
+
 	for cut in 0 ..< len(valid) {
-		_expect_load_fails(t, ST_TEST_PATH, valid[:cut], "safetensors truncation", is_gguf=false)
+		_expect_st_load_fails(t, ST_TEST_PATH, valid[:cut], "safetensors truncation", .Malformed)
 	}
 
 	corrupt: [dynamic]u8
@@ -192,33 +213,33 @@ test_safetensors_loader_robustness :: proc(t: ^testing.T) {
 	for i in 0 ..< 8 {
 		corrupt[i] = 0xFF
 	}
-	_expect_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors huge header length", is_gguf=false)
+	_expect_st_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors huge header length", .Malformed)
 
 	clear(&corrupt)
 	_st_build(&corrupt, `{"w":{"dtype":"F32","shape"`, 24)
-	_expect_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors malformed json", is_gguf=false)
+	_expect_st_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors malformed json", .Malformed)
 
 	clear(&corrupt)
 	_st_build(&corrupt, `[1,2,3]`, 24)
-	_expect_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors non-object root", is_gguf=false)
+	_expect_st_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors non-object root", .Malformed)
 
 	clear(&corrupt)
 	_st_build(&corrupt, `{"w":{"dtype":"F32","shape":[2,3],"data_offsets":[0,20]}}`, 24)
-	_expect_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors range vs shape mismatch", is_gguf=false)
+	_expect_st_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors range vs shape mismatch", .Malformed)
 
 	clear(&corrupt)
 	_st_build(&corrupt, `{"w":{"dtype":"F32","shape":[-2,3],"data_offsets":[0,24]}}`, 24)
-	_expect_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors negative dimension", is_gguf=false)
+	_expect_st_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors negative dimension", .Malformed)
 
 	clear(&corrupt)
 	_st_build(&corrupt, `{"w":{"dtype":"F32","shape":[2,3],"data_offsets":[0,64]}}`, 24)
-	_expect_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors out-of-bounds offsets", is_gguf=false)
+	_expect_st_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors out-of-bounds offsets", .Malformed)
 
 	clear(&corrupt)
 	_st_build(&corrupt, `{"w":{"dtype":"F32","shape":[4611686018427387904,4611686018427387904],"data_offsets":[0,24]}}`, 24)
-	_expect_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors dimension overflow", is_gguf=false)
+	_expect_st_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors dimension overflow", .Malformed)
 
 	clear(&corrupt)
 	_st_build(&corrupt, `{"w":{"dtype":"F32","shape":[2,3]}}`, 24)
-	_expect_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors missing data_offsets", is_gguf=false)
+	_expect_st_load_fails(t, ST_TEST_PATH, corrupt[:], "safetensors missing data_offsets", .Malformed)
 }

@@ -65,8 +65,8 @@ test_jepa_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		defer os.remove(JEPA_TEST_PATH)
 
 		restored_opt: ml.Optimizer
-		restored, iteration, decoder_iteration, ok := jepa.load(cfg, JEPA_TEST_PATH, opt=&restored_opt)
-		testing.expect(t, ok, "jepa.load should succeed")
+		restored, iteration, decoder_iteration, load_err := jepa.load(cfg, JEPA_TEST_PATH, opt=&restored_opt)
+		testing.expect_value(t, load_err, ml.Checkpoint_Error.None)
 		testing.expect_value(t, iteration, u64(7))
 		testing.expect_value(t, decoder_iteration, u64(3))
 		testing.expect_value(t, restored_opt.iteration, u64(1))

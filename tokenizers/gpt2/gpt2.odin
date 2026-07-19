@@ -22,49 +22,60 @@ Tokenizer :: struct {
 	_json_root: json.Value,
 }
 
+Error :: enum {
+	None,
+	Not_Found,
+	Read_Failed,
+	Malformed,
+}
+
 @(require_results)
-load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, ok: bool) {
+load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, err: Error) {
 	context.allocator = allocator
 
 	bytes, read_err := os.read_entire_file_from_path(path, allocator)
 	if read_err != nil {
+		if !os.exists(path) {
+			log.debugf("gpt2 tokenizer file not found: %v", path)
+			return {}, .Not_Found
+		}
 		log.errorf("failed to read %v: %v", path, read_err)
-		return {}, false
+		return {}, .Read_Failed
 	}
 	defer delete(bytes)
 
 	root, parse_err := json.parse(bytes, parse_integers = true)
 	if parse_err != .None {
 		log.errorf("JSON parse error %v in %v", parse_err, path)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	root_object, root_object_ok := root.(json.Object)
 	if !root_object_ok {
 		log.error("tokenizer.json root is not an object")
 		json.destroy_value(root)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	model_object, model_object_ok := root_object["model"].(json.Object)
 	if !model_object_ok {
 		log.error("missing 'model' object")
 		json.destroy_value(root)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	vocab_object, vocab_object_ok := model_object["vocab"].(json.Object)
 	if !vocab_object_ok {
 		log.error("missing 'model.vocab' object")
 		json.destroy_value(root)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	merges_array, merges_array_ok := model_object["merges"].(json.Array)
 	if !merges_array_ok {
 		log.error("missing 'model.merges' array")
 		json.destroy_value(root)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	tok._json_root  = root
@@ -74,7 +85,7 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 		if !id_int_ok || int(id_int) < 0 || int(id_int) >= len(vocab_object) {
 			log.errorf("vocab entry %q has invalid id", piece)
 			destroy(tok)
-			return {}, false
+			return {}, .Malformed
 		}
 		tok.vocab[piece] = int(id_int)
 		tok.id_to_piece[int(id_int)] = piece
@@ -85,13 +96,13 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 		if !merge_string_ok {
 			log.errorf("merge[%v] is not a string", merge_index)
 			destroy(tok)
-			return {}, false
+			return {}, .Malformed
 		}
 		space_index := strings.index_byte(merge_string, ' ')
 		if space_index <= 0 || space_index >= len(merge_string) - 1 {
 			log.errorf("merge[%v] = %q has no space separator", merge_index, merge_string)
 			destroy(tok)
-			return {}, false
+			return {}, .Malformed
 		}
 		tok.merge_rank[Pair{merge_string[:space_index], merge_string[space_index + 1:]}] = merge_index
 	}
@@ -112,7 +123,7 @@ load :: proc(path: string, allocator := context.allocator) -> (tok: Tokenizer, o
 	}
 
 	_init_byte_unicode_maps(&tok)
-	return tok, true
+	return tok, .None
 }
 
 destroy :: proc(tok: Tokenizer) {

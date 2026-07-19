@@ -6,8 +6,8 @@ import "../../loaders/safetensors"
 import "../../loaders/weights"
 
 load_safetensors :: proc(model: ^Llama, path: string) -> bool {
-	loader, load_ok := safetensors.load(path)
-	if !load_ok {
+	loader, load_err := safetensors.load(path)
+	if load_err != .None {
 		return false
 	}
 	defer safetensors.destroy(loader)

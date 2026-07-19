@@ -297,7 +297,7 @@ save :: proc(jepa: Jepa, path: string, opt: ^ml.Optimizer = nil, iteration: u64 
 }
 
 @(require_results)
-load :: proc(config: Config, path: string, opt: ^ml.Optimizer = nil, allocator := context.allocator, loc := #caller_location) -> (jepa: Jepa, iteration: u64, decoder_iteration: u64, ok: bool) {
+load :: proc(config: Config, path: string, opt: ^ml.Optimizer = nil, allocator := context.allocator, loc := #caller_location) -> (jepa: Jepa, iteration: u64, decoder_iteration: u64, err: ml.Checkpoint_Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	jepa = make(config, allocator=allocator, loc=loc)
@@ -307,10 +307,10 @@ load :: proc(config: Config, path: string, opt: ^ml.Optimizer = nil, allocator :
 	parameters(jepa, &gathered)
 	decoder_parameters(jepa, &gathered)
 
-	metadata, load_ok := ml.checkpoint_load(path, &gathered, opt, loc=loc)
-	if !load_ok {
+	metadata, load_err := ml.checkpoint_load(path, &gathered, opt, loc=loc)
+	if load_err != .None {
 		destroy(jepa)
-		return {}, 0, 0, false
+		return {}, 0, 0, load_err
 	}
 	defer ml.checkpoint_metadata_destroy(metadata)
 
@@ -320,12 +320,12 @@ load :: proc(config: Config, path: string, opt: ^ml.Optimizer = nil, allocator :
 	   !_metadata_dim_matches(metadata, "jepa.latent_size", config.latent_size) {
 		log.errorf("config dims in %v do not match the requested config", path, location=loc)
 		destroy(jepa)
-		return {}, 0, 0, false
+		return {}, 0, 0, .Mismatch
 	}
 
 	iteration         = ml.checkpoint_metadata_u64(metadata, "ml.iteration")
 	decoder_iteration = ml.checkpoint_metadata_u64(metadata, "ml.iteration.decoder")
-	return jepa, iteration, decoder_iteration, true
+	return jepa, iteration, decoder_iteration, .None
 }
 
 _metadata_dim_matches :: proc(metadata: map[string]string, key: string, expected: int) -> bool {

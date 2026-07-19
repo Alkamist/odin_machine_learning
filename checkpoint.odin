@@ -64,10 +64,25 @@ checkpoint_save :: proc(path: string, r: ^Registry, opt: ^Optimizer, metadata: m
 	return st.save(path, entries[:], full_metadata, loc=loc)
 }
 
+Checkpoint_Error :: enum {
+	None,
+	Not_Found,
+	Read_Failed,
+	Malformed,
+	Mismatch,
+}
+
 @(require_results)
-checkpoint_load :: proc(path: string, r: ^Registry, opt: ^Optimizer, loc := #caller_location) -> (metadata: map[string]string, ok: bool) {
-	loader, load_ok := st.load(path, loc=loc)
-	if !load_ok {
+checkpoint_load :: proc(path: string, r: ^Registry, opt: ^Optimizer, loc := #caller_location) -> (metadata: map[string]string, err: Checkpoint_Error) {
+	loader, load_err := st.load(path, loc=loc)
+	if load_err != .None {
+		switch load_err {
+		case .None:
+		case .Not_Found:   err = .Not_Found
+		case .Read_Failed: err = .Read_Failed
+		case .Malformed, .Unsupported:
+			err = .Malformed
+		}
 		return
 	}
 	defer st.destroy(loader)
@@ -81,22 +96,22 @@ checkpoint_load :: proc(path: string, r: ^Registry, opt: ^Optimizer, loc := #cal
 		info, present := st.get_info(loader, parameter.name)
 		if !present {
 			log.errorf("missing tensor %q in %v", parameter.name, path, location=loc)
-			return
+			return {}, .Mismatch
 		}
 		expected_dtype := _checkpoint_dtype_string(tensor.type)
 		if info.dtype != expected_dtype {
 			log.errorf("tensor %q dtype mismatch (file %v, model %v)", parameter.name, info.dtype, expected_dtype, location=loc)
-			return
+			return {}, .Mismatch
 		}
 		if !st.shapes_match(info.shape, tensor.shape[:tensor.rank]) {
 			log.errorf("tensor %q shape mismatch (file %v, model %v)", parameter.name, info.shape, tensor.shape[:tensor.rank], location=loc)
-			return
+			return {}, .Mismatch
 		}
 		file_bytes, _ := st.get_bytes(loader, parameter.name)
 		expected_bytes := buffer_byte_count(tensor, .Data)
 		if builtin.len(file_bytes) != expected_bytes {
 			log.errorf("tensor %q byte count mismatch (file %v, expected %v)", parameter.name, builtin.len(file_bytes), expected_bytes, location=loc)
-			return
+			return {}, .Mismatch
 		}
 
 		if opt != nil {
@@ -109,12 +124,12 @@ checkpoint_load :: proc(path: string, r: ^Registry, opt: ^Optimizer, loc := #cal
 				}
 				if moment_info.dtype != "F32" {
 					log.errorf("moment %q must be F32, got %v", moment_name, moment_info.dtype, location=loc)
-					return
+					return {}, .Mismatch
 				}
 				moment_bytes, _ := st.get_bytes(loader, moment_name)
 				if builtin.len(moment_bytes) != moment_byte_count {
 					log.errorf("moment %q byte count mismatch (file %v, expected %v)", moment_name, builtin.len(moment_bytes), moment_byte_count, location=loc)
-					return
+					return {}, .Mismatch
 				}
 			}
 		}
@@ -147,8 +162,7 @@ checkpoint_load :: proc(path: string, r: ^Registry, opt: ^Optimizer, loc := #cal
 	for key, value in loader.metadata {
 		metadata[strings.clone(key)] = strings.clone(value)
 	}
-	ok = true
-	return
+	return metadata, .None
 }
 
 checkpoint_metadata_destroy :: proc(metadata: map[string]string) {

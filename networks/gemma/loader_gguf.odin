@@ -12,8 +12,8 @@ import    "../../loaders/weights"
 
 @(require_results)
 load_gguf :: proc(model: ^Gemma, path: string) -> bool {
-	loader, load_ok := gguf.load(path)
-	if !load_ok {
+	loader, load_err := gguf.load(path)
+	if load_err != .None {
 		return false
 	}
 	defer gguf.destroy(loader)

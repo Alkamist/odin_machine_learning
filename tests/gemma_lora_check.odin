@@ -86,8 +86,8 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		gemma.parameters(restored, &restored_gathered)
 
 		restored_opt: ml.Optimizer
-		loaded_metadata, loaded := ml.checkpoint_load(GEMMA_LORA_TEST_PATH, &restored_gathered, &restored_opt)
-		testing.expect(t, loaded, "checkpoint_load should succeed")
+		loaded_metadata, load_err := ml.checkpoint_load(GEMMA_LORA_TEST_PATH, &restored_gathered, &restored_opt)
+		testing.expect_value(t, load_err, ml.Checkpoint_Error.None)
 		testing.expect_value(t, restored_opt.iteration, u64(1))
 
 		total := ml.registry_element_count(&gathered)

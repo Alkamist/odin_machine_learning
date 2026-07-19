@@ -31,27 +31,39 @@ Loader :: struct {
 	_json_root: json.Value,
 }
 
+Error :: enum {
+	None,
+	Not_Found,
+	Read_Failed,
+	Malformed,
+	Unsupported,
+}
+
 @(require_results)
-load :: proc(path: string, allocator := context.allocator, loc := #caller_location) -> (loader: Loader, ok: bool) {
+load :: proc(path: string, allocator := context.allocator, loc := #caller_location) -> (loader: Loader, err: Error) {
 	context.allocator = allocator
 
 	file_bytes, read_err := os.read_entire_file_from_path(path, allocator)
 	if read_err != nil {
+		if !os.exists(path) {
+			log.debugf("safetensors file not found: %v", path, location=loc)
+			return {}, .Not_Found
+		}
 		log.errorf("failed to read %v: %v", path, read_err, location=loc)
-		return {}, false
+		return {}, .Read_Failed
 	}
 
 	if len(file_bytes) < 8 {
 		log.errorf("%v is shorter than the 8-byte header prefix", path, location=loc)
 		delete(file_bytes)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	header_len_u64 := (^u64le)(raw_data(file_bytes))^
 	if u64(header_len_u64) > u64(len(file_bytes) - 8) {
 		log.errorf("header_len %v overruns file size %v", header_len_u64, len(file_bytes), location=loc)
 		delete(file_bytes)
-		return {}, false
+		return {}, .Malformed
 	}
 	header_len := int(header_len_u64)
 	data_start := 8 + header_len
@@ -60,7 +72,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	if !json.is_valid(header_bytes, parse_integers = true) {
 		log.errorf("invalid JSON header in %v", path, location=loc)
 		delete(file_bytes)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	root, parse_err := json.parse(header_bytes, parse_integers = true)
@@ -68,7 +80,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		log.errorf("JSON parse error %v in %v", parse_err, path, location=loc)
 		json.destroy_value(root)
 		delete(file_bytes)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	root_object, object_ok := root.(json.Object)
@@ -76,7 +88,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		log.errorf("header root is not a JSON object", location=loc)
 		json.destroy_value(root)
 		delete(file_bytes)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	tensors: map[string]Tensor_Info
@@ -89,7 +101,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		if !entry_ok {
 			log.errorf("tensor %q metadata is not an object", name, location=loc)
 			_destroy_partial(root, file_bytes, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		dtype_value, dtype_present       := entry_object["dtype"]
@@ -98,7 +110,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		if !(dtype_present && shape_present && offsets_present) {
 			log.errorf("tensor %q missing dtype/shape/data_offsets", name, location=loc)
 			_destroy_partial(root, file_bytes, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		dtype_string, dtype_string_ok := dtype_value.(string)
@@ -107,7 +119,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		if !(dtype_string_ok && shape_array_ok && offsets_array_ok) {
 			log.errorf("tensor %q has unexpected metadata types", name, location=loc)
 			_destroy_partial(root, file_bytes, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		shape := make([]int, len(shape_array))
@@ -118,7 +130,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 				log.errorf("tensor %q shape[%v] is not a valid dimension", name, axis_index, location=loc)
 				delete(shape)
 				_destroy_partial(root, file_bytes, tensors)
-				return {}, false
+				return {}, .Malformed
 			}
 			shape[axis_index] = int(axis_int)
 			element_count *= axis_int
@@ -128,7 +140,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 			log.errorf("tensor %q data_offsets has %v entries, expected 2", name, len(offsets_array), location=loc)
 			delete(shape)
 			_destroy_partial(root, file_bytes, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 		start_int, start_ok := offsets_array[0].(json.Integer)
 		end_int,   end_ok   := offsets_array[1].(json.Integer)
@@ -136,7 +148,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 			log.errorf("tensor %q data_offsets entries are not integers", name, location=loc)
 			delete(shape)
 			_destroy_partial(root, file_bytes, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		start := int(start_int)
@@ -145,14 +157,14 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 			log.errorf("tensor %q data_offsets [%v, %v) out of bounds", name, start, end, location=loc)
 			delete(shape)
 			_destroy_partial(root, file_bytes, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 		if dtype_size, dtype_size_known := _dtype_size(dtype_string); dtype_size_known {
 			if i64(end - start) != element_count * i64(dtype_size) {
 				log.errorf("tensor %q byte range %v does not match shape element count %v x dtype size %v", name, end - start, element_count, dtype_size, location=loc)
 				delete(shape)
 				_destroy_partial(root, file_bytes, tensors)
-				return {}, false
+				return {}, .Malformed
 			}
 		}
 
@@ -180,7 +192,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	loader.metadata   = metadata
 	loader._json_root = root
 
-	return loader, true
+	return loader, .None
 }
 
 @(require_results)

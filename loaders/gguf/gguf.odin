@@ -85,14 +85,26 @@ Loader :: struct {
 	kv:         map[string]KV,
 }
 
+Error :: enum {
+	None,
+	Not_Found,
+	Read_Failed,
+	Malformed,
+	Unsupported,
+}
+
 @(require_results)
-load :: proc(path: string, allocator := context.allocator, loc := #caller_location) -> (loader: Loader, ok: bool) {
+load :: proc(path: string, allocator := context.allocator, loc := #caller_location) -> (loader: Loader, err: Error) {
 	context.allocator = allocator
 
 	file_bytes, read_err := os.read_entire_file_from_path(path, allocator)
 	if read_err != nil {
+		if !os.exists(path) {
+			log.debugf("gguf file not found: %v", path, location=loc)
+			return {}, .Not_Found
+		}
 		log.errorf("failed to read %v: %v", path, read_err, location=loc)
-		return {}, false
+		return {}, .Read_Failed
 	}
 
 	r := Reader{bytes=file_bytes}
@@ -101,14 +113,19 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	if !magic_ok || magic != GGUF_MAGIC {
 		log.errorf("%v: bad magic 0x%08x (expected 'GGUF')", path, magic, location=loc)
 		delete(file_bytes)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	version, version_ok := _read_u32(&r)
-	if !version_ok || version != 3 {
+	if !version_ok {
+		log.errorf("%v: short read in version field", path, location=loc)
+		delete(file_bytes)
+		return {}, .Malformed
+	}
+	if version != 3 {
 		log.errorf("%v: unsupported GGUF version %v (only 3 implemented)", path, version, location=loc)
 		delete(file_bytes)
-		return {}, false
+		return {}, .Unsupported
 	}
 
 	tensor_count, tensor_count_ok := _read_u64(&r)
@@ -116,7 +133,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	if !tensor_count_ok || !kv_count_ok {
 		log.errorf("%v: short read in header counts", path, location=loc)
 		delete(file_bytes)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	kv: map[string]KV
@@ -124,13 +141,13 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		key, key_ok := _read_str(&r, file_bytes)
 		if !key_ok {
 			_destroy_partial(file_bytes, kv, nil)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		ty_raw, ty_raw_ok := _read_u32(&r)
 		if !ty_raw_ok {
 			_destroy_partial(file_bytes, kv, nil)
-			return {}, false
+			return {}, .Malformed
 		}
 		ty := Value_Type(ty_raw)
 
@@ -141,20 +158,20 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 			arr_count,   arr_count_ok := _read_u64(&r)
 			if !arr_ty_ok || !arr_count_ok {
 				_destroy_partial(file_bytes, kv, nil)
-				return {}, false
+				return {}, .Malformed
 			}
 			entry.array_type  = Value_Type(arr_ty_raw)
 			entry.array_count = int(arr_count)
 			if !_skip_array_payload(&r, entry.array_type, entry.array_count) {
 				log.errorf("array payload overrun at key %q", key, location=loc)
 				_destroy_partial(file_bytes, kv, nil)
-				return {}, false
+				return {}, .Malformed
 			}
 		} else {
 			if !_skip_scalar_payload(&r, ty) {
 				log.errorf("scalar payload overrun at key %q (type %v)", key, ty, location=loc)
 				_destroy_partial(file_bytes, kv, nil)
-				return {}, false
+				return {}, .Malformed
 			}
 		}
 		kv[key] = entry
@@ -165,13 +182,13 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		name, name_ok := _read_str(&r, file_bytes)
 		if !name_ok {
 			_destroy_partial(file_bytes, kv, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		n_dims, n_dims_ok := _read_u32(&r)
 		if !n_dims_ok {
 			_destroy_partial(file_bytes, kv, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		shape := make([]int, n_dims)
@@ -183,7 +200,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 				log.errorf("%v: tensor %q has invalid dimensions", path, name, location=loc)
 				delete(shape)
 				_destroy_partial(file_bytes, kv, tensors)
-				return {}, false
+				return {}, .Malformed
 			}
 			shape[i] = int(d)
 			element_count *= int(d)
@@ -194,7 +211,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		if !ty_raw_ok || !offset_ok {
 			delete(shape)
 			_destroy_partial(file_bytes, kv, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		ty := Tensor_Type(ty_raw)
@@ -203,14 +220,14 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 			log.errorf("tensor %q has unsupported type id %v", name, ty_raw, location=loc)
 			delete(shape)
 			_destroy_partial(file_bytes, kv, tensors)
-			return {}, false
+			return {}, _tensor_type_known(ty) ? .Malformed : .Unsupported
 		}
 
 		if name in tensors {
 			log.errorf("%v: duplicate tensor name %q", path, name, location=loc)
 			delete(shape)
 			_destroy_partial(file_bytes, kv, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 
 		tensors[name] = Tensor_Info{
@@ -229,7 +246,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	if alignment <= 0 {
 		log.errorf("%v: invalid general.alignment %v", path, alignment, location=loc)
 		_destroy_partial(file_bytes, kv, tensors)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	pad := (alignment - (r.offset % alignment)) % alignment
@@ -237,7 +254,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	if data_start > len(file_bytes) {
 		log.errorf("%v: data_start %v overruns file size %v", path, data_start, len(file_bytes), location=loc)
 		_destroy_partial(file_bytes, kv, tensors)
-		return {}, false
+		return {}, .Malformed
 	}
 
 	for name, info in tensors {
@@ -246,7 +263,7 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		   info.byte_count  > len(file_bytes) - data_start - info.data_offset {
 			log.errorf("%v: tensor %q byte range [%v, +%v) overruns file", path, name, info.data_offset, info.byte_count, location=loc)
 			_destroy_partial(file_bytes, kv, tensors)
-			return {}, false
+			return {}, .Malformed
 		}
 	}
 
@@ -256,7 +273,18 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	loader.version    = version
 	loader.tensors    = tensors
 	loader.kv         = kv
-	return loader, true
+	return loader, .None
+}
+
+@(require_results)
+_tensor_type_known :: proc(ty: Tensor_Type) -> bool {
+	#partial switch ty {
+	case .F32, .F16, .BF16,
+	     .Q4_0, .Q4_1, .Q5_0, .Q5_1, .Q8_0, .Q8_1,
+	     .Q2_K, .Q3_K, .Q4_K, .Q5_K, .Q6_K, .Q8_K:
+		return true
+	}
+	return false
 }
 
 destroy :: proc(loader: Loader) {

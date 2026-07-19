@@ -47,9 +47,13 @@ test_checkpoint_optimizer_iteration_roundtrip :: proc(t: ^testing.T) {
 	restored_registry: ml.Registry
 	ml.parameter_register(&restored_registry, "", "weight", restored_param, init=ml.Init_None{})
 	restored_opt := ml.optimizer_make(learning_rate=ADAM_LR, beta1=ADAM_B1, beta2=ADAM_B2, epsilon=ADAM_EPS, weight_decay=ADAM_WD)
-	loaded_metadata, loaded := ml.checkpoint_load(CHECKPOINT_TEST_PATH, &restored_registry, &restored_opt)
-	testing.expect(t, loaded, "checkpoint_load should succeed")
+	loaded_metadata, load_err := ml.checkpoint_load(CHECKPOINT_TEST_PATH, &restored_registry, &restored_opt)
+	testing.expect_value(t, load_err, ml.Checkpoint_Error.None)
 	defer ml.checkpoint_metadata_destroy(loaded_metadata)
+
+	missing_metadata, missing_err := ml.checkpoint_load("does_not_exist_checkpoint.safetensors", &restored_registry, &restored_opt)
+	testing.expect_value(t, missing_err, ml.Checkpoint_Error.Not_Found)
+	ml.checkpoint_metadata_destroy(missing_metadata)
 
 	testing.expect_value(t, restored_opt.iteration, u64(CHECKPOINT_TEST_STEPS))
 

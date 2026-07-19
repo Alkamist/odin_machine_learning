@@ -68,9 +68,9 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 	}
 
 	log.info("loading tokenizer")
-	tokenizer, tokenizer_ok := gemma_tok.load(GEMMA_TOKENIZER_PATH)
-	if !tokenizer_ok {
-		log.errorf("could not load tokenizer: %v", GEMMA_TOKENIZER_PATH)
+	tokenizer, tokenizer_err := gemma_tok.load(GEMMA_TOKENIZER_PATH)
+	if tokenizer_err != .None {
+		log.errorf("could not load tokenizer %v: %v", GEMMA_TOKENIZER_PATH, tokenizer_err)
 		return {}, false
 	}
 

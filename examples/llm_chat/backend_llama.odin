@@ -60,9 +60,9 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 	}
 
 	log.info("loading tokenizer")
-	tokenizer, tokenizer_ok := gpt2.load(LLAMA_TOKENIZER_PATH)
-	if !tokenizer_ok {
-		log.errorf("could not load tokenizer: %v", LLAMA_TOKENIZER_PATH)
+	tokenizer, tokenizer_err := gpt2.load(LLAMA_TOKENIZER_PATH)
+	if tokenizer_err != .None {
+		log.errorf("could not load tokenizer %v: %v", LLAMA_TOKENIZER_PATH, tokenizer_err)
 		return {}, false
 	}
 
