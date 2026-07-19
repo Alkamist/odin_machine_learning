@@ -156,8 +156,7 @@ main :: proc() {
 		fmt.println()
 		prefill_rate := f64(stats.prefill_tokens) / stats.prefill_seconds if stats.prefill_seconds > 0 else 0
 		decode_rate  := f64(stats.decode_tokens) / stats.decode_seconds if stats.decode_seconds > 0 else 0
-		fmt.printfln("  [prefill %v tok / %.2f s = %.1f tok/s   decode %v tok / %.2f s = %.1f tok/s]",
-			stats.prefill_tokens, stats.prefill_seconds, prefill_rate, stats.decode_tokens, stats.decode_seconds, decode_rate)
+		fmt.printfln("  [prefill %v tok / %.2f s = %.1f tok/s   decode %v tok / %.2f s = %.1f tok/s]", stats.prefill_tokens, stats.prefill_seconds, prefill_rate, stats.decode_tokens, stats.decode_seconds, decode_rate)
 		fmt.println()
 	}
 }

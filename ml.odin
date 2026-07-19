@@ -144,8 +144,7 @@ _context_destroy :: proc(ctx: ^Context, loc: runtime.Source_Code_Location) {
 context_begin :: proc(ctx: ^Context, loc := #caller_location) -> (previous: ^Context) {
 	thread_id := int(sync.current_thread_id())
 	owner, exchanged := sync.atomic_compare_exchange_strong(&ctx.owner_thread_id, 0, thread_id)
-	fmt.assertf(exchanged || owner == thread_id,
-		"context is active on thread %v; a context may only be used by one thread at a time", owner, loc=loc)
+	fmt.assertf(exchanged || owner == thread_id, "context is active on thread %v; a context may only be used by one thread at a time", owner, loc=loc)
 	previous     = _current_ctx
 	_current_ctx = ctx
 	return
@@ -192,9 +191,11 @@ op_arena_allocator :: proc() -> mem.Allocator {
 @(require_results)
 _op_arena_make :: proc($T: typeid, count: int, loc := #caller_location) -> []T {
 	slice, err := builtin.make([]T, count, allocator=op_arena_allocator(), loc=loc)
-	fmt.assertf(err == nil && builtin.len(slice) == count,
-		"op arena exhausted allocating %d x %v (%d bytes) - raise OP_ARENA_DEFAULT_SIZE",
-		count, typeid_of(T), count * size_of(T), loc=loc)
+	fmt.assertf(
+		err == nil && builtin.len(slice) == count, 
+		"op arena exhausted allocating %d x %v (%d bytes) - raise OP_ARENA_DEFAULT_SIZE", 
+		count, typeid_of(T), count * size_of(T), loc=loc,
+	)
 	return slice
 }
 

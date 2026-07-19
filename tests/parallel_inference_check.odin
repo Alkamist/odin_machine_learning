@@ -110,9 +110,11 @@ test_parallel_inference :: proc(t: ^testing.T) {
 
 	for i in 0 ..< PARALLEL_THREADS {
 		for e in 0 ..< PARALLEL_OUT_SIZE {
-			testing.expectf(t, transmute(u32)results[i][e] == transmute(u32)reference[e],
+			testing.expectf(t,
+				transmute(u32)results[i][e] == transmute(u32)reference[e],
 				"thread %v output must be bit-identical to reference, index %v: %v vs %v",
-				i, e, results[i][e], reference[e])
+				i, e, results[i][e], reference[e],
+			)
 		}
 	}
 

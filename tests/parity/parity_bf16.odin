@@ -202,19 +202,19 @@ _bf16p_cases :: proc() -> []Bf16p_Case {
 		return _bf16p_case_storage[:_bf16p_case_count]
 	}
 	list := []Bf16p_Case{
-		{name = "add",            kind = .Add,            input_count = 2, inputs = {0 = _bf16p_sp(3, 8), 1 = _bf16p_sp(8)},                          run = _bf16p_run_add,       backward = true},
-		{name = "mul",            kind = .Mul,            input_count = 2, inputs = {0 = _bf16p_sp(3, 8), 1 = _bf16p_sp(8)},                          run = _bf16p_run_mul,       backward = true},
-		{name = "gelu",           kind = .Gelu,           input_count = 1, inputs = {0 = _bf16p_sp(3, 8)},                                            run = _bf16p_run_gelu,      backward = true},
-		{name = "silu",           kind = .Silu,           input_count = 1, inputs = {0 = _bf16p_sp(3, 8)},                                            run = _bf16p_run_silu,      backward = true},
-		{name = "tanh",           kind = .Tanh,           input_count = 1, inputs = {0 = _bf16p_sp(3, 8)},                                            run = _bf16p_run_tanh,      backward = true},
-		{name = "gelu_mul",       kind = .Gelu_Mul,       input_count = 2, inputs = {0 = _bf16p_sp(3, 8), 1 = _bf16p_sp(3, 8)},                       run = _bf16p_run_gelu_mul},
-		{name = "rmsnorm",        kind = .Rmsnorm,        input_count = 2, inputs = {0 = _bf16p_sp(3, 8), 1 = _bf16p_sp(8)},                          run = _bf16p_run_rmsnorm,   backward = true},
-		{name = "rope",           kind = .Rope,           input_count = 1, inputs = {0 = _bf16p_sp(3, 8)},                                            run = _bf16p_run_rope,      backward = true},
-		{name = "select",         kind = .Select,         input_count = 1, inputs = {0 = _bf16p_sp(4, 8)},                                            run = _bf16p_run_select,    backward = true},
-		{name = "slice_trailing", kind = .Slice_Trailing, input_count = 1, inputs = {0 = _bf16p_sp(3, 8)},                                            run = _bf16p_run_slice_tr,  backward = true},
-		{name = "slice_leading",  kind = .Slice_Leading,  input_count = 1, inputs = {0 = _bf16p_sp(5, 8)},                                            run = _bf16p_run_slice_ld,  backward = true},
-		{name = "cast",           kind = .Cast,           input_count = 1, inputs = {0 = _bf16p_sp(4, 5)},                                            run = _bf16p_run_cast,      out_f32 = true, backward = true},
-		{name = "attention",      kind = .Attention,      input_count = 3, inputs = {0 = _bf16p_sp(4, 8), 1 = _bf16p_sp(4, 8), 2 = _bf16p_sp(4, 8)}, run = _bf16p_run_attention, backward = true},
+		{name="add",            kind=.Add,            input_count=2, inputs={0=_bf16p_sp(3, 8), 1=_bf16p_sp(8)},                       run=_bf16p_run_add,                backward=true},
+		{name="mul",            kind=.Mul,            input_count=2, inputs={0=_bf16p_sp(3, 8), 1=_bf16p_sp(8)},                       run=_bf16p_run_mul,                backward=true},
+		{name="gelu",           kind=.Gelu,           input_count=1, inputs={0=_bf16p_sp(3, 8)},                                       run=_bf16p_run_gelu,               backward=true},
+		{name="silu",           kind=.Silu,           input_count=1, inputs={0=_bf16p_sp(3, 8)},                                       run=_bf16p_run_silu,               backward=true},
+		{name="tanh",           kind=.Tanh,           input_count=1, inputs={0=_bf16p_sp(3, 8)},                                       run=_bf16p_run_tanh,               backward=true},
+		{name="gelu_mul",       kind=.Gelu_Mul,       input_count=2, inputs={0=_bf16p_sp(3, 8), 1=_bf16p_sp(3, 8)},                    run=_bf16p_run_gelu_mul},
+		{name="rmsnorm",        kind=.Rmsnorm,        input_count=2, inputs={0=_bf16p_sp(3, 8), 1=_bf16p_sp(8)},                       run=_bf16p_run_rmsnorm,            backward=true},
+		{name="rope",           kind=.Rope,           input_count=1, inputs={0=_bf16p_sp(3, 8)},                                       run=_bf16p_run_rope,               backward=true},
+		{name="select",         kind=.Select,         input_count=1, inputs={0=_bf16p_sp(4, 8)},                                       run=_bf16p_run_select,             backward=true},
+		{name="slice_trailing", kind=.Slice_Trailing, input_count=1, inputs={0=_bf16p_sp(3, 8)},                                       run=_bf16p_run_slice_tr,           backward=true},
+		{name="slice_leading",  kind=.Slice_Leading,  input_count=1, inputs={0=_bf16p_sp(5, 8)},                                       run=_bf16p_run_slice_ld,           backward=true},
+		{name="cast",           kind=.Cast,           input_count=1, inputs={0=_bf16p_sp(4, 5)},                                       run=_bf16p_run_cast, out_f32=true, backward=true},
+		{name="attention",      kind=.Attention,      input_count=3, inputs={0=_bf16p_sp(4, 8), 1=_bf16p_sp(4, 8), 2=_bf16p_sp(4, 8)}, run=_bf16p_run_attention,          backward=true},
 	}
 	for c, i in list {
 		_bf16p_case_storage[i] = c

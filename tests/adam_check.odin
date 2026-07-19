@@ -69,8 +69,7 @@ test_adam_update :: proc(t: ^testing.T) {
 		b := f64(got[i])
 		denom := max(max(abs(a), abs(b)), 1e-4)
 		rel   := abs(a - b) / denom
-		testing.expectf(t, rel <= 1e-4,
-			"adam elem %d ref=%.7g got=%.7g rel_err=%.4g", i, a, b, rel)
+		testing.expectf(t, rel <= 1e-4, "adam elem %d ref=%.7g got=%.7g rel_err=%.4g", i, a, b, rel)
 	}
 
 	ml.optimizer_destroy(&opt)
@@ -142,8 +141,7 @@ test_adam_accumulation :: proc(t: ^testing.T) {
 		b := f64(got[i])
 		denom := max(max(abs(a), abs(b)), 1e-4)
 		rel   := abs(a - b) / denom
-		testing.expectf(t, rel <= 1e-4,
-			"adam accum elem %d ref=%.7g got=%.7g rel_err=%.4g", i, a, b, rel)
+		testing.expectf(t, rel <= 1e-4, "adam accum elem %d ref=%.7g got=%.7g rel_err=%.4g", i, a, b, rel)
 	}
 
 	ml.optimizer_destroy(&opt)

@@ -15,7 +15,7 @@ Adapter :: struct {
 	b:     ml.Tensor, // [out_features, rank]
 	scale: ml.Tensor, // scalar, alpha / rank, baked once at make time
 
-	rank:        int,
+	rank:         int,
 	in_features:  int,
 	out_features: int,
 

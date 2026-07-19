@@ -15,13 +15,12 @@ LLAMA_DATA_DIR       :: #directory + "data/smollm"
 LLAMA_DEFAULT_MODEL  :: LLAMA_DATA_DIR + "/model_instruct.safetensors"
 LLAMA_TOKENIZER_PATH :: LLAMA_DATA_DIR + "/tokenizer.json"
 
-LLAMA_ASSETS := []fetch.Asset {
+LLAMA_ASSETS := []fetch.Asset{
 	{
 		url  = "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/model.safetensors",
 		dest = LLAMA_DEFAULT_MODEL,
 		size = 269_060_552,
-	},
-	{
+	}, {
 		url  = "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/tokenizer.json",
 		dest = LLAMA_TOKENIZER_PATH,
 		size = 2_104_556,
@@ -46,8 +45,6 @@ Llama_Backend :: struct {
 
 @(require_results)
 llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string) -> (Chat_Model, bool) {
-	// An explicit --model points at a file the user manages themselves, so only
-	// fetch when we are using the default location.
 	path := model_path
 	if builtin.len(path) == 0 {
 		if !fetch.ensure_assets(LLAMA_ASSETS, "SmolLM2-135M-Instruct") {

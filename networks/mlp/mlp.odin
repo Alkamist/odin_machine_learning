@@ -22,8 +22,8 @@ make :: proc(sizes: ..int, flags := ml.PARAMETER_DEFAULT_FLAGS, allocator := con
 	mlp.layers = builtin.make([]Layer, len(sizes) - 1)
 
 	for i in 0 ..< len(mlp.layers) {
-		mlp.layers[i].weight = ml.parameter_make(&mlp.params, "", fmt.tprintf("%d.weight", i), .F32, {sizes[i + 1], sizes[i]}, init=ml.Init_He{}, flags=flags)
-		mlp.layers[i].bias   = ml.parameter_make(&mlp.params, "", fmt.tprintf("%d.bias",   i), .F32, {sizes[i + 1]}, init=ml.Init_Value{value=0}, flags=flags)
+		mlp.layers[i].weight = ml.parameter_make(&mlp.params, "", fmt.tprintf("%d.weight", i), .F32, {sizes[i + 1], sizes[i]}, init=ml.Init_He{},           flags=flags)
+		mlp.layers[i].bias   = ml.parameter_make(&mlp.params, "", fmt.tprintf("%d.bias",   i), .F32, {sizes[i + 1]},           init=ml.Init_Value{value=0}, flags=flags)
 	}
 
 	randomize(mlp)

@@ -115,8 +115,8 @@ train_decoder_step :: proc(jepa: Jepa, states: []f32, count: int, loc := #caller
 	}
 
 	ml.clear(training=true)
-	decoded  := decode(jepa, ml.tensor(latent_data, []int{count, c.latent_size}))
-	loss_t   := ml.mean(ml.mean_squared_error(decoded, ml.tensor(states)))
+	decoded := decode(jepa, ml.tensor(latent_data, []int{count, c.latent_size}))
+	loss_t  := ml.mean(ml.mean_squared_error(decoded, ml.tensor(states)))
 	ml.backward(loss_t, loc=loc)
 
 	value: [1]f32

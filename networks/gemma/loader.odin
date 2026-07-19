@@ -43,7 +43,7 @@ load_safetensors :: proc(model: ^Gemma, path: string) -> bool {
 		            weights.write_tensor(&layer.post_feedforward_norm_weight,     source, fmt.tprintf("%v.post_feedforward_layernorm.weight", prefix)) &&
 		            weights.write_tensor(&layer.q_proj_weight,                    source, fmt.tprintf("%v.self_attn.q_proj.weight",           prefix), .Rope_Permute, cfg.num_attention_heads, head_dim) &&
 		            weights.write_tensor(&layer.o_proj_weight,                    source, fmt.tprintf("%v.self_attn.o_proj.weight",           prefix)) &&
-		            _load_norm_permuted (source, layer.q_norm_weight,             fmt.tprintf("%v.self_attn.q_norm.weight",           prefix), head_dim, math.sqrt(f32(head_dim))) &&
+		            _load_norm_permuted (source, layer.q_norm_weight,             fmt.tprintf("%v.self_attn.q_norm.weight",                   prefix), head_dim, math.sqrt(f32(head_dim))) &&
 		            weights.write_tensor(&layer.gate_proj_weight,                 source, fmt.tprintf("%v.mlp.gate_proj.weight",              prefix)) &&
 		            weights.write_tensor(&layer.up_proj_weight,                   source, fmt.tprintf("%v.mlp.up_proj.weight",                prefix)) &&
 		            weights.write_tensor(&layer.down_proj_weight,                 source, fmt.tprintf("%v.mlp.down_proj.weight",              prefix)) &&

@@ -49,14 +49,14 @@ load_gguf :: proc(model: ^Gemma, path: string) -> bool {
 		            weights.write_tensor(&layer.post_feedforward_norm_weight,     source, fmt.tprintf("%v.post_ffw_norm.weight",       prefix)) &&
 		            weights.write_tensor(&layer.post_per_layer_input_norm_weight, source, fmt.tprintf("%v.post_norm.weight",           prefix)) &&
 		            weights.write_tensor(&layer.layer_scalar,                     source, fmt.tprintf("%v.layer_output_scale.weight",  prefix)) &&
-		            _load_norm_f32_to_dtype(loader, layer.q_norm_weight,          fmt.tprintf("%v.attn_q_norm.weight",         prefix), q_norm_scale) &&
+		            _load_norm_f32_to_dtype(loader, layer.q_norm_weight,          fmt.tprintf("%v.attn_q_norm.weight",                 prefix), q_norm_scale) &&
 		            weights.write_tensor(&layer.q_proj_weight,                    source, fmt.tprintf("%v.attn_q.weight",              prefix), .Rope_Permute, cfg.num_attention_heads, head_dim) &&
 		            weights.write_tensor(&layer.o_proj_weight,                    source, fmt.tprintf("%v.attn_output.weight",         prefix)) &&
 		            weights.write_tensor(&layer.gate_proj_weight,                 source, fmt.tprintf("%v.ffn_gate.weight",            prefix)) &&
 		            weights.write_tensor(&layer.up_proj_weight,                   source, fmt.tprintf("%v.ffn_up.weight",              prefix)) &&
 		            weights.write_tensor(&layer.down_proj_weight,                 source, fmt.tprintf("%v.ffn_down.weight",            prefix)) &&
 		            weights.write_tensor(&layer.per_layer_input_gate_weight,      source, fmt.tprintf("%v.inp_gate.weight",            prefix)) &&
-		            weights.write_tensor(&layer.per_layer_projection_weight,      source, fmt.tprintf("%v.proj.weight",               prefix))
+		            weights.write_tensor(&layer.per_layer_projection_weight,      source, fmt.tprintf("%v.proj.weight",                prefix))
 		if !layer_ok {
 			return false
 		}

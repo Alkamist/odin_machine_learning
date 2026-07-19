@@ -17,17 +17,17 @@ Tokenizer_Golden :: struct {
 }
 
 GEMMA_TOKENIZER_GOLDENS :: []Tokenizer_Golden{
-	{text="Hello, world!", ids=[]int{9259, 236764, 1902, 236888}},
+	{text="Hello, world!",                                ids=[]int{9259, 236764, 1902, 236888}},
 	{text="The quick brown fox jumps over the lazy dog.", ids=[]int{818, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799, 236761}},
-	{text=" leading space", ids=[]int{5830, 2557}},
-	{text="trailing space ", ids=[]int{136697, 2557, 236743}},
-	{text="multi  space", ids=[]int{20028, 138, 5780}},
-	{text="a", ids=[]int{236746}},
-	{text="123 + 456 = 579", ids=[]int{236770, 236778, 236800, 900, 236743, 236812, 236810, 236825, 578, 236743, 236810, 236832, 236819}},
-	{text="CamelCaseIdentifier_snake_case", ids=[]int{114919, 9818, 19535, 236779, 37942, 236779, 4925}},
-	{text="né 日本語のテキスト", ids=[]int{8504, 33375, 238582, 236945, 95830}},
-	{text="emoji 🙂 test", ids=[]int{67906, 57235, 1594}},
-	{text="line\nbreak\ttab", ids=[]int{1257, 107, 7284, 255968, 4823}},
+	{text=" leading space",                               ids=[]int{5830, 2557}},
+	{text="trailing space ",                              ids=[]int{136697, 2557, 236743}},
+	{text="multi  space",                                 ids=[]int{20028, 138, 5780}},
+	{text="a",                                            ids=[]int{236746}},
+	{text="123 + 456 = 579",                              ids=[]int{236770, 236778, 236800, 900, 236743, 236812, 236810, 236825, 578, 236743, 236810, 236832, 236819}},
+	{text="CamelCaseIdentifier_snake_case",               ids=[]int{114919, 9818, 19535, 236779, 37942, 236779, 4925}},
+	{text="né 日本語のテキスト",                            ids=[]int{8504, 33375, 238582, 236945, 95830}},
+	{text="emoji 🙂 test",                                ids=[]int{67906, 57235, 1594}},
+	{text="line\nbreak\ttab",                             ids=[]int{1257, 107, 7284, 255968, 4823}},
 }
 
 @(test)

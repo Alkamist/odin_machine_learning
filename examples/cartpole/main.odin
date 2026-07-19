@@ -50,9 +50,6 @@ main :: proc() {
 			mouse_end(&game_state)
 		}
 
-		// Key edges are only true for a single rendered frame, so human input has to
-		// be sampled per frame rather than inside the fixed timestep loop, which
-		// usually runs zero times at high frame rates.
 		if human {
 			action = human_action(action)
 		}

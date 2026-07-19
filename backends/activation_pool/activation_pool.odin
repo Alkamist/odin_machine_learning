@@ -18,7 +18,7 @@ Ops :: struct($Handle: typeid) {
 	free:  proc(user: rawptr, handle: Handle, loc: runtime.Source_Code_Location),
 }
 
-take :: proc(pool: ^Pool($Handle), size: u64, ops: Ops(Handle), loc := #caller_location) -> Handle {
+take :: proc(pool: ^Pool($Handle), size: u64, ops: Ops(Handle), loc := #caller_location) -> (handle: Handle) {
 	if pool.cursor < len(pool.slots) {
 		slot := &pool.slots[pool.cursor]
 		if slot.size == size {
@@ -31,10 +31,11 @@ take :: proc(pool: ^Pool($Handle), size: u64, ops: Ops(Handle), loc := #caller_l
 		resize(&pool.slots, pool.cursor)
 	}
 
-	handle := ops.alloc(ops.user, size, loc)
-	append(&pool.slots, Slot(Handle){handle = handle, size = size})
+	handle = ops.alloc(ops.user, size, loc)
+	append(&pool.slots, Slot(Handle){handle=handle, size=size})
 	pool.cursor += 1
-	return handle
+
+	return
 }
 
 reset :: proc(pool: ^Pool($Handle)) {

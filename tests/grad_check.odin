@@ -131,9 +131,11 @@ _run_check :: proc(t: ^testing.T, tc: cases.Op_Test) {
 			denom    := max(max(abs(analytic), abs(numeric)), REL_FLOOR)
 			rel      := abs(analytic - numeric) / denom
 
-			testing.expectf(t, rel <= tc.tol,
+			testing.expectf(t, 
+				rel <= tc.tol,
 				"%s: input %d elem %d analytic=%.6g numeric=%.6g rel_err=%.4g (tol=%.3g)",
-				tc.name, i, e, analytic, numeric, rel, tc.tol)
+				tc.name, i, e, analytic, numeric, rel, tc.tol,
+			)
 		}
 	}
 }

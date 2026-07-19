@@ -17,18 +17,12 @@ GEMMA_DATA_DIR       :: #directory + "data/gemma"
 GEMMA_GGUF_PATH      :: GEMMA_DATA_DIR + "/model.gguf"
 GEMMA_TOKENIZER_PATH :: GEMMA_DATA_DIR + "/tokenizer.json"
 
-// Weights come from Ollama's registry (library/gemma4:e4b) rather than
-// HuggingFace: the GGUF there is a Q4_K/Q6_K mix, which is what load_gguf
-// dequantizes. The GGUFs published under ggml-org and google are Q4_0/Q8_0,
-// which load_gguf rejects. The blob is addressed by its own sha256, so this
-// URL is immutable.
-GEMMA_ASSETS := []fetch.Asset {
+GEMMA_ASSETS := []fetch.Asset{
 	{
 		url  = "https://registry.ollama.ai/v2/library/gemma4/blobs/sha256:4c27e0f5b5adf02ac956c7322bd2ee7636fe3f45a8512c9aba5385242cb6e09a",
 		dest = GEMMA_GGUF_PATH,
 		size = 9_608_338_848,
-	},
-	{
+	}, {
 		url  = "https://huggingface.co/google/gemma-4-e4b-it/resolve/main/tokenizer.json",
 		dest = GEMMA_TOKENIZER_PATH,
 		size = 32_169_626,
@@ -54,8 +48,6 @@ Gemma_Backend :: struct {
 
 @(require_results)
 gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) {
-	// An explicit --gguf points at a file the user manages themselves, so only
-	// fetch when we are using the default location.
 	weights_path := gguf_path
 	if builtin.len(weights_path) == 0 {
 		if !fetch.ensure_assets(GEMMA_ASSETS, "Gemma 4 E4B") {

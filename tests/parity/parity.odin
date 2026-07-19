@@ -223,8 +223,7 @@ test_cpu_cuda_parity :: proc(t: ^testing.T) {
 		b := f64(clip_cuda_norm)
 		denom := max(max(abs(a), abs(b)), REL_FLOOR)
 		rel   := abs(a - b) / denom
-		testing.expectf(t, rel <= PARITY_TOL,
-			"clip norm cpu=%.7g cuda=%.7g rel_err=%.4g (tol=%.3g)", a, b, rel, PARITY_TOL)
+		testing.expectf(t, rel <= PARITY_TOL, "clip norm cpu=%.7g cuda=%.7g rel_err=%.4g (tol=%.3g)", a, b, rel, PARITY_TOL)
 	}
 
 	cpu.context_destroy(cpu_ctx)
@@ -364,8 +363,10 @@ _adam_compare :: proc(t: ^testing.T, label: string, cpu_vals, cuda_vals: []f32) 
 		b := f64(cuda_vals[i])
 		denom := max(max(abs(a), abs(b)), REL_FLOOR)
 		rel   := abs(a - b) / denom
-		testing.expectf(t, rel <= PARITY_TOL,
+		testing.expectf(t,
+			rel <= PARITY_TOL,
 			"adam %s elem %d cpu=%.6g cuda=%.6g rel_err=%.4g (tol=%.3g)",
-			label, i, a, b, rel, PARITY_TOL)
+			label, i, a, b, rel, PARITY_TOL,
+		)
 	}
 }

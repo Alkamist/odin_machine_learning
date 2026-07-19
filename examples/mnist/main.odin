@@ -134,9 +134,6 @@ MNIST_CLASS_COUNT :: 10
 
 MNIST_DATA_DIR :: #directory + "data"
 
-// The canonical idx-ubyte files, from the S3 mirror the PyTorch project set up
-// after yann.lecun.com stopped serving them reliably. Sizes are the gzipped
-// sizes on the wire, which is what ensure_assets checks on disk.
 MNIST_ASSETS := []fetch.Asset {
 	{
 		url  = "https://ossci-datasets.s3.amazonaws.com/mnist/train-images-idx3-ubyte.gz",
@@ -166,9 +163,6 @@ Mnist :: struct {
 	targets: []int,
 }
 
-// Decompresses an idx file and returns its payload along with the header-declared
-// item count. idx headers are big endian: a magic number whose low byte is the
-// number of dimensions, followed by one i32be length per dimension.
 @(require_results)
 _idx_read :: proc(file_name: string, expect_magic: u32, allocator := context.temp_allocator) -> (payload: []u8, count: int, ok: bool) {
 	buffer: bytes.Buffer
@@ -197,8 +191,6 @@ _idx_read :: proc(file_name: string, expect_magic: u32, allocator := context.tem
 
 	count = int(be_u32(data[4:]))
 
-	// Every dimension past the first is per-item, so their product is the item
-	// stride. For labels that product is empty and the stride is 1 byte.
 	stride := 1
 	for d in 1 ..< dims {
 		stride *= int(be_u32(data[4 * (1 + d):]))
@@ -213,9 +205,6 @@ _idx_read :: proc(file_name: string, expect_magic: u32, allocator := context.tem
 
 @(require_results)
 mnist_load :: proc(images_file, labels_file: string, allocator := context.allocator) -> (mnist: Mnist, ok: bool) {
-	// The decompressed training images are ~47 MB of scratch; release them as
-	// soon as they have been converted rather than holding them until whatever
-	// the caller's next free_all happens to be.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	pixels, image_count := _idx_read(images_file, 0x0000_0803) or_return

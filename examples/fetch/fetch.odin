@@ -1,17 +1,5 @@
 package fetch
 
-// Automatic download of large example assets: model weights, tokenizers, and
-// training data.
-//
-// Everything is fetched over plain HTTPS with vendor:curl, which links
-// statically against Schannel on Windows -- no DLLs, no cert bundle, no Python.
-// Assets are pinned by exact byte size so a truncated or interrupted download is
-// detected rather than surfacing later as a confusing parse error.
-//
-// Gemma weights come from Ollama's registry, which is content-addressed: the
-// blob is named by its own sha256, so the URL can never silently start serving
-// different bytes.
-
 import "base:builtin"
 import "base:runtime"
 
@@ -24,8 +12,6 @@ import "core:strings"
 
 import curl "vendor:curl"
 
-// Reads a single line from stdin, stopping at the newline so any following
-// lines stay available to the caller rather than being swallowed here.
 read_line :: proc(buffer: []byte) -> (line: string, ok: bool) {
 	cursor := 0
 	one: [1]byte
@@ -56,7 +42,6 @@ Asset :: struct {
 	size: i64, // exact expected size in bytes; also used to detect partial files
 }
 
-// Progress state threaded through curl's C callbacks.
 Download_State :: struct {
 	file:        ^os.File,
 	ctx:         runtime.Context,
@@ -67,8 +52,6 @@ Download_State :: struct {
 	write_err:   os.Error,
 }
 
-// Formats a byte count with a unit that keeps the number readable, so a 2 MB
-// tokenizer does not print as "0.00 GB" next to a 9.6 GB checkpoint.
 @(require_results)
 _human_size :: proc(bytes: i64, allocator := context.temp_allocator) -> string {
 	KB :: 1024
@@ -91,9 +74,6 @@ _asset_present :: proc(asset: Asset) -> bool {
 	return info.size == asset.size
 }
 
-// Ensures every asset exists locally, downloading the missing ones after
-// confirming with the user. Returns false if the user declines or a download
-// fails.
 @(require_results)
 ensure_assets :: proc(assets: []Asset, model_label: string) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -141,8 +121,6 @@ ensure_assets :: proc(assets: []Asset, model_label: string) -> bool {
 	return true
 }
 
-// Writes downloaded bytes straight to disk. Runs on curl's thread, so it
-// restores the Odin context captured at call time.
 _write_cb :: proc "c" (ptr: rawptr, size, nmemb: uint, userdata: rawptr) -> uint {
 	state := cast(^Download_State)userdata
 	context = state.ctx
@@ -150,7 +128,6 @@ _write_cb :: proc "c" (ptr: rawptr, size, nmemb: uint, userdata: rawptr) -> uint
 	total := size * nmemb
 	written, err := os.write(state.file, (cast([^]u8)ptr)[:total])
 	if err != nil {
-		// Returning a short count aborts the transfer with E_WRITE_ERROR.
 		state.write_err = err
 		return 0
 	}
@@ -174,12 +151,6 @@ _progress_cb :: proc "c" (userdata: rawptr, dl_total, dl_now, ul_total, ul_now: 
 	return 0
 }
 
-// Downloads a single asset to `dest`.
-//
-// Bytes land in a sibling ".part" file that is only renamed into place once the
-// size matches exactly, so an interrupted run can never leave behind a file
-// that looks complete. A pre-existing ".part" is resumed rather than restarted,
-// which matters a great deal for the 9.6 GB Gemma weights.
 @(require_results)
 _download :: proc(asset: Asset) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -194,7 +165,6 @@ _download :: proc(asset: Asset) -> bool {
 		}
 	}
 
-	// Resume whatever a previous run already managed to write.
 	resume_from: i64
 	if info, err := os.stat(part, context.temp_allocator); err == nil && info.size < asset.size {
 		resume_from = info.size
@@ -212,7 +182,7 @@ _download :: proc(asset: Asset) -> bool {
 		log.errorf("could not open %v: %v", part, open_err)
 		return false
 	}
-	// Closed explicitly before the rename below; this only covers early exits.
+
 	file_open := true
 	defer if file_open { os.close(file) }
 
@@ -264,7 +234,6 @@ _download :: proc(asset: Asset) -> bool {
 		return false
 	}
 
-	// Verify before publishing the file under its real name.
 	written, size_err := os.file_size(file)
 	if size_err != nil {
 		log.errorf("could not stat %v: %v", part, size_err)

@@ -111,7 +111,7 @@ _sift_down_min_logit :: proc(indices: []int, logits: []f32, start, n: int) {
 	}
 }
 
-Eval_Proc :: proc(data: rawptr, tokens: []int, logits_out: []f32)
+Eval_Proc     :: proc(data: rawptr, tokens: []int, logits_out: []f32)
 On_Token_Proc :: proc(data: rawptr, token: int)
 
 Generate_Options :: struct {

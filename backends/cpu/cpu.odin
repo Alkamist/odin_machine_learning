@@ -547,113 +547,113 @@ _forward :: proc(op: ^ml.Operation, loc: runtime.Source_Code_Location) {
 	_alloc_scratch(op, loc)
 	op := op^
 	switch _ in op.variant {
-	case ml.Add:                _add_forward                (op)
-	case ml.Sub:                _sub_forward                (op)
-	case ml.Mul:                _mul_forward                (op)
-	case ml.Div:                _div_forward                (op)
-	case ml.Exp:                _exp_forward                (op)
-	case ml.Sqrt:               _sqrt_forward               (op, loc)
-	case ml.Clamp:              _clamp_forward              (op)
-	case ml.Min:                _min_forward                (op)
-	case ml.Max:                _max_forward                (op)
-	case ml.Mean:               _mean_forward               (op)
-	case ml.Sum:                _sum_forward                (op)
-	case ml.Max_Reduce:         _max_reduce_forward         (op)
-	case ml.Im2col:             _im2col_forward             (op)
-	case ml.Max_Pool2d:         _max_pool2d_forward         (op)
-	case ml.Avg_Pool2d:         _avg_pool2d_forward         (op)
-	case ml.Transpose:          _transpose_forward          (op)
-	case ml.Select:             _select_forward             (op)
-	case ml.Slice:              _slice_forward              (op)
-	case ml.Slice_Trailing:     _slice_trailing_forward     (op)
-	case ml.Slice_Leading:      _slice_leading_forward      (op)
-	case ml.Concat:             _concat_forward             (op)
-	case ml.Linear:             _linear_forward             (op)
-	case ml.Linear_Q4_K:        _linear_q4_k_forward        (op)
+	case ml.Add:                       _add_forward(op)
+	case ml.Sub:                       _sub_forward(op)
+	case ml.Mul:                       _mul_forward(op)
+	case ml.Div:                       _div_forward(op)
+	case ml.Exp:                       _exp_forward(op)
+	case ml.Sqrt:                      _sqrt_forward(op, loc)
+	case ml.Clamp:                     _clamp_forward(op)
+	case ml.Min:                       _min_forward(op)
+	case ml.Max:                       _max_forward(op)
+	case ml.Mean:                      _mean_forward(op)
+	case ml.Sum:                       _sum_forward(op)
+	case ml.Max_Reduce:                _max_reduce_forward(op)
+	case ml.Im2col:                    _im2col_forward(op)
+	case ml.Max_Pool2d:                _max_pool2d_forward(op)
+	case ml.Avg_Pool2d:                _avg_pool2d_forward(op)
+	case ml.Transpose:                 _transpose_forward(op)
+	case ml.Select:                    _select_forward(op)
+	case ml.Slice:                     _slice_forward(op)
+	case ml.Slice_Trailing:            _slice_trailing_forward(op)
+	case ml.Slice_Leading:             _slice_leading_forward(op)
+	case ml.Concat:                    _concat_forward(op)
+	case ml.Linear:                    _linear_forward(op)
+	case ml.Linear_Q4_K:               _linear_q4_k_forward(op)
 	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu is unreachable (the op decomposes when the capability is absent)", loc)
-	case ml.Linear_Q6_K:        _linear_q6_k_forward        (op)
-	case ml.Rope:               _rope_forward               (op)
-	case ml.Layernorm:          _layernorm_forward          (op)
-	case ml.Rmsnorm:            _rmsnorm_forward            (op)
-	case ml.Rmsnorm_Rope:       _rmsnorm_rope_forward       (op)
-	case ml.Rmsnorm_Rope_Write_Cache: panic("backend does not advertise the Rmsnorm_Rope_Write_Cache capability", loc)
-	case ml.Add_Rmsnorm:        _add_rmsnorm_forward        (op)
-	case ml.Softmax:            _softmax_forward            (op)
-	case ml.Entropy:            _entropy_forward            (op)
-	case ml.Log_Softmax:        _log_softmax_forward        (op)
-	case ml.Mean_Squared_Error: _mean_squared_error_forward (op)
-	case ml.Smooth_L1:          _smooth_l1_forward          (op)
-	case ml.Cross_Entropy:      _cross_entropy_forward      (op)
-	case ml.Relu:               _relu_forward               (op)
-	case ml.Sigmoid:            _sigmoid_forward            (op)
-	case ml.Gelu:               _gelu_forward               (op)
-	case ml.Gelu_Mul:           _gelu_mul_forward           (op)
-	case ml.Silu:               _silu_forward               (op)
-	case ml.Tanh:               _tanh_forward               (op)
-	case ml.Batched_Matmul:     _batched_matmul_forward     (op)
-	case ml.Permute:            _permute_forward            (op)
-	case ml.Causal_Mask:        _causal_mask_forward        (op)
-	case ml.Attention:          _attention_forward          (op)
-	case ml.Attention_Cache:    _attention_cache_forward    (op)
-	case ml.Cast:               _cast_forward               (op)
-	case ml.Lerp_Assign:        _lerp_assign_forward        (op)
-	case ml.Accumulate_Mean:    _accumulate_mean_forward    (op)
+	case ml.Linear_Q6_K:               _linear_q6_k_forward(op)
+	case ml.Rope:                      _rope_forward(op)
+	case ml.Layernorm:                 _layernorm_forward(op)
+	case ml.Rmsnorm:                   _rmsnorm_forward(op)
+	case ml.Rmsnorm_Rope:              _rmsnorm_rope_forward(op)
+	case ml.Rmsnorm_Rope_Write_Cache:  panic("backend does not advertise the Rmsnorm_Rope_Write_Cache capability", loc)
+	case ml.Add_Rmsnorm:               _add_rmsnorm_forward(op)
+	case ml.Softmax:                   _softmax_forward(op)
+	case ml.Entropy:                   _entropy_forward(op)
+	case ml.Log_Softmax:               _log_softmax_forward(op)
+	case ml.Mean_Squared_Error:        _mean_squared_error_forward(op)
+	case ml.Smooth_L1:                 _smooth_l1_forward(op)
+	case ml.Cross_Entropy:             _cross_entropy_forward(op)
+	case ml.Relu:                      _relu_forward(op)
+	case ml.Sigmoid:                   _sigmoid_forward(op)
+	case ml.Gelu:                      _gelu_forward(op)
+	case ml.Gelu_Mul:                  _gelu_mul_forward(op)
+	case ml.Silu:                      _silu_forward(op)
+	case ml.Tanh:                      _tanh_forward(op)
+	case ml.Batched_Matmul:            _batched_matmul_forward(op)
+	case ml.Permute:                   _permute_forward(op)
+	case ml.Causal_Mask:               _causal_mask_forward(op)
+	case ml.Attention:                 _attention_forward(op)
+	case ml.Attention_Cache:           _attention_cache_forward(op)
+	case ml.Cast:                      _cast_forward(op)
+	case ml.Lerp_Assign:               _lerp_assign_forward(op)
+	case ml.Accumulate_Mean:           _accumulate_mean_forward(op)
 	}
 }
 
 _backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
 	switch _ in op.variant {
-	case ml.Add:                _add_backward               (op)
-	case ml.Sub:                _sub_backward               (op)
-	case ml.Mul:                _mul_backward               (op)
-	case ml.Div:                _div_backward               (op)
-	case ml.Exp:                _exp_backward               (op)
-	case ml.Sqrt:               _sqrt_backward              (op)
-	case ml.Clamp:              _clamp_backward             (op)
-	case ml.Min:                _min_backward               (op)
-	case ml.Max:                _max_backward               (op)
-	case ml.Mean:               _mean_backward              (op)
-	case ml.Sum:                _sum_backward               (op)
-	case ml.Max_Reduce:         _max_reduce_backward        (op)
-	case ml.Im2col:             _im2col_backward            (op)
-	case ml.Max_Pool2d:         _max_pool2d_backward        (op)
-	case ml.Avg_Pool2d:         _avg_pool2d_backward        (op)
-	case ml.Transpose:          _transpose_backward         (op)
-	case ml.Select:             _select_backward            (op)
-	case ml.Slice:              _slice_backward             (op)
-	case ml.Slice_Trailing:     _slice_trailing_backward    (op)
-	case ml.Slice_Leading:      _slice_leading_backward     (op)
-	case ml.Concat:             _concat_backward            (op)
-	case ml.Linear:             _linear_backward            (op)
-	case ml.Linear_Q4_K:        panic("Linear_Q4_K is _forward-only", loc)
+	case ml.Add:                       _add_backward(op)
+	case ml.Sub:                       _sub_backward(op)
+	case ml.Mul:                       _mul_backward(op)
+	case ml.Div:                       _div_backward(op)
+	case ml.Exp:                       _exp_backward(op)
+	case ml.Sqrt:                      _sqrt_backward(op)
+	case ml.Clamp:                     _clamp_backward(op)
+	case ml.Min:                       _min_backward(op)
+	case ml.Max:                       _max_backward(op)
+	case ml.Mean:                      _mean_backward(op)
+	case ml.Sum:                       _sum_backward(op)
+	case ml.Max_Reduce:                _max_reduce_backward(op)
+	case ml.Im2col:                    _im2col_backward(op)
+	case ml.Max_Pool2d:                _max_pool2d_backward(op)
+	case ml.Avg_Pool2d:                _avg_pool2d_backward(op)
+	case ml.Transpose:                 _transpose_backward(op)
+	case ml.Select:                    _select_backward(op)
+	case ml.Slice:                     _slice_backward(op)
+	case ml.Slice_Trailing:            _slice_trailing_backward(op)
+	case ml.Slice_Leading:             _slice_leading_backward(op)
+	case ml.Concat:                    _concat_backward(op)
+	case ml.Linear:                    _linear_backward(op)
+	case ml.Linear_Q4_K:               panic("Linear_Q4_K is _forward-only", loc)
 	case ml.Linear_Q4_K_Gate_Up_Geglu: panic("Linear_Q4_K_Gate_Up_Geglu is _forward-only", loc)
-	case ml.Linear_Q6_K:        panic("Linear_Q6_K is _forward-only", loc)
-	case ml.Rope:               _rope_backward              (op)
-	case ml.Layernorm:          _layernorm_backward         (op)
-	case ml.Rmsnorm:            _rmsnorm_backward           (op)
-	case ml.Rmsnorm_Rope:       panic("Rmsnorm_Rope is _forward-only", loc)
-	case ml.Rmsnorm_Rope_Write_Cache: panic("Rmsnorm_Rope_Write_Cache is _forward-only", loc)
-	case ml.Add_Rmsnorm:        panic("Add_Rmsnorm is _forward-only", loc)
-	case ml.Softmax:            _softmax_backward           (op)
-	case ml.Entropy:            _entropy_backward           (op)
-	case ml.Log_Softmax:        _log_softmax_backward       (op)
-	case ml.Mean_Squared_Error: _mean_squared_error_backward(op)
-	case ml.Smooth_L1:          _smooth_l1_backward         (op)
-	case ml.Cross_Entropy:      _cross_entropy_backward     (op)
-	case ml.Relu:               _relu_backward              (op)
-	case ml.Sigmoid:            _sigmoid_backward           (op)
-	case ml.Gelu:               _gelu_backward              (op)
-	case ml.Gelu_Mul:           panic("Gelu_Mul is _forward-only", loc)
-	case ml.Silu:               _silu_backward              (op)
-	case ml.Tanh:               _tanh_backward              (op)
-	case ml.Batched_Matmul:     _batched_matmul_backward    (op)
-	case ml.Permute:            _permute_backward           (op)
-	case ml.Causal_Mask:        _causal_mask_backward       (op)
-	case ml.Attention:          _attention_backward         (op)
-	case ml.Attention_Cache:    _attention_cache_backward   (op, loc)
-	case ml.Cast:               _cast_backward              (op)
-	case ml.Lerp_Assign:        panic("Lerp_Assign is _forward-only", loc)
-	case ml.Accumulate_Mean:    panic("Accumulate_Mean is _forward-only", loc)
+	case ml.Linear_Q6_K:               panic("Linear_Q6_K is _forward-only", loc)
+	case ml.Rope:                      _rope_backward(op)
+	case ml.Layernorm:                 _layernorm_backward(op)
+	case ml.Rmsnorm:                   _rmsnorm_backward(op)
+	case ml.Rmsnorm_Rope:              panic("Rmsnorm_Rope is _forward-only", loc)
+	case ml.Rmsnorm_Rope_Write_Cache:  panic("Rmsnorm_Rope_Write_Cache is _forward-only", loc)
+	case ml.Add_Rmsnorm:               panic("Add_Rmsnorm is _forward-only", loc)
+	case ml.Softmax:                   _softmax_backward(op)
+	case ml.Entropy:                   _entropy_backward(op)
+	case ml.Log_Softmax:               _log_softmax_backward(op)
+	case ml.Mean_Squared_Error:        _mean_squared_error_backward(op)
+	case ml.Smooth_L1:                 _smooth_l1_backward(op)
+	case ml.Cross_Entropy:             _cross_entropy_backward(op)
+	case ml.Relu:                      _relu_backward(op)
+	case ml.Sigmoid:                   _sigmoid_backward(op)
+	case ml.Gelu:                      _gelu_backward(op)
+	case ml.Gelu_Mul:                  panic("Gelu_Mul is _forward-only", loc)
+	case ml.Silu:                      _silu_backward(op)
+	case ml.Tanh:                      _tanh_backward(op)
+	case ml.Batched_Matmul:            _batched_matmul_backward(op)
+	case ml.Permute:                   _permute_backward(op)
+	case ml.Causal_Mask:               _causal_mask_backward(op)
+	case ml.Attention:                 _attention_backward(op)
+	case ml.Attention_Cache:           _attention_cache_backward(op, loc)
+	case ml.Cast:                      _cast_backward(op)
+	case ml.Lerp_Assign:               panic("Lerp_Assign is _forward-only", loc)
+	case ml.Accumulate_Mean:           panic("Accumulate_Mean is _forward-only", loc)
 	}
 }
 
@@ -684,7 +684,9 @@ _cast_forward :: proc(op: ml.Operation) {
 }
 
 _cast_backward :: proc(op: ml.Operation) {
-	if !ml.has_gradient(op.input) { return }
+	if !ml.has_gradient(op.input) {
+		return
+	}
 	src_grad := _gradient(op.output)
 	dst_grad := _gradient(op.input)
 	for i in 0 ..< op.input.count {
@@ -760,18 +762,18 @@ _store :: #force_inline proc "contextless" (p: [^]$T, i: int, value: f32) {
 
 _add_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  _add_forward_impl(f32,      op)
+	case .F32:  _add_forward_impl(f32,     op)
 	case .Bf16: _add_forward_impl(ml.Bf16, op)
 	}
 }
 
 _add_forward_impl :: proc($T: typeid, op: ml.Operation) {
-	a, output := op.input, op.output
-	b := op.variant.(ml.Add).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Add).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap := _typed_data(T, a)
-	bp := _typed_data(T, b)
+	ap  := _typed_data(T, a)
+	bp  := _typed_data(T, b)
 	op_ := _typed_data(T, output)
 	#no_bounds_check for i in 0 ..< stride {
 		row := i * width
@@ -782,11 +784,11 @@ _add_forward_impl :: proc($T: typeid, op: ml.Operation) {
 }
 
 _add_backward :: proc(op: ml.Operation) {
-	a, output := op.input, op.output
-	b      := op.variant.(ml.Add).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Add).b
 	stride, width := _broadcast_tiling(a, b)
 
-	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
+	da, db, dy       := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	#no_bounds_check for i in 0 ..< stride {
 		row_da := da[i * width:]
@@ -800,18 +802,18 @@ _add_backward :: proc(op: ml.Operation) {
 
 _sub_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  _sub_forward_impl(f32,      op)
+	case .F32:  _sub_forward_impl(f32,     op)
 	case .Bf16: _sub_forward_impl(ml.Bf16, op)
 	}
 }
 
 _sub_forward_impl :: proc($T: typeid, op: ml.Operation) {
-	a, output := op.input, op.output
-	b := op.variant.(ml.Sub).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Sub).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap := _typed_data(T, a)
-	bp := _typed_data(T, b)
+	ap  := _typed_data(T, a)
+	bp  := _typed_data(T, b)
 	op_ := _typed_data(T, output)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -822,11 +824,11 @@ _sub_forward_impl :: proc($T: typeid, op: ml.Operation) {
 }
 
 _sub_backward :: proc(op: ml.Operation) {
-	a, output := op.input, op.output
-	b      := op.variant.(ml.Sub).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Sub).b
 	stride, width := _broadcast_tiling(a, b)
 
-	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
+	da, db, dy       := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -839,18 +841,18 @@ _sub_backward :: proc(op: ml.Operation) {
 
 _mul_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  _mul_forward_impl(f32,      op)
+	case .F32:  _mul_forward_impl(f32,     op)
 	case .Bf16: _mul_forward_impl(ml.Bf16, op)
 	}
 }
 
 _mul_forward_impl :: proc($T: typeid, op: ml.Operation) {
-	a, output := op.input, op.output
-	b := op.variant.(ml.Mul).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Mul).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap := _typed_data(T, a)
-	bp := _typed_data(T, b)
+	ap  := _typed_data(T, a)
+	bp  := _typed_data(T, b)
 	op_ := _typed_data(T, output)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -862,17 +864,17 @@ _mul_forward_impl :: proc($T: typeid, op: ml.Operation) {
 
 _mul_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  _mul_backward_impl(f32,      op)
+	case .F32:  _mul_backward_impl(f32,     op)
 	case .Bf16: _mul_backward_impl(ml.Bf16, op)
 	}
 }
 
 _mul_backward_impl :: proc($T: typeid, op: ml.Operation) {
-	a, output := op.input, op.output
-	b := op.variant.(ml.Mul).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Mul).b
 	stride, width := _broadcast_tiling(a, b)
 
-	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
+	da, db, dy       := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	ap := _typed_data(T, a)
 	bp := _typed_data(T, b)
@@ -887,18 +889,18 @@ _mul_backward_impl :: proc($T: typeid, op: ml.Operation) {
 
 _div_forward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  _div_forward_impl(f32,      op)
+	case .F32:  _div_forward_impl(f32,     op)
 	case .Bf16: _div_forward_impl(ml.Bf16, op)
 	}
 }
 
 _div_forward_impl :: proc($T: typeid, op: ml.Operation) {
-	a, output := op.input, op.output
-	b := op.variant.(ml.Div).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Div).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap := _typed_data(T, a)
-	bp := _typed_data(T, b)
+	ap  := _typed_data(T, a)
+	bp  := _typed_data(T, b)
 	op_ := _typed_data(T, output)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -910,17 +912,17 @@ _div_forward_impl :: proc($T: typeid, op: ml.Operation) {
 
 _div_backward :: proc(op: ml.Operation) {
 	#partial switch op.input.type {
-	case .F32:  _div_backward_impl(f32,      op)
+	case .F32:  _div_backward_impl(f32,     op)
 	case .Bf16: _div_backward_impl(ml.Bf16, op)
 	}
 }
 
 _div_backward_impl :: proc($T: typeid, op: ml.Operation) {
-	a, output := op.input, op.output
-	b := op.variant.(ml.Div).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Div).b
 	stride, width := _broadcast_tiling(a, b)
 
-	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
+	da, db, dy       := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	ap := _typed_data(T, a)
 	bp := _typed_data(T, b)
@@ -960,7 +962,7 @@ _exp_backward :: proc(op: ml.Operation) {
 
 _exp_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	dx, dy := _gradient(op.input), _gradient(op.output)
-	yp := _typed_data(T, op.output)
+	yp     := _typed_data(T, op.output)
 	for i in 0 ..< ml.len(op.input) {
 		dx[i] += _load(yp, i) * dy[i]
 	}
@@ -978,11 +980,13 @@ _sqrt_forward :: proc(op: ml.Operation, loc := #caller_location) {
 }
 
 _sqrt_backward :: proc(op: ml.Operation) {
-	if !ml.has_gradient(op.input) { return }
+	if !ml.has_gradient(op.input) {
+		return
+	}
 	input, output := op.input, op.output
 
 	dx, dy := _gradient(input), _gradient(output)
-	y := _data(output)
+	y      := _data(output)
 	for i in 0 ..< ml.len(input) {
 		if y[i] > 0 {
 			dx[i] += 0.5 / y[i] * dy[i]
@@ -1003,7 +1007,9 @@ _clamp_forward :: proc(op: ml.Operation) {
 }
 
 _clamp_backward :: proc(op: ml.Operation) {
-	if !ml.has_gradient(op.input) { return }
+	if !ml.has_gradient(op.input) {
+		return
+	}
 	input, output := op.input, op.output
 
 	variant := op.variant.(ml.Clamp)
@@ -1018,8 +1024,8 @@ _clamp_backward :: proc(op: ml.Operation) {
 }
 
 _min_forward :: proc(op: ml.Operation) {
-	a, output := op.input, op.output
-	b := op.variant.(ml.Min).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Min).b
 	stride, width := _broadcast_tiling(a, b)
 
 	ap, bp, op_ := _data(a), _data(b), _data(output)
@@ -1032,12 +1038,12 @@ _min_forward :: proc(op: ml.Operation) {
 }
 
 _min_backward :: proc(op: ml.Operation) {
-	a, output := op.input, op.output
-	b := op.variant.(ml.Min).b
+	a, output     := op.input, op.output
+	b             := op.variant.(ml.Min).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap, bp := _data(a), _data(b)
-	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
+	ap, bp           := _data(a), _data(b)
+	da, db, dy       := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -1070,8 +1076,8 @@ _max_backward :: proc(op: ml.Operation) {
 	b := op.variant.(ml.Max).b
 	stride, width := _broadcast_tiling(a, b)
 
-	ap, bp := _data(a), _data(b)
-	da, db, dy := _gradient(a), _gradient(b), _gradient(output)
+	ap, bp           := _data(a), _data(b)
+	da, db, dy       := _gradient(a), _gradient(b), _gradient(output)
 	have_da, have_db := ml.has_gradient(a), ml.has_gradient(b)
 	for i in 0 ..< stride {
 		for j in 0 ..< width {
@@ -1146,7 +1152,9 @@ _sum_forward_impl :: proc($T: typeid, op: ml.Operation) {
 }
 
 _sum_backward :: proc(op: ml.Operation) {
-	if !ml.has_gradient(op.input) { return }
+	if !ml.has_gradient(op.input) {
+		return
+	}
 	input, output := op.input, op.output
 	count := ml.len(output)
 	size  := ml.len(input) / count
@@ -1197,7 +1205,7 @@ _max_reduce_backward_impl :: proc($T: typeid, op: ml.Operation) {
 	count := ml.len(output)
 	size  := ml.len(input) / count
 
-	xp := _typed_data(T, input)
+	xp     := _typed_data(T, input)
 	dx, dy := _gradient(input), _gradient(output)
 	for sample in 0 ..< count {
 		best_index := 0
@@ -2914,7 +2922,7 @@ _batched_matmul_forward_bf16 :: proc(op: ml.Operation) {
 			acc: f32
 			for kk in 0 ..< k_count {
 				acc += ml.bf16_to_f32(a_row[kk]) *
-				       ml.bf16_to_f32(b_bf[bi * k_count * n + kk * n + j])
+					   ml.bf16_to_f32(b_bf[bi * k_count * n + kk * n + j])
 			}
 			c_row[j] = ml.bf16_from_f32(acc)
 		}
@@ -3019,7 +3027,7 @@ _batched_matmul_backward_bf16 :: proc(op: ml.Operation) {
 				acc: f32
 				for ii in 0 ..< m {
 					acc += ml.bf16_to_f32(a_bf[bi * m * k_count + ii * k_count + kk]) *
-					       dc[bi * m * n + ii * n + j]
+						   dc[bi * m * n + ii * n + j]
 				}
 				db_row[j] += acc
 			}

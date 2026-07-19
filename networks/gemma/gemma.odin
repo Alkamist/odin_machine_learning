@@ -5,7 +5,6 @@ import "base:builtin"
 import "core:fmt"
 import "core:math"
 import "core:math/rand"
-import "core:mem"
 
 import ml   "../../"
 import lora "../../networks/lora"
