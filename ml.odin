@@ -9,6 +9,7 @@ import "core:mem"
 import "core:math"
 import "core:math/rand"
 import "core:reflect"
+import "core:sync"
 
 MAX_OPERATIONS               :: 16384
 MAX_TENSOR_RANK              :: 6
@@ -113,6 +114,8 @@ Context :: struct {
 
 	training: bool,
 
+	owner_thread_id: int,
+
 	grad_norm_accumulator: Backend_Buffer,
 }
 
@@ -133,23 +136,31 @@ _context_init :: proc(ctx: ^Context, backend: ^Backend, allocator: mem.Allocator
 
 _context_destroy :: proc(ctx: ^Context, loc: runtime.Source_Code_Location) {
 	assert(_current_ctx != ctx, "cannot destroy the active context", loc=loc)
+	assert(sync.atomic_load(&ctx.owner_thread_id) == 0, "cannot destroy a context that is active on a thread", loc=loc)
 	builtin.delete(ctx._op_arena_buf, loc=loc)
 }
 
 @(require_results)
-context_begin :: proc(ctx: ^Context) -> (previous: ^Context) {
+context_begin :: proc(ctx: ^Context, loc := #caller_location) -> (previous: ^Context) {
+	thread_id := int(sync.current_thread_id())
+	owner, exchanged := sync.atomic_compare_exchange_strong(&ctx.owner_thread_id, 0, thread_id)
+	fmt.assertf(exchanged || owner == thread_id,
+		"context is active on thread %v; a context may only be used by one thread at a time", owner, loc=loc)
 	previous     = _current_ctx
 	_current_ctx = ctx
 	return
 }
 
 context_end :: proc(previous: ^Context) {
+	if _current_ctx != nil && _current_ctx != previous {
+		sync.atomic_store(&_current_ctx.owner_thread_id, 0)
+	}
 	_current_ctx = previous
 }
 
 @(deferred_out=context_end)
-context_scope :: proc(ctx: ^Context) -> ^Context {
-	return context_begin(ctx)
+context_scope :: proc(ctx: ^Context, loc := #caller_location) -> ^Context {
+	return context_begin(ctx, loc=loc)
 }
 
 @(require_results)

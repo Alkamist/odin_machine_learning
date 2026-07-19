@@ -185,7 +185,7 @@ _device_init_locked :: proc(loc := #caller_location) {
 	cuda.check(cuda.DevicePrimaryCtxRetain(&_gpu.ctx, _gpu.dev))
 	sync.atomic_add(&_gpu.generation, 1)
 
-	_gpu.pipeline_cache = builtin.make(map[string]^Pipeline)
+	_gpu.pipeline_cache = builtin.make(map[string]^Pipeline, allocator=runtime.default_allocator())
 
 	log.infof("%s  cc=%d.%d  SMs=%d  warp=%d", builtin.string(_gpu.name_buf[:_gpu.name_len]), _gpu.cc_major, _gpu.cc_minor, _gpu.sm_count, _gpu.warp_size)
 }
@@ -203,7 +203,7 @@ device_destroy :: proc() {
 
 	for key, p in _gpu.pipeline_cache {
 		_destroy_pipeline(p)
-		builtin.delete(key)
+		builtin.delete(key, allocator=runtime.default_allocator())
 	}
 	builtin.delete(_gpu.pipeline_cache)
 	_gpu.pipeline_cache = nil

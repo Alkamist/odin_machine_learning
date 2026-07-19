@@ -20,4 +20,4 @@ Structure:
 - `tests/parity/` — parity for the registry cases plus Bf16 forward/backward sweeps (`parity_bf16.odin`), fused/quant op oracles vs their decompositions (`fused_gpu_check.odin`), Adam and gradient-clip parity. The parity gate asserts every registry case's op is in CUDA `forward_ops`, so adding a case guarantees parity coverage.
 - `tests/golden/` — reference fixtures generated outside the library (HF tokenizers, llama.cpp quant block spec). Tests log a loud skip when optional model assets are absent.
 
-Known noise: the parity suite logs ~50 non-fatal leak/bad-free warnings from the global NVRTC pipeline cache interacting with per-test tracking allocators (entries compiled under one test are freed at device teardown under another). Pre-existing; tracked in `IMPROVEMENT_PLAN.md`.
+- `tests/parallel_inference_check.odin` and `tests/parity/parallel_gpu_check.odin` — the Tier 2 threading-contract tests: shared read-only weights, one context per thread, outputs bit-identical to a single-threaded reference (see the threading contract in the root `README.md`).

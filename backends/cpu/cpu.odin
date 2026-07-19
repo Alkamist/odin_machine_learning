@@ -37,6 +37,8 @@ when thread.IS_SUPPORTED {
 	_done_wg:    sync.Wait_Group
 	_pool_mutex: sync.Mutex
 
+	@(thread_local) _in_parallelize: bool
+
 	_worker_proc :: proc(t: ^thread.Thread) {
 		w := cast(^Worker)t.data
 		_enable_flush_to_zero()
@@ -57,7 +59,9 @@ when thread.IS_SUPPORTED {
 				}
 
 				if start < end {
+					_in_parallelize = true
 					d.chunk_proc(start, end, d.data)
+					_in_parallelize = false
 				}
 			}
 
@@ -66,6 +70,7 @@ when thread.IS_SUPPORTED {
 	}
 
 	_startup_thread_pool :: proc(thread_count: int) {
+		context.allocator = runtime.default_allocator()
 		_thread_pool_context = context
 
 		_shutdown = false
@@ -84,6 +89,7 @@ when thread.IS_SUPPORTED {
 	}
 
 	_cleanup_thread_pool :: proc() {
+		context.allocator = runtime.default_allocator()
 		_shutdown = true
 
 		for w in _workers {
@@ -168,6 +174,8 @@ when thread.IS_SUPPORTED {
 			return
 		}
 
+		assert(!_in_parallelize, "parallelize called from inside a parallelize job — this deadlocks the worker pool")
+
 		sync.mutex_lock(&_pool_mutex)
 		defer sync.mutex_unlock(&_pool_mutex)
 
@@ -201,7 +209,9 @@ when thread.IS_SUPPORTED {
 		if end > job_count {
 			end = job_count
 		}
+		_in_parallelize = true
 		thunk(0, end, &td)
+		_in_parallelize = false
 
 		sync.wait_group_wait(&_done_wg)
 	}

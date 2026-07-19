@@ -124,7 +124,7 @@ _compile_pipeline :: proc(
 	cubin := builtin.make([]u8, cubin_size, context.temp_allocator)
 	nvrtc.check(nvrtc.GetCUBIN(prog, raw_data(cubin)), loc=loc)
 
-	pipeline, err := builtin.new(Pipeline, loc=loc)
+	pipeline, err := builtin.new(Pipeline, allocator=runtime.default_allocator(), loc=loc)
 	fmt.assertf(err == nil, "Failed to allocate Pipeline: %v", err, loc=loc)
 
 	cuda.check(cuda.ModuleLoadData(&pipeline.module, raw_data(cubin)), loc=loc)
@@ -137,7 +137,7 @@ _compile_pipeline :: proc(
 		_destroy_pipeline(pipeline)
 		return existing
 	}
-	_gpu.pipeline_cache[strings.clone(key)] = pipeline
+	_gpu.pipeline_cache[strings.clone(key, allocator=runtime.default_allocator())] = pipeline
 	sync.unlock(&_gpu_mutex)
 
 	return pipeline
@@ -166,7 +166,7 @@ _destroy_pipeline :: proc(p: ^Pipeline) {
 	if p.module != nil {
 		cuda.ModuleUnload(p.module)
 	}
-	builtin.free(p)
+	builtin.free(p, allocator=runtime.default_allocator())
 }
 
 _acquire_timing_slot :: proc(gctx: ^Context, p: ^Pipeline) -> ^Timing_Slot {
