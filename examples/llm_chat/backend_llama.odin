@@ -75,7 +75,7 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 	}
 
 	log.infof("allocating SmolLM2-135M (bf16, %v)", ML_BACKEND)
-	model := llama.make(llama.SMOLLM2_135M_CONFIG, dtype = .Bf16)
+	model := llama.make(llama.SMOLLM2_135M_CONFIG, dtype=.Bf16, trainable=false)
 
 	log.infof("loading weights from %v", path)
 	load_ok := llama.load_safetensors(&model, path)
