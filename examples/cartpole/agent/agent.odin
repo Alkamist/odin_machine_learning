@@ -28,6 +28,9 @@ PLAN_SAMPLES  :: 64
 PLAN_ELITES   :: 8
 PLAN_DISCOUNT :: f32(0.98)
 
+POLICY_SEED_SAMPLES :: 16
+POLICY_TEMPERATURE  :: f32(1)
+
 PESSIMISM :: f32(1)
 
 BUFFER_CAPACITY  :: 4096
@@ -437,7 +440,13 @@ _plan_refine :: proc(a: ^Agent, sensor: Sensor) {
 	returns   := builtin.make([]f32,               PLAN_SAMPLES, context.temp_allocator)
 	order     := builtin.make([]int,               PLAN_SAMPLES, context.temp_allocator)
 
-	for n in 0 ..< PLAN_SAMPLES {
+	seeded := 0
+	if a.policy_buffer_count >= POLICY_MINIMUM {
+		seeded = POLICY_SEED_SAMPLES
+		_policy_seed(a, sensor, sequences[:seeded])
+	}
+
+	for n in seeded ..< PLAN_SAMPLES {
 		for h in 0 ..< PLAN_HORIZON {
 			sequences[n][h] = _sample_action(a.plan[h])
 		}
@@ -468,6 +477,73 @@ _plan_refine :: proc(a: ^Agent, sensor: Sensor) {
 			a.plan[h][action_index] = max(a.plan[h][action_index], 0.02)
 		}
 	}
+}
+
+_policy_seed :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int) {
+	count := len(sequences)
+
+	states       := builtin.make([]Sensor, count,                context.temp_allocator)
+	inputs       := builtin.make([]f32,    count * MODEL_INPUT,  context.temp_allocator)
+	observations := builtin.make([]f32,    count * SENSOR_SIZE,  context.temp_allocator)
+	logits       := builtin.make([]f32,    count * ACTION_COUNT, context.temp_allocator)
+	deltas       := builtin.make([]f32,    count * SENSOR_SIZE,  context.temp_allocator)
+
+	for p in 0 ..< count {
+		states[p] = sensor
+	}
+
+	for h in 0 ..< PLAN_HORIZON {
+		ml.clear()
+
+		for p in 0 ..< count {
+			for i in 0 ..< SENSOR_SIZE {
+				observations[p * SENSOR_SIZE + i] = states[p][i]
+			}
+		}
+
+		x := ml.tensor(observations, []int{count, SENSOR_SIZE})
+		ml.get_data(mlp.forward(a.policy, x), logits)
+
+		for p in 0 ..< count {
+			action := _sample_logits(logits[p * ACTION_COUNT:][:ACTION_COUNT])
+			sequences[p][h] = action
+			_encode(states[p], action, inputs[p * MODEL_INPUT:][:MODEL_INPUT])
+		}
+
+		model := rand.int_max(ENSEMBLE_SIZE)
+		y     := ml.tensor(inputs, []int{count, MODEL_INPUT})
+		ml.get_data(mlp.forward(a.models[model], y), deltas)
+
+		for p in 0 ..< count {
+			_apply_delta(a, &states[p], deltas[p * SENSOR_SIZE:][:SENSOR_SIZE])
+		}
+	}
+}
+
+_apply_delta :: proc(a: ^Agent, state: ^Sensor, deltas: []f32) {
+	for i in 0 ..< SENSOR_SIZE {
+		state[i] += deltas[i] * _delta_deviation(a, i) + a.delta_mean[i]
+	}
+
+	length := math.sqrt(state[2] * state[2] + state[3] * state[3])
+	if length > 1e-4 {
+		state[2] /= length
+		state[3] /= length
+	}
+}
+
+@(require_results)
+_sample_logits :: proc(logits: []f32) -> int {
+	highest := logits[0]
+	for i in 1 ..< ACTION_COUNT {
+		highest = max(highest, logits[i])
+	}
+
+	probabilities: [ACTION_COUNT]f32
+	for i in 0 ..< ACTION_COUNT {
+		probabilities[i] = math.exp((logits[i] - highest) / POLICY_TEMPERATURE)
+	}
+	return _sample_action(probabilities)
 }
 
 _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, returns: []f32) {
@@ -505,15 +581,7 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 					continue
 				}
 
-				for i in 0 ..< SENSOR_SIZE {
-					states[p][i] += deltas[n * SENSOR_SIZE + i] * _delta_deviation(a, i) + a.delta_mean[i]
-				}
-
-				length := math.sqrt(states[p][2] * states[p][2] + states[p][3] * states[p][3])
-				if length > 1e-4 {
-					states[p][2] /= length
-					states[p][3] /= length
-				}
+				_apply_delta(a, &states[p], deltas[n * SENSOR_SIZE:][:SENSOR_SIZE])
 
 				reward, dead := a.reward(states[p])
 				scores[p]    += discount * reward
