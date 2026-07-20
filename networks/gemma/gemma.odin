@@ -503,23 +503,16 @@ cache_make :: proc(model: Gemma, t_max: int, allocator := context.allocator) -> 
 
 @(require_results)
 forward :: proc(model: Gemma, tokens: []int) -> (logits: ml.Tensor) {
-	logits, _ = _forward(model, nil, tokens)
-	return
-}
-
-@(require_results)
-forward_with_hidden :: proc(model: Gemma, tokens: []int) -> (logits, final_hidden: ml.Tensor) {
 	return _forward(model, nil, tokens)
 }
 
 @(require_results)
-forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int, loc := #caller_location) -> (logits: ml.Tensor) {
-	logits, _ = _forward(model, cache, new_tokens, loc=loc)
-	return
+forward_cached :: proc(model: Gemma, cache: ^Cache, new_tokens: []int, logits_mode := ml.Logits_Mode.All, loc := #caller_location) -> (logits: ml.Tensor) {
+	return _forward(model, cache, new_tokens, logits_mode=logits_mode, loc=loc)
 }
 
 @(require_results)
-_forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_location) -> (logits, final_hidden: ml.Tensor) {
+_forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, logits_mode := ml.Logits_Mode.All, loc := #caller_location) -> (logits: ml.Tensor) {
 	cfg         := model.config
 	token_count := builtin.len(tokens)
 
@@ -624,7 +617,10 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 		residual = ml.mul(residual, layer.layer_scalar)
 	}
 
-	final_hidden = ml.rmsnorm(residual, model.output_norm_weight, eps=cfg.rms_norm_eps)
+	final_hidden := ml.rmsnorm(residual, model.output_norm_weight, eps=cfg.rms_norm_eps)
+	if logits_mode == .Last && token_count > 1 {
+		final_hidden = ml.slice_leading(final_hidden, token_count - 1, token_count)
+	}
 	logits = ml.linear(final_hidden, model.lm_head_weight)
 	if cfg.final_logit_softcapping > 0 {
 		logits = ml.mul(logits, model.softcap_inv)
@@ -632,16 +628,11 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 		logits = ml.mul(logits, model.softcap)
 	}
 
+	if logits.type != .F32 {
+		logits = ml.cast_to(logits, .F32)
+	}
 	if cache != nil {
-		if logits.type != .F32 {
-			logits = ml.cast_to(logits, .F32)
-		}
 		cache.length += token_count
-	} else {
-		if model.dtype != .F32 {
-			final_hidden = ml.cast_to(final_hidden, .F32)
-			logits       = ml.cast_to(logits,       .F32)
-		}
 	}
 
 	return

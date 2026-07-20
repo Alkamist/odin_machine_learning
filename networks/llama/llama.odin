@@ -104,12 +104,6 @@ destroy :: proc(model: Llama) {
 	delete(model.layers)
 }
 
-copy :: proc(dst, src: Llama) {
-	dst := dst
-	src := src
-	ml.registry_copy(&dst.params, &src.params)
-}
-
 randomize :: proc(model: Llama) {
 	model := model
 	ml.registry_randomize(&model.params)
@@ -141,7 +135,7 @@ cache_make :: proc(model: Llama, t_max: int, allocator := context.allocator) -> 
 }
 
 @(require_results)
-_forward :: proc(model: Llama, tokens: []int, cache: ^Cache = nil, loc := #caller_location) -> (output: ml.Tensor) {
+_forward :: proc(model: Llama, tokens: []int, cache: ^Cache = nil, logits_mode := ml.Logits_Mode.All, loc := #caller_location) -> (output: ml.Tensor) {
 	position_offset := 0
 	if cache != nil {
 		ml.kv_cache_check(cache^, builtin.len(tokens), len(model.layers), loc=loc)
@@ -188,6 +182,10 @@ _forward :: proc(model: Llama, tokens: []int, cache: ^Cache = nil, loc := #calle
 	}
 
 	output = ml.rmsnorm(residual, model.output_norm_weight)
+	token_count := builtin.len(tokens)
+	if logits_mode == .Last && token_count > 1 {
+		output = ml.slice_leading(output, token_count - 1, token_count)
+	}
 	output = ml.linear(output, model.lm_head_weight)
 	if output.type != .F32 {
 		output = ml.cast_to(output, .F32)
@@ -206,8 +204,8 @@ forward :: proc(model: Llama, tokens: []int, loc := #caller_location) -> (output
 }
 
 @(require_results)
-forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int, loc := #caller_location) -> (output: ml.Tensor) {
-	return _forward(model, new_tokens, cache=cache, loc=loc)
+forward_cached :: proc(model: Llama, cache: ^Cache, new_tokens: []int, logits_mode := ml.Logits_Mode.All, loc := #caller_location) -> (output: ml.Tensor) {
+	return _forward(model, new_tokens, cache=cache, logits_mode=logits_mode, loc=loc)
 }
 
 update :: proc(opt: ^ml.Optimizer, model: Llama) {

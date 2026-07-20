@@ -5,6 +5,7 @@ import "base:builtin"
 import "core:fmt"
 import "core:log"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 
 import ml       "../../"
@@ -167,12 +168,6 @@ main :: proc() {
 	}
 }
 
-_copy_last_row :: proc(logits: ml.Tensor, out: []f32) {
-	rows := logits.shape[0]
-	last := ml.slice_leading(logits, rows - 1, rows)
-	ml.get_data(last, out)
-}
-
 parse_args :: proc(options: ^Options) {
 	args := os.args[1:]
 	i := 0
@@ -210,50 +205,19 @@ _usage_exit :: proc() {
 }
 
 _parse_int :: proc(s: string) -> int {
-	value: int
-	negative := false
-	cursor := 0
-	if builtin.len(s) > 0 && s[0] == '-' {
-		negative = true
-		cursor = 1
+	value, ok := strconv.parse_int(s)
+	if !ok {
+		log.errorf("invalid integer: %q", s)
+		os.exit(1)
 	}
-	for cursor < builtin.len(s) {
-		c := s[cursor]
-		if c < '0' || c > '9' {
-			log.errorf("invalid integer: %q", s)
-			os.exit(1)
-		}
-		value = value * 10 + int(c - '0')
-		cursor += 1
-	}
-	return -value if negative else value
+	return value
 }
 
 _parse_float :: proc(s: string) -> f64 {
-	value: f64 = 0
-	scale: f64 = 1
-	in_frac  := false
-	negative := false
-	cursor   := 0
-	if builtin.len(s) > 0 && s[0] == '-' {
-		negative = true
-		cursor = 1
+	value, ok := strconv.parse_f64(s)
+	if !ok {
+		log.errorf("invalid float: %q", s)
+		os.exit(1)
 	}
-	for cursor < builtin.len(s) {
-		c := s[cursor]
-		if c == '.' {
-			in_frac = true
-		} else if c >= '0' && c <= '9' {
-			value = value * 10 + f64(c - '0')
-			if in_frac {
-				scale *= 10
-			}
-		} else {
-			log.errorf("invalid float: %q", s)
-			os.exit(1)
-		}
-		cursor += 1
-	}
-	out := value / scale
-	return -out if negative else out
+	return value
 }

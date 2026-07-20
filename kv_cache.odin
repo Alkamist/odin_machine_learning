@@ -2,6 +2,11 @@ package machine_learning
 
 import "base:builtin"
 
+Logits_Mode :: enum u8 {
+	All,
+	Last,
+}
+
 Kv_Layer_Cache :: struct {
 	k: Tensor,
 	v: Tensor,
