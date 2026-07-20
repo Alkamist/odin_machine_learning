@@ -109,10 +109,11 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 
 _gemma_eval :: proc(data: rawptr, tokens: []int, logits_out: []f32) {
 	backend := (^Gemma_Backend)(data)
-	ml.pass()
-	logits := gemma.forward_cached(backend.model, &backend.cache, tokens, logits_mode=.Last)
-	if logits_out != nil {
-		ml.get_data(logits, logits_out)
+	if ml.pass() {
+		logits := gemma.forward_cached(backend.model, &backend.cache, tokens, logits_mode=.Last)
+		if logits_out != nil {
+			ml.get_data(logits, logits_out)
+		}
 	}
 }
 

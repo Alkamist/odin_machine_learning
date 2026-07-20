@@ -182,14 +182,14 @@ clear :: proc(training := false, loc := #caller_location) {
 	_current_ctx.operation_count = 0
 }
 
-_pass_end :: proc(ctx: ^Context) {
-	ctx.pass_open = false
+_pass_end :: proc() {
+	_current_ctx.pass_open = false
 }
 
-@(deferred_out=_pass_end)
-pass :: proc(training := false, loc := #caller_location) -> ^Context {
+@(deferred_none=_pass_end)
+pass :: proc(training := false, loc := #caller_location) -> bool {
 	clear(training=training, loc=loc)
-	return _current_ctx
+	return true
 }
 
 @(require_results)

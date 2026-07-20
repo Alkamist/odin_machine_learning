@@ -111,10 +111,11 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 
 _llama_eval :: proc(data: rawptr, tokens: []int, logits_out: []f32) {
 	backend := (^Llama_Backend)(data)
-	ml.pass()
-	logits := llama.forward_cached(backend.model, &backend.cache, tokens, logits_mode=.Last)
-	if logits_out != nil {
-		ml.get_data(logits, logits_out)
+	if ml.pass() {
+		logits := llama.forward_cached(backend.model, &backend.cache, tokens, logits_mode=.Last)
+		if logits_out != nil {
+			ml.get_data(logits, logits_out)
+		}
 	}
 }
 

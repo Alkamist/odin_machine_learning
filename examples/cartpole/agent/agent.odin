@@ -330,11 +330,11 @@ _policy_action :: proc(a: ^Agent, sensor: Sensor) -> int {
 		input[i] = sensor[i]
 	}
 
-	ml.pass()
-
-	x      := ml.tensor(input, []int{1, SENSOR_SIZE})
-	output := mlp.forward(a.policy, x)
-	ml.get_data(output, logits)
+	if ml.pass() {
+		x      := ml.tensor(input, []int{1, SENSOR_SIZE})
+		output := mlp.forward(a.policy, x)
+		ml.get_data(output, logits)
+	}
 
 	best := 0
 	for action_index in 1 ..< ACTION_COUNT {
@@ -375,8 +375,7 @@ _train_value :: proc(a: ^Agent) {
 		target_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
 	}
 
-	ml.pass()
-	{
+	if ml.pass() {
 		successor_tensor := ml.tensor(successors, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
 		ml.get_data(ml.softmax(mlp.forward(a.policy, successor_tensor)), probabilities)
 		for v in 0 ..< VALUE_ENSEMBLE {
@@ -407,33 +406,33 @@ _train_value :: proc(a: ^Agent) {
 		gather[b] = b * ACTION_COUNT + actions[b]
 	}
 
-	ml.pass(training=true)
+	if ml.pass(training=true) {
+		x        := ml.tensor(states,  []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+		y        := ml.tensor(targets, []int{TRAIN_BATCH_SIZE})
+		total: ml.Tensor
 
-	x        := ml.tensor(states,  []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
-	y        := ml.tensor(targets, []int{TRAIN_BATCH_SIZE})
-	total: ml.Tensor
+		for v in 0 ..< VALUE_ENSEMBLE {
+			q_values   := mlp.forward(a.values[v], x)
+			flat       := ml.reshape(q_values, []int{TRAIN_BATCH_SIZE * ACTION_COUNT})
+			prediction := ml.select(flat, gather)
+			loss       := ml.mean(ml.mean_squared_error(prediction, y))
 
-	for v in 0 ..< VALUE_ENSEMBLE {
-		q_values   := mlp.forward(a.values[v], x)
-		flat       := ml.reshape(q_values, []int{TRAIN_BATCH_SIZE * ACTION_COUNT})
-		prediction := ml.select(flat, gather)
-		loss       := ml.mean(ml.mean_squared_error(prediction, y))
-
-		total = loss if v == 0 else ml.add(total, loss)
-	}
-
-	ml.backward(total)
-
-	for v in 0 ..< VALUE_ENSEMBLE {
-		if ml.optimizer_step(&a.value_opts[v]) {
-			mlp.update(&a.value_opts[v], a.values[v])
+			total = loss if v == 0 else ml.add(total, loss)
 		}
-	}
 
-	for v in 0 ..< VALUE_ENSEMBLE {
-		for layer, layer_index in a.values[v].layers {
-			ml.lerp_assign(a.value_targets[v].layers[layer_index].weight, layer.weight, TAU)
-			ml.lerp_assign(a.value_targets[v].layers[layer_index].bias,   layer.bias,   TAU)
+		ml.backward(total)
+
+		for v in 0 ..< VALUE_ENSEMBLE {
+			if ml.optimizer_step(&a.value_opts[v]) {
+				mlp.update(&a.value_opts[v], a.values[v])
+			}
+		}
+
+		for v in 0 ..< VALUE_ENSEMBLE {
+			for layer, layer_index in a.values[v].layers {
+				ml.lerp_assign(a.value_targets[v].layers[layer_index].weight, layer.weight, TAU)
+				ml.lerp_assign(a.value_targets[v].layers[layer_index].bias,   layer.bias,   TAU)
+			}
 		}
 	}
 }
@@ -458,8 +457,7 @@ _train_policy :: proc(a: ^Agent) {
 		online_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
 	}
 
-	ml.pass()
-	{
+	if ml.pass() {
 		state_tensor := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
 		for v in 0 ..< VALUE_ENSEMBLE {
 			ml.get_data(mlp.forward(a.values[v], state_tensor), online_q[v])
@@ -474,20 +472,20 @@ _train_policy :: proc(a: ^Agent) {
 		neg_q[idx] = -q
 	}
 
-	ml.pass(training=true)
+	if ml.pass(training=true) {
+		x             := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+		neg_q_tensor  := ml.tensor(neg_q,  []int{TRAIN_BATCH_SIZE, ACTION_COUNT})
+		logits        := mlp.forward(a.policy, x)
+		probabilities := ml.softmax(logits)
+		value_term    := ml.mean(ml.sum(ml.mul(probabilities, neg_q_tensor)))
+		entropy_term  := ml.mul(ml.mean(ml.entropy(probabilities)), ml.scalar(.F32, -ENTROPY_WEIGHT))
+		loss          := ml.add(value_term, entropy_term)
 
-	x             := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
-	neg_q_tensor  := ml.tensor(neg_q,  []int{TRAIN_BATCH_SIZE, ACTION_COUNT})
-	logits        := mlp.forward(a.policy, x)
-	probabilities := ml.softmax(logits)
-	value_term    := ml.mean(ml.sum(ml.mul(probabilities, neg_q_tensor)))
-	entropy_term  := ml.mul(ml.mean(ml.entropy(probabilities)), ml.scalar(.F32, -ENTROPY_WEIGHT))
-	loss          := ml.add(value_term, entropy_term)
+		ml.backward(loss)
 
-	ml.backward(loss)
-
-	if ml.optimizer_step(&a.policy_opt) {
-		mlp.update(&a.policy_opt, a.policy)
+		if ml.optimizer_step(&a.policy_opt) {
+			mlp.update(&a.policy_opt, a.policy)
+		}
 	}
 }
 
@@ -526,34 +524,34 @@ _train :: proc(a: ^Agent) {
 	inputs  := builtin.make([]f32, TRAIN_BATCH_SIZE * MODEL_INPUT, context.temp_allocator)
 	targets := builtin.make([]f32, TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
 
-	ml.pass(training=true)
+	if ml.pass(training=true) {
+		total: ml.Tensor
 
-	total: ml.Tensor
+		for m in 0 ..< ENSEMBLE_SIZE {
+			for b in 0 ..< TRAIN_BATCH_SIZE {
+				transition := a.buffer[_sample_index(a)]
 
-	for m in 0 ..< ENSEMBLE_SIZE {
-		for b in 0 ..< TRAIN_BATCH_SIZE {
-			transition := a.buffer[_sample_index(a)]
+				_encode(transition.sensor, transition.action, inputs[b * MODEL_INPUT:][:MODEL_INPUT])
 
-			_encode(transition.sensor, transition.action, inputs[b * MODEL_INPUT:][:MODEL_INPUT])
-
-			for i in 0 ..< SENSOR_SIZE {
-				targets[b * SENSOR_SIZE + i] = (transition.delta[i] - a.delta_mean[i]) / _delta_deviation(a, i)
+				for i in 0 ..< SENSOR_SIZE {
+					targets[b * SENSOR_SIZE + i] = (transition.delta[i] - a.delta_mean[i]) / _delta_deviation(a, i)
+				}
 			}
+
+			x          := ml.tensor(inputs,  []int{TRAIN_BATCH_SIZE, MODEL_INPUT})
+			y          := ml.tensor(targets, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+			prediction := mlp.forward(a.models[m], x)
+			loss       := ml.mean(ml.mean_squared_error(prediction, y))
+
+			total = loss if m == 0 else ml.add(total, loss)
 		}
 
-		x          := ml.tensor(inputs,  []int{TRAIN_BATCH_SIZE, MODEL_INPUT})
-		y          := ml.tensor(targets, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
-		prediction := mlp.forward(a.models[m], x)
-		loss       := ml.mean(ml.mean_squared_error(prediction, y))
+		ml.backward(total)
 
-		total = loss if m == 0 else ml.add(total, loss)
-	}
-
-	ml.backward(total)
-
-	for m in 0 ..< ENSEMBLE_SIZE {
-		if ml.optimizer_step(&a.opts[m]) {
-			mlp.update(&a.opts[m], a.models[m])
+		for m in 0 ..< ENSEMBLE_SIZE {
+			if ml.optimizer_step(&a.opts[m]) {
+				mlp.update(&a.opts[m], a.models[m])
+			}
 		}
 	}
 }
@@ -633,29 +631,29 @@ _policy_seed :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int) 
 	}
 
 	for h in 0 ..< PLAN_HORIZON {
-		ml.pass()
-
-		for p in 0 ..< count {
-			for i in 0 ..< SENSOR_SIZE {
-				observations[p * SENSOR_SIZE + i] = states[p][i]
+		if ml.pass() {
+			for p in 0 ..< count {
+				for i in 0 ..< SENSOR_SIZE {
+					observations[p * SENSOR_SIZE + i] = states[p][i]
+				}
 			}
-		}
 
-		x := ml.tensor(observations, []int{count, SENSOR_SIZE})
-		ml.get_data(mlp.forward(a.policy, x), logits)
+			x := ml.tensor(observations, []int{count, SENSOR_SIZE})
+			ml.get_data(mlp.forward(a.policy, x), logits)
 
-		for p in 0 ..< count {
-			action := _sample_logits(logits[p * ACTION_COUNT:][:ACTION_COUNT])
-			sequences[p][h] = action
-			_encode(states[p], action, inputs[p * MODEL_INPUT:][:MODEL_INPUT])
-		}
+			for p in 0 ..< count {
+				action := _sample_logits(logits[p * ACTION_COUNT:][:ACTION_COUNT])
+				sequences[p][h] = action
+				_encode(states[p], action, inputs[p * MODEL_INPUT:][:MODEL_INPUT])
+			}
 
-		model := rand.int_max(ENSEMBLE_SIZE)
-		y     := ml.tensor(inputs, []int{count, MODEL_INPUT})
-		ml.get_data(mlp.forward(a.models[model], y), deltas)
+			model := rand.int_max(ENSEMBLE_SIZE)
+			y     := ml.tensor(inputs, []int{count, MODEL_INPUT})
+			ml.get_data(mlp.forward(a.models[model], y), deltas)
 
-		for p in 0 ..< count {
-			_apply_delta(a, &states[p], deltas[p * SENSOR_SIZE:][:SENSOR_SIZE])
+			for p in 0 ..< count {
+				_apply_delta(a, &states[p], deltas[p * SENSOR_SIZE:][:SENSOR_SIZE])
+			}
 		}
 	}
 }
@@ -704,39 +702,37 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 	discount := f32(1)
 
 	for h in 0 ..< PLAN_HORIZON {
-		ml.pass()
-
-		for m in 0 ..< ENSEMBLE_SIZE {
-			for n in 0 ..< PLAN_SAMPLES {
-				_encode(states[n * ENSEMBLE_SIZE + m], sequences[n][h], inputs[n * MODEL_INPUT:][:MODEL_INPUT])
-			}
-
-			x          := ml.tensor(inputs, []int{PLAN_SAMPLES, MODEL_INPUT})
-			prediction := mlp.forward(a.models[m], x)
-			ml.get_data(prediction, deltas)
-
-			for n in 0 ..< PLAN_SAMPLES {
-				p := n * ENSEMBLE_SIZE + m
-				if !alive[p] {
-					continue
+		if ml.pass() {
+			for m in 0 ..< ENSEMBLE_SIZE {
+				for n in 0 ..< PLAN_SAMPLES {
+					_encode(states[n * ENSEMBLE_SIZE + m], sequences[n][h], inputs[n * MODEL_INPUT:][:MODEL_INPUT])
 				}
 
-				_apply_delta(a, &states[p], deltas[n * SENSOR_SIZE:][:SENSOR_SIZE])
+				x          := ml.tensor(inputs, []int{PLAN_SAMPLES, MODEL_INPUT})
+				prediction := mlp.forward(a.models[m], x)
+				ml.get_data(prediction, deltas)
 
-				reward, dead := a.reward(states[p])
-				scores[p]    += discount * reward
+				for n in 0 ..< PLAN_SAMPLES {
+					p := n * ENSEMBLE_SIZE + m
+					if !alive[p] {
+						continue
+					}
 
-				if dead {
-					scores[p] -= DEATH_PENALTY
-					alive[p]   = false
+					_apply_delta(a, &states[p], deltas[n * SENSOR_SIZE:][:SENSOR_SIZE])
+
+					reward, dead := a.reward(states[p])
+					scores[p]    += discount * reward
+
+					if dead {
+						scores[p] -= DEATH_PENALTY
+						alive[p]   = false
+					}
 				}
 			}
 		}
 
 		discount *= PLAN_DISCOUNT
 	}
-
-	ml.pass()
 
 	terminal_states := builtin.make([]f32, PARTICLES * SENSOR_SIZE,  context.temp_allocator)
 	terminal_probs  := builtin.make([]f32, PARTICLES * ACTION_COUNT, context.temp_allocator)
@@ -752,10 +748,12 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 		}
 	}
 
-	terminal_input := ml.tensor(terminal_states, []int{PARTICLES, SENSOR_SIZE})
-	ml.get_data(ml.softmax(mlp.forward(a.policy, terminal_input)), terminal_probs)
-	for v in 0 ..< VALUE_ENSEMBLE {
-		ml.get_data(mlp.forward(a.values[v], terminal_input), terminal_q[v])
+	if ml.pass() {
+		terminal_input := ml.tensor(terminal_states, []int{PARTICLES, SENSOR_SIZE})
+		ml.get_data(ml.softmax(mlp.forward(a.policy, terminal_input)), terminal_probs)
+		for v in 0 ..< VALUE_ENSEMBLE {
+			ml.get_data(mlp.forward(a.values[v], terminal_input), terminal_q[v])
+		}
 	}
 
 	for p in 0 ..< PARTICLES {
