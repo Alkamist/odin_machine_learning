@@ -1,22 +1,85 @@
 # Roadmap
 
-Gap analysis from the 2026-07-19 full review (see `docs/REVIEW.md` for the completed
-fix arc). Each item is self-contained enough to pick up cold: current state, design
-sketch, files, and how to verify. Ordered by expected return for the current mission
-(local quantized LLM inference + small-model training / continual-learning experiments).
+Gap analysis from the 2026-07-19 full review, whose fix arc is complete. Each item is
+self-contained enough to pick up cold: current state, design sketch, files, and how to
+verify.
 
-## 1. tokenizer.json interpreter
+The mission is two tracks — local quantized LLM **inference** and small-model
+**training** / continual-learning experiments — so there is no single return axis to
+sort by. Within each track, the ordering rule is:
+
+1. **Silent-correctness bugs first** (wrong output that looks fine).
+2. **Loud failures next** (can't load / can't run, but you know it).
+3. **Capacity ceilings last** (works, but not at the size you want).
+
+## Known defects (fix regardless of feature order)
+
+Latent correctness smells, each a near-one-liner, none gated behind a feature landing:
+
+- `quantize_q8_1_bf16.cu` stores `s = d * sum(x)`, which matches neither ggml
+  (`sum(x)`) nor its own comment. Currently unread by any consumer — fix or document
+  before anything reads `ds.y`.
+- `attention_long` parity case is time-seeded and rarely grazes tolerance. Pin the seed
+  (see `tests/parity`).
+
+# Inference track
+
+## I1. tokenizer.json unsupported-spec rejection (silent-correctness)
 
 **Problem.** Tokenizers are hand-ported per model family (`tokenizers/gemma`,
 `tokenizers/gpt2`), and the tokenizer.json normalizer/pretokenizer specs are ignored
 rather than interpreted. The SmolLM2 digit-splitting incident during the review is the
 failure mode: the file declared `Digits(individual_digits=true)` and the hardcoded port
-was almost "fixed" away from correct behavior. Every new model family currently means a
-new hand-written tokenizer and a new class of silent encoding divergence.
+was almost "fixed" away from correct behavior. This is the dangerous class — a hand-port
+that silently disagrees with the spec produces plausible-but-wrong ids.
 
-**Design.** One `tokenizers/hf` package that parses the tokenizer.json `normalizer`,
-`pre_tokenizer`, `model` (BPE), `decoder`, and `added_tokens` sections and interprets
-the small set of combinators that cover the popular families:
+**Design.** Before building any interpreter, close the silent-divergence hole cheaply: at
+load time, parse the tokenizer.json `normalizer` / `pre_tokenizer` / `model` / `decoder`
+sections enough to enumerate the combinators present, and **hard-error** on any the
+active hand-port does not implement. This is a much smaller deliverable than a full
+interpreter and eliminates the entire failure class on its own — an unsupported spec
+becomes a loud load error instead of a wrong tokenization.
+
+**Verify.** Feed a tokenizer.json with a combinator the port lacks; load must fail loud.
+Existing goldens (`tests/golden/golden.odin` gemma, `tests/golden/gpt2_check.odin`
+SmolLM2/HF-pinned) must still pass.
+
+## I2. GGUF dtype coverage (loud-failure)
+
+**Problem.** Only Q4_K / Q6_K / BF16 / F32 tensors load (`loaders/weights`,
+`backends/cuda/kernels/linear/`, `quants.odin`). Much of what people actually download
+is Q8_0, Q5_K-mix, or F16 — "run any GGUF" fails more often than it succeeds.
+
+**Order of value.** Q8_0 (simplest block format, very common), F16 (trivial — decode
+path only), Q5_K (rounds out the K-quant mixes; the scale/min unpack scaffolding from
+Q4_K transfers). Each needs: block layout in `quants.odin` (verify element-by-element
+against llama.cpp `dequantize_row_*`, as was done for Q4_K/Q6_K), a dequant path in
+`loaders/weights`, CUDA mmvq or dequant-to-bf16 kernel (`Q8_1_BLOCK_*` quantize stream
+already exists for the dp4a path), CPU linear path, and a golden block fixture in
+`tests/golden` plus a parity case. The parity gate ("every registry case's op is in
+CUDA forward_ops") keeps coverage honest automatically.
+
+## I3. Sampling quality knobs (interactive-use gap)
+
+**Problem.** `sampling/sampling.odin` has temperature/top-k/top-p only. Small models
+loop badly without repetition control; these are table stakes for interactive use.
+
+**Add** (in rough order): repetition penalty (needs recent-token window — thread
+`out_tokens` or a ring of recent ids into `sample`), presence/frequency penalties,
+min-p. Keep the existing shape: pure functions over a logits row, options in `Sampler`.
+The `generate` loop already owns the token history. Seedable determinism is already
+solved via `context.random_generator` (pinned by
+`tests/sampling_check.odin:test_sample_deterministic_with_seeded_generator`).
+
+## I4. tokenizer.json interpreter (deferred — build on the 3rd family)
+
+**Problem.** Once I1 lands, every new model family still means a new hand-written
+tokenizer. That cost is real but only bites when a third family arrives; building a
+general interpreter speculatively competes with the mission (same logic as the deferred
+`Language_Model` vtable — revisit when a third consumer exists).
+
+**Design.** One `tokenizers/hf` package that parses and interprets the small set of
+combinators covering the popular families:
 - pre_tokenizers: `Sequence`, `ByteLevel` (with/without regex), `Digits`, `Split`
   (the GPT-2 regex as a special case, as today), `Metaspace`, `Whitespace`.
 - normalizers: `Replace`, `NFC`/`NFKC` (core:unicode has decomposition tables; if NFKC
@@ -24,20 +87,29 @@ the small set of combinators that cover the popular families:
 - model: BPE with merges (both current implementations already have correct merge
   loops to reuse); byte_fallback.
 - Longest-match added-token segmentation is already implemented twice; write it once.
-Unsupported combinators must be a loud load error, never silently skipped — that is
-the current bug class being eliminated.
 
 **Migration.** gemma and gpt2 packages become thin wrappers or get deleted once the
 interpreter passes their goldens. Keep the golden-fixture pattern: generate reference
-ids with HF `tokenizers` (available locally: `python -c "import tokenizers"`), pin
-them in `tests/golden/`. Existing fixtures: `tests/golden/golden.odin` (gemma),
-`tests/golden/gpt2_check.odin` (SmolLM2, HF-pinned).
+ids with HF `tokenizers` (available locally: `python -c "import tokenizers"`), pin them
+in `tests/golden/`.
 
 **Perf notes while in there** (from review, currently minor): O(n^3) worst-case BPE on
 long space-free segments (use a heap like SentencePiece), per-segment `strings.index`
 scan over all added tokens (precompute or trie).
 
-## 2. Gradient checkpointing (training memory ceiling)
+## I5. Op generality (do lazily, when a model needs it)
+
+Known limitations, acceptable today, each a wall for some future architecture:
+- Broadcasting is trailing-tile only (`_assert_broadcastable` in ops.odin).
+- `permute` is 3-axis; `transpose` is F32-only (CUDA kernels exist only for f32).
+- `select` is the only gather; no scatter.
+- Conv is im2col + 2d pools only.
+Recommendation: extend on demand with the case-registry discipline (add the op case →
+gradient check + parity come free), rather than speculatively.
+
+# Training track
+
+## T1. Gradient checkpointing (capacity ceiling — the binding one)
 
 **Problem.** The tape (`tape.odin`, `MAX_OPERATIONS` 16384) retains every activation;
 training attention scratch is O(heads * T^2) (`backends/cpu/cpu.odin:_alloc_scratch`,
@@ -65,78 +137,37 @@ training path. The 2048-token training-attention cap and the O(T^2) softmax scra
 **Verify.** Gradient-check suite must stay bit-identical with checkpointing on/off for
 a fixed seed; add a case registry dimension for "checkpointed" so parity covers it.
 
-## 3. GGUF dtype coverage
-
-**Problem.** Only Q4_K / Q6_K / BF16 / F32 tensors load (`loaders/weights`,
-`backends/cuda/kernels/linear/`, `quants.odin`). Much of what people actually download
-is Q8_0, Q5_K-mix, or F16 — "run any GGUF" fails more often than it succeeds.
-
-**Order of value.** Q8_0 (simplest block format, very common), F16 (trivial — decode
-path only), Q5_K (rounds out the K-quant mixes; the scale/min unpack scaffolding from
-Q4_K transfers). Each needs: block layout in `quants.odin` (verify element-by-element
-against llama.cpp `dequantize_row_*`, as was done for Q4_K/Q6_K), a dequant path in
-`loaders/weights`, CUDA mmvq or dequant-to-bf16 kernel (`Q8_1_BLOCK_*` quantize stream
-already exists for the dp4a path), CPU linear path, and a golden block fixture in
-`tests/golden` plus a parity case. The parity gate ("every registry case's op is in
-CUDA forward_ops") keeps coverage honest automatically.
-
-**Related loose end.** `quantize_q8_1_bf16.cu` stores `s = d * sum(x)` which matches
-neither ggml (`sum(x)`) nor its own comment — currently unread by any consumer, but
-fix or document before adding a consumer that reads `ds.y`.
-
-## 4. Sampling quality knobs
-
-**Problem.** `sampling/sampling.odin` has temperature/top-k/top-p only. Small models
-loop badly without repetition control; these are table stakes for interactive use.
-
-**Add** (in rough order): repetition penalty (needs recent-token window — thread
-`out_tokens` or a ring of recent ids into `sample`), presence/frequency penalties,
-min-p. Keep the existing shape: pure functions over a logits row, options in `Sampler`.
-The `generate` loop already owns the token history. Seedable determinism is already
-solved via `context.random_generator` (pinned by
-`tests/sampling_check.odin:test_sample_deterministic_with_seeded_generator`).
-
-**Also here.** Pin the time-seeded `attention_long` parity case's seed (known rare
-tolerance-graze flake, noted in REVIEW.md status).
-
-## 5. Batched / multi-sequence inference (only if serving becomes a goal)
-
-**Current state.** Single sequence per context; parallel inference = one context per
-thread over shared weights (documented threading contract, tested by
-`parallel_inference_check`). No batched KV cache, no continuous batching.
-
-**Scope warning.** This is the largest item here and reshapes `attention_with_cache`
-(per-sequence cache positions), the cache layout (paged or per-slot), and `generate`.
-Do not start it casually; the per-thread-context model may honestly be enough for a
-personal-use library. Decide the mission first.
-
-## 6. Op generality (do lazily, when a model needs it)
-
-Known limitations, acceptable today, each a wall for some future architecture:
-- Broadcasting is trailing-tile only (`_assert_broadcastable` in ops.odin).
-- `permute` is 3-axis; `transpose` is F32-only (CUDA kernels exist only for f32).
-- `select` is the only gather; no scatter.
-- Conv is im2col + 2d pools only.
-Recommendation: extend on demand with the case-registry discipline (add the op case →
-gradient check + parity come free), rather than speculatively.
-
-## 7. Optimizer/trainer breadth (cheap, on demand)
+## T2. Optimizer/trainer breadth (cheap, on demand)
 
 - SGD+momentum (RL baselines want it); trivial next to the existing AdamW plumbing in
   `optimizer.odin` + backend `update` procs.
 - Multi-GPU / data parallel: out of scope until a concrete need; noted for honesty.
 
+# Non-goals (current default: do not build)
+
+## Batched / multi-sequence inference
+
+**Current state.** Single sequence per context; parallel inference = one context per
+thread over shared weights (documented threading contract, tested by
+`parallel_inference_check`). No batched KV cache, no continuous batching.
+
+**Decision.** The per-thread-context model is treated as sufficient for a personal-use
+library, so this is a non-goal by default. Promote it to the roadmap only if serving
+becomes an actual goal — and note that it is the largest single item here, reshaping
+`attention_with_cache` (per-sequence cache positions), the cache layout (paged or
+per-slot), and `generate`. Do not start it casually.
+
 ## Deferred by explicit decision (do not redo without new evidence)
 
 - `Language_Model` vtable package — after convergence + `logits_mode=.Last`, the
   generic surface per backend is ~4 lines; revisit only when a third network or second
-  consumer exists (see REVIEW.md).
+  consumer exists.
 - safetensors unknown-dtype laxness — byte ranges are bounds-checked; rejecting
   unknown dtypes would refuse files with ignorable auxiliary tensors.
 - `decode_tokens` counting the stop draw — intended semantics, asserted by
   `test_generate`.
 
-## Standing verification bar for all of the above
+# Standing verification bar for all of the above
 
 `odin check` every touched package; `odin test tests` (plus `-define:ML_CPU_POISON=true`
 and `-microarch:x86-64-v3`); `odin test tests/golden`; `odin test tests/parity` on the
