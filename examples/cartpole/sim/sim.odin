@@ -179,7 +179,7 @@ init :: proc(state: ^State) {
 	reset(state)
 }
 
-destroy :: proc(state: ^State) {
+_destroy_bodies :: proc(state: ^State) {
 	if state.revolute_joint  != {} {
 		b2.DestroyJoint(state.revolute_joint)
 	}
@@ -194,24 +194,15 @@ destroy :: proc(state: ^State) {
 	box_destroy(state.cart)
 	box_destroy(state.left_wall)
 	box_destroy(state.right_wall)
+}
+
+destroy :: proc(state: ^State) {
+	_destroy_bodies(state)
 	b2.DestroyWorld(state.world)
 }
 
 reset :: proc(state: ^State) {
-	if state.revolute_joint  != {} {
-		b2.DestroyJoint(state.revolute_joint)
-	}
-	if state.prismatic_joint != {} {
-		b2.DestroyJoint(state.prismatic_joint)
-	}
-	if state.anchor_body     != {} {
-		b2.DestroyBody(state.anchor_body)
-	}
-	mouse_destroy(state^)
-	box_destroy(state.cart)
-	box_destroy(state.pole)
-	box_destroy(state.left_wall)
-	box_destroy(state.right_wall)
+	_destroy_bodies(state)
 
 	state.time     = 0
 	state.score    = 0

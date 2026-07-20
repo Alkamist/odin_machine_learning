@@ -20,9 +20,6 @@ Gpu_Device :: struct {
 	cc_major, cc_minor: i32,
 	sm_count:           i32,
 	warp_size:          i32,
-	max_threads_per_sm: i32,
-	max_smem_per_block: i32,
-	max_smem_optin:     i32,
 
 	name_buf: [128]u8,
 	name_len: int,
@@ -175,9 +172,6 @@ _device_init_locked :: proc(loc := #caller_location) {
 	cuda.check(cuda.DeviceGetAttribute(&_gpu.cc_minor,           .COMPUTE_CAPABILITY_MINOR,          _gpu.dev))
 	cuda.check(cuda.DeviceGetAttribute(&_gpu.sm_count,           .MULTIPROCESSOR_COUNT,              _gpu.dev))
 	cuda.check(cuda.DeviceGetAttribute(&_gpu.warp_size,          .WARP_SIZE,                         _gpu.dev))
-	cuda.check(cuda.DeviceGetAttribute(&_gpu.max_threads_per_sm, .MAX_THREADS_PER_MULTIPROCESSOR,    _gpu.dev))
-	cuda.check(cuda.DeviceGetAttribute(&_gpu.max_smem_per_block, .MAX_SHARED_MEMORY_PER_BLOCK,       _gpu.dev))
-	cuda.check(cuda.DeviceGetAttribute(&_gpu.max_smem_optin,     .MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, _gpu.dev))
 
 	cuda.check(cuda.DevicePrimaryCtxRetain(&_gpu.ctx, _gpu.dev))
 	sync.atomic_add(&_gpu.generation, 1)

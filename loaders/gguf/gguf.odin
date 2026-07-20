@@ -141,6 +141,12 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 	for _ in 0 ..< kv_count {
 		key, key_ok := _read_str(&r, file_bytes)
 		if !key_ok {
+			log.errorf("%v: short read in KV key", path, location=loc)
+			_destroy_partial(file_bytes, kv, nil)
+			return {}, .Malformed
+		}
+		if key in kv {
+			log.errorf("%v: duplicate KV key %q", path, key, location=loc)
 			_destroy_partial(file_bytes, kv, nil)
 			return {}, .Malformed
 		}
@@ -382,32 +388,6 @@ get_str :: proc(loader: Loader, key: string) -> (string, bool) {
 		return "", false
 	}
 	return _peek_str(loader.bytes, entry.value_offset)
-}
-
-@(require_results)
-get_array_meta :: proc(loader: Loader, key: string) -> (elem_type: Value_Type, count: int, payload_offset: int, ok: bool) {
-	entry, found := loader.kv[key]
-	if !found || entry.type != .Array {
-		return {}, 0, 0, false
-	}
-	return entry.array_type, entry.array_count, entry.value_offset + 12, true
-}
-
-@(require_results)
-get_array_str :: proc(loader: Loader, key: string, index: int) -> (string, bool) {
-	elem_type, count, base, ok := get_array_meta(loader, key)
-	if !ok || elem_type != .String || index < 0 || index >= count {
-		return "", false
-	}
-	off := base
-	for _ in 0 ..< index {
-		s, s_ok := _peek_str(loader.bytes, off)
-		if !s_ok {
-			return "", false
-		}
-		off += 8 + len(s)
-	}
-	return _peek_str(loader.bytes, off)
 }
 
 Reader :: struct {

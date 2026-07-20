@@ -65,9 +65,6 @@ Pipeline :: struct {
 	module:   cuda.Module,
 	function: cuda.Function,
 	name:     string,
-
-	threads_per_block: u32,
-	max_dynamic_smem:  u32,
 }
 
 _compile_pipeline :: proc(

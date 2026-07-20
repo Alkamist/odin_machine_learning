@@ -64,26 +64,6 @@ _cast_bytes :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: 
 	}
 }
 
-_cast_bytes_accumulate :: proc(src: []byte, src_type: ml.Data_Type, dst: []byte, dst_type: ml.Data_Type, count: int) {
-	src_f32  := ([^]f32    )(raw_data(src))[:count] if src_type == .F32  else nil
-	src_bf16 := ([^]ml.Bf16)(raw_data(src))[:count] if src_type == .Bf16 else nil
-
-	dst_f32  := ([^]f32    )(raw_data(dst))[:count] if dst_type == .F32  else nil
-	dst_bf16 := ([^]ml.Bf16)(raw_data(dst))[:count] if dst_type == .Bf16 else nil
-
-	for i in 0 ..< count {
-		v: f32
-		#partial switch src_type {
-		case .F32:  v = src_f32 [i]
-		case .Bf16: v = ml.bf16_to_f32(src_bf16[i])
-		}
-		#partial switch dst_type {
-		case .F32:  dst_f32 [i] += v
-		case .Bf16: dst_bf16[i]  = ml.bf16_from_f32(ml.bf16_to_f32(dst_bf16[i]) + v)
-		}
-	}
-}
-
 _broadcast_tiling :: #force_inline proc(a, b: ml.Tensor) -> (stride, width: int) {
 	width  = ml.len(b)
 	stride = ml.len(a) / width

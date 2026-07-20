@@ -18,8 +18,6 @@ Gpu_Buffer :: struct {
 }
 #assert(size_of(Gpu_Buffer) == 16)
 
-F32_ONE_BITS :: 0x3F800000
-
 buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
 	sync.lock(&_gpu_mutex)
 	defer sync.unlock(&_gpu_mutex)

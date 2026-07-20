@@ -207,7 +207,7 @@ _op_arena_make :: proc($T: typeid, count: int, loc := #caller_location) -> []T {
 	slice, err := builtin.make([]T, count, allocator=op_arena_allocator(), loc=loc)
 	fmt.assertf(
 		err == nil && builtin.len(slice) == count, 
-		"op arena exhausted allocating %d x %v (%d bytes) - raise OP_ARENA_DEFAULT_SIZE", 
+		"op arena exhausted allocating %d x %v (%d bytes) - raise OPERATION_ARENA_DEFAULT_SIZE",
 		count, typeid_of(T), count * size_of(T), loc=loc,
 	)
 	return slice

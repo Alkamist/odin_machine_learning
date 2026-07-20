@@ -473,6 +473,7 @@ _reduce_trailing_record :: proc(input: Tensor, variant: Operation_Variant, loc: 
 _reduce_axis :: proc(input: Tensor, axis: int, variant: Operation_Variant, loc: runtime.Source_Code_Location) -> (output: Tensor) {
 	_assert_float(input, "reduce", loc)
 	rank := input.rank
+	assert(axis == -1 || axis >= 0, "reduce axis must be -1 (last) or non-negative", loc=loc)
 	target := axis < 0 ? rank - 1 : axis
 	assert(target >= 0 && target < rank, "reduce axis out of range", loc=loc)
 
@@ -602,7 +603,7 @@ Slice :: struct {
 
 @(require_results)
 slice :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
-	fmt.assertf(start >= 0 && end <= len(input) && start <= end, "slice indices out of bounds %v:%v", start, end, loc=loc)
+	fmt.assertf(start >= 0 && end <= len(input) && start < end, "slice requires 0 <= start < end <= len, got %v:%v", start, end, loc=loc)
 
 	output = zeros(input.type, {end - start}, loc=loc)
 
@@ -627,7 +628,7 @@ Slice_Trailing :: struct {
 slice_trailing :: proc(input: Tensor, start, end: int, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 1, "slice_trailing input must have rank >= 1", loc=loc)
 	trailing := input.shape[input.rank - 1]
-	fmt.assertf(start >= 0 && end <= trailing && start <= end, "slice_trailing indices out of bounds %v:%v (trailing=%v)", start, end, trailing, loc=loc)
+	fmt.assertf(start >= 0 && end <= trailing && start < end, "slice_trailing requires 0 <= start < end <= trailing, got %v:%v (trailing=%v)", start, end, trailing, loc=loc)
 
 	new_trailing := end - start
 	output = _zeros_replace_trailing(input, new_trailing, loc=loc)
@@ -1173,6 +1174,7 @@ Mean_Squared_Error :: struct {
 mean_squared_error :: proc(predictions, targets: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(predictions.type == .F32 && targets.type == .F32, "mean_squared_error is F32-only", loc=loc)
 	assert(len(predictions) == len(targets), "predictions and targets must have same length", loc=loc)
+	assert(targets.rank == 1 || (targets.rank == predictions.rank && targets.shape == predictions.shape), "targets must be flat or match predictions shape", loc=loc)
 
 	output = _zeros_drop_last(predictions, loc=loc)
 
@@ -1197,6 +1199,7 @@ Smooth_L1 :: struct {
 smooth_l1 :: proc(predictions, targets: Tensor, beta: f32 = 1.0, loc := #caller_location) -> (output: Tensor) {
 	assert(predictions.type == .F32 && targets.type == .F32, "smooth_l1 is F32-only", loc=loc)
 	assert(len(predictions) == len(targets), "predictions and targets must have same length", loc=loc)
+	assert(targets.rank == 1 || (targets.rank == predictions.rank && targets.shape == predictions.shape), "targets must be flat or match predictions shape", loc=loc)
 	assert(beta > 0, "smooth_l1 beta must be positive", loc=loc)
 
 	output = _zeros_drop_last(predictions, loc=loc)

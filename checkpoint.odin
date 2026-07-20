@@ -154,6 +154,8 @@ checkpoint_load :: proc(path: string, r: ^Registry, opt: ^Optimizer, loc := #cal
 				state := _optimizer_state(opt, tensor, loc)
 				tensor.backend.buffer_set(state.m, m_bytes, loc)
 				tensor.backend.buffer_set(state.v, v_bytes, loc)
+			} else if m_ok != v_ok {
+				log.warnf("parameter %q has only one of adam_m/adam_v in %v; optimizer state dropped", parameter.name, path, location=loc)
 			}
 		}
 	}

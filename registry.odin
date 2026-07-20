@@ -4,6 +4,7 @@ import "base:builtin"
 import "base:runtime"
 
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 
 Parameter_Flag  :: enum {
@@ -150,7 +151,7 @@ registry_read :: proc(r: ^Registry, dst: []f32, loc := #caller_location) {
 	index := 0
 	for parameter in r.parameters {
 		if .Train in parameter.flags {
-			get_data(parameter.tensor, dst[index:index + parameter.tensor.count], loc=loc)
+			_tensor_read_f32(parameter.tensor, dst[index:index + parameter.tensor.count], loc=loc)
 			index += parameter.tensor.count
 		}
 	}
@@ -161,8 +162,40 @@ registry_write :: proc(r: ^Registry, src: []f32, loc := #caller_location) {
 	index := 0
 	for parameter in r.parameters {
 		if .Train in parameter.flags {
-			set_data(parameter.tensor, src[index:index + parameter.tensor.count], loc=loc)
+			_tensor_write_f32(parameter.tensor, src[index:index + parameter.tensor.count], loc=loc)
 			index += parameter.tensor.count
 		}
+	}
+}
+
+_tensor_read_f32 :: proc(t: Tensor, dst: []f32, loc := #caller_location) {
+	#partial switch t.type {
+	case .F32:
+		get_data(t, dst, loc=loc)
+	case .Bf16:
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		raw := builtin.make([]Bf16, t.count, allocator=context.temp_allocator, loc=loc)
+		get_bytes(t, .Data, mem.slice_to_bytes(raw), loc=loc)
+		for value, i in raw {
+			dst[i] = bf16_to_f32(value)
+		}
+	case:
+		fmt.panicf("cannot read dtype %v as f32", t.type, loc=loc)
+	}
+}
+
+_tensor_write_f32 :: proc(t: Tensor, src: []f32, loc := #caller_location) {
+	#partial switch t.type {
+	case .F32:
+		set_data(t, src, loc=loc)
+	case .Bf16:
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		raw := builtin.make([]Bf16, t.count, allocator=context.temp_allocator, loc=loc)
+		for value, i in src {
+			raw[i] = bf16_from_f32(value)
+		}
+		set_bytes(t, .Data, mem.slice_to_bytes(raw), loc=loc)
+	case:
+		fmt.panicf("cannot write dtype %v from f32", t.type, loc=loc)
 	}
 }
