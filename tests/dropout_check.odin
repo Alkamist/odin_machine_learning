@@ -19,7 +19,7 @@ test_dropout :: proc(t: ^testing.T) {
 		input_data[i] = f32(i % 7) + 1
 	}
 
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 	x := ml.tensor(input_data[:])
 	y := ml.dropout(x, RATE)
 
@@ -37,7 +37,7 @@ test_dropout :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, dropped > DROPOUT_SIZE / 4 && dropped < DROPOUT_SIZE * 3 / 4, "dropout rate 0.5 should drop roughly half, dropped %v of %v", dropped, DROPOUT_SIZE)
 
-	ml.clear()
+	ml.pass_begin()
 	x_infer := ml.tensor(input_data[:])
 	y_infer := ml.dropout(x_infer, RATE)
 	testing.expect(t, y_infer.buffers[.Data] == x_infer.buffers[.Data], "dropout must be identity outside training")

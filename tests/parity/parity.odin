@@ -43,7 +43,7 @@ _cuda_ready :: proc(t: ^testing.T, what: string) -> bool {
 }
 
 _output_count :: proc(tc: cases.Op_Test, inputs_data: [][]f32) -> int {
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 
 	tensors: [cases.MAX_INPUTS]ml.Tensor
 	n := len(inputs_data)
@@ -58,7 +58,7 @@ _output_count :: proc(tc: cases.Op_Test, inputs_data: [][]f32) -> int {
 }
 
 _parity_eval :: proc(tc: cases.Op_Test, inputs_data: [][]f32, w: []f32, do_backward: bool, out_host: []f32, grads_host: [][]f32) {
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 
 	tensors: [cases.MAX_INPUTS]ml.Tensor
 	n := len(inputs_data)
@@ -302,7 +302,7 @@ test_cuda_lifecycle :: proc(t: ^testing.T) {
 			want := src[i] * (src[i] + 4)
 			testing.expectf(t, product[i] == want, "lifecycle cycle %d mul elem %d got=%v want=%v", cycle, i, product[i], want)
 		}
-		ml.clear()
+		ml.pass_begin()
 
 		ml.destroy(param)
 	}

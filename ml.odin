@@ -171,7 +171,7 @@ current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
 	return _current_ctx
 }
 
-clear :: proc(training := false, loc := #caller_location) {
+pass_begin :: proc(training := false, loc := #caller_location) {
 	assert(_current_ctx != nil, "no active context", loc=loc)
 
 	_current_ctx.training  = training
@@ -188,7 +188,7 @@ _pass_end :: proc() {
 
 @(deferred_none=_pass_end)
 pass :: proc(training := false, loc := #caller_location) -> bool {
-	clear(training=training, loc=loc)
+	pass_begin(training=training, loc=loc)
 	return true
 }
 

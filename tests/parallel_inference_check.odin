@@ -60,7 +60,7 @@ _parallel_model_destroy :: proc(model: Parallel_Model) {
 }
 
 _parallel_forward :: proc(model: ^Parallel_Model, input: []f32, result: []f32) {
-	ml.clear()
+	ml.pass_begin()
 	x      := ml.tensor(input, []int{PARALLEL_BATCH, PARALLEL_IN_DIM})
 	hidden := ml.relu(ml.linear(x, model.w1, bias=model.b1))
 	output := ml.linear(hidden, model.w2, bias=model.b2)

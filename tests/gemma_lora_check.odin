@@ -61,7 +61,7 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		}
 		testing.expectf(t, trainable_count == 8, "expected 8 trainable LoRA parameters under QLoRA, got %d", trainable_count)
 
-		ml.clear(training=true)
+		ml.pass_begin(training=true)
 		logits := gemma.forward(model, []int{1, 2, 3})
 		loss   := ml.mean(ml.cross_entropy(logits, []int{2, 3, 4}))
 		ml.backward(loss)
@@ -70,7 +70,7 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		stepped := ml.optimizer_step(&opt)
 		testing.expect(t, stepped, "optimizer_step should fire every step by default")
 		gemma.update(&opt, model)
-		ml.clear()
+		ml.pass_begin()
 
 		metadata: map[string]string
 		saved := ml.checkpoint_save(GEMMA_LORA_TEST_PATH, &gathered, &opt, metadata)

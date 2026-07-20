@@ -84,7 +84,7 @@ _bf16p_compare :: proc(t: ^testing.T, name, label: string, cpu_vals, cuda_vals: 
 }
 
 _bf16p_forward_eval :: proc(tc: Bf16p_Case, inputs: [][]f32, out: ^[]f32) {
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	tensors: [BF16P_MAX_INPUTS]ml.Tensor
 	for i in 0 ..< tc.input_count {
 		dims := tc.inputs[i].dims
@@ -98,7 +98,7 @@ _bf16p_forward_eval :: proc(tc: Bf16p_Case, inputs: [][]f32, out: ^[]f32) {
 }
 
 _bf16p_backward_eval :: proc(tc: Bf16p_Case, inputs: [][]f32, weights: []f32, grads: [][]f32) {
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 	tensors: [BF16P_MAX_INPUTS]ml.Tensor
 	for i in 0 ..< tc.input_count {
 		dims := tc.inputs[i].dims

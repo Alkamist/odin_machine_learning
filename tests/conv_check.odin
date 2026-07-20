@@ -11,7 +11,7 @@ test_conv2d_forward :: proc(t: ^testing.T) {
 	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	ml.clear()
+	ml.pass_begin()
 
 	input_data  := [9]f32{1, 2, 3, 4, 5, 6, 7, 8, 9}
 	weight_data := [4]f32{1, 2, 3, 4}
@@ -42,7 +42,7 @@ test_conv2d_bias_shape :: proc(t: ^testing.T) {
 	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	ml.clear()
+	ml.pass_begin()
 
 	input  := ml.zeros(.F32, {2, 5, 5, 3})
 	weight := ml.zeros(.F32, {4, 2, 2, 3})
@@ -63,7 +63,7 @@ test_conv1d_shape :: proc(t: ^testing.T) {
 	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	ml.clear()
+	ml.pass_begin()
 
 	input  := ml.zeros(.F32, {1, 6, 3})
 	weight := ml.zeros(.F32, {4, 2, 3})

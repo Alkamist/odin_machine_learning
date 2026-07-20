@@ -152,7 +152,7 @@ test_fixed_mlp_forward :: proc(t: ^testing.T) {
 	ml.set_data(model.layers[1].weight, []f32{1, -1})
 	ml.set_data(model.layers[1].bias,   []f32{0.25})
 
-	ml.clear()
+	ml.pass_begin()
 	x      := ml.tensor([]f32{1, 1}, []int{1, 2})
 	output := mlp.forward(model, x)
 

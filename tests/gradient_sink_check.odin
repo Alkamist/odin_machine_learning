@@ -12,7 +12,7 @@ test_backward_skips_gradient_sinks :: proc(t: ^testing.T) {
 	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 
 	shape := [1]int{4}
 	x := ml.zeros(.F32, shape[:])

@@ -36,7 +36,7 @@ _seeded_train_run :: proc(seed: u64, params_out: []f32) {
 			target_data[i] = rand.float32_normal(0, 1)
 		}
 
-		ml.clear(training=true)
+		ml.pass_begin(training=true)
 		x      := ml.tensor(input_data[:], []int{DETERMINISM_BATCH, 4})
 		target := ml.tensor(target_data[:], []int{DETERMINISM_BATCH, 2})
 

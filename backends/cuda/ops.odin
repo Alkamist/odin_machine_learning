@@ -527,7 +527,7 @@ _linear_q4_k_backward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locatio
 // The result is cached in `gctx.dequant_cache` keyed by the source weight
 // pointer, so a forward followed by a backward over the same weight only
 // pays for one dequantization. The scratch lives in the activation pool
-// and is invalidated at the next ml.clear() (which also clears the cache).
+// and is invalidated at the next ml.pass_begin() (which also clears the cache).
 _dequantize_q4_k :: proc(gctx: ^Context, src: cuda.DevicePtr, output_size, input_size: int, loc: runtime.Source_Code_Location) -> cuda.DevicePtr {
 	if cached, ok := gctx.dequant_cache[src]; ok {
 		return cached

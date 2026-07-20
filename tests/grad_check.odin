@@ -14,7 +14,7 @@ H_MIN     :: f64(1e-3)
 REL_FLOOR :: f64(1e-3)
 
 _forward_output_count :: proc(tc: cases.Op_Test, inputs_data: [][]f32) -> int {
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 
 	tensors: [cases.MAX_INPUTS]ml.Tensor
 	n := len(inputs_data)
@@ -29,7 +29,7 @@ _forward_output_count :: proc(tc: cases.Op_Test, inputs_data: [][]f32) -> int {
 }
 
 _eval :: proc(tc: cases.Op_Test, inputs_data: [][]f32, w: []f32, do_backward: bool, grads_out: [][]f32) -> f64 {
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 
 	tensors: [cases.MAX_INPUTS]ml.Tensor
 	n := len(inputs_data)

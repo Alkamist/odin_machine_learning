@@ -17,7 +17,7 @@ test_i32_tensor_round_trip :: proc(t: ^testing.T) {
 		defer cpu.context_destroy(ctx)
 		ml.context_scope(ctx)
 
-		ml.clear(training=false)
+		ml.pass_begin(training=false)
 
 		flat := ml.tensor([]i32{5, -3, 7, 11})
 		testing.expect(t, flat.type == .I32, "flat tensor must be I32")
@@ -61,7 +61,7 @@ test_i32_tensor_has_no_gradient :: proc(t: ^testing.T) {
 	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 
 	ints := ml.zeros(.I32, []int{4})
 	testing.expect(t, !ml.has_gradient(ints), "I32 tensor must not have a gradient buffer under training")
@@ -76,7 +76,7 @@ test_i32_select_tensor_matches_ints :: proc(t: ^testing.T) {
 	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 
 	input := ml.zeros(.F32, []int{4, 3})
 	ml.set_data(input, []f32{
@@ -119,7 +119,7 @@ test_i32_cross_entropy_tensor_matches_ints :: proc(t: ^testing.T) {
 		defer cpu.context_destroy(ctx)
 		ml.context_scope(ctx)
 
-		ml.clear(training=true)
+		ml.pass_begin(training=true)
 		logits := ml.zeros(.F32, []int{3, 4})
 		ml.set_data(logits, logits_data)
 		loss := ml.mean(ml.cross_entropy(logits, targets))
@@ -136,7 +136,7 @@ test_i32_cross_entropy_tensor_matches_ints :: proc(t: ^testing.T) {
 		defer cpu.context_destroy(ctx)
 		ml.context_scope(ctx)
 
-		ml.clear(training=true)
+		ml.pass_begin(training=true)
 		logits := ml.zeros(.F32, []int{3, 4})
 		ml.set_data(logits, logits_data)
 		target_tensor := ml.tensor([]i32{2, 0, 3})

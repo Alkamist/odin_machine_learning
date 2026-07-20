@@ -27,7 +27,7 @@ test_decode_graph_select :: proc(t: ^testing.T) {
 	ml.set_data(table, table_data[:])
 
 	for step in 0 ..< DECODE_GRAPH_STEPS {
-		ml.clear(training=false)
+		ml.pass_begin(training=false)
 
 		indices := [2]int{step % DECODE_GRAPH_ROWS, (step * 3 + 1) % DECODE_GRAPH_ROWS}
 		output  := ml.select(table, indices[:])
@@ -46,7 +46,7 @@ test_decode_graph_select :: proc(t: ^testing.T) {
 	}
 
 	cuda.enable_decode_graph(false)
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	ml.destroy(table)
 	ml.context_end(previous)
 	cuda.context_destroy(ctx)

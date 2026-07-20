@@ -59,7 +59,7 @@ _gpu_parallel_model_destroy :: proc(model: Gpu_Parallel_Model) {
 }
 
 _gpu_parallel_forward :: proc(model: ^Gpu_Parallel_Model, input: []f32, result: []f32) {
-	ml.clear()
+	ml.pass_begin()
 	x      := ml.tensor(input, []int{GPU_PARALLEL_BATCH, GPU_PARALLEL_IN_DIM})
 	hidden := ml.relu(ml.linear(x, model.w1, bias=model.b1))
 	output := ml.linear(hidden, model.w2, bias=model.b2)

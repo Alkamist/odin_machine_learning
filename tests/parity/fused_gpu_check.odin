@@ -135,7 +135,7 @@ _fusedgpu_check_attention_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
 	}
 
 	oracle := make([]f32, total * q_size); defer delete(oracle)
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		q := _bf16p_make({total, q_size},  q_full)
 		k := _bf16p_make({total, kv_size}, k_full)
@@ -144,7 +144,7 @@ _fusedgpu_check_attention_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
 		_bf16p_read(out, oracle)
 	}
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		q := _bf16p_make({prefill, q_size},  q_full[:prefill * q_size])
 		k := _bf16p_make({prefill, kv_size}, k_full[:prefill * kv_size])
@@ -153,7 +153,7 @@ _fusedgpu_check_attention_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
 	}
 
 	decoded := make([]f32, decode * q_size); defer delete(decoded)
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		q := _bf16p_make({decode, q_size},  q_full[prefill * q_size:])
 		k := _bf16p_make({decode, kv_size}, k_full[prefill * kv_size:])
@@ -190,7 +190,7 @@ _fusedgpu_check_rmsnorm_rope_write_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Co
 	mod   := saved^
 	mod.forward_ops -= {.Rmsnorm_Rope_Write_Cache, .Rmsnorm_Rope}
 	cuda_ctx.backend = &mod
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		x := _bf16p_make({tokens, trailing}, x_src)
 		w := _bf16p_make({head_size}, w_src)
@@ -199,7 +199,7 @@ _fusedgpu_check_rmsnorm_rope_write_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Co
 	}
 	cuda_ctx.backend = saved
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		x     := _bf16p_make({tokens, trailing}, x_src)
 		w     := _bf16p_make({head_size}, w_src)
@@ -229,7 +229,7 @@ _fusedgpu_check_gate_up_geglu :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
 	mod   := saved^
 	mod.forward_ops -= {.Linear_Q4_K_Gate_Up_Geglu}
 	cuda_ctx.backend = &mod
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		x  := _bf16p_make({1, input_size}, x_src)
 		wg := _fusedgpu_make_q4k(output_size, input_size, 1)
@@ -239,7 +239,7 @@ _fusedgpu_check_gate_up_geglu :: proc(t: ^testing.T, cuda_ctx: ^ml.Context) {
 	}
 	cuda_ctx.backend = saved
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		x  := _bf16p_make({1, input_size}, x_src)
 		wg := _fusedgpu_make_q4k(output_size, input_size, 1)
@@ -271,7 +271,7 @@ _fusedgpu_check_quant_backward_dx :: proc(t: ^testing.T, cuda_ctx: ^ml.Context, 
 	dx_quant  := make([]f32, tokens * input_size); defer delete(dx_quant)
 	dx_oracle := make([]f32, tokens * input_size); defer delete(dx_oracle)
 
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 	{
 		x   := _bf16p_make({tokens, input_size}, x_src)
 		wq  := q6 ? _fusedgpu_make_q6k(output_size, input_size, salt) : _fusedgpu_make_q4k(output_size, input_size, salt)
@@ -282,7 +282,7 @@ _fusedgpu_check_quant_backward_dx :: proc(t: ^testing.T, cuda_ctx: ^ml.Context, 
 
 	deq := _fusedgpu_dequant_host(output_size, input_size, salt, q6); defer delete(deq)
 
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 	{
 		x   := _bf16p_make({tokens, input_size}, x_src)
 		w   := _bf16p_make({output_size, input_size}, deq)

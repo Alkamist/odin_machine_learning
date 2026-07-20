@@ -58,7 +58,7 @@ test_jepa_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		testing.expect(t, stepped, "optimizer_step should fire every step by default")
 		jepa.update(&opt, model)
 		jepa.ema_update(model, 0.99)
-		ml.clear()
+		ml.pass_begin()
 
 		saved := jepa.save(model, JEPA_TEST_PATH, opt=&opt, iteration=7, decoder_iteration=3)
 		testing.expect(t, saved, "jepa.save should succeed")

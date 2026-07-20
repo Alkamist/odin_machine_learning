@@ -78,7 +78,7 @@ test_fused_gelu_mul :: proc(t: ^testing.T) {
 	mod   := saved^
 	mod.forward_ops -= {.Gelu_Mul}
 	ctx.backend = &mod
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		a   := _fused_make_bf16(shape, a_src)
 		b   := _fused_make_bf16(shape, b_src)
@@ -87,7 +87,7 @@ test_fused_gelu_mul :: proc(t: ^testing.T) {
 	}
 	ctx.backend = saved
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		a   := _fused_make_bf16(shape, a_src)
 		b   := _fused_make_bf16(shape, b_src)
@@ -123,7 +123,7 @@ test_fused_add_rmsnorm :: proc(t: ^testing.T) {
 	mod   := saved^
 	mod.forward_ops -= {.Add_Rmsnorm}
 	ctx.backend = &mod
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		a := _fused_make_bf16(shape, a_src)
 		b := _fused_make_bf16(shape, b_src)
@@ -134,7 +134,7 @@ test_fused_add_rmsnorm :: proc(t: ^testing.T) {
 	}
 	ctx.backend = saved
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		a := _fused_make_bf16(shape, a_src)
 		b := _fused_make_bf16(shape, b_src)
@@ -174,7 +174,7 @@ test_fused_rmsnorm_rope :: proc(t: ^testing.T) {
 	mod   := saved^
 	mod.forward_ops -= {.Rmsnorm_Rope}
 	ctx.backend = &mod
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		x   := _fused_make_bf16(shape, x_src)
 		w   := _fused_make_bf16(wshape, w_src)
@@ -183,7 +183,7 @@ test_fused_rmsnorm_rope :: proc(t: ^testing.T) {
 	}
 	ctx.backend = saved
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	{
 		x   := _fused_make_bf16(shape, x_src)
 		w   := _fused_make_bf16(wshape, w_src)
@@ -207,7 +207,7 @@ test_fused_cast_round_trip :: proc(t: ^testing.T) {
 		src[i] = math.sin(f32(i) * 1.31) * 3.0 + 0.123
 	}
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	x    := ml.tensor(src, shape)
 	xbf  := ml.cast_to(x, .Bf16)
 	back := ml.cast_to(xbf, .F32)
@@ -239,7 +239,7 @@ test_fused_lerp_assign :: proc(t: ^testing.T) {
 		host[i] = 0.2 * f32(i) - 0.5
 	}
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	dst := ml.zeros(.F32, shape)
 	ml.set_data(dst, host)
 	source := ml.zeros(.F32, shape)
@@ -267,7 +267,7 @@ test_fused_accumulate_mean :: proc(t: ^testing.T) {
 	n     := 12
 	running: f32 = 0
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 	scalar_shape := []int{1}
 	dst := ml.zeros(.F32, scalar_shape)
 	zero := []f32{0}
@@ -348,7 +348,7 @@ test_fused_linear_q4_k :: proc(t: ^testing.T) {
 	tokens      := 3
 	blocks      := input_size / ml.K_QUANT_BLOCK_SIZE
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 
 	weight_bytes := make([]byte, output_size * blocks * ml.Q4_K_BLOCK_BYTES)
 	defer delete(weight_bytes)
@@ -396,7 +396,7 @@ test_fused_linear_q6_k :: proc(t: ^testing.T) {
 	tokens      := 3
 	blocks      := input_size / ml.K_QUANT_BLOCK_SIZE
 
-	ml.clear(training=false)
+	ml.pass_begin(training=false)
 
 	weight_bytes := make([]byte, output_size * blocks * ml.Q6_K_BLOCK_BYTES)
 	defer delete(weight_bytes)

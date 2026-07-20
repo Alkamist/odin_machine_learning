@@ -31,7 +31,7 @@ ml.context_scope(ctx)
 
 Each unit of graph building is a pass. `ml.pass()` (inference) or
 `ml.pass(training=true)` clears the tape and scopes the pass to the enclosing
-block; recording ops after the scope closes is an assert. `ml.clear(...)` is the
+block; recording ops after the scope closes is an assert. `ml.pass_begin(...)` is the
 unscoped equivalent for code that manages pass boundaries manually. A training
 pass builds a graph, reduces to a scalar loss, then calls `ml.backward(loss)`.
 

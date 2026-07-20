@@ -58,14 +58,14 @@ test_tdmpc_smoke :: proc(t: ^testing.T) {
 		neg_q[i] = -f32(i % 5) * 0.2
 	}
 
-	ml.clear()
+	ml.pass_begin()
 	{
 		x := ml.tensor(states, []int{BATCH, SENSORS})
 		ml.get_data(ml.softmax(mlp.forward(policy, x)), result)
 		ml.get_data(mlp.forward(target, x), result)
 	}
 
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 	{
 		x          := ml.tensor(states,  []int{BATCH, SENSORS})
 		y          := ml.tensor(targets, []int{BATCH})
@@ -86,7 +86,7 @@ test_tdmpc_smoke :: proc(t: ^testing.T) {
 		ml.lerp_assign(target.layers[layer_index].bias,   layer.bias,   0.01)
 	}
 
-	ml.clear(training=true)
+	ml.pass_begin(training=true)
 	{
 		x             := ml.tensor(states, []int{BATCH, SENSORS})
 		nq            := ml.tensor(neg_q,  []int{BATCH, ACTIONS})

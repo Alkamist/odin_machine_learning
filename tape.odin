@@ -150,8 +150,8 @@ Operation :: struct {
 }
 
 _record_forward :: proc(op: Operation, loc := #caller_location) {
-	assert(_current_ctx.pass_open, "no open pass; scope work with ml.pass(...) or call ml.clear(...) first", loc=loc)
-	assert(_current_ctx.operation_count < MAX_OPERATIONS, "maximum operations exceeded; call clear to reset", loc=loc)
+	assert(_current_ctx.pass_open, "no open pass; scope work with ml.pass(...) or call ml.pass_begin(...) first", loc=loc)
+	assert(_current_ctx.operation_count < MAX_OPERATIONS, "maximum operations exceeded; call pass_begin to reset", loc=loc)
 	slot := &_current_ctx.operations[_current_ctx.operation_count]
 	slot^ = op
 	_current_ctx.operation_count += 1
@@ -166,7 +166,7 @@ backward :: proc(loss: Tensor, loc := #caller_location) {
 
 	backend := _current_ctx.backend
 
-	assert(_current_ctx.training, "backward called on an inference pass; call clear(training=true) first", loc=loc)
+	assert(_current_ctx.training, "backward called on an inference pass; call pass_begin(training=true) first", loc=loc)
 	assert(loss.backend == _current_ctx.backend, "loss tensor is not from the active context", loc=loc)
 	assert(loss.type == .F32, "backward requires an F32 loss tensor", loc=loc)
 	assert(loss.count == 1, "backward requires a scalar loss (reduce with mean first)", loc=loc)
