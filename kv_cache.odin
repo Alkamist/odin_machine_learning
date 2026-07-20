@@ -29,6 +29,12 @@ kv_cache_reset :: proc(cache: ^Kv_Cache) {
 	cache.length = 0
 }
 
+kv_cache_check :: proc(cache: Kv_Cache, new_token_count, layer_count: int, loc := #caller_location) {
+	assert(new_token_count > 0, "requires at least one new token", loc=loc)
+	assert(cache.length + new_token_count <= cache.t_max, "would overflow KV cache", loc=loc)
+	assert(builtin.len(cache.layers) == layer_count, "cache layer count must match model", loc=loc)
+}
+
 @(require_results)
 kv_cache_remaining :: proc(cache: Kv_Cache) -> int {
 	return cache.t_max - cache.length

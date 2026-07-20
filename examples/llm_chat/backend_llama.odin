@@ -97,7 +97,7 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 
 	return Chat_Model{
 		data          = backend,
-		vocab_size    = llama.SMOLLM2_135M_CONFIG.vocabulary_size,
+		vocab_size    = llama.SMOLLM2_135M_CONFIG.vocab_size,
 		prefill_chunk = 0,
 		stop_tokens   = backend.stop_tokens[:],
 		eval          = _llama_eval,
@@ -160,13 +160,13 @@ _llama_remaining :: proc(data: rawptr) -> int {
 
 _llama_reset :: proc(data: rawptr) {
 	backend := (^Llama_Backend)(data)
-	llama.cache_reset(&backend.cache)
+	ml.kv_cache_reset(&backend.cache)
 	backend.first_turn = true
 }
 
 _llama_destroy :: proc(data: rawptr) {
 	backend := (^Llama_Backend)(data)
-	llama.cache_destroy(backend.cache)
+	ml.kv_cache_destroy(backend.cache)
 	llama.destroy(backend.model)
 	gpt2.destroy(backend.tokenizer)
 	free(backend)

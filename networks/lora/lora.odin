@@ -4,6 +4,25 @@ import "core:mem"
 
 import ml "../../"
 
+Target :: enum {
+	Q,
+	K,
+	V,
+	O,
+	Gate,
+	Up,
+	Down,
+}
+Targets :: bit_set[Target]
+
+DEFAULT_TARGETS :: Targets{.Q, .K, .V, .O}
+
+Config :: struct {
+	rank:    int,
+	alpha:   f32,
+	targets: Targets,
+}
+
 // Low-Rank Adaptation: y = base + scale * B @ (A @ x), where A is small
 // and B is small (rank << in_features and rank << out_features).
 //
@@ -37,6 +56,9 @@ make :: proc(in_features, out_features, rank: int, alpha: f32, dtype: ml.Data_Ty
 }
 
 destroy :: proc(adapter: Adapter) {
+	if adapter.rank == 0 {
+		return
+	}
 	adapter := adapter
 	ml.registry_destroy(&adapter.params)
 	ml.destroy(adapter.scale)
@@ -46,6 +68,9 @@ destroy :: proc(adapter: Adapter) {
 // B = 0 so the adapter contribution starts at zero. The model behaves
 // identically to the frozen base at step 0; LoRA learns from there.
 randomize :: proc(adapter: Adapter, sigma: f32 = 0.02) {
+	if adapter.rank == 0 {
+		return
+	}
 	ml.fill_normal(adapter.a, 0, sigma)
 	ml.fill_value (adapter.b, 0)
 }
@@ -55,6 +80,9 @@ randomize :: proc(adapter: Adapter, sigma: f32 = 0.02) {
 // `base_output + scale * B @ (A @ input)`.
 @(require_results)
 apply :: proc(input, base_output: ml.Tensor, adapter: Adapter) -> ml.Tensor {
+	if adapter.rank == 0 {
+		return base_output
+	}
 	a_out  := ml.linear(input, adapter.a)  // [tokens, rank]
 	b_out  := ml.linear(a_out, adapter.b)  // [tokens, out_features]
 	scaled := ml.mul(b_out, adapter.scale)
@@ -62,6 +90,9 @@ apply :: proc(input, base_output: ml.Tensor, adapter: Adapter) -> ml.Tensor {
 }
 
 update :: proc(opt: ^ml.Optimizer, adapter: Adapter) {
+	if adapter.rank == 0 {
+		return
+	}
 	adapter := adapter
 	ml.registry_update(opt, &adapter.params)
 }
@@ -78,6 +109,9 @@ parameter_count :: proc(adapter: Adapter) -> int {
 // interoperate with the wider ecosystem. `scale` is a frozen constant
 // recomputed from alpha/rank at make time, so it is not a saved parameter.
 parameters :: proc(adapter: Adapter, prefix: string, dst: ^ml.Registry) {
+	if adapter.rank == 0 {
+		return
+	}
 	adapter := adapter
 	ml.registry_gather(dst, &adapter.params, prefix=prefix)
 }

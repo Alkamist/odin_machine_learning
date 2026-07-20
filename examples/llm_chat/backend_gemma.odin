@@ -36,7 +36,6 @@ BOS_TEXT         :: "<bos>"
 GEMMA_PREFILL_CHUNK :: 64
 
 Gemma_Backend :: struct {
-	config:         gemma.Config,
 	model:          gemma.Gemma,
 	cache:          gemma.Cache,
 	tokenizer:      gemma_tok.Tokenizer,
@@ -67,7 +66,7 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 	}
 
 	log.infof("allocating Gemma 4 E4B (Q4_K/Q6_K GGUF, %v)", ML_BACKEND)
-	config := gemma.make_e4b_config()
+	config := gemma.E4B_CONFIG
 	model  := gemma.make(config, dtype = .Bf16)
 
 	log.infof("loading weights from %v", weights_path)
@@ -80,14 +79,12 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 	if !load_ok {
 		log.errorf("could not load weights from %v", weights_path)
 		gemma.destroy(model)
-		gemma.config_destroy(config)
 		gemma_tok.destroy(tokenizer)
 		return {}, false
 	}
 	log.infof("loaded in %.1f s", time.duration_seconds(time.tick_since(t_load)))
 
 	backend := new(Gemma_Backend)
-	backend.config         = config
 	backend.model          = model
 	backend.cache          = gemma.cache_make(model, t_max)
 	backend.tokenizer      = tokenizer
@@ -147,15 +144,14 @@ _gemma_remaining :: proc(data: rawptr) -> int {
 
 _gemma_reset :: proc(data: rawptr) {
 	backend := (^Gemma_Backend)(data)
-	gemma.cache_reset(&backend.cache)
+	ml.kv_cache_reset(&backend.cache)
 	backend.first_turn = true
 }
 
 _gemma_destroy :: proc(data: rawptr) {
 	backend := (^Gemma_Backend)(data)
-	gemma.cache_destroy(backend.cache)
+	ml.kv_cache_destroy(backend.cache)
 	gemma.destroy(backend.model)
-	gemma.config_destroy(backend.config)
 	gemma_tok.destroy(backend.tokenizer)
 	free(backend)
 }

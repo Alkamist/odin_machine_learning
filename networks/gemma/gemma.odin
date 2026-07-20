@@ -15,88 +15,78 @@ Layer_Type :: enum u8 {
 }
 
 Config :: struct {
-	num_hidden_layers:           int,
+	layer_count:                 int,
 	hidden_size:                 int,
 	intermediate_size:           int,
-	num_attention_heads:         int,
-	num_key_value_heads:         int,
-	head_dim_sliding:            int,
-	head_dim_full:               int,
+	n_q_heads:                   int,
+	n_kv_heads:                  int,
+	head_size_sliding:           int,
+	head_size_full:              int,
 	vocab_size:                  int,
 	max_position_embeddings:     int,
 	sliding_window:              int,
 	hidden_size_per_layer_input: int,
-	num_kv_shared_layers:        int,
+	kv_shared_layer_count:       int,
+	full_attention_interval:     int,
 	rope_base_sliding:           f32,
 	rope_base_full:              f32,
 	rope_fraction_full:          f32,
 	rms_norm_eps:                f32,
 	final_logit_softcapping:     f32, // 0 disables; Gemma 4 uses 30.0 in `Gemma4ForCausalLM.forward`.
-	tie_word_embeddings:         bool,
+	tied_embeddings:             bool,
+}
 
-	layer_types: []Layer_Type, // length == num_hidden_layers
+E4B_CONFIG :: Config{
+	layer_count                 = 42,
+	hidden_size                 = 2560,
+	intermediate_size           = 10240,
+	n_q_heads                   = 8,
+	n_kv_heads                  = 2,
+	head_size_sliding           = 256,
+	head_size_full              = 512,
+	vocab_size                  = 262144,
+	max_position_embeddings     = 131072,
+	sliding_window              = 512,
+	hidden_size_per_layer_input = 256,
+	kv_shared_layer_count       = 18,
+	full_attention_interval     = 6,
+	rope_base_sliding           = 10000,
+	rope_base_full              = 1000000,
+	rope_fraction_full          = 0.25,
+	rms_norm_eps                = 1e-6,
+	final_logit_softcapping     = 30,
+	tied_embeddings             = true,
 }
 
 @(require_results)
-make_e4b_config :: proc(allocator := context.allocator) -> (cfg: Config) {
-	cfg = {
-		num_hidden_layers           = 42,
-		hidden_size                 = 2560,
-		intermediate_size           = 10240,
-		num_attention_heads         = 8,
-		num_key_value_heads         = 2,
-		head_dim_sliding            = 256,
-		head_dim_full               = 512,
-		vocab_size                  = 262144,
-		max_position_embeddings     = 131072,
-		sliding_window              = 512,
-		hidden_size_per_layer_input = 256,
-		num_kv_shared_layers        = 18,
-		rope_base_sliding           = 10000,
-		rope_base_full              = 1000000,
-		rope_fraction_full          = 0.25,
-		rms_norm_eps                = 1e-6,
-		final_logit_softcapping     = 30,
-		tie_word_embeddings         = true,
-	}
-
-	// 5 sliding : 1 full repeating; full layers at 5, 11, 17, 23, 29, 35, 41.
-	cfg.layer_types = builtin.make([]Layer_Type, cfg.num_hidden_layers, allocator)
-	for i in 0 ..< cfg.num_hidden_layers {
-		cfg.layer_types[i] = .Full if (i + 1) % 6 == 0 else .Sliding
-	}
-
-	return
-}
-
-config_destroy :: proc(cfg: Config) {
-	delete(cfg.layer_types)
+config_layer_type :: proc(cfg: Config, layer_idx: int) -> Layer_Type {
+	return .Full if cfg.full_attention_interval > 0 && (layer_idx + 1) % cfg.full_attention_interval == 0 else .Sliding
 }
 
 @(require_results)
 config_head_dim :: proc(cfg: Config, layer_idx: int) -> int {
-	return cfg.head_dim_full if cfg.layer_types[layer_idx] == .Full else cfg.head_dim_sliding
+	return cfg.head_size_full if config_layer_type(cfg, layer_idx) == .Full else cfg.head_size_sliding
 }
 
 @(require_results)
 config_rope_base :: proc(cfg: Config, layer_idx: int) -> f32 {
-	return cfg.rope_base_full if cfg.layer_types[layer_idx] == .Full else cfg.rope_base_sliding
+	return cfg.rope_base_full if config_layer_type(cfg, layer_idx) == .Full else cfg.rope_base_sliding
 }
 
 @(require_results)
 config_rope_fraction :: proc(cfg: Config, layer_idx: int) -> f32 {
-	return cfg.rope_fraction_full if cfg.layer_types[layer_idx] == .Full else f32(1.0)
+	return cfg.rope_fraction_full if config_layer_type(cfg, layer_idx) == .Full else f32(1.0)
 }
 
 @(require_results)
 kv_source_layer_idx :: proc(cfg: Config, layer_idx: int) -> int {
-	first_shared := cfg.num_hidden_layers - cfg.num_kv_shared_layers
-	if layer_idx < first_shared || cfg.num_kv_shared_layers == 0 {
+	first_shared := cfg.layer_count - cfg.kv_shared_layer_count
+	if layer_idx < first_shared || cfg.kv_shared_layer_count == 0 {
 		return layer_idx
 	}
-	target_type := cfg.layer_types[layer_idx]
+	target_type := config_layer_type(cfg, layer_idx)
 	for i := first_shared - 1; i >= 0; i -= 1 {
-		if cfg.layer_types[i] == target_type {
+		if config_layer_type(cfg, i) == target_type {
 			return i
 		}
 	}
@@ -105,29 +95,10 @@ kv_source_layer_idx :: proc(cfg: Config, layer_idx: int) -> int {
 
 @(require_results)
 is_kv_shared_layer :: proc(cfg: Config, layer_idx: int) -> bool {
-	if cfg.num_kv_shared_layers == 0 {
+	if cfg.kv_shared_layer_count == 0 {
 		return false
 	}
-	return layer_idx >= cfg.num_hidden_layers - cfg.num_kv_shared_layers
-}
-
-LoRA_Target :: enum {
-	Q,
-	K,
-	V,
-	O,
-	Gate,
-	Up,
-	Down,
-}
-LoRA_Targets :: bit_set[LoRA_Target]
-
-LORA_DEFAULT_TARGETS :: LoRA_Targets{.Q, .K, .V, .O}
-
-LoRA_Config :: struct {
-	rank:    int,
-	alpha:   f32,
-	targets: LoRA_Targets,
+	return layer_idx >= cfg.layer_count - cfg.kv_shared_layer_count
 }
 
 Layer :: struct {
@@ -136,12 +107,12 @@ Layer :: struct {
 	pre_feedforward_norm_weight:  ml.Tensor, // [hidden_size]
 	post_feedforward_norm_weight: ml.Tensor, // [hidden_size]
 
-	q_proj_weight: ml.Tensor, // [num_attention_heads * head_dim, hidden_size]
+	q_proj_weight: ml.Tensor, // [n_q_heads * head_dim, hidden_size]
 	q_norm_weight: ml.Tensor, // [head_dim] pre-baked with sqrt(head_dim) for scaling=1.0
-	k_proj_weight: ml.Tensor, // [num_kv_heads * head_dim, hidden_size] (omitted for shared layers)
+	k_proj_weight: ml.Tensor, // [n_kv_heads * head_dim, hidden_size] (omitted for shared layers)
 	k_norm_weight: ml.Tensor, // [head_dim] (omitted for shared layers)
-	v_proj_weight: ml.Tensor, // [num_kv_heads * head_dim, hidden_size] (omitted for shared layers)
-	o_proj_weight: ml.Tensor, // [hidden_size, num_attention_heads * head_dim]
+	v_proj_weight: ml.Tensor, // [n_kv_heads * head_dim, hidden_size] (omitted for shared layers)
+	o_proj_weight: ml.Tensor, // [hidden_size, n_q_heads * head_dim]
 
 	gate_proj_weight: ml.Tensor, // [intermediate_size, hidden_size]
 	up_proj_weight:   ml.Tensor, // [intermediate_size, hidden_size]
@@ -175,11 +146,11 @@ Gemma :: struct {
 
 	embed_tokens_per_layer_bytes:      []byte,
 	embed_tokens_per_layer_row_bytes:  int,       // bytes per vocab row
-	per_layer_model_projection_weight: ml.Tensor, // [num_hidden_layers * ple_dim, hidden_size]
+	per_layer_model_projection_weight: ml.Tensor, // [layer_count * ple_dim, hidden_size]
 	per_layer_projection_norm_weight:  ml.Tensor, // [hidden_size_per_layer_input]
 
-	v_norm_ones_sliding: ml.Tensor, // [head_dim_sliding]
-	v_norm_ones_full:    ml.Tensor, // [head_dim_full]
+	v_norm_ones_sliding: ml.Tensor, // [head_size_sliding]
+	v_norm_ones_full:    ml.Tensor, // [head_size_full]
 
 	embed_scale:         ml.Tensor, // sqrt(hidden_size)
 	ple_token_scale:     ml.Tensor, // sqrt(ple_dim)
@@ -193,12 +164,12 @@ Gemma :: struct {
 }
 
 @(require_results)
-make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = false, lora_cfg: Maybe(LoRA_Config) = nil, allocator := context.allocator) -> (model: Gemma) {
+make :: proc(config: Config, dtype: ml.Data_Type = .F32, trainable: bool = false, lora_cfg: Maybe(lora.Config) = nil, allocator := context.allocator) -> (model: Gemma) {
 	context.allocator = allocator
 
 	model.config = config
 	model.dtype  = dtype
-	model.layers = builtin.make([]Layer, config.num_hidden_layers)
+	model.layers = builtin.make([]Layer, config.layer_count)
 
 	// Const scalars stay .Data-only: ml.mul backward skips the b-side
 	// when there is no gradient buffer, which avoids both the bf16 CAS
@@ -215,7 +186,7 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 	use_lora := lora_cfg != nil
 	base_buffers := ml.Buffer_Set{.Data}
 	switch {
-	case !for_training:
+	case !trainable:
 		base_buffers = frozen_buffers
 	case use_lora:
 		base_buffers = frozen_buffers // QLoRA: only adapters train
@@ -230,13 +201,13 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 
 	model.embed_tokens_weight = make_w(dtype, {config.vocab_size, config.hidden_size}, base_buffers)
 	model.output_norm_weight  = make_w(dtype, {config.hidden_size}, base_buffers)
-	if config.tie_word_embeddings {
+	if config.tied_embeddings {
 		model.lm_head_weight = model.embed_tokens_weight
 	} else {
 		model.lm_head_weight = make_w(dtype, {config.vocab_size, config.hidden_size}, base_buffers)
 	}
 
-	ple_total := config.num_hidden_layers * config.hidden_size_per_layer_input
+	ple_total := config.layer_count * config.hidden_size_per_layer_input
 	dtype_bytes := dtype == .F32 ? 4 : 2
 	model.embed_tokens_per_layer_row_bytes  = ple_total * dtype_bytes
 	model.embed_tokens_per_layer_bytes      = builtin.make([]byte, config.vocab_size * model.embed_tokens_per_layer_row_bytes)
@@ -244,15 +215,15 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 	model.per_layer_projection_norm_weight  = make_w(dtype, {config.hidden_size_per_layer_input}, base_buffers)
 
 	// v_norm_ones is a literal constant (filled with 1.0), no gradient ever needed.
-	model.v_norm_ones_sliding = make_w(dtype, {config.head_dim_sliding}, const_buffers)
-	model.v_norm_ones_full    = make_w(dtype, {config.head_dim_full}, const_buffers)
+	model.v_norm_ones_sliding = make_w(dtype, {config.head_size_sliding}, const_buffers)
+	model.v_norm_ones_full    = make_w(dtype, {config.head_size_full}, const_buffers)
 	ml.fill_value(model.v_norm_ones_sliding, 1)
 	ml.fill_value(model.v_norm_ones_full,    1)
 
 	for &layer, layer_idx in model.layers {
 		head_dim := config_head_dim(config, layer_idx)
-		q_size   := config.num_attention_heads * head_dim
-		kv_size  := config.num_key_value_heads * head_dim
+		q_size   := config.n_q_heads  * head_dim
+		kv_size  := config.n_kv_heads * head_dim
 
 		layer.input_norm_weight             = make_w(dtype, {config.hidden_size}, base_buffers)
 		layer.post_attention_norm_weight    = make_w(dtype, {config.hidden_size}, base_buffers)
@@ -314,7 +285,7 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 		model.softcap     = ml.scalar(dtype, config.final_logit_softcapping, persistent=true)
 	}
 
-	reserve(&model.params.parameters, 16 * config.num_hidden_layers + 12)
+	reserve(&model.params.parameters, 16 * config.layer_count + 12)
 	_register_parameters(&model)
 
 	return
@@ -322,7 +293,7 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, for_training: bool = fa
 
 _register_parameters :: proc(model: ^Gemma) {
 	cfg            := model.config
-	residual_scale := f32(0.02 / math.sqrt(f32(2 * cfg.num_hidden_layers)))
+	residual_scale := f32(0.02 / math.sqrt(f32(2 * cfg.layer_count)))
 
 	reg :: proc(model: ^Gemma, prefix, name: string, tensor: ml.Tensor, init: ml.Init) {
 		used_init: ml.Init = ml.Init_None{}
@@ -334,7 +305,7 @@ _register_parameters :: proc(model: ^Gemma) {
 
 	reg(model, "", "model.language_model.embed_tokens.weight",            model.embed_tokens_weight,               ml.Init_Normal{mean=0, std=0.02})
 	reg(model, "", "model.language_model.norm.weight",                    model.output_norm_weight,                ml.Init_Value{value=1})
-	if !cfg.tie_word_embeddings {
+	if !cfg.tied_embeddings {
 		reg(model, "", "lm_head.weight", model.lm_head_weight, ml.Init_Normal{mean=0, std=0.02})
 	}
 	reg(model, "", "model.language_model.per_layer_model_projection.weight", model.per_layer_model_projection_weight, ml.Init_Normal{mean=0, std=0.02})
@@ -384,19 +355,14 @@ destroy :: proc(model: Gemma) {
 
 	delete(model.embed_tokens_per_layer_bytes)
 
-	_destroy_lora :: proc(adapter: lora.Adapter) {
-		if adapter.rank > 0 {
-			lora.destroy(adapter)
-		}
-	}
 	for layer in model.layers {
-		_destroy_lora(layer.q_lora)
-		_destroy_lora(layer.k_lora)
-		_destroy_lora(layer.v_lora)
-		_destroy_lora(layer.o_lora)
-		_destroy_lora(layer.gate_lora)
-		_destroy_lora(layer.up_lora)
-		_destroy_lora(layer.down_lora)
+		lora.destroy(layer.q_lora)
+		lora.destroy(layer.k_lora)
+		lora.destroy(layer.v_lora)
+		lora.destroy(layer.o_lora)
+		lora.destroy(layer.gate_lora)
+		lora.destroy(layer.up_lora)
+		lora.destroy(layer.down_lora)
 	}
 	delete(model.layers)
 }
@@ -408,19 +374,19 @@ randomize :: proc(model: Gemma) {
 	_fill_per_layer_bytes_normal(model, 0.02)
 
 	for layer in model.layers {
-		if layer.q_lora.rank    > 0 { lora.randomize(layer.q_lora) }
-		if layer.k_lora.rank    > 0 { lora.randomize(layer.k_lora) }
-		if layer.v_lora.rank    > 0 { lora.randomize(layer.v_lora) }
-		if layer.o_lora.rank    > 0 { lora.randomize(layer.o_lora) }
-		if layer.gate_lora.rank > 0 { lora.randomize(layer.gate_lora) }
-		if layer.up_lora.rank   > 0 { lora.randomize(layer.up_lora) }
-		if layer.down_lora.rank > 0 { lora.randomize(layer.down_lora) }
+		lora.randomize(layer.q_lora)
+		lora.randomize(layer.k_lora)
+		lora.randomize(layer.v_lora)
+		lora.randomize(layer.o_lora)
+		lora.randomize(layer.gate_lora)
+		lora.randomize(layer.up_lora)
+		lora.randomize(layer.down_lora)
 	}
 }
 
 _fill_per_layer_bytes_normal :: proc(model: Gemma, std: f32) {
 	cfg     := model.config
-	count   := cfg.vocab_size * cfg.num_hidden_layers * cfg.hidden_size_per_layer_input
+	count   := cfg.vocab_size * cfg.layer_count * cfg.hidden_size_per_layer_input
 	bytes   := model.embed_tokens_per_layer_bytes
 	switch model.dtype {
 	case .F32:
@@ -443,13 +409,13 @@ update :: proc(opt: ^ml.Optimizer, model: Gemma) {
 	ml.registry_update(opt, &model.params)
 
 	for layer in model.layers {
-		if layer.q_lora.rank    > 0 { lora.update(opt, layer.q_lora) }
-		if layer.k_lora.rank    > 0 { lora.update(opt, layer.k_lora) }
-		if layer.v_lora.rank    > 0 { lora.update(opt, layer.v_lora) }
-		if layer.o_lora.rank    > 0 { lora.update(opt, layer.o_lora) }
-		if layer.gate_lora.rank > 0 { lora.update(opt, layer.gate_lora) }
-		if layer.up_lora.rank   > 0 { lora.update(opt, layer.up_lora) }
-		if layer.down_lora.rank > 0 { lora.update(opt, layer.down_lora) }
+		lora.update(opt, layer.q_lora)
+		lora.update(opt, layer.k_lora)
+		lora.update(opt, layer.v_lora)
+		lora.update(opt, layer.o_lora)
+		lora.update(opt, layer.gate_lora)
+		lora.update(opt, layer.up_lora)
+		lora.update(opt, layer.down_lora)
 	}
 }
 
@@ -460,13 +426,13 @@ parameters :: proc(model: Gemma, dst: ^ml.Registry) {
 	for layer, layer_idx in model.layers {
 		attn_prefix := fmt.tprintf("model.language_model.layers.%v.self_attn", layer_idx)
 		mlp_prefix  := fmt.tprintf("model.language_model.layers.%v.mlp",       layer_idx)
-		if layer.q_lora.rank    > 0 { lora.parameters(layer.q_lora,    fmt.tprintf("%v.q_proj",    attn_prefix), dst) }
-		if layer.k_lora.rank    > 0 { lora.parameters(layer.k_lora,    fmt.tprintf("%v.k_proj",    attn_prefix), dst) }
-		if layer.v_lora.rank    > 0 { lora.parameters(layer.v_lora,    fmt.tprintf("%v.v_proj",    attn_prefix), dst) }
-		if layer.o_lora.rank    > 0 { lora.parameters(layer.o_lora,    fmt.tprintf("%v.o_proj",    attn_prefix), dst) }
-		if layer.gate_lora.rank > 0 { lora.parameters(layer.gate_lora, fmt.tprintf("%v.gate_proj", mlp_prefix),  dst) }
-		if layer.up_lora.rank   > 0 { lora.parameters(layer.up_lora,   fmt.tprintf("%v.up_proj",   mlp_prefix),  dst) }
-		if layer.down_lora.rank > 0 { lora.parameters(layer.down_lora, fmt.tprintf("%v.down_proj", mlp_prefix),  dst) }
+		lora.parameters(layer.q_lora,    fmt.tprintf("%v.q_proj",    attn_prefix), dst)
+		lora.parameters(layer.k_lora,    fmt.tprintf("%v.k_proj",    attn_prefix), dst)
+		lora.parameters(layer.v_lora,    fmt.tprintf("%v.v_proj",    attn_prefix), dst)
+		lora.parameters(layer.o_lora,    fmt.tprintf("%v.o_proj",    attn_prefix), dst)
+		lora.parameters(layer.gate_lora, fmt.tprintf("%v.gate_proj", mlp_prefix),  dst)
+		lora.parameters(layer.up_lora,   fmt.tprintf("%v.up_proj",   mlp_prefix),  dst)
+		lora.parameters(layer.down_lora, fmt.tprintf("%v.down_proj", mlp_prefix),  dst)
 	}
 }
 
@@ -484,7 +450,7 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	cfg         := model.config
 	ple_dim     := cfg.hidden_size_per_layer_input
 	token_count := builtin.len(tokens)
-	ple_total   := cfg.num_hidden_layers * ple_dim
+	ple_total   := cfg.layer_count * ple_dim
 
 	row_bytes := model.embed_tokens_per_layer_row_bytes
 	lookup_buf := builtin.make([]byte, token_count * row_bytes, context.temp_allocator)
@@ -501,7 +467,7 @@ _per_layer_inputs :: proc(model: Gemma, tokens: []int, inputs_embeds: ml.Tensor)
 	ctx_proj := ml.linear(inputs_embeds, model.per_layer_model_projection_weight)
 	ctx_proj  = ml.mul(ctx_proj, model.ple_ctx_scale)
 
-	flat_shape := []int{token_count * cfg.num_hidden_layers, ple_dim}
+	flat_shape := []int{token_count * cfg.layer_count, ple_dim}
 	ctx_proj    = ml.reshape(ctx_proj, flat_shape)
 	ctx_proj    = ml.rmsnorm(ctx_proj, model.per_layer_projection_norm_weight, eps=cfg.rms_norm_eps)
 	ctx_proj    = ml.reshape(ctx_proj, []int{token_count, ple_total})
@@ -518,29 +484,21 @@ cache_make :: proc(model: Gemma, t_max: int, allocator := context.allocator) -> 
 	cfg := model.config
 	cache.t_max  = t_max
 	cache.length = 0
-	cache.layers = builtin.make([]ml.Kv_Layer_Cache, cfg.num_hidden_layers, allocator)
+	cache.layers = builtin.make([]ml.Kv_Layer_Cache, cfg.layer_count, allocator)
 
-	for i in 0 ..< cfg.num_hidden_layers {
+	for i in 0 ..< cfg.layer_count {
 		if is_kv_shared_layer(cfg, i) {
 			continue
 		}
 		head_dim   := config_head_dim(cfg, i)
-		kv_size    := cfg.num_key_value_heads * head_dim
-		is_sliding := cfg.layer_types[i] == .Sliding
+		kv_size    := cfg.n_kv_heads * head_dim
+		is_sliding := config_layer_type(cfg, i) == .Sliding
 		t_cap      := cfg.sliding_window if is_sliding else t_max
 		cache.layers[i].k = ml.alloc(model.dtype, {t_cap, kv_size}, persistent=true, buffers={.Data})
 		cache.layers[i].v = ml.alloc(model.dtype, {t_cap, kv_size}, persistent=true, buffers={.Data})
 	}
 
 	return
-}
-
-cache_destroy :: proc(cache: Cache) {
-	ml.kv_cache_destroy(cache)
-}
-
-cache_reset :: proc(cache: ^Cache) {
-	ml.kv_cache_reset(cache)
 }
 
 @(require_results)
@@ -567,9 +525,7 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 
 	cache_position := 0
 	if cache != nil {
-		assert(token_count > 0, "requires at least one new token", loc=loc)
-		assert(cache.length + token_count <= cache.t_max, "would overflow KV cache", loc=loc)
-		assert(builtin.len(cache.layers) == cfg.num_hidden_layers, "cache layer count must match model", loc=loc)
+		ml.kv_cache_check(cache^, token_count, cfg.layer_count, loc=loc)
 		cache_position = cache.length
 	}
 
@@ -589,16 +545,14 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 		head_dim      := config_head_dim(cfg, layer_idx)
 		rope_base     := config_rope_base(cfg, layer_idx)
 		rope_fraction := config_rope_fraction(cfg, layer_idx)
-		is_sliding    := cfg.layer_types[layer_idx] == .Sliding
+		is_sliding    := config_layer_type(cfg, layer_idx) == .Sliding
 		window        := cfg.sliding_window if is_sliding else 0
 
 		hidden := ml.rmsnorm(residual, layer.input_norm_weight, eps=cfg.rms_norm_eps)
 
 		q := ml.linear(hidden, layer.q_proj_weight)
-		if layer.q_lora.rank > 0 {
-			q = lora.apply(hidden, q, layer.q_lora)
-		}
-		q = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
+		q = lora.apply(hidden, q, layer.q_lora)
+		q = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.n_q_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 
 		k, v: ml.Tensor
 		k_wrote_cache := false
@@ -609,22 +563,18 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 			v = shared_values[source]
 		} else {
 			k = ml.linear(hidden, layer.k_proj_weight)
-			if layer.k_lora.rank > 0 {
-				k = lora.apply(hidden, k, layer.k_lora)
-			}
+			k = lora.apply(hidden, k, layer.k_lora)
 			if cache != nil {
 				k_cache := cache.layers[layer_idx].k
-				k, k_wrote_cache = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, k_cache, k_cache.shape[0], cfg.num_key_value_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
+				k, k_wrote_cache = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, k_cache, k_cache.shape[0], cfg.n_kv_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 			} else {
-				k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
+				k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.n_kv_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 			}
 
-			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_dim_full else model.v_norm_ones_sliding
+			v_norm_ones := model.v_norm_ones_full if head_dim == cfg.head_size_full else model.v_norm_ones_sliding
 			v = ml.linear(hidden, layer.v_proj_weight)
-			if layer.v_lora.rank > 0 {
-				v = lora.apply(hidden, v, layer.v_lora)
-			}
-			v = ml.per_head_rmsnorm(v, v_norm_ones, cfg.num_key_value_heads, eps=cfg.rms_norm_eps)
+			v = lora.apply(hidden, v, layer.v_lora)
+			v = ml.per_head_rmsnorm(v, v_norm_ones, cfg.n_kv_heads, eps=cfg.rms_norm_eps)
 
 			shared_keys  [layer_idx] = k
 			shared_values[layer_idx] = v
@@ -635,16 +585,14 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 			cache_layer_idx := layer_idx if !kv_shared else kv_source_layer_idx(cfg, layer_idx)
 			k_cache := cache.layers[cache_layer_idx].k
 			v_cache := cache.layers[cache_layer_idx].v
-			attn = ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window, k_already_cached=kv_shared || k_wrote_cache, v_already_cached=kv_shared)
+			attn = ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.n_q_heads, cfg.n_kv_heads, window, k_already_cached=kv_shared || k_wrote_cache, v_already_cached=kv_shared)
 		} else {
-			attn = ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
+			attn = ml.attention(q, k, v, cfg.n_q_heads, cfg.n_kv_heads, true, window)
 		}
 
 		attn_pre_o := attn
 		attn  = ml.linear(attn_pre_o, layer.o_proj_weight)
-		if layer.o_lora.rank > 0 {
-			attn = lora.apply(attn_pre_o, attn, layer.o_lora)
-		}
+		attn = lora.apply(attn_pre_o, attn, layer.o_lora)
 		attn  = ml.rmsnorm(attn, layer.post_attention_norm_weight, eps=cfg.rms_norm_eps)
 
 		mlp_in: ml.Tensor
@@ -655,19 +603,13 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 			mlp_act = _gate_up_geglu(mlp_in, layer.gate_proj_weight, layer.up_proj_weight)
 		} else {
 			gate := ml.linear(mlp_in, layer.gate_proj_weight)
-			if layer.gate_lora.rank > 0 {
-				gate = lora.apply(mlp_in, gate, layer.gate_lora)
-			}
+			gate = lora.apply(mlp_in, gate, layer.gate_lora)
 			up := ml.linear(mlp_in, layer.up_proj_weight)
-			if layer.up_lora.rank > 0 {
-				up = lora.apply(mlp_in, up, layer.up_lora)
-			}
+			up = lora.apply(mlp_in, up, layer.up_lora)
 			mlp_act = ml.gelu_mul(gate, up)
 		}
 		mlp := ml.linear(mlp_act, layer.down_proj_weight)
-		if layer.down_lora.rank > 0 {
-			mlp = lora.apply(mlp_act, mlp, layer.down_lora)
-		}
+		mlp = lora.apply(mlp_act, mlp, layer.down_lora)
 		mlp  = ml.rmsnorm(mlp, layer.post_feedforward_norm_weight, eps=cfg.rms_norm_eps)
 
 		residual = ml.add(residual, mlp)

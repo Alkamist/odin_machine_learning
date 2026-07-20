@@ -141,8 +141,9 @@ Gaps:
   `registry_read/write` assert F32 while Bf16 params are trainable.
 - Withdrawn: sampling RNG seeding — `core:math/rand` already takes `gen := context.random_generator`,
   so callers can inject a seeded generator via Odin's context. Just add a determinism test.
-  (Sampling nits kept: `decode_tokens` counts a stop token as decoded; nil-logits `Eval_Proc`
-  contract undocumented.)
+  (Withdrawn during implementation: the `decode_tokens` stop-draw nit — `test_generate` asserts
+  that counting the stop draw is intended semantics. Remaining nit: nil-logits `Eval_Proc`
+  contract undocumented; cover in the root README.)
 
 ## Additional minors (by area)
 

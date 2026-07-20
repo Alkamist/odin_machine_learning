@@ -50,7 +50,7 @@ load_gguf :: proc(model: ^Gemma, path: string, loc := #caller_location) -> bool 
 		            weights.write_tensor(&layer.post_per_layer_input_norm_weight, source, fmt.tprintf("%v.post_norm.weight",           prefix)) &&
 		            weights.write_tensor(&layer.layer_scalar,                     source, fmt.tprintf("%v.layer_output_scale.weight",  prefix)) &&
 		            _load_norm_f32_to_dtype(loader, layer.q_norm_weight,          fmt.tprintf("%v.attn_q_norm.weight",                 prefix), q_norm_scale, loc=loc) &&
-		            weights.write_tensor(&layer.q_proj_weight,                    source, fmt.tprintf("%v.attn_q.weight",              prefix), .Rope_Permute, cfg.num_attention_heads, head_dim) &&
+		            weights.write_tensor(&layer.q_proj_weight,                    source, fmt.tprintf("%v.attn_q.weight",              prefix), .Rope_Permute, cfg.n_q_heads, head_dim) &&
 		            weights.write_tensor(&layer.o_proj_weight,                    source, fmt.tprintf("%v.attn_output.weight",         prefix)) &&
 		            weights.write_tensor(&layer.gate_proj_weight,                 source, fmt.tprintf("%v.ffn_gate.weight",            prefix)) &&
 		            weights.write_tensor(&layer.up_proj_weight,                   source, fmt.tprintf("%v.ffn_up.weight",              prefix)) &&
@@ -62,7 +62,7 @@ load_gguf :: proc(model: ^Gemma, path: string, loc := #caller_location) -> bool 
 		}
 
 		if !is_kv_shared_layer(cfg, layer_idx) {
-			kv_ok := weights.write_tensor(&layer.k_proj_weight, source, fmt.tprintf("%v.attn_k.weight", prefix), .Rope_Permute, cfg.num_key_value_heads, head_dim) &&
+			kv_ok := weights.write_tensor(&layer.k_proj_weight, source, fmt.tprintf("%v.attn_k.weight", prefix), .Rope_Permute, cfg.n_kv_heads, head_dim) &&
 			         weights.write_tensor(&layer.v_proj_weight, source, fmt.tprintf("%v.attn_v.weight", prefix)) &&
 			         _load_norm_f32_to_dtype(loader, layer.k_norm_weight, fmt.tprintf("%v.attn_k_norm.weight", prefix), 1.0, loc=loc)
 			if !kv_ok {
@@ -71,7 +71,7 @@ load_gguf :: proc(model: ^Gemma, path: string, loc := #caller_location) -> bool 
 		}
 	}
 
-	if !cfg.tie_word_embeddings {
+	if !cfg.tied_embeddings {
 		log.errorf("untied lm_head not present in this GGUF; not implemented", location=loc)
 		return false
 	}
@@ -98,12 +98,12 @@ _validate_gguf_metadata :: proc(loader: gguf.Loader, cfg: Config, loc := #caller
 		}
 		return true
 	}
-	return check(loader, "gemma4.block_count",                        cfg.num_hidden_layers,           loc=loc) &&
+	return check(loader, "gemma4.block_count",                        cfg.layer_count,                 loc=loc) &&
 	       check(loader, "gemma4.embedding_length",                   cfg.hidden_size,                 loc=loc) &&
 	       check(loader, "gemma4.embedding_length_per_layer_input",   cfg.hidden_size_per_layer_input, loc=loc) &&
 	       check(loader, "gemma4.feed_forward_length",                cfg.intermediate_size,           loc=loc) &&
-	       check(loader, "gemma4.attention.head_count",               cfg.num_attention_heads,         loc=loc) &&
-	       check(loader, "gemma4.attention.head_count_kv",            cfg.num_key_value_heads,         loc=loc)
+	       check(loader, "gemma4.attention.head_count",               cfg.n_q_heads,                   loc=loc) &&
+	       check(loader, "gemma4.attention.head_count_kv",            cfg.n_kv_heads,                  loc=loc)
 }
 
 _load_norm_f32_to_dtype :: proc(loader: gguf.Loader, target: ml.Tensor, name: string, extra_scale: f32, loc := #caller_location) -> bool {
@@ -210,7 +210,7 @@ _load_per_layer_token_embd :: proc(loader: gguf.Loader, model: Gemma, loc := #ca
 		return false
 	}
 	cfg := model.config
-	expected_unreversed := []int{cfg.vocab_size, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input}
+	expected_unreversed := []int{cfg.vocab_size, cfg.layer_count * cfg.hidden_size_per_layer_input}
 	if !_shape_matches_reversed(info.shape, expected_unreversed) {
 		log.errorf("%q shape %v != expected (reversed of %v)", name, info.shape, expected_unreversed, location=loc)
 		return false
@@ -221,7 +221,7 @@ _load_per_layer_token_embd :: proc(loader: gguf.Loader, model: Gemma, loc := #ca
 		return false
 	}
 
-	count := cfg.vocab_size * cfg.num_hidden_layers * cfg.hidden_size_per_layer_input
+	count := cfg.vocab_size * cfg.layer_count * cfg.hidden_size_per_layer_input
 	#partial switch info.type {
 	case .BF16:
 		if model.dtype != .Bf16 {

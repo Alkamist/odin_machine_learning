@@ -8,34 +8,30 @@ import "core:testing"
 import ml    "../"
 import cpu   "../backends/cpu"
 import gemma "../networks/gemma"
+import lora  "../networks/lora"
 
 GEMMA_LORA_TEST_PATH :: "test_gemma_lora_roundtrip.safetensors"
 
-_tiny_gemma_config :: proc(allocator := context.allocator) -> (cfg: gemma.Config) {
-	cfg = {
-		num_hidden_layers           = 2,
-		hidden_size                 = 8,
-		intermediate_size           = 16,
-		num_attention_heads         = 2,
-		num_key_value_heads         = 1,
-		head_dim_sliding            = 4,
-		head_dim_full               = 4,
-		vocab_size                  = 32,
-		max_position_embeddings     = 16,
-		sliding_window              = 4,
-		hidden_size_per_layer_input = 4,
-		num_kv_shared_layers        = 0,
-		rope_base_sliding           = 10000,
-		rope_base_full              = 10000,
-		rope_fraction_full          = 1,
-		rms_norm_eps                = 1e-6,
-		final_logit_softcapping     = 0,
-		tie_word_embeddings         = true,
-	}
-	cfg.layer_types = make([]gemma.Layer_Type, cfg.num_hidden_layers, allocator)
-	cfg.layer_types[0] = .Sliding
-	cfg.layer_types[1] = .Full
-	return
+TINY_GEMMA_CONFIG :: gemma.Config{
+	layer_count                 = 2,
+	hidden_size                 = 8,
+	intermediate_size           = 16,
+	n_q_heads                   = 2,
+	n_kv_heads                  = 1,
+	head_size_sliding           = 4,
+	head_size_full              = 4,
+	vocab_size                  = 32,
+	max_position_embeddings     = 16,
+	sliding_window              = 4,
+	hidden_size_per_layer_input = 4,
+	kv_shared_layer_count       = 0,
+	full_attention_interval     = 2,
+	rope_base_sliding           = 10000,
+	rope_base_full              = 10000,
+	rope_fraction_full          = 1,
+	rms_norm_eps                = 1e-6,
+	final_logit_softcapping     = 0,
+	tied_embeddings             = true,
 }
 
 @(test)
@@ -49,9 +45,9 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		defer cpu.context_destroy(ctx)
 		ml.context_scope(ctx)
 
-		cfg := _tiny_gemma_config()
-		lora_cfg := gemma.LoRA_Config{rank=2, alpha=4, targets={.Q, .V}}
-		model := gemma.make(cfg, dtype=.F32, for_training=true, lora_cfg=lora_cfg)
+		cfg := TINY_GEMMA_CONFIG
+		lora_cfg := lora.Config{rank=2, alpha=4, targets={.Q, .V}}
+		model := gemma.make(cfg, dtype=.F32, trainable=true, lora_cfg=lora_cfg)
 		gemma.randomize(model)
 
 		gathered: ml.Registry
@@ -81,7 +77,7 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		testing.expect_value(t, saved, ml.Checkpoint_Error.None)
 		defer os.remove(GEMMA_LORA_TEST_PATH)
 
-		restored := gemma.make(cfg, dtype=.F32, for_training=true, lora_cfg=lora_cfg)
+		restored := gemma.make(cfg, dtype=.F32, trainable=true, lora_cfg=lora_cfg)
 		restored_gathered: ml.Registry
 		gemma.parameters(restored, &restored_gathered)
 
@@ -108,7 +104,6 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 		ml.optimizer_destroy(&restored_opt)
 		gemma.destroy(model)
 		gemma.destroy(restored)
-		gemma.config_destroy(cfg)
 	}
 
 	testing.expectf(t, len(track.allocation_map) == 0, "expected no leaks, got %d live allocations", len(track.allocation_map))

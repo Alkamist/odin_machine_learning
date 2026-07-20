@@ -11,9 +11,9 @@ Config :: struct {
 	n_q_heads:         int,
 	n_kv_heads:        int,
 	head_size:         int,
-	embedding_size:    int,
+	hidden_size:       int,
 	intermediate_size: int,
-	vocabulary_size:   int,
+	vocab_size:        int,
 	rope_base:         f32,
 	tied_embeddings:   bool,
 }
@@ -23,34 +23,34 @@ SMOLLM2_135M_CONFIG :: Config{
 	n_q_heads         = 9,
 	n_kv_heads        = 3,
 	head_size         = 64,
-	embedding_size    = 576,
+	hidden_size       = 576,
 	intermediate_size = 1536,
-	vocabulary_size   = 49152,
+	vocab_size        = 49152,
 	rope_base         = 100000,
 	tied_embeddings   = true,
 }
 
 Layer :: struct {
-	input_norm_weight:     ml.Tensor, // [embedding_size]
-	q_proj_weight:         ml.Tensor, // [n_q_heads  * head_size, embedding_size]
-	k_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, embedding_size]
-	v_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, embedding_size]
-	o_proj_weight:         ml.Tensor, // [embedding_size, n_q_heads * head_size]
-	post_attn_norm_weight: ml.Tensor, // [embedding_size]
-	gate_proj_weight:      ml.Tensor, // [intermediate_size, embedding_size]
-	up_proj_weight:        ml.Tensor, // [intermediate_size, embedding_size]
-	down_proj_weight:      ml.Tensor, // [embedding_size, intermediate_size]
+	input_norm_weight:     ml.Tensor, // [hidden_size]
+	q_proj_weight:         ml.Tensor, // [n_q_heads  * head_size, hidden_size]
+	k_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, hidden_size]
+	v_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, hidden_size]
+	o_proj_weight:         ml.Tensor, // [hidden_size, n_q_heads * head_size]
+	post_attn_norm_weight: ml.Tensor, // [hidden_size]
+	gate_proj_weight:      ml.Tensor, // [intermediate_size, hidden_size]
+	up_proj_weight:        ml.Tensor, // [intermediate_size, hidden_size]
+	down_proj_weight:      ml.Tensor, // [hidden_size, intermediate_size]
 }
 
 Llama :: struct {
 	config: Config,
 
-	token_embeddings:   ml.Tensor, // [vocabulary_size, embedding_size]
+	token_embeddings:   ml.Tensor, // [vocab_size, hidden_size]
 
 	layers: []Layer,
 
-	output_norm_weight: ml.Tensor, // [embedding_size]
-	lm_head_weight:     ml.Tensor, // [vocabulary_size, embedding_size]; aliases token_embeddings when tied.
+	output_norm_weight: ml.Tensor, // [hidden_size]
+	lm_head_weight:     ml.Tensor, // [vocab_size, hidden_size]; aliases token_embeddings when tied.
 
 	params: ml.Registry,
 }
@@ -68,29 +68,29 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, trainable := true, allo
 	model.config = config
 	model.layers = builtin.make([]Layer, config.layer_count)
 
-	model.token_embeddings = ml.parameter_make(&model.params, "", "model.embed_tokens.weight", dtype, {config.vocabulary_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+	model.token_embeddings = ml.parameter_make(&model.params, "", "model.embed_tokens.weight", dtype, {config.vocab_size, config.hidden_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
 
 	for &layer, i in model.layers {
 		prefix := fmt.tprintf("model.layers.%v", i)
 
-		layer.input_norm_weight = ml.parameter_make(&model.params, prefix, "input_layernorm.weight",  dtype, {config.embedding_size}, init=ml.Init_Value{value=1}, flags=flags)
-		layer.q_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.q_proj.weight", dtype, {q_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
-		layer.k_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.k_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
-		layer.v_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.v_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
-		layer.o_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.o_proj.weight", dtype, {config.embedding_size, q_size}, init=ml.Init_Normal{mean=0, std=residual_scale}, flags=flags)
+		layer.input_norm_weight = ml.parameter_make(&model.params, prefix, "input_layernorm.weight",  dtype, {config.hidden_size}, init=ml.Init_Value{value=1}, flags=flags)
+		layer.q_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.q_proj.weight", dtype, {q_size, config.hidden_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.k_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.k_proj.weight", dtype, {kv_size, config.hidden_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.v_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.v_proj.weight", dtype, {kv_size, config.hidden_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.o_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.o_proj.weight", dtype, {config.hidden_size, q_size}, init=ml.Init_Normal{mean=0, std=residual_scale}, flags=flags)
 
-		layer.post_attn_norm_weight = ml.parameter_make(&model.params, prefix, "post_attention_layernorm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1}, flags=flags)
-		layer.gate_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.gate_proj.weight", dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
-		layer.up_proj_weight        = ml.parameter_make(&model.params, prefix, "mlp.up_proj.weight",   dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
-		layer.down_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.down_proj.weight", dtype, {config.embedding_size, config.intermediate_size}, init=ml.Init_Normal{mean=0, std=residual_scale}, flags=flags)
+		layer.post_attn_norm_weight = ml.parameter_make(&model.params, prefix, "post_attention_layernorm.weight", dtype, {config.hidden_size}, init=ml.Init_Value{value=1}, flags=flags)
+		layer.gate_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.gate_proj.weight", dtype, {config.intermediate_size, config.hidden_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.up_proj_weight        = ml.parameter_make(&model.params, prefix, "mlp.up_proj.weight",   dtype, {config.intermediate_size, config.hidden_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		layer.down_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.down_proj.weight", dtype, {config.hidden_size, config.intermediate_size}, init=ml.Init_Normal{mean=0, std=residual_scale}, flags=flags)
 	}
 
-	model.output_norm_weight = ml.parameter_make(&model.params, "", "model.norm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1}, flags=flags)
+	model.output_norm_weight = ml.parameter_make(&model.params, "", "model.norm.weight", dtype, {config.hidden_size}, init=ml.Init_Value{value=1}, flags=flags)
 
 	if config.tied_embeddings {
 		model.lm_head_weight = model.token_embeddings
 	} else {
-		model.lm_head_weight = ml.parameter_make(&model.params, "", "lm_head.weight", dtype, {config.vocabulary_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
+		model.lm_head_weight = ml.parameter_make(&model.params, "", "lm_head.weight", dtype, {config.vocab_size, config.hidden_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
 	}
 
 	randomize(model)
@@ -140,22 +140,11 @@ cache_make :: proc(model: Llama, t_max: int, allocator := context.allocator) -> 
 	return
 }
 
-cache_destroy :: proc(cache: Cache) {
-	ml.kv_cache_destroy(cache)
-}
-
-cache_reset :: proc(cache: ^Cache) {
-	ml.kv_cache_reset(cache)
-}
-
 @(require_results)
 _forward :: proc(model: Llama, tokens: []int, cache: ^Cache = nil, loc := #caller_location) -> (output: ml.Tensor) {
 	position_offset := 0
 	if cache != nil {
-		token_count := builtin.len(tokens)
-		assert(token_count > 0,                           "requires at least one new token", loc=loc)
-		assert(cache.length + token_count <= cache.t_max, "would overflow KV cache", loc=loc)
-		assert(len(cache.layers) == len(model.layers),    "cache layer count must match model", loc=loc)
+		ml.kv_cache_check(cache^, builtin.len(tokens), len(model.layers), loc=loc)
 		position_offset = cache.length
 	}
 

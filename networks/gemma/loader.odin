@@ -29,7 +29,7 @@ load_safetensors :: proc(model: ^Gemma, path: string, loc := #caller_location) -
 	if !ok {
 		return false
 	}
-	if cfg.tie_word_embeddings {
+	if cfg.tied_embeddings {
 		model.lm_head_weight = model.embed_tokens_weight
 	}
 
@@ -41,7 +41,7 @@ load_safetensors :: proc(model: ^Gemma, path: string, loc := #caller_location) -
 		            weights.write_tensor(&layer.post_attention_norm_weight,       source, fmt.tprintf("%v.post_attention_layernorm.weight",   prefix)) &&
 		            weights.write_tensor(&layer.pre_feedforward_norm_weight,      source, fmt.tprintf("%v.pre_feedforward_layernorm.weight",  prefix)) &&
 		            weights.write_tensor(&layer.post_feedforward_norm_weight,     source, fmt.tprintf("%v.post_feedforward_layernorm.weight", prefix)) &&
-		            weights.write_tensor(&layer.q_proj_weight,                    source, fmt.tprintf("%v.self_attn.q_proj.weight",           prefix), .Rope_Permute, cfg.num_attention_heads, head_dim) &&
+		            weights.write_tensor(&layer.q_proj_weight,                    source, fmt.tprintf("%v.self_attn.q_proj.weight",           prefix), .Rope_Permute, cfg.n_q_heads, head_dim) &&
 		            weights.write_tensor(&layer.o_proj_weight,                    source, fmt.tprintf("%v.self_attn.o_proj.weight",           prefix)) &&
 		            _load_norm_permuted (source, layer.q_norm_weight,             fmt.tprintf("%v.self_attn.q_norm.weight",                   prefix), head_dim, math.sqrt(f32(head_dim)), loc=loc) &&
 		            weights.write_tensor(&layer.gate_proj_weight,                 source, fmt.tprintf("%v.mlp.gate_proj.weight",              prefix)) &&
@@ -56,7 +56,7 @@ load_safetensors :: proc(model: ^Gemma, path: string, loc := #caller_location) -
 		}
 
 		if !is_kv_shared_layer(cfg, layer_idx) {
-			kv_ok := weights.write_tensor(&layer.k_proj_weight, source, fmt.tprintf("%v.self_attn.k_proj.weight", prefix), .Rope_Permute, cfg.num_key_value_heads, head_dim) &&
+			kv_ok := weights.write_tensor(&layer.k_proj_weight, source, fmt.tprintf("%v.self_attn.k_proj.weight", prefix), .Rope_Permute, cfg.n_kv_heads, head_dim) &&
 			         weights.write_tensor(&layer.v_proj_weight, source, fmt.tprintf("%v.self_attn.v_proj.weight", prefix)) &&
 			         _load_norm_permuted(source, layer.k_norm_weight, fmt.tprintf("%v.self_attn.k_norm.weight", prefix), head_dim, 1.0, loc=loc)
 			if !kv_ok {
@@ -65,7 +65,7 @@ load_safetensors :: proc(model: ^Gemma, path: string, loc := #caller_location) -
 		}
 	}
 
-	if !cfg.tie_word_embeddings {
+	if !cfg.tied_embeddings {
 		if !weights.write_tensor(&model.lm_head_weight, source, "lm_head.weight") {
 			return false
 		}
@@ -109,7 +109,7 @@ _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma,
 		return false
 	}
 	cfg := model.config
-	expected_shape := []int{cfg.vocab_size, cfg.num_hidden_layers * cfg.hidden_size_per_layer_input}
+	expected_shape := []int{cfg.vocab_size, cfg.layer_count * cfg.hidden_size_per_layer_input}
 	if !slice.equal(info.shape, expected_shape) {
 		log.errorf("%q shape %v != expected %v", name, info.shape, expected_shape, location=loc)
 		return false
@@ -120,7 +120,7 @@ _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma,
 		return false
 	}
 
-	count := cfg.vocab_size * cfg.num_hidden_layers * cfg.hidden_size_per_layer_input
+	count := cfg.vocab_size * cfg.layer_count * cfg.hidden_size_per_layer_input
 	#partial switch model.dtype {
 	case .Bf16:
 		switch info.dtype {

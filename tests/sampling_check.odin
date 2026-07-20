@@ -26,6 +26,27 @@ test_sample_greedy :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_sample_deterministic_with_seeded_generator :: proc(t: ^testing.T) {
+	logits := []f32{0.1, 5.0, 0.2, 9.0, 0.3, 7.0, 0.05, 1.0, 0.02, 3.0}
+
+	run :: proc(logits: []f32, ids: []int) {
+		state := rand.create(u64(1234))
+		context.random_generator = rand.default_random_generator(&state)
+		for &id in ids {
+			id = sampling.sample(logits, {temperature=0.9, top_k=5, top_p=0.9})
+		}
+	}
+
+	first:  [64]int
+	second: [64]int
+	run(logits, first[:])
+	run(logits, second[:])
+	for i in 0 ..< 64 {
+		testing.expect_value(t, second[i], first[i])
+	}
+}
+
+@(test)
 test_sample_top_k :: proc(t: ^testing.T) {
 	state := rand.create(u64(42))
 	context.random_generator = rand.default_random_generator(&state)

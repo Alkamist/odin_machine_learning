@@ -120,6 +120,17 @@ optimizer_step :: proc(opt: ^Optimizer) -> bool {
 	return true
 }
 
+registry_step :: proc(opt: ^Optimizer, r: ^Registry, max_grad_norm: f32 = 0, loc := #caller_location) -> (stepped: bool) {
+	if !optimizer_step(opt) {
+		return false
+	}
+	if max_grad_norm > 0 {
+		clip_gradient_norm(r, max_grad_norm, loc=loc)
+	}
+	registry_update(opt, r, loc=loc)
+	return true
+}
+
 update :: proc(opt: ^Optimizer, t: Tensor, loc := #caller_location) {
 	assert(opt.iteration > 0, "update called before optimizer_step; gate updates with `if optimizer_step(&opt) { ... }`", loc=loc)
 	state := _optimizer_state(opt, t, loc)
