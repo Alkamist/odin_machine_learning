@@ -37,15 +37,15 @@ test_checkpoint_optimizer_iteration_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, opt.iteration, u64(CHECKPOINT_TEST_STEPS))
 
 	registry: ml.Registry
-	ml.parameter_register(&registry, "", "weight", param, init=ml.Init_None{})
+	ml.parameter_register(&registry, "", "weight", param, init=ml.Init_None{}, flags=ml.PARAMETER_DEFAULT_FLAGS + {.Owned})
 	metadata: map[string]string
 	saved := ml.checkpoint_save(CHECKPOINT_TEST_PATH, &registry, &opt, metadata)
-	testing.expect(t, saved, "checkpoint_save should succeed")
+	testing.expect_value(t, saved, ml.Checkpoint_Error.None)
 	defer os.remove(CHECKPOINT_TEST_PATH)
 
 	restored_param := ml.alloc(.F32, {CHECKPOINT_TEST_SIZE}, persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 	restored_registry: ml.Registry
-	ml.parameter_register(&restored_registry, "", "weight", restored_param, init=ml.Init_None{})
+	ml.parameter_register(&restored_registry, "", "weight", restored_param, init=ml.Init_None{}, flags=ml.PARAMETER_DEFAULT_FLAGS + {.Owned})
 	restored_opt := ml.optimizer_make(learning_rate=ADAM_LR, beta1=ADAM_B1, beta2=ADAM_B2, epsilon=ADAM_EPS, weight_decay=ADAM_WD)
 	loaded_metadata, load_err := ml.checkpoint_load(CHECKPOINT_TEST_PATH, &restored_registry, &restored_opt)
 	testing.expect_value(t, load_err, ml.Checkpoint_Error.None)

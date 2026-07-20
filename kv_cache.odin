@@ -28,3 +28,8 @@ kv_cache_destroy :: proc(cache: Kv_Cache, loc := #caller_location) {
 kv_cache_reset :: proc(cache: ^Kv_Cache) {
 	cache.length = 0
 }
+
+@(require_results)
+kv_cache_remaining :: proc(cache: Kv_Cache) -> int {
+	return cache.t_max - cache.length
+}

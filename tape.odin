@@ -158,9 +158,8 @@ _record_forward :: proc(op: Operation, loc := #caller_location) {
 }
 
 backward :: proc(loss: Tensor, loc := #caller_location) {
-	if _current_ctx == nil || _current_ctx.operation_count <= 0 {
-		return
-	}
+	assert(_current_ctx != nil, "no active context", loc=loc)
+	assert(_current_ctx.operation_count > 0, "backward called with no recorded operations; run a forward pass first", loc=loc)
 
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 

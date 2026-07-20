@@ -9,6 +9,7 @@ import "core:strings"
 Parameter_Flag  :: enum {
 	Train,
 	Checkpoint,
+	Owned,
 }
 Parameter_Flags :: bit_set[Parameter_Flag]
 PARAMETER_DEFAULT_FLAGS :: Parameter_Flags{.Train, .Checkpoint}
@@ -40,8 +41,7 @@ Parameter :: struct {
 }
 
 Registry :: struct {
-	parameters:   [dynamic]Parameter,
-	owns_tensors: bool,
+	parameters: [dynamic]Parameter,
 }
 
 _registry_clone_name :: proc(r: ^Registry, prefix, name: string) -> string {
@@ -67,8 +67,7 @@ parameter_make :: proc(r: ^Registry, prefix, name: string, type: Data_Type, shap
 	normalized := _registry_normalize_init(init, flags, loc)
 	buffers    := DEFAULT_PARAMETER_BUFFERS if .Train in flags else Buffer_Set{.Data}
 	t = alloc(type, shape, persistent=true, buffers=buffers, loc=loc)
-	append(&r.parameters, Parameter{name=_registry_clone_name(r, prefix, name), tensor=t, init=normalized, flags=flags})
-	r.owns_tensors = true
+	append(&r.parameters, Parameter{name=_registry_clone_name(r, prefix, name), tensor=t, init=normalized, flags=flags + {.Owned}})
 	return
 }
 
@@ -76,12 +75,11 @@ parameter_register :: proc(r: ^Registry, prefix, name: string, tensor: Tensor, i
 	assert(.Train not_in flags || has_gradient(tensor), "trainable parameter requires a gradient buffer", loc=loc)
 	normalized := _registry_normalize_init(init, flags, loc)
 	append(&r.parameters, Parameter{name=_registry_clone_name(r, prefix, name), tensor=tensor, init=normalized, flags=flags})
-	r.owns_tensors = true
 }
 
 registry_destroy :: proc(r: ^Registry, loc := #caller_location) {
 	for parameter in r.parameters {
-		if r.owns_tensors {
+		if .Owned in parameter.flags {
 			destroy(parameter.tensor, loc=loc)
 		}
 		builtin.delete(parameter.name, allocator=r.parameters.allocator, loc=loc)
@@ -132,9 +130,8 @@ registry_copy :: proc(dst, src: ^Registry, loc := #caller_location) {
 }
 
 registry_gather :: proc(dst, src: ^Registry, prefix := "", loc := #caller_location) {
-	assert(!dst.owns_tensors, "registry_gather requires a registry that does not own tensors", loc=loc)
 	for parameter in src.parameters {
-		append(&dst.parameters, Parameter{name=_registry_clone_name(dst, prefix, parameter.name), tensor=parameter.tensor, init=parameter.init, flags=parameter.flags})
+		append(&dst.parameters, Parameter{name=_registry_clone_name(dst, prefix, parameter.name), tensor=parameter.tensor, init=parameter.init, flags=parameter.flags - {.Owned}})
 	}
 }
 

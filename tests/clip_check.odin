@@ -17,7 +17,7 @@ _clip_case :: proc(t: ^testing.T, name: string, grads: [][]f32, max_norm: f32) {
 		shape := [1]int{len(g)}
 		tensors[i] = ml.alloc(.F32, shape[:], persistent=true, buffers=ml.DEFAULT_PARAMETER_BUFFERS)
 		ml.set_bytes(tensors[i], .Gradient, mem.slice_to_bytes(g))
-		ml.parameter_register(&r, "", "", tensors[i], init=ml.Init_None{})
+		ml.parameter_register(&r, "", "", tensors[i], init=ml.Init_None{}, flags=ml.PARAMETER_DEFAULT_FLAGS + {.Owned})
 	}
 
 	total_sq := f64(0)

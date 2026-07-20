@@ -293,7 +293,7 @@ save :: proc(jepa: Jepa, path: string, opt: ^ml.Optimizer = nil, iteration: u64 
 	metadata["jepa.hidden_size"]     = fmt.tprintf("%d", jepa.config.hidden_size)
 	metadata["jepa.latent_size"]     = fmt.tprintf("%d", jepa.config.latent_size)
 
-	return ml.checkpoint_save(path, &gathered, opt, metadata, loc=loc)
+	return ml.checkpoint_save(path, &gathered, opt, metadata, loc=loc) == .None
 }
 
 @(require_results)

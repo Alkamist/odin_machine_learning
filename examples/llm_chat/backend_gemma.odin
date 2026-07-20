@@ -104,6 +104,7 @@ gemma_backend_make :: proc(gguf_path: string, t_max: int) -> (Chat_Model, bool) 
 		eval          = _gemma_eval,
 		encode_turn   = _gemma_encode_turn,
 		decode        = _gemma_decode,
+		remaining     = _gemma_remaining,
 		reset         = _gemma_reset,
 		destroy       = _gemma_destroy,
 	}, true
@@ -137,6 +138,11 @@ _gemma_encode_turn :: proc(data: rawptr, user_text: string) -> []int {
 _gemma_decode :: proc(data: rawptr, tokens: []int) -> string {
 	backend := (^Gemma_Backend)(data)
 	return gemma_tok.decode(&backend.tokenizer, tokens, context.temp_allocator)
+}
+
+_gemma_remaining :: proc(data: rawptr) -> int {
+	backend := (^Gemma_Backend)(data)
+	return ml.kv_cache_remaining(backend.cache)
 }
 
 _gemma_reset :: proc(data: rawptr) {

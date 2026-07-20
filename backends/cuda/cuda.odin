@@ -62,9 +62,6 @@ Context :: struct {
 	q8_1_cache:    map[cuda.DevicePtr]cuda.DevicePtr,
 	dequant_cache: map[cuda.DevicePtr]cuda.DevicePtr, // Q4_K/Q6_K weight ptr -> bf16 dequantized scratch
 
-	k_cache_written_this_forward: map[cuda.DevicePtr]bool,
-	v_cache_written_this_forward: map[cuda.DevicePtr]bool,
-
 	position_pinned:                rawptr,
 	position_dev:                   cuda.DevicePtr,
 	position_written_this_forward:  bool,
@@ -333,8 +330,6 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 	}
 	delete(gctx.q8_1_cache)
 	delete(gctx.dequant_cache)
-	delete(gctx.k_cache_written_this_forward)
-	delete(gctx.v_cache_written_this_forward)
 
 	if gctx.position_dev != 0 {
 		cuda.MemFree(gctx.position_dev)
@@ -399,9 +394,6 @@ clear :: proc(loc: runtime.Source_Code_Location) {
 
 	builtin.clear(&gctx.q8_1_cache)
 	builtin.clear(&gctx.dequant_cache)
-
-	builtin.clear(&gctx.k_cache_written_this_forward)
-	builtin.clear(&gctx.v_cache_written_this_forward)
 
 	gctx.position_written_this_forward = false
 

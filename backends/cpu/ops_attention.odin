@@ -408,13 +408,21 @@ _attention_cache_forward :: proc(op: ml.Operation) {
 	if first_phys + first_count > t_capacity { first_count = t_capacity - first_phys }
 	first_bytes := first_count * row_bytes
 	dst0 := first_phys * row_bytes
-	builtin.copy(k_cache_bytes[dst0:dst0 + first_bytes], k_new_bytes[:first_bytes])
-	builtin.copy(v_cache_bytes[dst0:dst0 + first_bytes], v_new_bytes[:first_bytes])
+	if !v.k_cached {
+		builtin.copy(k_cache_bytes[dst0:dst0 + first_bytes], k_new_bytes[:first_bytes])
+	}
+	if !v.v_cached {
+		builtin.copy(v_cache_bytes[dst0:dst0 + first_bytes], v_new_bytes[:first_bytes])
+	}
 
 	if first_count < token_count {
 		wrap_bytes := (token_count - first_count) * row_bytes
-		builtin.copy(k_cache_bytes[:wrap_bytes], k_new_bytes[first_bytes:first_bytes + wrap_bytes])
-		builtin.copy(v_cache_bytes[:wrap_bytes], v_new_bytes[first_bytes:first_bytes + wrap_bytes])
+		if !v.k_cached {
+			builtin.copy(k_cache_bytes[:wrap_bytes], k_new_bytes[first_bytes:first_bytes + wrap_bytes])
+		}
+		if !v.v_cached {
+			builtin.copy(v_cache_bytes[:wrap_bytes], v_new_bytes[first_bytes:first_bytes + wrap_bytes])
+		}
 	}
 
 	#partial switch op.input.type {

@@ -926,7 +926,7 @@ _rmsnorm_rope_write_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_
 	row_bytes    := uint(kv_size) * 2
 	excess       := v.position_offset + token_count - v.cache_capacity
 	shift_amount := min(max(excess, 0), token_count)
-	if shift_amount > 0 && !(cp in gctx.k_cache_written_this_forward) {
+	if shift_amount > 0 {
 		preserved_rows  := v.cache_capacity - shift_amount
 		preserved_bytes := uint(preserved_rows) * row_bytes
 		_ensure_shift_scratch(gctx, u64(preserved_bytes), loc)
@@ -948,8 +948,6 @@ _rmsnorm_rope_write_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_
 	fmt.assertf(x.type == .Bf16, "unsupported input dtype %v", x.type, loc=loc)
 	_rmsnorm_rope_cache_bf16_pipeline := _compile_pipeline(RMSNORM_ROPE_CACHE_BF16_SRC, "rmsnorm_rope_cache_bf16.cu", "rmsnorm_rope_cache_bf16")
 	_dispatch(_rmsnorm_rope_cache_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
-
-	gctx.k_cache_written_this_forward[cp] = true
 }
 
 _rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -1204,8 +1202,8 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 
 	k_cache_ptr := data(k_cache).ptr
 	v_cache_ptr := data(v_cache).ptr
-	k_already_written := k_cache_ptr in gctx.k_cache_written_this_forward
-	v_already_written := v_cache_ptr in gctx.v_cache_written_this_forward
+	k_already_written := v.k_cached
+	v_already_written := v.v_cached
 
 	row_bytes  := uint(kv_size) * 2
 	shift_amount := 0
@@ -1257,9 +1255,6 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 			_dispatch_cache_write(val.type, grid, v_args[:], loc)
 		}
 	}
-
-	gctx.k_cache_written_this_forward[k_cache_ptr] = true
-	gctx.v_cache_written_this_forward[v_cache_ptr] = true
 
 	qp := data(q).ptr; kcp := data(k_cache).ptr; vcp := data(v_cache).ptr; op_ptr := data(o).ptr
 	n_q_heads  := i32(v.n_q_heads)

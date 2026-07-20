@@ -78,7 +78,7 @@ test_gemma_lora_checkpoint_roundtrip :: proc(t: ^testing.T) {
 
 		metadata: map[string]string
 		saved := ml.checkpoint_save(GEMMA_LORA_TEST_PATH, &gathered, &opt, metadata)
-		testing.expect(t, saved, "checkpoint_save should succeed")
+		testing.expect_value(t, saved, ml.Checkpoint_Error.None)
 		defer os.remove(GEMMA_LORA_TEST_PATH)
 
 		restored := gemma.make(cfg, dtype=.F32, for_training=true, lora_cfg=lora_cfg)

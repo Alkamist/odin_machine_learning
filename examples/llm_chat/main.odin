@@ -20,6 +20,7 @@ Chat_Model :: struct {
 	eval:          proc(data: rawptr, tokens: []int, logits_out: []f32),
 	encode_turn:   proc(data: rawptr, user_text: string) -> []int,
 	decode:        proc(data: rawptr, tokens: []int) -> string,
+	remaining:     proc(data: rawptr) -> int,
 	reset:         proc(data: rawptr),
 	destroy:       proc(data: rawptr),
 }
@@ -138,6 +139,11 @@ main :: proc() {
 		new_tokens := model.encode_turn(model.data, line)
 		if builtin.len(new_tokens) == 0 {
 			log.warn("empty tokenization, skipped")
+			continue
+		}
+
+		if builtin.len(new_tokens) + options.max_new_tokens > model.remaining(model.data) {
+			fmt.printfln("(context window full: %v tokens left, this turn needs up to %v; use :reset to clear the conversation)", model.remaining(model.data), builtin.len(new_tokens) + options.max_new_tokens)
 			continue
 		}
 

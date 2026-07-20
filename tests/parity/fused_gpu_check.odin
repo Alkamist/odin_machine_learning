@@ -204,7 +204,7 @@ _fusedgpu_check_rmsnorm_rope_write_cache :: proc(t: ^testing.T, cuda_ctx: ^ml.Co
 		x     := _bf16p_make({tokens, trailing}, x_src)
 		w     := _bf16p_make({head_size}, w_src)
 		cache := ml.alloc(.Bf16, {tokens, trailing}, persistent=false, buffers={.Data})
-		_ = ml.rmsnorm_rope_write_cache(x, w, cache, tokens, head_count, eps=1e-5, base=10000, position_offset=0, rope_fraction=1.0)
+		_, _ = ml.rmsnorm_rope_write_cache(x, w, cache, tokens, head_count, eps=1e-5, base=10000, position_offset=0, rope_fraction=1.0)
 		_bf16p_read(cache, actual)
 	}
 

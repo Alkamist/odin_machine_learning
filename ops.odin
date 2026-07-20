@@ -131,6 +131,8 @@ Attention_Cache :: struct {
 	n_kv_heads:     int,
 	cache_position: int,
 	window:         int,
+	k_cached:       bool,
+	v_cached:       bool,
 
 	key:     Tensor,
 	value:   Tensor,
@@ -147,9 +149,11 @@ attention_with_cache :: proc(
 	v_cache:        Tensor,
 	cache_position: int,
 	n_q_heads:      int,
-	n_kv_heads      := 0,
-	window          := 0,
-	loc             := #caller_location,
+	n_kv_heads         := 0,
+	window             := 0,
+	k_already_cached   := false,
+	v_already_cached   := false,
+	loc                := #caller_location,
 ) -> (output: Tensor) {
 	kv_heads := n_kv_heads if n_kv_heads > 0 else n_q_heads
 
@@ -201,6 +205,8 @@ attention_with_cache :: proc(
 			n_kv_heads     = kv_heads,
 			cache_position = cache_position,
 			window         = window,
+			k_cached       = k_already_cached,
+			v_cached       = v_already_cached,
 			key            = key,
 			value          = value,
 			k_cache        = k_cache,
@@ -299,7 +305,8 @@ gelu_mul :: proc(a, b: Tensor, loc := #caller_location) -> (output: Tensor) {
 	_assert_float(a, "gelu_mul", loc)
 	_assert_broadcastable(a, b, loc)
 
-	if a.type == .F32 || _current_ctx.training || .Gelu_Mul not_in _current_ctx.backend.forward_ops {
+	ctx := current_context(loc=loc)
+	if a.type == .F32 || ctx.training || .Gelu_Mul not_in ctx.backend.forward_ops {
 		return mul(gelu(a, loc=loc), b, loc=loc)
 	}
 
@@ -806,7 +813,8 @@ linear_q4_k_gate_up_geglu :: proc(input, w_gate, w_up: Tensor, loc := #caller_lo
 	assert(input_size % K_QUANT_BLOCK_SIZE == 0, "input dim must be a multiple of 256", loc=loc)
 	assert(input.shape[input.rank - 1] == input_size, "input trailing dim must equal weight's input dim", loc=loc)
 
-	if _leading_count(input) == 1 && !_current_ctx.training && .Linear_Q4_K_Gate_Up_Geglu in _current_ctx.backend.forward_ops {
+	ctx := current_context(loc=loc)
+	if _leading_count(input) == 1 && !ctx.training && .Linear_Q4_K_Gate_Up_Geglu in ctx.backend.forward_ops {
 		new_shape: [MAX_TENSOR_RANK]int = input.shape
 		new_shape[input.rank - 1] = output_size
 		output = zeros(.Bf16, new_shape[:input.rank], loc=loc)
@@ -981,7 +989,8 @@ rmsnorm_rope :: proc(input, weight: Tensor, head_count: int, eps: f32 = RMSNORM_
 	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
 	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
 
-	if input.type == .F32 || _current_ctx.training || .Rmsnorm_Rope not_in _current_ctx.backend.forward_ops {
+	ctx := current_context(loc=loc)
+	if input.type == .F32 || ctx.training || .Rmsnorm_Rope not_in ctx.backend.forward_ops {
 		view   := reshape(input, []int{input.shape[0] * head_count, head_size}, loc=loc)
 		normed := rmsnorm(view, weight, eps=eps, loc=loc)
 		normed  = reshape(normed, []int{input.shape[0], head_count * head_size}, loc=loc)
@@ -1015,7 +1024,7 @@ rmsnorm_rope_write_cache :: proc(
 	eps: f32 = RMSNORM_DEFAULT_EPS, base: f32 = 10000,
 	position_offset := 0, rope_fraction: f32 = 1.0,
 	loc := #caller_location,
-) -> (output: Tensor) {
+) -> (output: Tensor, wrote_cache: bool) {
 	assert(input.rank == 2, "rmsnorm_rope_write_cache requires rank-2 input", loc=loc)
 	_assert_float(input, "rmsnorm_rope_write_cache", loc)
 	assert(weight.rank == 1, "rmsnorm_rope_write_cache weight must be 1-D", loc=loc)
@@ -1035,7 +1044,8 @@ rmsnorm_rope_write_cache :: proc(
 	rotate_pair_count := int(rope_fraction * f32(head_size)) / 2
 	assert(rotate_pair_count > 0 && rotate_pair_count <= half_head, "rope_fraction yields zero rotated pairs", loc=loc)
 
-	if !_current_ctx.training && .Rmsnorm_Rope_Write_Cache in _current_ctx.backend.forward_ops {
+	ctx := current_context(loc=loc)
+	if !ctx.training && .Rmsnorm_Rope_Write_Cache in ctx.backend.forward_ops {
 		output = zeros_like(input, loc=loc)
 		op := Operation{
 			input   = input,
@@ -1052,6 +1062,7 @@ rmsnorm_rope_write_cache :: proc(
 			},
 		}
 		_record_forward(op, loc=loc)
+		wrote_cache = true
 		return
 	}
 
@@ -1078,7 +1089,8 @@ add_rmsnorm :: proc(a, b, weight: Tensor, eps: f32 = RMSNORM_DEFAULT_EPS, loc :=
 		assert(a.shape[d] == b.shape[d], "add_rmsnorm a/b shape must match", loc=loc)
 	}
 
-	if a.type == .F32 || _current_ctx.training || .Add_Rmsnorm not_in _current_ctx.backend.forward_ops {
+	ctx := current_context(loc=loc)
+	if a.type == .F32 || ctx.training || .Add_Rmsnorm not_in ctx.backend.forward_ops {
 		residual_new = add(a, b, loc=loc)
 		normed       = rmsnorm(residual_new, weight, eps, loc=loc)
 		return

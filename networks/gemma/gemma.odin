@@ -329,7 +329,7 @@ _register_parameters :: proc(model: ^Gemma) {
 		if .Train in model.train_flags {
 			used_init = init
 		}
-		ml.parameter_register(&model.params, prefix, name, tensor, init=used_init, flags=model.train_flags)
+		ml.parameter_register(&model.params, prefix, name, tensor, init=used_init, flags=model.train_flags + {.Owned})
 	}
 
 	reg(model, "", "model.language_model.embed_tokens.weight",            model.embed_tokens_weight,               ml.Init_Normal{mean=0, std=0.02})
@@ -601,7 +601,9 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 		q = ml.rmsnorm_rope(q, layer.q_norm_weight, cfg.num_attention_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 
 		k, v: ml.Tensor
-		if is_kv_shared_layer(cfg, layer_idx) {
+		k_wrote_cache := false
+		kv_shared     := is_kv_shared_layer(cfg, layer_idx)
+		if kv_shared {
 			source := kv_source_layer_idx(cfg, layer_idx)
 			k = shared_keys  [source]
 			v = shared_values[source]
@@ -612,7 +614,7 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 			}
 			if cache != nil {
 				k_cache := cache.layers[layer_idx].k
-				k = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, k_cache, k_cache.shape[0], cfg.num_key_value_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
+				k, k_wrote_cache = ml.rmsnorm_rope_write_cache(k, layer.k_norm_weight, k_cache, k_cache.shape[0], cfg.num_key_value_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 			} else {
 				k = ml.rmsnorm_rope(k, layer.k_norm_weight, cfg.num_key_value_heads, eps=cfg.rms_norm_eps, base=rope_base, position_offset=cache_position, rope_fraction=rope_fraction)
 			}
@@ -630,10 +632,10 @@ _forward :: proc(model: Gemma, cache: ^Cache, tokens: []int, loc := #caller_loca
 
 		attn: ml.Tensor
 		if cache != nil {
-			cache_layer_idx := layer_idx if !is_kv_shared_layer(cfg, layer_idx) else kv_source_layer_idx(cfg, layer_idx)
+			cache_layer_idx := layer_idx if !kv_shared else kv_source_layer_idx(cfg, layer_idx)
 			k_cache := cache.layers[cache_layer_idx].k
 			v_cache := cache.layers[cache_layer_idx].v
-			attn = ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window)
+			attn = ml.attention_with_cache(q, k, v, k_cache, v_cache, cache_position, cfg.num_attention_heads, cfg.num_key_value_heads, window, k_already_cached=kv_shared || k_wrote_cache, v_already_cached=kv_shared)
 		} else {
 			attn = ml.attention(q, k, v, cfg.num_attention_heads, cfg.num_key_value_heads, true, window)
 		}

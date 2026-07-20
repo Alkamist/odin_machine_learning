@@ -98,8 +98,7 @@ _load_norm_permuted :: proc(source: weights.Source, target: ml.Tensor, name: str
 		permuted[2 * i + 0] = values[i]             * extra_scale
 		permuted[2 * i + 1] = values[half_size + i] * extra_scale
 	}
-	weights.set_floats(target, permuted)
-	return true
+	return weights.set_floats(target, permuted)
 }
 
 _load_per_layer_embedding_host :: proc(loader: safetensors.Loader, model: Gemma, loc := #caller_location) -> bool {

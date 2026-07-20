@@ -158,6 +158,10 @@ _write_float :: proc(target: ml.Tensor, dtype: Data_Type, raw: []byte, name: str
 			log.errorf("tensor %q rope permute requires head_count/head_size", name, location=loc)
 			return false
 		}
+		if head_size % 2 != 0 {
+			log.errorf("tensor %q rope permute requires even head_size, got %v", name, head_size, location=loc)
+			return false
+		}
 		if target.rank != 2 || target_shape[0] != head_count * head_size {
 			log.errorf("tensor %q rope permute expected [%v, embed], got %v", name, head_count * head_size, target_shape, location=loc)
 			return false
@@ -179,11 +183,10 @@ _write_float :: proc(target: ml.Tensor, dtype: Data_Type, raw: []byte, name: str
 		floats = permuted
 	}
 
-	set_floats(target, floats, loc)
-	return true
+	return set_floats(target, floats, loc)
 }
 
-set_floats :: proc(target: ml.Tensor, floats: []f32, loc := #caller_location) {
+set_floats :: proc(target: ml.Tensor, floats: []f32, loc := #caller_location) -> bool {
 	#partial switch target.type {
 	case .F32:
 		ml.set_data(target, floats, loc=loc)
@@ -195,8 +198,10 @@ set_floats :: proc(target: ml.Tensor, floats: []f32, loc := #caller_location) {
 		}
 		ml.set_bytes(target, .Data, bytes, loc=loc)
 	case:
-		fmt.panicf("unsupported target dtype %v", target.type, loc=loc)
+		log.errorf("set_floats does not support target dtype %v", target.type, location=loc)
+		return false
 	}
+	return true
 }
 
 @(require_results)

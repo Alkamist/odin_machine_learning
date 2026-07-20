@@ -226,10 +226,13 @@ parity suite on the GPU machine.
     restriction.
 12. Free `grad_norm_accumulator` in core `_context_destroy`; document backend contract that
     `buffer_free` works on an inactive-but-live context.
-13. K-cache protocol (decision): recommended — `attention_with_cache` never writes the cache;
-    every backend implements `Rmsnorm_Rope_Write_Cache` (CPU gets a real unfused impl: rmsnorm_rope
-    + cache copy). Deletes `k_cache_written_this_forward` and the CPU silent fallback.
-    Alternative: promote handshake to explicit backend capability flag.
+13. K-cache protocol (decision, revised during implementation): explicit per-op flags instead of
+    a mandatory fused op — the original "uniform op" idea did not cover V-writes or KV-shared
+    layers. `rmsnorm_rope_write_cache` returns `wrote_cache: bool`; `attention_with_cache` takes
+    `k_already_cached` / `v_already_cached`, stored in the op variant. Gemma threads the bool
+    through and passes both flags true for KV-shared layers. Deletes the hidden
+    `k/v_cache_written_this_forward` sets from the CUDA context entirely — cache-write
+    responsibility is now encoded in the recorded graph, visible to any backend.
 14. Assert/error boundary: `checkpoint_save` returns error enum; `weights.set_floats` returns
     false; `backward` asserts on nil context / zero ops; fused dispatch uses `current_context(loc)`.
 15. KV-cache exhaustion recoverable: `forward_cached -> (logits, ok)` or `cache_remaining` idiom

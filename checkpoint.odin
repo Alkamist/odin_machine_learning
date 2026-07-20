@@ -13,7 +13,7 @@ import st "loaders/safetensors"
 CHECKPOINT_VERSION :: "1"
 
 @(require_results)
-checkpoint_save :: proc(path: string, r: ^Registry, opt: ^Optimizer, metadata: map[string]string, loc := #caller_location) -> bool {
+checkpoint_save :: proc(path: string, r: ^Registry, opt: ^Optimizer, metadata: map[string]string, loc := #caller_location) -> Checkpoint_Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 
 	entries := builtin.make([dynamic]st.Entry, allocator=context.temp_allocator)
@@ -23,11 +23,10 @@ checkpoint_save :: proc(path: string, r: ^Registry, opt: ^Optimizer, metadata: m
 			continue
 		}
 		tensor := parameter.tensor
-		assert(
-			tensor.type == .F32 || tensor.type == .Bf16,
-			"only F32/BF16 tensors are checkpointable (quantized base weights are frozen state, saved by reference)",
-			loc = loc,
-		)
+		if tensor.type != .F32 && tensor.type != .Bf16 {
+			log.errorf("parameter %q has dtype %v; only F32/BF16 tensors are checkpointable (quantized base weights are frozen state, saved by reference)", parameter.name, tensor.type, location=loc)
+			return .Unsupported_Dtype
+		}
 
 		shape := builtin.make([]int, tensor.rank, allocator=context.temp_allocator)
 		builtin.copy(shape, tensor.shape[:tensor.rank])
@@ -61,15 +60,20 @@ checkpoint_save :: proc(path: string, r: ^Registry, opt: ^Optimizer, metadata: m
 		full_metadata["ml.optimizer_iteration"] = fmt.tprintf("%v", opt.iteration)
 	}
 
-	return st.save(path, entries[:], full_metadata, loc=loc)
+	if !st.save(path, entries[:], full_metadata, loc=loc) {
+		return .Write_Failed
+	}
+	return .None
 }
 
 Checkpoint_Error :: enum {
 	None,
 	Not_Found,
 	Read_Failed,
+	Write_Failed,
 	Malformed,
 	Mismatch,
+	Unsupported_Dtype,
 }
 
 @(require_results)

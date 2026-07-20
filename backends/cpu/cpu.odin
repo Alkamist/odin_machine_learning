@@ -326,8 +326,9 @@ when intrinsics.has_target_feature("avx") {
 Context :: struct {
 	using _: ml.Context,
 
-	arena:      mem.Arena,
-	persistent: map[rawptr]bool,
+	arena:                mem.Arena,
+	persistent:           map[rawptr]bool,
+	persistent_allocator: mem.Allocator,
 }
 
 POISON_TRANSIENT :: #config(ML_CPU_POISON, false)
@@ -365,7 +366,8 @@ context_create :: proc(size: int, allocator := context.allocator, loc := #caller
 	assert(arena_buf_err == nil, "failed to allocate CPU backend arena data", loc=loc)
 	mem.arena_init(&ctx.arena, arena_buf)
 
-	ctx.persistent = builtin.make(map[rawptr]bool, allocator=allocator)
+	ctx.persistent           = builtin.make(map[rawptr]bool, allocator=allocator)
+	ctx.persistent_allocator = allocator
 
 	ml._context_init(ctx, &_backend, allocator, loc)
 
@@ -375,9 +377,8 @@ context_create :: proc(size: int, allocator := context.allocator, loc := #caller
 context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc := #caller_location) {
 	ctx := cast(^Context)ctx
 	ml._context_destroy(ctx, loc)
-	accumulator_bytes := transmute([]byte)ctx.grad_norm_accumulator
-	if raw_data(accumulator_bytes) != nil {
-		builtin.delete(accumulator_bytes, loc=loc)
+	for ptr in ctx.persistent {
+		builtin.free(ptr, allocator=ctx.persistent_allocator, loc=loc)
 	}
 	builtin.delete(ctx.arena.data, loc=loc)
 	builtin.delete(ctx.persistent)
@@ -415,7 +416,7 @@ _moment :: #force_inline proc(buffer: ml.Backend_Buffer, count: int) -> []f32 {
 
 _buffer_alloc :: proc(byte_count: int, kind: ml.Buffer_Kind, persist: bool, loc: runtime.Source_Code_Location) -> ml.Backend_Buffer {
 	ctx       := cast(^Context)ml.current_context(loc=loc)
-	allocator := persist ? context.allocator : mem.arena_allocator(&ctx.arena)
+	allocator := persist ? ctx.persistent_allocator : mem.arena_allocator(&ctx.arena)
 
 	bytes, err := builtin.make([]byte, byte_count, allocator=allocator, loc=loc)
 	fmt.assertf(err == nil, "failed to allocate CPU buffer: %v", err, loc=loc)
@@ -445,7 +446,7 @@ _buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Locatio
 		return
 	}
 	builtin.delete_key(&ctx.persistent, rawptr(raw_data(bytes)))
-	builtin.delete(bytes, loc=loc)
+	builtin.delete(bytes, allocator=ctx.persistent_allocator, loc=loc)
 }
 
 _buffer_get :: proc(buffer: ml.Backend_Buffer, dst: []byte, loc: runtime.Source_Code_Location) {

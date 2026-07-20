@@ -103,6 +103,7 @@ llama_backend_make :: proc(model_path: string, t_max: int, system_prompt: string
 		eval          = _llama_eval,
 		encode_turn   = _llama_encode_turn,
 		decode        = _llama_decode,
+		remaining     = _llama_remaining,
 		reset         = _llama_reset,
 		destroy       = _llama_destroy,
 	}, true
@@ -150,6 +151,11 @@ _chatml_prefix :: proc(out: ^[dynamic]int, backend: ^Llama_Backend, role: string
 _llama_decode :: proc(data: rawptr, tokens: []int) -> string {
 	backend := (^Llama_Backend)(data)
 	return gpt2.decode(&backend.tokenizer, tokens, context.temp_allocator)
+}
+
+_llama_remaining :: proc(data: rawptr) -> int {
+	backend := (^Llama_Backend)(data)
+	return ml.kv_cache_remaining(backend.cache)
 }
 
 _llama_reset :: proc(data: rawptr) {

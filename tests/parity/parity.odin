@@ -256,7 +256,7 @@ _run_clip :: proc(grads_out: []f32, loc := #caller_location) -> f32 {
 		}
 		ml.set_bytes(tensors[i], .Gradient, mem.slice_to_bytes(grad))
 		delete(grad)
-		ml.parameter_register(&r, "", "", tensors[i], init=ml.Init_None{})
+		ml.parameter_register(&r, "", "", tensors[i], init=ml.Init_None{}, flags=ml.PARAMETER_DEFAULT_FLAGS + {.Owned})
 		offset += size
 	}
 
