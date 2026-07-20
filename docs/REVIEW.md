@@ -267,8 +267,11 @@ pass :: proc(training := false, loc := #caller_location) -> ^Context {
   asserts in `ml`; LoRA plumbing extracted into `networks/lora` for both; derive
   `gemma.Config.layer_types` from layer index so Config becomes a value type (`config_destroy`
   dies, double-free trap with it).
-- Common LM interface: formalize the `llm_chat` vtable as a `Language_Model` struct of proc
-  pointers next to the networks.
+- Common LM interface: DEFERRED after implementation experience. With the config vocabulary
+  unified, `ml.kv_cache_*` shared, and `logits_mode=.Last` shrinking each eval to ~4 lines, the
+  remaining generic surface is just `eval` — a vtable package would not pull its weight. The
+  chat-specific parts of `llm_chat`'s adapter (templates, tokenizer wiring) are app logic no
+  interface removes. Revisit if a third network or a second consumer appears.
 - Last-position logits: `Logits_Mode.All / .Last` param on `forward_cached` (or hidden + explicit
   lm_head — decide at implementation). Delete `forward_with_hidden`.
 - Sampling: determinism test via seeded `context.random_generator`; fix decode-token count nit;
@@ -289,3 +292,18 @@ pass :: proc(training := false, loc := #caller_location) -> ^Context {
 
 Rough sizing: Phases 1-2 ~a day each, Phase 3 small, Phase 4 largest (gemma/llama convergence),
 Phase 5 mechanical.
+
+## Status — 2026-07-19
+
+All phases implemented and committed (7cc67b8, b789979, 50886c8, 866772e, a480265, cafa63b).
+Every suite green at completion: 46 CPU tests (incl. ML_CPU_POISON and -microarch:x86-64-v3),
+6 golden tests (incl. new HF-pinned gpt2 fixtures), 5 CUDA parity tests on an RTX 3090 Ti.
+
+Known remaining items:
+- `tests/parity` `attention_long` case is time-seeded and was observed once grazing its 1e-4
+  tolerance (pre-existing flakiness, unrelated to these changes); consider pinning the seed or
+  widening the tolerance for that case.
+- Phase 2 item 15 chose the `kv_cache_remaining` idiom over a `(logits, ok)` return; network
+  forwards still assert on overflow, with the chat example demonstrating the check-first idiom.
+- The safetensors unknown-dtype laxness (S2) was accepted as-is: byte ranges are still bounds
+  checked, and rejecting unknown dtypes would refuse files with ignorable auxiliary tensors.
