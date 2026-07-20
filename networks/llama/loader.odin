@@ -1,11 +1,12 @@
 package llama
 
 import "core:fmt"
+import "core:log"
 
 import "../../loaders/safetensors"
 import "../../loaders/weights"
 
-load_safetensors :: proc(model: ^Llama, path: string) -> bool {
+load_safetensors :: proc(model: ^Llama, path: string, loc := #caller_location) -> bool {
 	loader, load_err := safetensors.load(path)
 	if load_err != .None {
 		return false
@@ -41,11 +42,13 @@ load_safetensors :: proc(model: ^Llama, path: string) -> bool {
 		return false
 	}
 
-	if _, has_lm_head := safetensors.get_info(loader, "lm_head.weight"); has_lm_head {
-		if !cfg.tied_embeddings {
-			if !weights.write_tensor(&model.lm_head_weight, source, "lm_head.weight") {
-				return false
-			}
+	if !cfg.tied_embeddings {
+		if _, has_lm_head := safetensors.get_info(loader, "lm_head.weight"); !has_lm_head {
+			log.errorf("model config is untied but %v has no lm_head.weight", path, location=loc)
+			return false
+		}
+		if !weights.write_tensor(&model.lm_head_weight, source, "lm_head.weight") {
+			return false
 		}
 	}
 

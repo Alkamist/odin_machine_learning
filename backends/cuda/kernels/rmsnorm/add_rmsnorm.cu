@@ -1,18 +1,10 @@
 #include <cuda_bf16.h>
-#ifdef DTYPE_BF16
 #include "bf16.cuh"
 #define DATA_T unsigned short
 #define RD(p, i) ld_bf16(p, i)
 #define WR(p, i, val) st_bf16(p, i, (val))
 #define ROUND_STORE(v) __bfloat162float(__float2bfloat16(v))
 #define KERNEL_NAME add_rmsnorm_bf16
-#else
-#define DATA_T float
-#define RD(p, i) (p[i])
-#define WR(p, i, val) do { (p)[i] = (val); } while (0)
-#define ROUND_STORE(v) (v)
-#define KERNEL_NAME add_rmsnorm_f32
-#endif
 
 #define ARN_WG     256
 #define ARN_NWARPS (ARN_WG / 32)

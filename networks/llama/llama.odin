@@ -16,7 +16,6 @@ Config :: struct {
 	vocabulary_size:   int,
 	rope_base:         f32,
 	tied_embeddings:   bool,
-	use_qk_norm:       bool,
 }
 
 SMOLLM2_135M_CONFIG :: Config{
@@ -37,8 +36,6 @@ Layer :: struct {
 	k_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, embedding_size]
 	v_proj_weight:         ml.Tensor, // [n_kv_heads * head_size, embedding_size]
 	o_proj_weight:         ml.Tensor, // [embedding_size, n_q_heads * head_size]
-	q_norm_weight:         ml.Tensor, // [head_size]; only allocated when config.use_qk_norm
-	k_norm_weight:         ml.Tensor, // [head_size]; only allocated when config.use_qk_norm
 	post_attn_norm_weight: ml.Tensor, // [embedding_size]
 	gate_proj_weight:      ml.Tensor, // [intermediate_size, embedding_size]
 	up_proj_weight:        ml.Tensor, // [intermediate_size, embedding_size]
@@ -81,11 +78,6 @@ make :: proc(config: Config, dtype: ml.Data_Type = .F32, trainable := true, allo
 		layer.k_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.k_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
 		layer.v_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.v_proj.weight", dtype, {kv_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
 		layer.o_proj_weight     = ml.parameter_make(&model.params, prefix, "self_attn.o_proj.weight", dtype, {config.embedding_size, q_size}, init=ml.Init_Normal{mean=0, std=residual_scale}, flags=flags)
-
-		if config.use_qk_norm {
-			layer.q_norm_weight = ml.parameter_make(&model.params, prefix, "self_attn.q_norm.weight", dtype, {config.head_size}, init=ml.Init_Value{value=1}, flags=flags)
-			layer.k_norm_weight = ml.parameter_make(&model.params, prefix, "self_attn.k_norm.weight", dtype, {config.head_size}, init=ml.Init_Value{value=1}, flags=flags)
-		}
 
 		layer.post_attn_norm_weight = ml.parameter_make(&model.params, prefix, "post_attention_layernorm.weight", dtype, {config.embedding_size}, init=ml.Init_Value{value=1}, flags=flags)
 		layer.gate_proj_weight      = ml.parameter_make(&model.params, prefix, "mlp.gate_proj.weight", dtype, {config.intermediate_size, config.embedding_size}, init=ml.Init_Normal{mean=0, std=0.02}, flags=flags)
@@ -177,11 +169,6 @@ _forward :: proc(model: Llama, tokens: []int, cache: ^Cache = nil, loc := #calle
 		q := ml.linear(normed, layer.q_proj_weight)
 		k := ml.linear(normed, layer.k_proj_weight)
 		v := ml.linear(normed, layer.v_proj_weight)
-
-		if model.config.use_qk_norm {
-			q = ml.per_head_rmsnorm(q, layer.q_norm_weight, model.config.n_q_heads)
-			k = ml.per_head_rmsnorm(k, layer.k_norm_weight, model.config.n_kv_heads)
-		}
 
 		q = ml.rope(q, model.config.n_q_heads,  base=model.config.rope_base, position_offset=position_offset)
 		k = ml.rope(k, model.config.n_kv_heads, base=model.config.rope_base, position_offset=position_offset)

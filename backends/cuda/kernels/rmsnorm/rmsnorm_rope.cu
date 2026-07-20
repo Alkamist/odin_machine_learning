@@ -1,16 +1,9 @@
 #include <cuda_bf16.h>
-#ifdef DTYPE_BF16
 #include "bf16.cuh"
 #define DATA_T unsigned short
 #define RD(p, i) ld_bf16(p, i)
 #define WR(p, i, val) st_bf16(p, i, (val))
 #define KERNEL_NAME rmsnorm_rope_bf16
-#else
-#define DATA_T float
-#define RD(p, i) (p[i])
-#define WR(p, i, val) do { (p)[i] = (val); } while (0)
-#define KERNEL_NAME rmsnorm_rope_f32
-#endif
 
 #define RMSROPE_WG     128
 #define RMSROPE_NWARPS (RMSROPE_WG / 32)

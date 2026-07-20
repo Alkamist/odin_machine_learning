@@ -24,6 +24,7 @@ import "core:slice"
 
 GGUF_MAGIC             :: 0x4655_4747 // 'GGUF' little-endian
 GGUF_DEFAULT_ALIGNMENT :: 32
+MAX_TENSOR_DIMS        :: 4
 
 Value_Type :: enum u32 {
 	U8     = 0,
@@ -186,7 +187,8 @@ load :: proc(path: string, allocator := context.allocator, loc := #caller_locati
 		}
 
 		n_dims, n_dims_ok := _read_u32(&r)
-		if !n_dims_ok {
+		if !n_dims_ok || n_dims == 0 || n_dims > MAX_TENSOR_DIMS {
+			log.errorf("%v: tensor %q has invalid dimension count %v", path, name, n_dims, location=loc)
 			_destroy_partial(file_bytes, kv, tensors)
 			return {}, .Malformed
 		}

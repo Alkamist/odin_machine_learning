@@ -9,6 +9,10 @@ void cast_f32_to_bf16(const float* __restrict__ src,
 	if (i >= pair_count) return;
 	int i0 = 2 * i, i1 = i0 + 1;
 	unsigned short lo = __bfloat16_as_ushort(__float2bfloat16(src[i0]));
-	unsigned short hi = (i1 < n) ? __bfloat16_as_ushort(__float2bfloat16(src[i1])) : 0;
-	dst[i] = (unsigned int)lo | ((unsigned int)hi << 16);
+	if (i1 < n) {
+		unsigned short hi = __bfloat16_as_ushort(__float2bfloat16(src[i1]));
+		dst[i] = (unsigned int)lo | ((unsigned int)hi << 16);
+	} else {
+		((unsigned short*)dst)[i0] = lo;
+	}
 }

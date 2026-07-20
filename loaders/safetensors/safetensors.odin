@@ -327,10 +327,14 @@ save :: proc(path: string, entries: []Entry, metadata: map[string]string, loc :=
 		return false
 	}
 
-	os.remove(path)
+	if os.exists(path) {
+		if remove_err := os.remove(path); remove_err != nil {
+			log.errorf("failed to remove %v: %v; new data preserved at %v", path, remove_err, tmp_path, location=loc)
+			return false
+		}
+	}
 	if rename_err := os.rename(tmp_path, path); rename_err != nil {
-		log.errorf("failed to rename %v -> %v: %v", tmp_path, path, rename_err, location=loc)
-		os.remove(tmp_path)
+		log.errorf("failed to rename %v -> %v: %v; new data preserved at %v", tmp_path, path, rename_err, tmp_path, location=loc)
 		return false
 	}
 	return true

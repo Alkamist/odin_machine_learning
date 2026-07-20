@@ -137,6 +137,56 @@ destroy :: proc(tok: Tokenizer) {
 
 @(require_results)
 encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator, loc := #caller_location) -> (result: []int, ok: bool) #optional_ok {
+	ids: [dynamic]int
+	ids.allocator = allocator
+
+	ok = true
+	cursor := 0
+	for cursor < len(text) {
+		match_content: string
+		match_id := -1
+		for content, id in tok.added_tokens {
+			if len(content) == 0 {
+				continue
+			}
+			if cursor + len(content) > len(text) {
+				continue
+			}
+			if text[cursor:cursor + len(content)] != content {
+				continue
+			}
+			if len(content) > len(match_content) {
+				match_content = content
+				match_id      = id
+			}
+		}
+		if match_id >= 0 {
+			append(&ids, match_id)
+			cursor += len(match_content)
+			continue
+		}
+
+		next_special := len(text)
+		for content in tok.added_tokens {
+			if len(content) == 0 {
+				continue
+			}
+			index := strings.index(text[cursor:], content)
+			if index >= 0 && cursor + index < next_special {
+				next_special = cursor + index
+			}
+		}
+
+		if !_encode_text_segment(tok, text[cursor:next_special], &ids, loc=loc) {
+			ok = false
+		}
+		cursor = next_special
+	}
+
+	return ids[:], ok
+}
+
+_encode_text_segment :: proc(tok: ^Tokenizer, text: string, ids: ^[dynamic]int, loc := #caller_location) -> bool {
 	pretokens: [dynamic]string
 	pretokens.allocator = context.temp_allocator
 	_pretokenize(text, &pretokens)
@@ -150,9 +200,6 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator, lo
 	merge_buffer: [dynamic]string
 	merge_buffer.allocator = context.temp_allocator
 
-	ids: [dynamic]int
-	ids.allocator = allocator
-
 	for pretoken in pretokens {
 		clear(&encoded_buffer)
 		for byte_value in transmute([]u8)pretoken {
@@ -164,7 +211,7 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator, lo
 		encoded := string(encoded_buffer[:])
 
 		if id, present := tok.vocab[encoded]; present {
-			append(&ids, id)
+			append(ids, id)
 			continue
 		}
 
@@ -181,13 +228,13 @@ encode :: proc(tok: ^Tokenizer, text: string, allocator := context.allocator, lo
 			id, present := tok.vocab[symbol]
 			if !present {
 				log.errorf("symbol %q not in vocab (pretoken=%q)", symbol, pretoken, location=loc)
-				return ids[:], false
+				return false
 			}
-			append(&ids, id)
+			append(ids, id)
 		}
 	}
 
-	return ids[:], true
+	return true
 }
 
 @(require_results)
@@ -246,9 +293,9 @@ _pretokenize :: proc(text: string, out: ^[dynamic]string) {
 	chunk_start := 0
 	for offset := 0; offset < len(text); {
 		rune_value, rune_size := utf8.decode_rune_in_string(text[offset:])
-		if unicode.is_digit(rune_value) {
+		if unicode.is_number(rune_value) {
 			if offset > chunk_start {
-				_gpt2_split(text[chunk_start:offset], out)
+				_byte_level_split(text[chunk_start:offset], out)
 			}
 			append(out, text[offset:offset + rune_size])
 			offset += rune_size
@@ -258,11 +305,11 @@ _pretokenize :: proc(text: string, out: ^[dynamic]string) {
 		}
 	}
 	if chunk_start < len(text) {
-		_gpt2_split(text[chunk_start:], out)
+		_byte_level_split(text[chunk_start:], out)
 	}
 }
 
-_gpt2_split :: proc(text: string, out: ^[dynamic]string) {
+_byte_level_split :: proc(text: string, out: ^[dynamic]string) {
 	offset := 0
 	for offset < len(text) {
 		match_length := _match_one(text, offset)

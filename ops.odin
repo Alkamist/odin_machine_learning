@@ -176,6 +176,8 @@ attention_with_cache :: proc(
 	assert(n_q_heads % kv_heads == 0, "n_q_heads must be a multiple of n_kv_heads", loc=loc)
 
 	assert(query.type == value.type, "attention_with_cache Q/V must share dtype", loc=loc)
+	assert(key.type == query.type, "attention_with_cache K must share dtype with Q/V", loc=loc)
+	assert(key.type == k_cache.type, "attention_with_cache key dtype must match k_cache", loc=loc)
 	assert(k_cache.type == v_cache.type, "attention_with_cache k_cache/v_cache must share dtype", loc=loc)
 	assert(query.type == .F32 || query.type == .Bf16, "attention_with_cache requires F32 or Bf16 activations", loc=loc)
 
@@ -543,6 +545,7 @@ select :: proc{_select_tensor, _select_ints}
 @(require_results)
 _select_tensor :: proc(input: Tensor, indices: Tensor, loc := #caller_location) -> (output: Tensor) {
 	assert(input.rank >= 1, "select input must have rank >= 1", loc=loc)
+	assert(input.type != .Q4_K && input.type != .Q6_K, "select does not support quantized input; dequantize first", loc=loc)
 	assert(indices.type == .I32, "select indices must be an I32 tensor", loc=loc)
 	assert(indices.rank == 1, "select indices must be rank-1", loc=loc)
 	assert(len(indices) > 0, "select requires at least one index", loc=loc)

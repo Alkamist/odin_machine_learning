@@ -121,6 +121,7 @@ optimizer_step :: proc(opt: ^Optimizer) -> bool {
 }
 
 update :: proc(opt: ^Optimizer, t: Tensor, loc := #caller_location) {
+	assert(opt.iteration > 0, "update called before optimizer_step; gate updates with `if optimizer_step(&opt) { ... }`", loc=loc)
 	state := _optimizer_state(opt, t, loc)
 	t.backend.update(opt^, t, state.m, state.v, loc)
 }

@@ -62,6 +62,10 @@ buffer_free :: proc(buffer: ml.Backend_Buffer, loc: runtime.Source_Code_Location
 
 	gctx := _gctx(loc)
 
+	if gctx.auto_capturing {
+		_auto_graph_finish(gctx, loc)
+	}
+
 	for ptr, i in gctx.persistent {
 		if ptr == gb.ptr {
 			cuda.check(cuda.StreamSynchronize(gctx.stream), loc=loc)

@@ -292,6 +292,15 @@ context_destroy :: proc(ctx: ^ml.Context, allocator := context.allocator, loc :=
 
 	gctx := cast(^Context)ctx
 
+	if gctx.auto_capturing {
+		ended: cuda.Graph
+		cuda.StreamEndCapture(gctx.stream, &ended)
+		gctx.auto_capturing = false
+		if ended != nil {
+			cuda.GraphDestroy(ended)
+		}
+	}
+
 	if gctx.stream != nil {
 		cuda.check(cuda.StreamSynchronize(gctx.stream))
 	}
@@ -410,6 +419,8 @@ enable_decode_graph :: proc(enabled: bool, loc := #caller_location) {
 	if enabled {
 		fmt.assertf(!gctx.timing_enabled, "cannot combine with enable_timing", loc=loc)
 		fmt.assertf(!gctx.graph_capturing, "explicit graph capture in progress", loc=loc)
+	} else if gctx.auto_capturing {
+		_auto_graph_finish(gctx, loc)
 	}
 	gctx.auto_graph_enabled = enabled
 }

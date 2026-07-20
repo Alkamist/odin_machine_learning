@@ -7,6 +7,7 @@ import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
 import "core:math"
+import "core:simd"
 import "core:sync"
 import "core:thread"
 

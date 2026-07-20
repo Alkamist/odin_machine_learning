@@ -875,17 +875,12 @@ _add_rmsnorm_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location
 	c   := i32(count); s := i32(size); eps := v.eps
 	args := [?]rawptr{&ap, &bp, &wp, &rp, &yp, &c, &s, &eps}
 
-	#partial switch a.type {
-	case .Bf16:
-		opts := [?]cstring{"-DDTYPE_BF16"}
-		_add_rmsnorm_bf16_pipeline := _compile_pipeline(ADD_RMSNORM_SRC, "add_rmsnorm_bf16.cu", "add_rmsnorm_bf16", opts[:])
-		_dispatch(_add_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case .F32:
-		_add_rmsnorm_f32_pipeline := _compile_pipeline(ADD_RMSNORM_SRC, "add_rmsnorm_f32.cu", "add_rmsnorm_f32")
-		_dispatch(_add_rmsnorm_f32_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", a.type, loc=loc)
-	}
+	fmt.assertf(a.type == .Bf16, "add_rmsnorm requires Bf16 input (got %v)", a.type, loc=loc)
+	fmt.assertf(v.weight.type == .Bf16, "add_rmsnorm requires Bf16 weight (got %v)", v.weight.type, loc=loc)
+
+	opts := [?]cstring{"-DDTYPE_BF16"}
+	_add_rmsnorm_bf16_pipeline := _compile_pipeline(ADD_RMSNORM_SRC, "add_rmsnorm_bf16.cu", "add_rmsnorm_bf16", opts[:])
+	_dispatch(_add_rmsnorm_bf16_pipeline, u32(count), 1, 1, 256, 1, 1, 0, args[:], loc)
 }
 
 _rmsnorm_rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -906,17 +901,12 @@ _rmsnorm_rope_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Locatio
 	pos_dev := gctx.position_dev; rpc := i32(v.rotate_pair_count)
 	args := [?]rawptr{&xp, &wp, &yp, &tc, &hc, &hs, &eps, &base, &pos_dev, &rpc}
 
-	#partial switch x.type {
-	case .Bf16:
-		opts := [?]cstring{"-DDTYPE_BF16"}
-		_rmsnorm_rope_bf16_pipeline := _compile_pipeline(RMSNORM_ROPE_SRC, "rmsnorm_rope_bf16.cu", "rmsnorm_rope_bf16", opts[:])
-		_dispatch(_rmsnorm_rope_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
-	case .F32:
-		_rmsnorm_rope_f32_pipeline := _compile_pipeline(RMSNORM_ROPE_SRC, "rmsnorm_rope_f32.cu", "rmsnorm_rope_f32")
-		_dispatch(_rmsnorm_rope_f32_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
-	case:
-		fmt.panicf("unsupported dtype %v", x.type, loc=loc)
-	}
+	fmt.assertf(x.type == .Bf16, "rmsnorm_rope requires Bf16 input (got %v)", x.type, loc=loc)
+	fmt.assertf(v.weight.type == .Bf16, "rmsnorm_rope requires Bf16 weight (got %v)", v.weight.type, loc=loc)
+
+	opts := [?]cstring{"-DDTYPE_BF16"}
+	_rmsnorm_rope_bf16_pipeline := _compile_pipeline(RMSNORM_ROPE_SRC, "rmsnorm_rope_bf16.cu", "rmsnorm_rope_bf16", opts[:])
+	_dispatch(_rmsnorm_rope_bf16_pipeline, u32(token_count * v.head_count), 1, 1, 128, 1, 1, 0, args[:], loc)
 }
 
 _rmsnorm_rope_write_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Location) {
@@ -1292,6 +1282,7 @@ _attention_cache_forward :: proc(op: ml.Operation, loc: runtime.Source_Code_Loca
 		_attention_cache_vec_bf16_d512_pipeline := _compile_pipeline(ATTENTION_CACHE_VEC_BF16_SRC, "attention_cache_vec_bf16_d512.cu", "attention_cache_vec_bf16", opts[:])
 		_dispatch(_attention_cache_vec_bf16_d512_pipeline, u32(v.n_q_heads), u32(token_count), 1, 32, 4, 1, 0, args[:], loc)
 	case:
+		fmt.assertf(head_size < 8 || head_size % 8 == 0, "attention_with_cache fallback kernel does uint4 K loads requiring head_size %% 8 == 0 when head_size >= 8 (got %v)", head_size, loc=loc)
 		_attention_cache_bf16_pipeline := _compile_pipeline(ATTENTION_CACHE_BF16_SRC, "attention_cache_bf16.cu", "attention_cache_bf16")
 		_dispatch(_attention_cache_bf16_pipeline, u32(v.n_q_heads), u32(token_count), 1, 64, 1, 1, 0, args[:], loc)
 	}
