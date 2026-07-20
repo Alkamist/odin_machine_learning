@@ -150,6 +150,7 @@ Operation :: struct {
 }
 
 _record_forward :: proc(op: Operation, loc := #caller_location) {
+	assert(_current_ctx.pass_open, "no open pass; scope work with ml.pass(...) or call ml.clear(...) first", loc=loc)
 	assert(_current_ctx.operation_count < MAX_OPERATIONS, "maximum operations exceeded; call clear to reset", loc=loc)
 	slot := &_current_ctx.operations[_current_ctx.operation_count]
 	slot^ = op

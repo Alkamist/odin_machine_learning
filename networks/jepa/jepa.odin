@@ -106,7 +106,7 @@ train_decoder_step :: proc(jepa: Jepa, states: []f32, count: int, loc := #caller
 	c := jepa.config
 	assert(len(states) == count * c.state_size, "states length mismatch", loc=loc)
 
-	ml.clear()
+	ml.pass()
 	target_latents := encode_target(jepa, ml.tensor(states, []int{count, c.state_size}))
 	latent_data    := builtin.make([]f32, count * c.latent_size, allocator=context.temp_allocator)
 	ml.get_data(target_latents, latent_data)
@@ -114,7 +114,7 @@ train_decoder_step :: proc(jepa: Jepa, states: []f32, count: int, loc := #caller
 		_normalize_rows(latent_data, count, c.latent_size)
 	}
 
-	ml.clear(training=true)
+	ml.pass(training=true)
 	decoded := decode(jepa, ml.tensor(latent_data, []int{count, c.latent_size}))
 	loss_t  := ml.mean(ml.mean_squared_error(decoded, ml.tensor(states)))
 	ml.backward(loss_t, loc=loc)
@@ -173,7 +173,7 @@ plan :: proc(jepa: Jepa, planner: Planner_Config, state: []f32, reward: proc(sta
 	assert(n > 0 && h > 0 && planner.iterations > 0 && planner.action_repeat > 0, "planner config values must be positive", loc=loc)
 	assert(planner.elite_count > 0 && planner.elite_count <= n, "elite_count must be in [1, sequence_count]", loc=loc)
 
-	ml.clear()
+	ml.pass()
 	start := encode(jepa, ml.tensor(state, []int{1, c.state_size}))
 	start_data := builtin.make([]f32, l, allocator=context.temp_allocator)
 	ml.get_data(start, start_data)
@@ -207,7 +207,7 @@ plan :: proc(jepa: Jepa, planner: Planner_Config, state: []f32, reward: proc(sta
 			cost = 0
 		}
 
-		ml.clear()
+		ml.pass()
 		z := ml.tensor(tiled_start, []int{n, l})
 
 		for t in 0 ..< h {
@@ -357,7 +357,7 @@ train_step :: proc(jepa: Jepa, batch: Batch, loc := #caller_location) -> (metric
 	assert(len(batch.actions) == k * b * c.action_size, "actions length mismatch", loc=loc)
 	assert(len(batch.next_states) == k * b * c.state_size, "next_states length mismatch", loc=loc)
 
-	ml.clear()
+	ml.pass()
 	target_latents := encode_target(jepa, ml.tensor(batch.next_states, []int{k * b, c.state_size}))
 	target_data    := builtin.make([]f32, k * b * c.latent_size, allocator=context.temp_allocator)
 	ml.get_data(target_latents, target_data)
@@ -365,7 +365,7 @@ train_step :: proc(jepa: Jepa, batch: Batch, loc := #caller_location) -> (metric
 		_normalize_rows(target_data, k * b, c.latent_size)
 	}
 
-	ml.clear(training=true)
+	ml.pass(training=true)
 
 	latents := encode(jepa, ml.tensor(batch.states, []int{b, c.state_size}))
 

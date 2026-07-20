@@ -330,7 +330,7 @@ _policy_action :: proc(a: ^Agent, sensor: Sensor) -> int {
 		input[i] = sensor[i]
 	}
 
-	ml.clear()
+	ml.pass()
 
 	x      := ml.tensor(input, []int{1, SENSOR_SIZE})
 	output := mlp.forward(a.policy, x)
@@ -375,7 +375,7 @@ _train_value :: proc(a: ^Agent) {
 		target_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
 	}
 
-	ml.clear()
+	ml.pass()
 	{
 		successor_tensor := ml.tensor(successors, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
 		ml.get_data(ml.softmax(mlp.forward(a.policy, successor_tensor)), probabilities)
@@ -407,7 +407,7 @@ _train_value :: proc(a: ^Agent) {
 		gather[b] = b * ACTION_COUNT + actions[b]
 	}
 
-	ml.clear(training=true)
+	ml.pass(training=true)
 
 	x        := ml.tensor(states,  []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
 	y        := ml.tensor(targets, []int{TRAIN_BATCH_SIZE})
@@ -458,7 +458,7 @@ _train_policy :: proc(a: ^Agent) {
 		online_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
 	}
 
-	ml.clear()
+	ml.pass()
 	{
 		state_tensor := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
 		for v in 0 ..< VALUE_ENSEMBLE {
@@ -474,7 +474,7 @@ _train_policy :: proc(a: ^Agent) {
 		neg_q[idx] = -q
 	}
 
-	ml.clear(training=true)
+	ml.pass(training=true)
 
 	x             := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
 	neg_q_tensor  := ml.tensor(neg_q,  []int{TRAIN_BATCH_SIZE, ACTION_COUNT})
@@ -526,7 +526,7 @@ _train :: proc(a: ^Agent) {
 	inputs  := builtin.make([]f32, TRAIN_BATCH_SIZE * MODEL_INPUT, context.temp_allocator)
 	targets := builtin.make([]f32, TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
 
-	ml.clear(training=true)
+	ml.pass(training=true)
 
 	total: ml.Tensor
 
@@ -633,7 +633,7 @@ _policy_seed :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int) 
 	}
 
 	for h in 0 ..< PLAN_HORIZON {
-		ml.clear()
+		ml.pass()
 
 		for p in 0 ..< count {
 			for i in 0 ..< SENSOR_SIZE {
@@ -704,7 +704,7 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 	discount := f32(1)
 
 	for h in 0 ..< PLAN_HORIZON {
-		ml.clear()
+		ml.pass()
 
 		for m in 0 ..< ENSEMBLE_SIZE {
 			for n in 0 ..< PLAN_SAMPLES {
@@ -736,7 +736,7 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 		discount *= PLAN_DISCOUNT
 	}
 
-	ml.clear()
+	ml.pass()
 
 	terminal_states := builtin.make([]f32, PARTICLES * SENSOR_SIZE,  context.temp_allocator)
 	terminal_probs  := builtin.make([]f32, PARTICLES * ACTION_COUNT, context.temp_allocator)

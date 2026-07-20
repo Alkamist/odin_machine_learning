@@ -110,14 +110,14 @@ model_forward :: proc(model: Model, input: []f32, batch_size: int) -> ml.Tensor 
 model_predict :: proc(model: Model, input: []f32, predictions: []int) {
 	count := len(predictions)
 
-	ml.clear()
+	ml.pass()
 
 	logits := model_forward(model, input, count)
 	ml.argmax(logits, predictions)
 }
 
 model_learn :: proc(model: ^Model, input: []f32, targets: []int) {
-	ml.clear(training=true)
+	ml.pass(training=true)
 
 	logits := model_forward(model^, input, len(targets))
 	loss   := ml.mean(ml.cross_entropy(logits, targets))

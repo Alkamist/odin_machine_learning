@@ -113,7 +113,8 @@ Context :: struct {
 	operation_count: int,
 	operations:      [MAX_OPERATIONS]Operation,
 
-	training: bool,
+	training:  bool,
+	pass_open: bool,
 
 	owner_thread_id: int,
 
@@ -126,8 +127,9 @@ _current_ctx: ^Context
 _context_init :: proc(ctx: ^Context, backend: ^Backend, allocator: mem.Allocator, loc: runtime.Source_Code_Location) {
 	_assert_operation_variant_order()
 
-	ctx.backend  = backend
-	ctx.training = true
+	ctx.backend   = backend
+	ctx.training  = true
+	ctx.pass_open = true
 
 	op_arena_buf, op_arena_err := builtin.make([]byte, OPERATION_ARENA_DEFAULT_SIZE, allocator=allocator, loc=loc)
 	assert(op_arena_err == nil, "failed to allocate op-metadata arena", loc=loc)
@@ -172,11 +174,22 @@ current_context :: #force_inline proc(loc := #caller_location) -> ^Context {
 clear :: proc(training := false, loc := #caller_location) {
 	assert(_current_ctx != nil, "no active context", loc=loc)
 
-	_current_ctx.training = training
+	_current_ctx.training  = training
+	_current_ctx.pass_open = true
 	_current_ctx.backend.clear(loc)
 
 	mem.arena_free_all(&_current_ctx.op_arena)
 	_current_ctx.operation_count = 0
+}
+
+_pass_end :: proc(ctx: ^Context) {
+	ctx.pass_open = false
+}
+
+@(deferred_out=_pass_end)
+pass :: proc(training := false, loc := #caller_location) -> ^Context {
+	clear(training=training, loc=loc)
+	return _current_ctx
 }
 
 @(require_results)
