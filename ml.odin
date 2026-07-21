@@ -1,7 +1,6 @@
 package machine_learning
 
 import "base:builtin"
-import "base:intrinsics"
 import "base:runtime"
 
 import "core:fmt"

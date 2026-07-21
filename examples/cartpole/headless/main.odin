@@ -42,7 +42,7 @@ main :: proc() {
 	sim.init(&game)
 	defer sim.destroy(&game)
 
-	brain := agent.make(sim.reward)
+	brain := agent.make(sim.reward, sim.ANGLE_PAIRS)
 	agent.boot(brain)
 	defer agent.destroy(brain)
 	defer agent.shutdown(brain)
@@ -65,9 +65,10 @@ main :: proc() {
 		agent.drive(brain, sim_time, sim.observe(game), action, episode)
 
 		if done {
-			duration    := game.time
-			score       := game.score
-			wall_elapsed := time.duration_seconds(time.tick_diff(start_tick, time.tick_now()))
+			duration       := game.time
+			score          := game.score
+			wall_elapsed   := time.duration_seconds(time.tick_diff(start_tick, time.tick_now()))
+			value_fit, _   := agent.value_fit(brain)
 
 			append(&scores, score)
 			if score > best_score {
@@ -75,12 +76,13 @@ main :: proc() {
 			}
 
 			fmt.printfln(
-				"episode %d | score %.2f | sim %.1fs | decisions %d | agreement %.0f%% | wall %.1fs | speedup %.1fx",
+				"episode %d | score %.2f | sim %.1fs | decisions %d | policy match %.0f%% | value fit %.2f | wall %.1fs | speedup %.1fx",
 				episode,
 				score,
 				duration,
 				agent.decisions(brain),
-				agent.agreement(brain) * 100,
+				agent.policy_match(brain) * 100,
+				value_fit,
 				wall_elapsed,
 				sim_time / max(wall_elapsed, 1e-9),
 			)
@@ -105,7 +107,10 @@ main :: proc() {
 	fmt.printfln("episodes         %d", len(scores))
 	fmt.printfln("best score       %.2f", best_score)
 	fmt.printfln("mean last 10     %.2f", recent_mean)
+	final_fit, fit_samples := agent.value_fit(brain)
+
 	fmt.printfln("total decisions  %d", agent.decisions(brain))
-	fmt.printfln("final agreement  %.0f%%", agent.agreement(brain) * 100)
+	fmt.printfln("final match      %.0f%%", agent.policy_match(brain) * 100)
+	fmt.printfln("value fit        %.2f (%d samples)", final_fit, fit_samples)
 	fmt.printfln("overall speedup  %.1fx", sim_time / max(wall_elapsed, 1e-9))
 }

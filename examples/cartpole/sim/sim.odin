@@ -4,6 +4,8 @@ import "core:math"
 
 import b2 "vendor:box2d"
 
+import "../agent"
+
 FIXED_DELTA :: 1.0 / 60.0
 
 PIXELS_PER_METER :: 24
@@ -19,6 +21,11 @@ WALL_SIZE  :: [2]f32{ 10, 1000}
 MOUSE_RADIUS :: 20.0
 
 OBS_SIZE :: 5
+
+OBS_POLE_SIN :: 2
+OBS_POLE_COS :: 3
+
+ANGLE_PAIRS :: []agent.Angle_Pair{{sin=OBS_POLE_SIN, cos=OBS_POLE_COS}}
 
 X_SCALE :: f32(CART_LIMIT)
 V_SCALE :: f32(CART_SPEED)
@@ -325,15 +332,15 @@ observe :: proc(state: State) -> (sensor: Observation) {
 
 	sensor[0] = position / X_SCALE
 	sensor[1] = velocity / V_SCALE
-	sensor[2] = math.sin(angle)
-	sensor[3] = math.cos(angle)
-	sensor[4] = spin / W_SCALE
+	sensor[OBS_POLE_SIN] = math.sin(angle)
+	sensor[OBS_POLE_COS] = math.cos(angle)
+	sensor[4]            = spin / W_SCALE
 	return
 }
 
 @(require_results)
 reward :: proc(sensor: Observation) -> (reward: f32, dead: bool) {
-	cos_angle := sensor[3]
+	cos_angle := sensor[OBS_POLE_COS]
 	spin      := sensor[4] * W_SCALE
 
 	upright := -cos_angle

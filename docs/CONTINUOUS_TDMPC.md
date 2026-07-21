@@ -200,3 +200,28 @@ object the retention thesis is about. The clean next step when Q should re-enter
 is the trust-aware bootstrap — scale `BOOTSTRAP_WEIGHT` by ensemble agreement — rather
 than the current all-or-nothing constant, so a from-scratch or corrupted Q degrades
 gracefully to the pure-reward planner instead of poisoning it.
+
+## Follow-up (2026-07-21): Q verified, sensor layout parameterized
+
+Three cleanups, all behavior-preserving (headless seed 1 scores are unchanged to the
+decimal), taken before starting game B:
+
+- **Q is no longer unmeasured.** Because `BOOTSTRAP_WEIGHT` is 0 and the policy is
+  behavior-cloned, nothing downstream depended on the critic, so nothing would have
+  noticed it rotting. `agent.value_fit` walks the buffer in chronological order (episode
+  boundaries detected by `s + Δ ≈ s'`), accumulates the observed discounted return over a
+  150-step window (`γ^150 ≈ 0.05`, terminating early on `dead` with the same
+  `-DEATH_PENALTY` the critic is trained against), and reports the Pearson correlation
+  against `min_i Q_i(s, a)`. Measured: **0.76 after one episode, 0.84-0.87 thereafter**.
+  Q was in fact learning a sensible function the whole time; it was simply unread. The
+  learning check now asserts fit ≥ 0.5, so the trust-aware bootstrap will be debugging one
+  new thing rather than two.
+- **The sin/cos renormalization is now data, not code.** `_apply_delta`'s hardcoded
+  `state[2]/state[3]` wart is replaced by `[]Angle_Pair` passed to `agent.make` and copied
+  into a fixed `MAX_ANGLE_PAIRS` array, with bounds asserted at construction. Cartpole
+  declares its own layout in `sim.ANGLE_PAIRS`. This was the item blocking a second game
+  sharing the observation space.
+- **The two "agreement" signals are disambiguated.** The exposed one was planner↔policy
+  action match, which saturates at 100% by episode 2 and is not a trust signal; it is now
+  `policy_match`. The name `agreement` is left free for the ensemble-disagreement quantity
+  in `_rollout`, which is what the trust-aware bootstrap will actually consume.

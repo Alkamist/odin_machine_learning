@@ -55,8 +55,14 @@ TRAIN_STEPS      :: 24
 TRAIN_BACKLOG    :: TRAIN_STEPS * 2
 LEARNING_RATE    :: 3e-3
 
-POLICY_RATE    :: 1e-3
-AGREEMENT_RATE :: f32(0.01)
+POLICY_RATE       :: 1e-3
+POLICY_MATCH_RATE :: f32(0.01)
+
+VALUE_FIT_HORIZON :: 150
+VALUE_FIT_SAMPLES :: 512
+VALUE_FIT_EPSILON :: f32(1e-3)
+
+MAX_ANGLE_PAIRS :: 4
 
 WARMUP_DECISIONS :: 24
 
@@ -67,6 +73,11 @@ REFINE_INTERVAL      :: TRAIN_STEPS / REFINES_PER_DECISION
 CONTEXT_SIZE :: 1024 * 1024 * 256
 
 Sensor :: [SENSOR_SIZE]f32
+
+Angle_Pair :: struct {
+	sin: int,
+	cos: int,
+}
 
 Transition :: struct {
 	sensor:  Sensor,
@@ -94,16 +105,19 @@ Plan_Step :: struct {
 Agent :: struct {
 	reward: Reward_Proc,
 
+	angle_pairs:      [MAX_ANGLE_PAIRS]Angle_Pair,
+	angle_pair_count: int,
+
 	worker:  ^thread.Thread,
 	running: bool,
 
 	mailbox_mutex: sync.Mutex,
 	mailbox:       Snapshot,
 
-	action_mutex:   sync.Mutex,
-	latch:          Action,
-	decisions:      int,
-	agreement_bits: u32,
+	action_mutex:      sync.Mutex,
+	latch:             Action,
+	decisions:         int,
+	policy_match_bits: u32,
 
 	models: [ENSEMBLE_SIZE]mlp.Mlp,
 	opts:   [ENSEMBLE_SIZE]ml.Optimizer,
@@ -119,7 +133,7 @@ Agent :: struct {
 	buffer_count: int,
 	buffer_next:  int,
 
-	agreement: f32,
+	policy_match: f32,
 
 	delta_mean:    Sensor,
 	delta_sq_mean: Sensor,
@@ -136,9 +150,19 @@ Agent :: struct {
 	refine_budget:      int,
 }
 
-make :: proc(reward: Reward_Proc, allocator := context.allocator) -> (a: ^Agent) {
+make :: proc(reward: Reward_Proc, angle_pairs: []Angle_Pair, allocator := context.allocator, loc := #caller_location) -> (a: ^Agent) {
+	assert(len(angle_pairs) <= MAX_ANGLE_PAIRS, "sensor layout declares more angle pairs than MAX_ANGLE_PAIRS", loc)
+
 	a = new(Agent, allocator)
-	a.reward = reward
+	a.reward           = reward
+	a.angle_pair_count = len(angle_pairs)
+
+	for pair, index in angle_pairs {
+		assert(pair.sin >= 0 && pair.sin < SENSOR_SIZE, "angle pair sin index outside the sensor", loc)
+		assert(pair.cos >= 0 && pair.cos < SENSOR_SIZE, "angle pair cos index outside the sensor", loc)
+		assert(pair.sin != pair.cos, "angle pair sin and cos index are the same channel", loc)
+		a.angle_pairs[index] = pair
+	}
 	return
 }
 
@@ -176,8 +200,8 @@ decisions :: proc(a: ^Agent) -> int {
 }
 
 @(require_results)
-agreement :: proc(a: ^Agent) -> f32 {
-	return transmute(f32)sync.atomic_load(&a.agreement_bits)
+policy_match :: proc(a: ^Agent) -> f32 {
+	return transmute(f32)sync.atomic_load(&a.policy_match_bits)
 }
 
 boot :: proc(a: ^Agent) {
@@ -337,8 +361,8 @@ _decide :: proc(a: ^Agent, snapshot: Snapshot) {
 				match = 0
 			}
 		}
-		a.agreement += (match - a.agreement) * AGREEMENT_RATE
-		sync.atomic_store(&a.agreement_bits, transmute(u32)a.agreement)
+		a.policy_match += (match - a.policy_match) * POLICY_MATCH_RATE
+		sync.atomic_store(&a.policy_match_bits, transmute(u32)a.policy_match)
 	}
 
 	sync.mutex_lock(&a.action_mutex)
@@ -536,6 +560,127 @@ _train_value :: proc(a: ^Agent) {
 			}
 		}
 	}
+}
+
+@(require_results)
+_buffer_index :: proc(a: ^Agent, position: int) -> int {
+	return (a.buffer_next - a.buffer_count + position + BUFFER_CAPACITY) % BUFFER_CAPACITY
+}
+
+@(require_results)
+_continues :: proc(previous, next: Transition) -> bool {
+	for i in 0 ..< SENSOR_SIZE {
+		if abs(previous.sensor[i] + previous.delta[i] - next.sensor[i]) > VALUE_FIT_EPSILON {
+			return false
+		}
+	}
+	return true
+}
+
+@(require_results)
+_observed_return :: proc(a: ^Agent, position: int) -> (observed: f32, ok: bool) {
+	discount := f32(1)
+	cursor   := position
+
+	for _ in 0 ..< VALUE_FIT_HORIZON {
+		transition := a.buffer[_buffer_index(a, cursor)]
+		observed   += discount * transition.reward
+
+		if transition.dead {
+			observed -= discount * DEATH_PENALTY
+			return observed, true
+		}
+
+		discount *= PLAN_DISCOUNT
+		cursor   += 1
+
+		if cursor >= a.buffer_count {
+			return 0, false
+		}
+		if !_continues(transition, a.buffer[_buffer_index(a, cursor)]) {
+			return 0, false
+		}
+	}
+
+	return observed, true
+}
+
+@(require_results)
+_correlation :: proc(x, y: []f32) -> f32 {
+	count := f32(len(x))
+
+	mean_x, mean_y: f32
+	for i in 0 ..< len(x) {
+		mean_x += x[i] / count
+		mean_y += y[i] / count
+	}
+
+	covariance, variance_x, variance_y: f32
+	for i in 0 ..< len(x) {
+		difference_x := x[i] - mean_x
+		difference_y := y[i] - mean_y
+
+		covariance += difference_x * difference_y
+		variance_x += difference_x * difference_x
+		variance_y += difference_y * difference_y
+	}
+
+	spread := math.sqrt(variance_x * variance_y)
+	if spread < 1e-12 {
+		return 0
+	}
+	return covariance / spread
+}
+
+@(require_results)
+value_fit :: proc(a: ^Agent) -> (correlation: f32, samples: int) {
+	CRITIC_INPUT :: SENSOR_SIZE + ACTION_DIM
+
+	stride := max((a.buffer_count + VALUE_FIT_SAMPLES - 1) / VALUE_FIT_SAMPLES, 1)
+
+	inputs  := builtin.make([]f32, VALUE_FIT_SAMPLES * CRITIC_INPUT, context.temp_allocator)
+	returns := builtin.make([]f32, VALUE_FIT_SAMPLES,                context.temp_allocator)
+
+	for position := 0; position < a.buffer_count && samples < VALUE_FIT_SAMPLES; position += stride {
+		observed, complete := _observed_return(a, position)
+		if !complete {
+			continue
+		}
+
+		transition := a.buffer[_buffer_index(a, position)]
+		_encode(transition.sensor, transition.action, inputs[samples * CRITIC_INPUT:][:CRITIC_INPUT])
+		returns[samples] = observed
+		samples += 1
+	}
+
+	if samples < 2 {
+		samples = 0
+		return
+	}
+
+	estimates: [VALUE_ENSEMBLE][]f32
+	for v in 0 ..< VALUE_ENSEMBLE {
+		estimates[v] = builtin.make([]f32, samples, context.temp_allocator)
+	}
+
+	if ml.pass() {
+		x := ml.tensor(inputs[:samples * CRITIC_INPUT], []int{samples, CRITIC_INPUT})
+		for v in 0 ..< VALUE_ENSEMBLE {
+			ml.get_data(mlp.forward(a.values[v], x), estimates[v])
+		}
+	}
+
+	predictions := builtin.make([]f32, samples, context.temp_allocator)
+	for s in 0 ..< samples {
+		q := estimates[0][s]
+		for v in 1 ..< VALUE_ENSEMBLE {
+			q = min(q, estimates[v][s])
+		}
+		predictions[s] = q
+	}
+
+	correlation = _correlation(predictions, returns[:samples])
+	return
 }
 
 _train_policy :: proc(a: ^Agent) {
@@ -789,10 +934,13 @@ _apply_delta :: proc(a: ^Agent, state: ^Sensor, deltas: []f32) {
 		state[i] += deltas[i] * _delta_deviation(a, i) + a.delta_mean[i]
 	}
 
-	length := math.sqrt(state[2] * state[2] + state[3] * state[3])
-	if length > 1e-4 {
-		state[2] /= length
-		state[3] /= length
+	for index in 0 ..< a.angle_pair_count {
+		pair   := a.angle_pairs[index]
+		length := math.sqrt(state[pair.sin] * state[pair.sin] + state[pair.cos] * state[pair.cos])
+		if length > 1e-4 {
+			state[pair.sin] /= length
+			state[pair.cos] /= length
+		}
 	}
 }
 

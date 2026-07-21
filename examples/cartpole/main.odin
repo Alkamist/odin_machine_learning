@@ -14,7 +14,7 @@ main :: proc() {
 	sim.init(&game_state)
 	defer sim.destroy(&game_state)
 
-	brain := agent.make(sim.reward)
+	brain := agent.make(sim.reward, sim.ANGLE_PAIRS)
 	defer agent.destroy(brain)
 	agent.start(brain)
 	defer agent.stop(brain)
@@ -87,7 +87,7 @@ main :: proc() {
 		}
 
 		draw(game_state, timestep.interpolation)
-		draw_status(human, agent.decisions(brain), agent.agreement(brain))
+		draw_status(human, agent.decisions(brain), agent.policy_match(brain))
 
 		frame_end()
 	}
