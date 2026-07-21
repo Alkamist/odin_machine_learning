@@ -1,4 +1,4 @@
-package learner_tests
+package cartpole_tests
 
 import "core:fmt"
 import "core:math/rand"
@@ -6,12 +6,11 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 
-import ml  "../../../"
-import cpu "../../../backends/cpu"
+import ml  "../../../../"
+import cpu "../../../../backends/cpu"
 
-import "../agent"
-import "../cartpole"
-import "../world"
+import          "../../agent"
+import cartpole ".."
 
 CONTEXT_SIZE :: 1024 * 1024 * 256
 
@@ -85,7 +84,7 @@ _run_seed :: proc(run: ^Seed_Run) {
 
 	for {
 		action  := agent.act(brain)
-		control := action[world.ACTION_AXIS_X]
+		control := action[agent.ACTION_AXIS_X]
 		done    := cartpole.step(&game, control, cartpole.FIXED_DELTA)
 
 		sim_time += f64(cartpole.FIXED_DELTA)

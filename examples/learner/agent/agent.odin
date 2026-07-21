@@ -13,17 +13,35 @@ import ml  "../../../"
 import     "../../../networks/mlp"
 import cpu "../../../backends/cpu"
 
-import "../world"
+SENSOR_SIZE :: 8
 
-SENSOR_SIZE  :: world.SENSOR_SIZE
-BINARY_COUNT :: world.BINARY_COUNT
-ANALOG_COUNT :: world.ANALOG_COUNT
-ACTION_DIM   :: world.ACTION_DIM
+SENSOR_X          :: 0
+SENSOR_Y          :: 1
+SENSOR_VELOCITY_X :: 2
+SENSOR_VELOCITY_Y :: 3
+SENSOR_ANGLE_SIN  :: 4
+SENSOR_ANGLE_COS  :: 5
+SENSOR_SPIN       :: 6
+SENSOR_CONTACT    :: 7
 
-Sensor :: world.Sensor
-Action :: world.Action
+BINARY_COUNT :: 0
+ANALOG_COUNT :: 2
+ACTION_DIM   :: BINARY_COUNT + ANALOG_COUNT
 
-Reward_Proc :: world.Reward_Proc
+ACTION_AXIS_X :: 0
+ACTION_AXIS_Y :: 1
+
+Sensor :: [SENSOR_SIZE]f32
+Action :: [ACTION_DIM]f32
+
+Angle_Pair :: struct {
+	sin: int,
+	cos: int,
+}
+
+ANGLE_PAIRS :: []Angle_Pair{{sin=SENSOR_ANGLE_SIN, cos=SENSOR_ANGLE_COS}}
+
+Reward_Proc :: proc(sensor: Sensor) -> (reward: f32, dead: bool)
 
 MODEL_INPUT :: SENSOR_SIZE + ACTION_DIM
 POLICY_OUT  :: BINARY_COUNT + ANALOG_COUNT
@@ -925,7 +943,7 @@ _apply_delta :: proc(a: ^Agent, state: ^Sensor, deltas: []f32) {
 		state[i] += deltas[i] * _delta_deviation(a, i) + a.delta_mean[i]
 	}
 
-	for pair in world.ANGLE_PAIRS {
+	for pair in ANGLE_PAIRS {
 		length := math.sqrt(state[pair.sin] * state[pair.sin] + state[pair.cos] * state[pair.cos])
 		if length > 1e-4 {
 			state[pair.sin] /= length

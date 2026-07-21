@@ -4,7 +4,7 @@ import "core:math"
 
 import b2 "vendor:box2d"
 
-import "../world"
+import "../agent"
 
 FIXED_DELTA :: 1.0 / 60.0
 
@@ -82,8 +82,6 @@ State :: struct {
 	lander: Box,
 	ground: Box,
 }
-
-Observation :: world.Sensor
 
 box_make :: proc(state: State, type: b2.BodyType, position, size: [2]f32, density: f32, friction: f32) -> (box: Box) {
 	box.size      = size
@@ -195,11 +193,11 @@ lander_contact :: proc(state: State) -> bool {
 	return len(b2.Body_GetContactData(state.lander.body, contacts[:])) > 0
 }
 
-step :: proc(state: ^State, action: world.Action, delta: f32) -> (done: bool) {
+step :: proc(state: ^State, action: agent.Action, delta: f32) -> (done: bool) {
 	state.time += delta
 
-	steer  := clamp(action[world.ACTION_AXIS_X], -1, 1)
-	thrust := clamp(action[world.ACTION_AXIS_Y],  0, 1)
+	steer  := clamp(action[agent.ACTION_AXIS_X], -1, 1)
+	thrust := clamp(action[agent.ACTION_AXIS_Y],  0, 1)
 
 	angle := lander_angle(state^)
 	up    := [2]f32{-math.sin(angle), math.cos(angle)}
@@ -242,14 +240,14 @@ step :: proc(state: ^State, action: world.Action, delta: f32) -> (done: bool) {
 }
 
 @(require_results)
-classify :: proc(sensor: Observation) -> Outcome {
-	offset     := sensor[world.SENSOR_X]
-	height     := sensor[world.SENSOR_Y]
-	velocity_x := sensor[world.SENSOR_VELOCITY_X]
-	velocity_y := sensor[world.SENSOR_VELOCITY_Y]
-	cos_angle  := sensor[world.SENSOR_ANGLE_COS]
+classify :: proc(sensor: agent.Sensor) -> Outcome {
+	offset     := sensor[agent.SENSOR_X]
+	height     := sensor[agent.SENSOR_Y]
+	velocity_x := sensor[agent.SENSOR_VELOCITY_X]
+	velocity_y := sensor[agent.SENSOR_VELOCITY_Y]
+	cos_angle  := sensor[agent.SENSOR_ANGLE_COS]
 
-	contact := sensor[world.SENSOR_CONTACT] > 0.5
+	contact := sensor[agent.SENSOR_CONTACT] > 0.5
 	speed   := math.sqrt(velocity_x * velocity_x + velocity_y * velocity_y)
 
 	switch {
@@ -266,31 +264,31 @@ classify :: proc(sensor: Observation) -> Outcome {
 }
 
 @(require_results)
-observe :: proc(state: State) -> (sensor: Observation) {
+observe :: proc(state: State) -> (sensor: agent.Sensor) {
 	position := lander_position(state)
 	velocity := state.impact ? state.impact_velocity : lander_velocity(state)
 	angle    := lander_angle(state)
 	spin     := lander_spin(state)
 
-	sensor[world.SENSOR_X]          = position.x / X_SCALE
-	sensor[world.SENSOR_Y]          = lander_height(state) / Y_SCALE
-	sensor[world.SENSOR_VELOCITY_X] = velocity.x / V_SCALE
-	sensor[world.SENSOR_VELOCITY_Y] = velocity.y / V_SCALE
-	sensor[world.SENSOR_ANGLE_SIN]  = math.sin(angle)
-	sensor[world.SENSOR_ANGLE_COS]  = math.cos(angle)
-	sensor[world.SENSOR_SPIN]       = spin / W_SCALE
-	sensor[world.SENSOR_CONTACT]    = lander_contact(state) ? 1 : 0
+	sensor[agent.SENSOR_X]          = position.x / X_SCALE
+	sensor[agent.SENSOR_Y]          = lander_height(state) / Y_SCALE
+	sensor[agent.SENSOR_VELOCITY_X] = velocity.x / V_SCALE
+	sensor[agent.SENSOR_VELOCITY_Y] = velocity.y / V_SCALE
+	sensor[agent.SENSOR_ANGLE_SIN]  = math.sin(angle)
+	sensor[agent.SENSOR_ANGLE_COS]  = math.cos(angle)
+	sensor[agent.SENSOR_SPIN]       = spin / W_SCALE
+	sensor[agent.SENSOR_CONTACT]    = lander_contact(state) ? 1 : 0
 	return
 }
 
 @(require_results)
-reward :: proc(sensor: Observation) -> (reward: f32, dead: bool) {
-	offset     := sensor[world.SENSOR_X]
-	height     := sensor[world.SENSOR_Y]
-	velocity_x := sensor[world.SENSOR_VELOCITY_X]
-	velocity_y := sensor[world.SENSOR_VELOCITY_Y]
-	cos_angle  := sensor[world.SENSOR_ANGLE_COS]
-	spin       := sensor[world.SENSOR_SPIN]
+reward :: proc(sensor: agent.Sensor) -> (reward: f32, dead: bool) {
+	offset     := sensor[agent.SENSOR_X]
+	height     := sensor[agent.SENSOR_Y]
+	velocity_x := sensor[agent.SENSOR_VELOCITY_X]
+	velocity_y := sensor[agent.SENSOR_VELOCITY_Y]
+	cos_angle  := sensor[agent.SENSOR_ANGLE_COS]
+	spin       := sensor[agent.SENSOR_SPIN]
 
 	reward  = -POS_WEIGHT * (offset * offset + height * height)
 	reward -=  VEL_WEIGHT * (velocity_x * velocity_x + velocity_y * velocity_y)

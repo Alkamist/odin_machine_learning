@@ -6,12 +6,11 @@ import "core:os"
 import "core:strconv"
 import "core:time"
 
-import ml  "../../../"
-import cpu "../../../backends/cpu"
+import ml  "../../../../"
+import cpu "../../../../backends/cpu"
 
-import "../cartpole"
-import "../agent"
-import "../world"
+import          "../../agent"
+import cartpole ".."
 
 THREAD_COUNT :: 1
 
@@ -88,7 +87,7 @@ main :: proc() {
 
 	for sim_time < minutes * 60 {
 		action  := agent.act(brain)
-		control := action[world.ACTION_AXIS_X]
+		control := action[agent.ACTION_AXIS_X]
 		done    := cartpole.step(&game, control, cartpole.FIXED_DELTA)
 
 		sim_time += f64(cartpole.FIXED_DELTA)

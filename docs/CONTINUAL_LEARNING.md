@@ -376,3 +376,42 @@ streak M)` so a run's dip structure is visible without re-instrumenting. `LEARN_
 (150s) is unchanged and still the right bar: the median seed masters at 60-90s, well inside
 "a minute or two", and swing-up in this few seconds of interaction is old news in the
 model-based RL literature. The target is not harsh; only the old stability gate was.
+
+## Layout (2026-07-21f): each game owns its harnesses, and `world` is gone
+
+The `2026-07-21d` layout above put `headless/`, `viewer/`, and `tests/` at the top of
+`examples/learner/` while the lander, added later, nested its own under `lander/`. Two
+conventions for the same thing, and the top-level ones were cartpole-only (they imported
+`../cartpole` and nothing else). They now live under `cartpole/`, so both games read the
+same way:
+
+    agent/    utility/
+    cartpole/{cartpole.odin, headless/, viewer/, tests/}
+    lander/  {lander.odin,   headless/, viewer/}
+
+`world` is folded into `agent`. It held the sensor slot indices, the action layout,
+`ANGLE_PAIRS`, and `Reward_Proc` — the agent's own input/output spec — and existed as a
+separate package only so the sims could name those without importing the brain. But
+`agent` already re-exported every symbol of it (`agent.Sensor`, `agent.SENSOR_SIZE`, ...),
+so the arrangement bought a package and an alias block to avoid a dependency edge that
+nothing was enforcing. The sims now import `../agent` directly and the alias block is
+gone. The cost is honest and accepted: `cartpole` and `lander` now compile against the
+package that pulls in `ml`/`mlp`/`cpu`. If a sim ever needs to build without the learner,
+that edge is where to cut.
+
+`frame` -> `utility` (`Fixed_Timestep` plus the render-interpolation angle helpers, shared
+by both viewers; `normalize_angle` is only used by `lerp_angle` and is now
+`_normalize_angle`). The cartpole viewer's two files merged into one `main.odin` matching
+the lander's, dropping a layer of one-line raylib wrappers (`window_open`, `frame_begin`,
+`mouse_held`, ...) and a `draw_text` that nothing called. The per-sim `Observation ::
+agent.Sensor` alias is gone for the same reason `world`'s alias block is.
+
+Behavior-identical, verified not assumed: headless seed 1 at 10 sim-minutes, built
+`-o:speed`, still returns the `2026-07-21d` reference exactly — `best score 92.32 | 19
+episodes | 10635 decisions | value fit 0.88 | upright_last10 0.9602`.
+
+Still not done, still deliberately: nothing dispatches over a game. Both harnesses call
+`cartpole.step`/`lander.step` directly, and the two `step` signatures have already
+diverged (cartpole takes a bare `f32`, lander an `agent.Action`). That divergence is the
+first thing a game interface would have to reconcile, and it is cheap to reconcile now
+that the trees are symmetric.

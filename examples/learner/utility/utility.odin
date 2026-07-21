@@ -1,4 +1,4 @@
-package frame
+package utility
 
 import "core:time"
 
@@ -34,7 +34,7 @@ fixed_timestep :: proc(step: ^Fixed_Timestep, fixed_delta: f32) -> bool {
 }
 
 @(require_results)
-normalize_angle :: proc(angle: f32) -> f32 {
+_normalize_angle :: proc(angle: f32) -> f32 {
 	result := angle
 	for result >  180.0 {
 		result -= 360.0
@@ -47,5 +47,5 @@ normalize_angle :: proc(angle: f32) -> f32 {
 
 @(require_results)
 lerp_angle :: proc(from, to, t: f32) -> f32 {
-	return from + normalize_angle(to - from) * t
+	return from + _normalize_angle(to - from) * t
 }
