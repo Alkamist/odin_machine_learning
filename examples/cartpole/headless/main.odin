@@ -59,11 +59,12 @@ main :: proc() {
 	start_tick := time.tick_now()
 
 	for sim_time < minutes * 60 {
-		action := sim.Action(agent.act(brain))
-		done   := sim.step(&game, action, sim.FIXED_DELTA)
+		action  := agent.act(brain)
+		control := sim.action_control(sim.Action(action))
+		done    := sim.step(&game, control, sim.FIXED_DELTA)
 
 		sim_time += f64(sim.FIXED_DELTA)
-		agent.drive(brain, sim_time, sim.observe(game), int(action), episode)
+		agent.drive(brain, sim_time, sim.observe(game), action, episode)
 
 		if done {
 			duration    := game.time

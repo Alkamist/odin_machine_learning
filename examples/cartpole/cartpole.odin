@@ -52,38 +52,36 @@ mouse_pressed :: proc() -> bool {
 	return rl.IsMouseButtonPressed(.LEFT)
 }
 
-human_action :: proc(previous: sim.Action) -> (res: sim.Action) {
-	if !rl.IsKeyDown(.A) && !rl.IsKeyDown(.D) {
-		return .None
-	}
+MOUSE_GAIN  :: f32(1.0)
+MOUSE_SPEED :: f32(2000)
 
-	res = previous
+Human_Control :: struct {
+	pending:  f32,
+	settling: bool,
+}
 
-	if rl.IsKeyPressed(.A) {
-		res = .Left
-	}
-	if rl.IsKeyPressed(.D) {
-		res = .Right
-	}
+human_begin :: proc(controls: ^Human_Control) {
+	rl.DisableCursor()
+	controls^ = {settling = true}
+}
 
-	if rl.IsKeyReleased(.A) {
-		if rl.IsKeyDown(.D) {
-			res = .Right
-		}
-		else {
-			res = .None
-		}
-	}
-	if rl.IsKeyReleased(.D) {
-		if rl.IsKeyDown(.A) {
-			res = .Left
-		}
-		else {
-			res = .None
-		}
-	}
+human_end :: proc() {
+	rl.EnableCursor()
+}
 
-	return
+human_accumulate :: proc(controls: ^Human_Control) {
+	mouse_delta := rl.GetMouseDelta()
+	if controls.settling {
+		controls.settling = false
+		return
+	}
+	controls.pending += mouse_delta.x * MOUSE_GAIN
+}
+
+human_consume :: proc(controls: ^Human_Control) -> f32 {
+	velocity        := clamp(controls.pending / sim.FIXED_DELTA, -MOUSE_SPEED, MOUSE_SPEED)
+	controls.pending = 0
+	return velocity / sim.CART_SPEED
 }
 
 box_draw :: proc(box: sim.Box, color: rl.Color, interpolation: f32) {
@@ -128,7 +126,7 @@ draw :: proc(state: sim.State, interpolation: f32) {
 
 draw_status :: proc(human: bool, decisions: int, agreement: f32) {
 	if human {
-		rl.DrawText("Human (TAB to hand back to the agent) - A/D to move", 20, 20, 20, rl.WHITE)
+		rl.DrawText("Human (TAB to hand back to the agent) - move the mouse to steer", 20, 20, 20, rl.WHITE)
 	}
 	else {
 		rl.DrawText(rl.TextFormat("Agent, %d decisions learned (TAB to take over)", decisions), 20, 20, 20, rl.WHITE)

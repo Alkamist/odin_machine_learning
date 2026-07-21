@@ -11,7 +11,7 @@ PIXELS_PER_METER :: 24
 TIME_LIMIT :: 30
 GRAVITY    :: 2000
 CART_LIMIT :: 500
-CART_SPEED :: 500
+CART_SPEED :: 2000
 CART_SIZE  :: [2]f32{100,   50}
 POLE_SIZE  :: [2]f32{  8,  300}
 WALL_SIZE  :: [2]f32{ 10, 1000}
@@ -271,17 +271,34 @@ pole_spin :: proc(state: State) -> f32 {
 	return b2.Body_GetAngularVelocity(state.pole.body)
 }
 
-step :: proc(state: ^State, action: Action, delta: f32) -> (done: bool) {
+@(require_results)
+action_control :: proc(action: Action) -> f32 {
+	switch action {
+	case .None:  return 0
+	case .Left:  return -1
+	case .Right: return 1
+	}
+	return 0
+}
+
+@(require_results)
+control_action :: proc(control: f32) -> Action {
+	DEADZONE :: f32(0.2)
+	if control >  DEADZONE {
+		return .Right
+	}
+	if control < -DEADZONE {
+		return .Left
+	}
+	return .None
+}
+
+step :: proc(state: ^State, control: f32, delta: f32) -> (done: bool) {
 	state.time += delta
 
 	mouse_apply(state, delta)
 
-	target_speed: f32
-	switch action {
-	case .None:
-	case .Left:  target_speed = -CART_SPEED
-	case .Right: target_speed =  CART_SPEED
-	}
+	target_speed := clamp(control, -1, 1) * CART_SPEED
 
 	speed_diff := target_speed - b2.Body_GetLinearVelocity(state.cart.body).x
 	force      := speed_diff * 200000.0

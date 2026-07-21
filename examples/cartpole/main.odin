@@ -22,7 +22,8 @@ main :: proc() {
 	defer agent.stop(brain)
 
 	human:    bool
-	action:   sim.Action
+	control:  f32
+	controls: Human_Control
 	timestep: Fixed_Timestep
 
 	sim_time: f64
@@ -38,31 +39,48 @@ main :: proc() {
 
 		if toggle_pressed() {
 			human = !human
+			if human {
+				sim.mouse_end(&game_state)
+				human_begin(&controls)
+			}
+			else {
+				human_end()
+			}
 		}
 
-		if mouse_pressed() {
-			sim.mouse_begin(&game_state, mouse_position())
-		}
-		if mouse_held() {
-			game_state.mouse_target = mouse_position()
-		}
-		else {
-			sim.mouse_end(&game_state)
+		if !human {
+			if mouse_pressed() {
+				sim.mouse_begin(&game_state, mouse_position())
+			}
+			if mouse_held() {
+				game_state.mouse_target = mouse_position()
+			}
+			else {
+				sim.mouse_end(&game_state)
+			}
 		}
 
 		if human {
-			action = human_action(action)
+			human_accumulate(&controls)
 		}
+
+		applied: int
 
 		for fixed_timestep(&timestep, sim.FIXED_DELTA) {
 			if !human {
-				action = sim.Action(agent.act(brain))
+				action := agent.act(brain)
+				control = sim.action_control(sim.Action(action))
+				applied = action
+			}
+			else {
+				control = human_consume(&controls)
+				applied = int(sim.control_action(control))
 			}
 
-			done := sim.step(&game_state, action, sim.FIXED_DELTA)
+			done := sim.step(&game_state, control, sim.FIXED_DELTA)
 
 			sim_time += f64(sim.FIXED_DELTA)
-			agent.sense(brain, sim_time, sim.observe(game_state), int(action), episode)
+			agent.sense(brain, sim_time, sim.observe(game_state), applied, episode)
 
 			if done {
 				sim.reset(&game_state)
