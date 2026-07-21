@@ -201,6 +201,62 @@ is the trust-aware bootstrap — scale `BOOTSTRAP_WEIGHT` by ensemble agreement 
 than the current all-or-nothing constant, so a from-scratch or corrupted Q degrades
 gracefully to the pure-reward planner instead of poisoning it.
 
+## Follow-up (2026-07-21b): the score metric was gameable, pessimism was hurting
+
+Three findings, all from replacing single-seed spot checks with paired multi-seed sweeps.
+Every claim below is n>=12 with seeds matched across variants.
+
+**The score metric rewarded spinning.** `score = integral of |pole_angle| dt` over a 30s
+episode. A freely spinning pole averages `|angle| = pi/2` and scores **~47**; a balanced
+one averages `pi` and scores **~94**. The learning check's `best score >= 45` gate was
+therefore satisfied by a pole spinning and never balancing — observed directly at seed 7,
+episode 1: `score 43.91 | upright 11%`. `sim` now tracks `upright_time` (time with
+`cos(angle) < -0.9`, i.e. within ~26 degrees of inverted) and the gate is
+`best_upright >= 50%`. The separation is unambiguous and ungameable: spinning reads ~14%,
+balancing reads 90%+.
+
+**`PESSIMISM :: 1` was costing early learning.** The planner subtracted the ensemble's
+return standard deviation from every candidate's score. Early in training the models
+disagree everywhere, so an unnormalized penalty on 20-step *accumulated* return swamps the
+reward term and makes CEM select for "where the models already agree" — i.e. visited
+states — instead of for reward. That penalizes precisely the swing-up exploration the task
+needs. Paired by seed, `PESSIMISM=0` minus `PESSIMISM=1`:
+
+| metric | 24 seeds x 2 sim-min | 12 seeds x 6 sim-min |
+| --- | --- | --- |
+| best score | +7.38 (t=2.86) | +0.67 (t=3.78) |
+| best upright | +14.88 pts (t=2.74) | +0.92 pts (t=3.53) |
+| upright last 10 | +12.46 pts (t=2.90) | +5.50 pts (t=1.54) |
+
+Median best-upright at 2 sim-min moves 48% -> 88%. The effect is large early and mostly
+gone by 6 minutes (both converge to ~97%), which is why it hid from single long runs.
+`PESSIMISM` is now 0 and the deviation computation sits behind a compile-time
+`when PESSIMISM > 0`, mirroring `BOOTSTRAP_WEIGHT`. The machinery is kept because ensemble
+disagreement is still wanted as the *trust signal* gating the value bootstrap — a targeted
+use, not a blanket penalty on every rollout return.
+
+**The test harness and the headless harness were not running the same experiment.**
+`core:testing` installs a Xoshiro256 generator (`runner.odin:155-158`) while `main` uses
+the runtime default, so `rand.reset(seed)` seeded different PRNGs and identical seeds
+produced different trajectories — seed 1 read 93% upright headless and 27% under
+`odin test`. Both harnesses now install `rand.default_random_generator` over an explicit
+`rand.create(seed)` state, and seed 1 reproduces `best score 89.99` in both. Any
+comparison made across the two harnesses before this fix is void.
+
+**Method note.** Wall time scales with total sim-time, so many-short-runs is both cheaper
+and better-powered than few-long-runs for early-learning questions: 24 seeds x 2 sim-min
+is less work than 12 x 6 and doubles the sample. Variants must be compared **paired by
+seed** — the unpaired test on the same data read t~1.8 (inconclusive) where the paired test
+read t~2.9, because per-seed difficulty variance dwarfs the treatment effect.
+
+**Still open.** About a third of seeds fail to reach balancing within 2 sim-min (q1 = 45%
+upright, min 16%), so "learns reliably and fast" is not yet true. `value_fit` went
+*negative* on some seeds (-0.52, 0.22 at two axes) while sitting at 0.85-0.96 on others:
+Q is not reliably sane, which matters before any trust-aware bootstrap reads it. And the
+wall-stuck failure mode did not reproduce in 36 headless seeds (0 early-ended episodes) —
+plausibly because it lives in the *async* windowed path (`start`/`sense`/`act`), which the
+lockstep `drive` harness structurally cannot exercise.
+
 ## Follow-up (2026-07-21): Q verified, sensor layout parameterized
 
 Three cleanups, all behavior-preserving (headless seed 1 scores are unchanged to the

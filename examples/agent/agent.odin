@@ -9,18 +9,21 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
-import ml  "../../../"
-import     "../../../networks/mlp"
-import cpu "../../../backends/cpu"
+import ml  "../../"
+import     "../../networks/mlp"
+import cpu "../../backends/cpu"
 
-SENSOR_SIZE  :: 5
-BINARY_COUNT :: 0
-ANALOG_COUNT :: 1
-ACTION_DIM   :: BINARY_COUNT + ANALOG_COUNT
+import "../world"
 
-Action :: [ACTION_DIM]f32
+SENSOR_SIZE  :: world.SENSOR_SIZE
+BINARY_COUNT :: world.BINARY_COUNT
+ANALOG_COUNT :: world.ANALOG_COUNT
+ACTION_DIM   :: world.ACTION_DIM
 
-Reward_Proc :: proc(sensor: [SENSOR_SIZE]f32) -> (reward: f32, dead: bool)
+Sensor :: world.Sensor
+Action :: world.Action
+
+Reward_Proc :: world.Reward_Proc
 
 MODEL_INPUT :: SENSOR_SIZE + ACTION_DIM
 POLICY_OUT  :: BINARY_COUNT + ANALOG_COUNT
@@ -40,7 +43,7 @@ POLICY_SEED_SAMPLES :: 16
 
 ANALOG_STD :: f32(0.3)
 
-PESSIMISM :: f32(1)
+PESSIMISM :: f32(0)
 
 BOOTSTRAP_WEIGHT :: f32(0)
 
@@ -62,8 +65,6 @@ VALUE_FIT_HORIZON :: 150
 VALUE_FIT_SAMPLES :: 512
 VALUE_FIT_EPSILON :: f32(1e-3)
 
-MAX_ANGLE_PAIRS :: 4
-
 WARMUP_DECISIONS :: 24
 
 DECISION_PERIOD      :: f64(0.05)
@@ -71,13 +72,6 @@ REFINES_PER_DECISION :: 3
 REFINE_INTERVAL      :: TRAIN_STEPS / REFINES_PER_DECISION
 
 CONTEXT_SIZE :: 1024 * 1024 * 256
-
-Sensor :: [SENSOR_SIZE]f32
-
-Angle_Pair :: struct {
-	sin: int,
-	cos: int,
-}
 
 Transition :: struct {
 	sensor:  Sensor,
@@ -104,9 +98,6 @@ Plan_Step :: struct {
 
 Agent :: struct {
 	reward: Reward_Proc,
-
-	angle_pairs:      [MAX_ANGLE_PAIRS]Angle_Pair,
-	angle_pair_count: int,
 
 	worker:  ^thread.Thread,
 	running: bool,
@@ -150,19 +141,9 @@ Agent :: struct {
 	refine_budget:      int,
 }
 
-make :: proc(reward: Reward_Proc, angle_pairs: []Angle_Pair, allocator := context.allocator, loc := #caller_location) -> (a: ^Agent) {
-	assert(len(angle_pairs) <= MAX_ANGLE_PAIRS, "sensor layout declares more angle pairs than MAX_ANGLE_PAIRS", loc)
-
+make :: proc(reward: Reward_Proc, allocator := context.allocator) -> (a: ^Agent) {
 	a = new(Agent, allocator)
-	a.reward           = reward
-	a.angle_pair_count = len(angle_pairs)
-
-	for pair, index in angle_pairs {
-		assert(pair.sin >= 0 && pair.sin < SENSOR_SIZE, "angle pair sin index outside the sensor", loc)
-		assert(pair.cos >= 0 && pair.cos < SENSOR_SIZE, "angle pair cos index outside the sensor", loc)
-		assert(pair.sin != pair.cos, "angle pair sin and cos index are the same channel", loc)
-		a.angle_pairs[index] = pair
-	}
+	a.reward = reward
 	return
 }
 
@@ -934,8 +915,7 @@ _apply_delta :: proc(a: ^Agent, state: ^Sensor, deltas: []f32) {
 		state[i] += deltas[i] * _delta_deviation(a, i) + a.delta_mean[i]
 	}
 
-	for index in 0 ..< a.angle_pair_count {
-		pair   := a.angle_pairs[index]
+	for pair in world.ANGLE_PAIRS {
 		length := math.sqrt(state[pair.sin] * state[pair.sin] + state[pair.cos] * state[pair.cos])
 		if length > 1e-4 {
 			state[pair.sin] /= length
@@ -1046,16 +1026,19 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]Action, r
 	}
 
 	for n in 0 ..< PLAN_SAMPLES {
-		mean:    f32
-		sq_mean: f32
-
+		mean: f32
 		for m in 0 ..< ENSEMBLE_SIZE {
-			score   := scores[n * ENSEMBLE_SIZE + m]
-			mean    += score          / f32(ENSEMBLE_SIZE)
-			sq_mean += score * score  / f32(ENSEMBLE_SIZE)
+			mean += scores[n * ENSEMBLE_SIZE + m] / f32(ENSEMBLE_SIZE)
 		}
+		returns[n] = mean
 
-		deviation := math.sqrt(max(sq_mean - mean * mean, 0))
-		returns[n] = mean - PESSIMISM * deviation
+		when PESSIMISM > 0 {
+			sq_mean: f32
+			for m in 0 ..< ENSEMBLE_SIZE {
+				score   := scores[n * ENSEMBLE_SIZE + m]
+				sq_mean += score * score / f32(ENSEMBLE_SIZE)
+			}
+			returns[n] -= PESSIMISM * math.sqrt(max(sq_mean - mean * mean, 0))
+		}
 	}
 }

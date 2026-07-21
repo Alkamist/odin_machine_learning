@@ -3,7 +3,8 @@ package main
 import cpu "../../backends/cpu"
 
 import "sim"
-import "./agent"
+import "../agent"
+import "../world"
 
 THREAD_COUNT :: 4
 
@@ -14,7 +15,7 @@ main :: proc() {
 	sim.init(&game_state)
 	defer sim.destroy(&game_state)
 
-	brain := agent.make(sim.reward, sim.ANGLE_PAIRS)
+	brain := agent.make(sim.reward)
 	defer agent.destroy(brain)
 	agent.start(brain)
 	defer agent.stop(brain)
@@ -62,17 +63,17 @@ main :: proc() {
 			human_accumulate(&controls)
 		}
 
-		applied: agent.Action
+		applied: world.Action
 
 		for fixed_timestep(&timestep, sim.FIXED_DELTA) {
 			if !human {
 				action := agent.act(brain)
-				control = action[0]
+				control = action[world.ACTION_AXIS_X]
 				applied = action
 			}
 			else {
 				control = human_consume(&controls)
-				applied = agent.Action{control}
+				applied = world.Action{world.ACTION_AXIS_X=control}
 			}
 
 			done := sim.step(&game_state, control, sim.FIXED_DELTA)

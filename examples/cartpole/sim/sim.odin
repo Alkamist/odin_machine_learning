@@ -4,7 +4,7 @@ import "core:math"
 
 import b2 "vendor:box2d"
 
-import "../agent"
+import "../../world"
 
 FIXED_DELTA :: 1.0 / 60.0
 
@@ -20,12 +20,6 @@ WALL_SIZE  :: [2]f32{ 10, 1000}
 
 MOUSE_RADIUS :: 20.0
 
-OBS_SIZE :: 5
-
-OBS_POLE_SIN :: 2
-OBS_POLE_COS :: 3
-
-ANGLE_PAIRS :: []agent.Angle_Pair{{sin=OBS_POLE_SIN, cos=OBS_POLE_COS}}
 
 X_SCALE :: f32(CART_LIMIT)
 V_SCALE :: f32(CART_SPEED)
@@ -39,6 +33,8 @@ CENTER_WEIGHT  :: f32(3)
 SPIN_WEIGHT    :: f32(2)
 BARRIER_ONSET  :: f32(0.5)
 BARRIER_WEIGHT :: f32(20)
+
+UPRIGHT_COSINE :: f32(0.9)
 
 Category :: enum u64 {
 	Normal,
@@ -60,8 +56,9 @@ Box :: struct {
 State :: struct {
 	high_score: f32,
 
-	time:  f32,
-	score: f32,
+	time:         f32,
+	score:        f32,
+	upright_time: f32,
 
 	world: b2.WorldId,
 
@@ -80,7 +77,7 @@ State :: struct {
 	mouse_position_: [2]f32,
 }
 
-Observation :: [OBS_SIZE]f32
+Observation :: world.Sensor
 
 box_make :: proc(state: State, type: b2.BodyType, position, size: [2]f32, density: f32, category: Category_Set = {.Normal}, mask: Category_Set = {.Normal}) -> (box: Box) {
 	box.size      = size
@@ -205,8 +202,9 @@ destroy :: proc(state: ^State) {
 reset :: proc(state: ^State) {
 	_destroy_bodies(state)
 
-	state.time     = 0
-	state.score    = 0
+	state.time         = 0
+	state.score        = 0
+	state.upright_time = 0
 
 	state.mouse_active = false
 
@@ -298,6 +296,10 @@ step :: proc(state: ^State, control: f32, delta: f32) -> (done: bool) {
 
 	state.score += abs(pole_angle) * delta
 
+	if math.cos(pole_angle) < -UPRIGHT_COSINE {
+		state.upright_time += delta
+	}
+
 	contact_events := b2.World_GetContactEvents(state.world)
 	wall_hit       := false
 
@@ -330,18 +332,19 @@ observe :: proc(state: State) -> (sensor: Observation) {
 	angle    := pole_angle(state)
 	spin     := pole_spin(state)
 
-	sensor[0] = position / X_SCALE
-	sensor[1] = velocity / V_SCALE
-	sensor[OBS_POLE_SIN] = math.sin(angle)
-	sensor[OBS_POLE_COS] = math.cos(angle)
-	sensor[4]            = spin / W_SCALE
+	sensor[world.SENSOR_X]          = position / X_SCALE
+	sensor[world.SENSOR_VELOCITY_X] = velocity / V_SCALE
+	sensor[world.SENSOR_ANGLE_SIN]  = math.sin(angle)
+	sensor[world.SENSOR_ANGLE_COS]  = math.cos(angle)
+	sensor[world.SENSOR_SPIN]       = spin / W_SCALE
+	sensor[world.SENSOR_CONTACT]    = 1
 	return
 }
 
 @(require_results)
 reward :: proc(sensor: Observation) -> (reward: f32, dead: bool) {
-	cos_angle := sensor[OBS_POLE_COS]
-	spin      := sensor[4] * W_SCALE
+	cos_angle := sensor[world.SENSOR_ANGLE_COS]
+	spin      := sensor[world.SENSOR_SPIN] * W_SCALE
 
 	upright := -cos_angle
 	energy  := ENERGY_SCALE * spin * spin + 0.5 * (1 - cos_angle)
@@ -350,15 +353,15 @@ reward :: proc(sensor: Observation) -> (reward: f32, dead: bool) {
 
 	reward  = UPRIGHT_WEIGHT * upright
 	reward -= ENERGY_WEIGHT * energy_error * energy_error
-	reward -= CENTER_WEIGHT * sensor[0] * sensor[0]
+	reward -= CENTER_WEIGHT * sensor[world.SENSOR_X] * sensor[world.SENSOR_X]
 
 	if upright > 0 {
-		reward -= SPIN_WEIGHT * upright * sensor[4] * sensor[4]
+		reward -= SPIN_WEIGHT * upright * sensor[world.SENSOR_SPIN] * sensor[world.SENSOR_SPIN]
 	}
 
-	barrier := max(abs(sensor[0]) - BARRIER_ONSET, 0)
+	barrier := max(abs(sensor[world.SENSOR_X]) - BARRIER_ONSET, 0)
 	reward  -= BARRIER_WEIGHT * barrier * barrier
 
-	dead = abs(sensor[0]) > 0.9
+	dead = abs(sensor[world.SENSOR_X]) > 0.9
 	return
 }

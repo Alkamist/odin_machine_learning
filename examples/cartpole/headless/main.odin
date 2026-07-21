@@ -10,7 +10,8 @@ import ml  "../../../"
 import cpu "../../../backends/cpu"
 
 import "../sim"
-import "../agent"
+import "../../agent"
+import "../../world"
 
 THREAD_COUNT :: 4
 
@@ -29,7 +30,8 @@ main :: proc() {
 		}
 	}
 
-	rand.reset(seed)
+	random_state := rand.create(seed)
+	context.random_generator = rand.default_random_generator(&random_state)
 
 	cpu.set_thread_count(THREAD_COUNT)
 
@@ -42,7 +44,7 @@ main :: proc() {
 	sim.init(&game)
 	defer sim.destroy(&game)
 
-	brain := agent.make(sim.reward, sim.ANGLE_PAIRS)
+	brain := agent.make(sim.reward)
 	agent.boot(brain)
 	defer agent.destroy(brain)
 	defer agent.shutdown(brain)
@@ -51,14 +53,17 @@ main :: proc() {
 	episode:  u64 = 1
 
 	best_score:   f32
+	best_upright: f32
 	scores:       [dynamic]f32
+	uprights:     [dynamic]f32
 	defer delete(scores)
+	defer delete(uprights)
 
 	start_tick := time.tick_now()
 
 	for sim_time < minutes * 60 {
 		action  := agent.act(brain)
-		control := action[0]
+		control := action[world.ACTION_AXIS_X]
 		done    := sim.step(&game, control, sim.FIXED_DELTA)
 
 		sim_time += f64(sim.FIXED_DELTA)
@@ -70,15 +75,22 @@ main :: proc() {
 			wall_elapsed   := time.duration_seconds(time.tick_diff(start_tick, time.tick_now()))
 			value_fit, _   := agent.value_fit(brain)
 
+			upright := game.upright_time / max(game.time, 1e-9)
+
 			append(&scores, score)
+			append(&uprights, upright)
 			if score > best_score {
 				best_score = score
 			}
+			if upright > best_upright {
+				best_upright = upright
+			}
 
 			fmt.printfln(
-				"episode %d | score %.2f | sim %.1fs | decisions %d | policy match %.0f%% | value fit %.2f | wall %.1fs | speedup %.1fx",
+				"episode %d | score %.2f | upright %.0f%% | sim %.1fs | decisions %d | policy match %.0f%% | value fit %.2f | wall %.1fs | speedup %.1fx",
 				episode,
 				score,
+				upright * 100,
 				duration,
 				agent.decisions(brain),
 				agent.policy_match(brain) * 100,
@@ -95,18 +107,24 @@ main :: proc() {
 	wall_elapsed := time.duration_seconds(time.tick_diff(start_tick, time.tick_now()))
 
 	recent_count := min(len(scores), 10)
-	recent_mean:  f32
+	recent_mean:    f32
+	recent_upright: f32
 	for i in len(scores) - recent_count ..< len(scores) {
-		recent_mean += scores[i]
+		recent_mean    += scores[i]
+		recent_upright += uprights[i]
 	}
 	if recent_count > 0 {
-		recent_mean /= f32(recent_count)
+		recent_mean    /= f32(recent_count)
+		recent_upright /= f32(recent_count)
 	}
 
 	fmt.printfln("--- summary ---")
 	fmt.printfln("episodes         %d", len(scores))
 	fmt.printfln("best score       %.2f", best_score)
+	fmt.printfln("best upright     %.0f%%", best_upright * 100)
 	fmt.printfln("mean last 10     %.2f", recent_mean)
+	fmt.printfln("upright last 10  %.0f%%", recent_upright * 100)
+
 	final_fit, fit_samples := agent.value_fit(brain)
 
 	fmt.printfln("total decisions  %d", agent.decisions(brain))
