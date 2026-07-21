@@ -4,9 +4,22 @@ import "core:math"
 
 import b2 "vendor:box2d"
 
-import "../agent"
-
 FIXED_DELTA :: 1.0 / 60.0
+
+SENSOR_COUNT :: 8
+ACTION_COUNT :: 2
+
+SENSOR_X          :: 0
+SENSOR_Y          :: 1
+SENSOR_VELOCITY_X :: 2
+SENSOR_VELOCITY_Y :: 3
+SENSOR_ANGLE_SIN  :: 4
+SENSOR_ANGLE_COS  :: 5
+SENSOR_SPIN       :: 6
+SENSOR_CONTACT    :: 7
+
+ACTION_AXIS_X :: 0
+ACTION_AXIS_Y :: 1
 
 PIXELS_PER_METER :: 24
 
@@ -193,11 +206,11 @@ lander_contact :: proc(state: State) -> bool {
 	return len(b2.Body_GetContactData(state.lander.body, contacts[:])) > 0
 }
 
-step :: proc(state: ^State, action: agent.Action, delta: f32) -> (done: bool) {
+step :: proc(state: ^State, action: []f32, delta: f32) -> (done: bool) {
 	state.time += delta
 
-	steer  := clamp(action[agent.ACTION_AXIS_X], -1, 1)
-	thrust := clamp(action[agent.ACTION_AXIS_Y],  0, 1)
+	steer  := clamp(action[ACTION_AXIS_X], -1, 1)
+	thrust := clamp(action[ACTION_AXIS_Y],  0, 1)
 
 	angle := lander_angle(state^)
 	up    := [2]f32{-math.sin(angle), math.cos(angle)}
@@ -225,12 +238,13 @@ step :: proc(state: ^State, action: agent.Action, delta: f32) -> (done: bool) {
 		state.impact_velocity = velocity_before
 	}
 
-	sensor    := observe(state^)
-	reward_, _ := reward(sensor)
+	sensor: [SENSOR_COUNT]f32
+	observe(state^, sensor[:])
 
-	state.score += reward_ * delta
+	step_reward, _ := reward(sensor[:])
+	state.score    += step_reward * delta
 
-	state.outcome = classify(sensor)
+	state.outcome = classify(sensor[:])
 	if state.outcome == .Flying && state.time > TIME_LIMIT {
 		state.outcome = .Timeout
 	}
@@ -240,14 +254,14 @@ step :: proc(state: ^State, action: agent.Action, delta: f32) -> (done: bool) {
 }
 
 @(require_results)
-classify :: proc(sensor: agent.Sensor) -> Outcome {
-	offset     := sensor[agent.SENSOR_X]
-	height     := sensor[agent.SENSOR_Y]
-	velocity_x := sensor[agent.SENSOR_VELOCITY_X]
-	velocity_y := sensor[agent.SENSOR_VELOCITY_Y]
-	cos_angle  := sensor[agent.SENSOR_ANGLE_COS]
+classify :: proc(sensor: []f32) -> Outcome {
+	offset     := sensor[SENSOR_X]
+	height     := sensor[SENSOR_Y]
+	velocity_x := sensor[SENSOR_VELOCITY_X]
+	velocity_y := sensor[SENSOR_VELOCITY_Y]
+	cos_angle  := sensor[SENSOR_ANGLE_COS]
 
-	contact := sensor[agent.SENSOR_CONTACT] > 0.5
+	contact := sensor[SENSOR_CONTACT] > 0.5
 	speed   := math.sqrt(velocity_x * velocity_x + velocity_y * velocity_y)
 
 	switch {
@@ -263,32 +277,40 @@ classify :: proc(sensor: agent.Sensor) -> Outcome {
 	return .Flying
 }
 
-@(require_results)
-observe :: proc(state: State) -> (sensor: agent.Sensor) {
+observe :: proc(state: State, sensor: []f32) {
 	position := lander_position(state)
 	velocity := state.impact ? state.impact_velocity : lander_velocity(state)
 	angle    := lander_angle(state)
 	spin     := lander_spin(state)
 
-	sensor[agent.SENSOR_X]          = position.x / X_SCALE
-	sensor[agent.SENSOR_Y]          = lander_height(state) / Y_SCALE
-	sensor[agent.SENSOR_VELOCITY_X] = velocity.x / V_SCALE
-	sensor[agent.SENSOR_VELOCITY_Y] = velocity.y / V_SCALE
-	sensor[agent.SENSOR_ANGLE_SIN]  = math.sin(angle)
-	sensor[agent.SENSOR_ANGLE_COS]  = math.cos(angle)
-	sensor[agent.SENSOR_SPIN]       = spin / W_SCALE
-	sensor[agent.SENSOR_CONTACT]    = lander_contact(state) ? 1 : 0
-	return
+	sensor[SENSOR_X]          = position.x / X_SCALE
+	sensor[SENSOR_Y]          = lander_height(state) / Y_SCALE
+	sensor[SENSOR_VELOCITY_X] = velocity.x / V_SCALE
+	sensor[SENSOR_VELOCITY_Y] = velocity.y / V_SCALE
+	sensor[SENSOR_ANGLE_SIN]  = math.sin(angle)
+	sensor[SENSOR_ANGLE_COS]  = math.cos(angle)
+	sensor[SENSOR_SPIN]       = spin / W_SCALE
+	sensor[SENSOR_CONTACT]    = lander_contact(state) ? 1 : 0
+}
+
+normalize :: proc(sensor: []f32) {
+	sin    := sensor[SENSOR_ANGLE_SIN]
+	cos    := sensor[SENSOR_ANGLE_COS]
+	length := math.sqrt(sin * sin + cos * cos)
+	if length > 1e-4 {
+		sensor[SENSOR_ANGLE_SIN] = sin / length
+		sensor[SENSOR_ANGLE_COS] = cos / length
+	}
 }
 
 @(require_results)
-reward :: proc(sensor: agent.Sensor) -> (reward: f32, dead: bool) {
-	offset     := sensor[agent.SENSOR_X]
-	height     := sensor[agent.SENSOR_Y]
-	velocity_x := sensor[agent.SENSOR_VELOCITY_X]
-	velocity_y := sensor[agent.SENSOR_VELOCITY_Y]
-	cos_angle  := sensor[agent.SENSOR_ANGLE_COS]
-	spin       := sensor[agent.SENSOR_SPIN]
+reward :: proc(sensor: []f32) -> (reward: f32, dead: bool) {
+	offset     := sensor[SENSOR_X]
+	height     := sensor[SENSOR_Y]
+	velocity_x := sensor[SENSOR_VELOCITY_X]
+	velocity_y := sensor[SENSOR_VELOCITY_Y]
+	cos_angle  := sensor[SENSOR_ANGLE_COS]
+	spin       := sensor[SENSOR_SPIN]
 
 	reward  = -POS_WEIGHT * (offset * offset + height * height)
 	reward -=  VEL_WEIGHT * (velocity_x * velocity_x + velocity_y * velocity_y)

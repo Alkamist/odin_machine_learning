@@ -4,9 +4,18 @@ import "core:math"
 
 import b2 "vendor:box2d"
 
-import "../agent"
-
 FIXED_DELTA :: 1.0 / 60.0
+
+SENSOR_COUNT :: 5
+ACTION_COUNT :: 1
+
+SENSOR_X          :: 0
+SENSOR_VELOCITY_X :: 1
+SENSOR_ANGLE_SIN  :: 2
+SENSOR_ANGLE_COS  :: 3
+SENSOR_SPIN       :: 4
+
+ACTION_AXIS_X :: 0
 
 PIXELS_PER_METER :: 24
 
@@ -268,12 +277,12 @@ pole_spin :: proc(state: State) -> f32 {
 	return b2.Body_GetAngularVelocity(state.pole.body)
 }
 
-step :: proc(state: ^State, control: f32, delta: f32) -> (done: bool) {
+step :: proc(state: ^State, action: []f32, delta: f32) -> (done: bool) {
 	state.time += delta
 
 	mouse_apply(state, delta)
 
-	target_speed := clamp(control, -1, 1) * CART_SPEED
+	target_speed := clamp(action[ACTION_AXIS_X], -1, 1) * CART_SPEED
 
 	speed_diff := target_speed - b2.Body_GetLinearVelocity(state.cart.body).x
 	force      := speed_diff * 200000.0
@@ -323,26 +332,33 @@ step :: proc(state: ^State, control: f32, delta: f32) -> (done: bool) {
 	return
 }
 
-@(require_results)
-observe :: proc(state: State) -> (sensor: agent.Sensor) {
+observe :: proc(state: State, sensor: []f32) {
 	position := cart_position(state)
 	velocity := cart_velocity(state)
 	angle    := pole_angle(state)
 	spin     := pole_spin(state)
 
-	sensor[agent.SENSOR_X]          = position / X_SCALE
-	sensor[agent.SENSOR_VELOCITY_X] = velocity / V_SCALE
-	sensor[agent.SENSOR_ANGLE_SIN]  = math.sin(angle)
-	sensor[agent.SENSOR_ANGLE_COS]  = math.cos(angle)
-	sensor[agent.SENSOR_SPIN]       = spin / W_SCALE
-	sensor[agent.SENSOR_CONTACT]    = 1
-	return
+	sensor[SENSOR_X]          = position / X_SCALE
+	sensor[SENSOR_VELOCITY_X] = velocity / V_SCALE
+	sensor[SENSOR_ANGLE_SIN]  = math.sin(angle)
+	sensor[SENSOR_ANGLE_COS]  = math.cos(angle)
+	sensor[SENSOR_SPIN]       = spin / W_SCALE
+}
+
+normalize :: proc(sensor: []f32) {
+	sin    := sensor[SENSOR_ANGLE_SIN]
+	cos    := sensor[SENSOR_ANGLE_COS]
+	length := math.sqrt(sin * sin + cos * cos)
+	if length > 1e-4 {
+		sensor[SENSOR_ANGLE_SIN] = sin / length
+		sensor[SENSOR_ANGLE_COS] = cos / length
+	}
 }
 
 @(require_results)
-reward :: proc(sensor: agent.Sensor) -> (reward: f32, dead: bool) {
-	cos_angle := sensor[agent.SENSOR_ANGLE_COS]
-	spin      := sensor[agent.SENSOR_SPIN] * W_SCALE
+reward :: proc(sensor: []f32) -> (reward: f32, dead: bool) {
+	cos_angle := sensor[SENSOR_ANGLE_COS]
+	spin      := sensor[SENSOR_SPIN] * W_SCALE
 
 	upright := -cos_angle
 	energy  := ENERGY_SCALE * spin * spin + 0.5 * (1 - cos_angle)
@@ -351,15 +367,15 @@ reward :: proc(sensor: agent.Sensor) -> (reward: f32, dead: bool) {
 
 	reward  = UPRIGHT_WEIGHT * upright
 	reward -= ENERGY_WEIGHT * energy_error * energy_error
-	reward -= CENTER_WEIGHT * sensor[agent.SENSOR_X] * sensor[agent.SENSOR_X]
+	reward -= CENTER_WEIGHT * sensor[SENSOR_X] * sensor[SENSOR_X]
 
 	if upright > 0 {
-		reward -= SPIN_WEIGHT * upright * sensor[agent.SENSOR_SPIN] * sensor[agent.SENSOR_SPIN]
+		reward -= SPIN_WEIGHT * upright * sensor[SENSOR_SPIN] * sensor[SENSOR_SPIN]
 	}
 
-	barrier := max(abs(sensor[agent.SENSOR_X]) - BARRIER_ONSET, 0)
+	barrier := max(abs(sensor[SENSOR_X]) - BARRIER_ONSET, 0)
 	reward  -= BARRIER_WEIGHT * barrier * barrier
 
-	dead = abs(sensor[agent.SENSOR_X]) > 0.9
+	dead = abs(sensor[SENSOR_X]) > 0.9
 	return
 }

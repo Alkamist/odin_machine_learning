@@ -4,8 +4,6 @@ import "core:math"
 
 import rl "vendor:raylib"
 
-import cpu "../../../../backends/cpu"
-
 import        "../../agent"
 import        "../../utility"
 import lander ".."
@@ -34,15 +32,15 @@ Reason :: enum {
 }
 
 @(require_results)
-_verdict :: proc(sensor: agent.Sensor) -> (reason: Reason, value, limit: f32) {
-	velocity_x := sensor[agent.SENSOR_VELOCITY_X]
-	velocity_y := sensor[agent.SENSOR_VELOCITY_Y]
+_verdict :: proc(sensor: []f32) -> (reason: Reason, value, limit: f32) {
+	velocity_x := sensor[lander.SENSOR_VELOCITY_X]
+	velocity_y := sensor[lander.SENSOR_VELOCITY_Y]
 
 	speed     := math.sqrt(velocity_x * velocity_x + velocity_y * velocity_y)
-	cos_angle := sensor[agent.SENSOR_ANGLE_COS]
-	offset    := abs(sensor[agent.SENSOR_X])
-	height    := sensor[agent.SENSOR_Y]
-	contact   := sensor[agent.SENSOR_CONTACT] > 0.5
+	cos_angle := sensor[lander.SENSOR_ANGLE_COS]
+	offset    := abs(sensor[lander.SENSOR_X])
+	height    := sensor[lander.SENSOR_Y]
+	contact   := sensor[lander.SENSOR_CONTACT] > 0.5
 
 	switch {
 	case contact && speed > lander.LAND_SPEED_NORM:
@@ -80,32 +78,28 @@ _human_accumulate :: proc(controls: ^Human_Control) {
 	controls.pending += mouse_delta.x * MOUSE_GAIN
 }
 
-@(require_results)
-_human_consume :: proc(controls: ^Human_Control) -> (action: agent.Action) {
-	action[agent.ACTION_AXIS_X] = clamp(controls.pending / lander.FIXED_DELTA / MOUSE_SPIN_SPEED, -1, 1)
-	action[agent.ACTION_AXIS_Y] = rl.IsMouseButtonDown(.LEFT) ? 1 : 0
+_human_consume :: proc(controls: ^Human_Control, action: []f32) {
+	action[lander.ACTION_AXIS_X] = clamp(controls.pending / lander.FIXED_DELTA / MOUSE_SPIN_SPEED, -1, 1)
+	action[lander.ACTION_AXIS_Y] = rl.IsMouseButtonDown(.LEFT) ? 1 : 0
 	controls.pending = 0
-	return
 }
 
 main :: proc() {
-	cpu.set_thread_count(THREAD_COUNT)
-
 	game: lander.State
 	lander.init(&game)
 	defer lander.destroy(&game)
 
-	brain := agent.make(lander.reward)
+	brain := agent.create(lander.SENSOR_COUNT, lander.ACTION_COUNT, lander.reward, normalize=lander.normalize, compute_threads=THREAD_COUNT)
 	defer agent.destroy(brain)
-	agent.start(brain)
-	defer agent.stop(brain)
 
 	human:    bool
 	controls: Human_Control
 	timestep: utility.Fixed_Timestep
 
+	sensor:  [lander.SENSOR_COUNT]f32
+	applied: [lander.ACTION_COUNT]f32
+
 	sim_time: f64
-	episode:  u64 = 1
 	outcome:  lander.Outcome
 	outcome_timer: f32
 	attempts:      int
@@ -136,22 +130,20 @@ main :: proc() {
 			_human_accumulate(&controls)
 		}
 
-		applied: agent.Action
-
 		for utility.fixed_timestep(&timestep, lander.FIXED_DELTA) {
 			if human {
-				applied = _human_consume(&controls)
+				_human_consume(&controls, applied[:])
 			}
 			else {
-				applied = agent.act(brain)
+				agent.act(brain, applied[:])
 			}
 
-			done := lander.step(&game, applied, lander.FIXED_DELTA)
+			done := lander.step(&game, applied[:], lander.FIXED_DELTA)
 
-			sensor := lander.observe(game)
+			lander.observe(game, sensor[:])
 
 			sim_time += f64(lander.FIXED_DELTA)
-			agent.sense(brain, sim_time, sensor, applied, episode)
+			agent.observe(brain, sim_time, sensor[:], applied=applied[:])
 
 			outcome_timer = max(outcome_timer - lander.FIXED_DELTA, 0)
 			if outcome_timer == 0 {
@@ -162,21 +154,23 @@ main :: proc() {
 			if done {
 				outcome       = game.outcome
 				outcome_timer = OUTCOME_HOLD
-				reason, reason_value, reason_limit = _verdict(sensor)
+				reason, reason_value, reason_limit = _verdict(sensor[:])
 				attempts += 1
 				if outcome == .Landed {
 					landings += 1
 				}
 				lander.reset(&game)
-				episode += 1
+				agent.end_episode(brain)
 			}
 		}
+
+		summary := agent.stats(brain)
 
 		rl.BeginDrawing()
 		rl.ClearBackground({8, 8, 16, 255})
 
-		_draw_world(game, applied, timestep.interpolation)
-		_draw_status(game, human, applied, outcome, reason, reason_value, reason_limit, landings, attempts, agent.decisions(brain))
+		_draw_world(game, applied[:], timestep.interpolation)
+		_draw_status(game, human, applied[:], outcome, reason, reason_value, reason_limit, landings, attempts, summary.decisions)
 
 		rl.EndDrawing()
 	}
@@ -193,7 +187,7 @@ _box_draw :: proc(box: lander.Box, color: rl.Color, interpolation: f32) {
 	)
 }
 
-_draw_world :: proc(game: lander.State, applied: agent.Action, interpolation: f32) {
+_draw_world :: proc(game: lander.State, applied: []f32, interpolation: f32) {
 	camera: rl.Camera2D
 	camera.offset = {
 		f32(rl.GetScreenWidth())  / 2.0,
@@ -212,7 +206,7 @@ _draw_world :: proc(game: lander.State, applied: agent.Action, interpolation: f3
 		rl.GREEN,
 	)
 
-	thrust := clamp(applied[agent.ACTION_AXIS_Y], 0, 1)
+	thrust := clamp(applied[lander.ACTION_AXIS_Y], 0, 1)
 	if thrust > 0.01 {
 		angle    := lander.lander_angle(game)
 		position := math.lerp(game.lander.position_, lander.box_position(game.lander), interpolation)
@@ -235,7 +229,7 @@ _draw_world :: proc(game: lander.State, applied: agent.Action, interpolation: f3
 	rl.EndMode2D()
 }
 
-_draw_status :: proc(game: lander.State, human: bool, applied: agent.Action, outcome: lander.Outcome, reason: Reason, reason_value, reason_limit: f32, landings, attempts: int, decisions: int) {
+_draw_status :: proc(game: lander.State, human: bool, applied: []f32, outcome: lander.Outcome, reason: Reason, reason_value, reason_limit: f32, landings, attempts: int, decisions: int) {
 	if human {
 		rl.DrawText("Human - hold LEFT MOUSE to thrust, move mouse left/right to steer (TAB to hand back)", 20, 20, 20, rl.WHITE)
 	}
@@ -253,8 +247,8 @@ _draw_status :: proc(game: lander.State, human: bool, applied: agent.Action, out
 	rl.DrawText(rl.TextFormat("height   %.0f", lander.lander_height(game)), 20, 72, 20, rl.WHITE)
 	rl.DrawText(rl.TextFormat("speed    %.3f  (down %.3f, side %.3f)", speed, abs(velocity.y) / lander.V_SCALE, abs(velocity.x) / lander.V_SCALE), 20, 96, 20, speed_color)
 	rl.DrawText(rl.TextFormat("tilt     %.2f", math.cos(lander.lander_angle(game))), 20, 120, 20, angle_color)
-	rl.DrawText(rl.TextFormat("steer    %+.2f", applied[agent.ACTION_AXIS_X]), 20, 144, 20, rl.WHITE)
-	rl.DrawText(rl.TextFormat("thrust    %.2f", clamp(applied[agent.ACTION_AXIS_Y], 0, 1)), 20, 168, 20, rl.WHITE)
+	rl.DrawText(rl.TextFormat("steer    %+.2f", applied[lander.ACTION_AXIS_X]), 20, 144, 20, rl.WHITE)
+	rl.DrawText(rl.TextFormat("thrust    %.2f", clamp(applied[lander.ACTION_AXIS_Y], 0, 1)), 20, 168, 20, rl.WHITE)
 
 	offset_color := abs(lander.lander_position(game).x) > lander.PAD_HALF_WIDTH ? rl.ORANGE : rl.GREEN
 	rl.DrawText(rl.TextFormat("pad off  %+.0f", lander.lander_position(game).x), 20, 196, 20, offset_color)

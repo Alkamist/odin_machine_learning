@@ -4,8 +4,6 @@ import "core:math"
 
 import rl "vendor:raylib"
 
-import cpu "../../../../backends/cpu"
-
 import          "../../agent"
 import          "../../utility"
 import cartpole ".."
@@ -55,24 +53,21 @@ _mouse_position :: proc() -> [2]f32 {
 }
 
 main :: proc() {
-	cpu.set_thread_count(THREAD_COUNT)
-
 	game: cartpole.State
 	cartpole.init(&game)
 	defer cartpole.destroy(&game)
 
-	brain := agent.make(cartpole.reward)
+	brain := agent.create(cartpole.SENSOR_COUNT, cartpole.ACTION_COUNT, cartpole.reward, normalize=cartpole.normalize, compute_threads=THREAD_COUNT)
 	defer agent.destroy(brain)
-	agent.start(brain)
-	defer agent.stop(brain)
 
 	human:    bool
-	control:  f32
 	controls: Human_Control
 	timestep: utility.Fixed_Timestep
 
+	sensor: [cartpole.SENSOR_COUNT]f32
+	applied: [cartpole.ACTION_COUNT]f32
+
 	sim_time: f64
-	episode:  u64 = 1
 
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 	rl.InitWindow(1280, 720, "CartPole")
@@ -108,34 +103,33 @@ main :: proc() {
 			}
 		}
 
-		applied: agent.Action
-
 		for utility.fixed_timestep(&timestep, cartpole.FIXED_DELTA) {
 			if human {
-				control = _human_consume(&controls)
-				applied = agent.Action{agent.ACTION_AXIS_X=control}
+				applied[cartpole.ACTION_AXIS_X] = _human_consume(&controls)
 			}
 			else {
-				applied = agent.act(brain)
-				control = applied[agent.ACTION_AXIS_X]
+				agent.act(brain, applied[:])
 			}
 
-			done := cartpole.step(&game, control, cartpole.FIXED_DELTA)
+			done := cartpole.step(&game, applied[:], cartpole.FIXED_DELTA)
 
 			sim_time += f64(cartpole.FIXED_DELTA)
-			agent.sense(brain, sim_time, cartpole.observe(game), applied, episode)
+			cartpole.observe(game, sensor[:])
+			agent.observe(brain, sim_time, sensor[:], applied=applied[:])
 
 			if done {
 				cartpole.reset(&game)
-				episode += 1
+				agent.end_episode(brain)
 			}
 		}
 
 		rl.BeginDrawing()
 		rl.ClearBackground({12, 12, 12, 255})
 
+		summary := agent.stats(brain)
+
 		_draw_world(game, timestep.interpolation)
-		_draw_status(game, human, agent.decisions(brain), agent.policy_match(brain))
+		_draw_status(game, human, summary.decisions, summary.policy_match)
 
 		rl.EndDrawing()
 	}

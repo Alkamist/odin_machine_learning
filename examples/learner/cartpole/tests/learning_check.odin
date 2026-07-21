@@ -6,13 +6,8 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 
-import ml  "../../../../"
-import cpu "../../../../backends/cpu"
-
 import          "../../agent"
 import cartpole ".."
-
-CONTEXT_SIZE :: 1024 * 1024 * 256
 
 SEEDS            :: 8
 REQUIRED_PASSES  :: 7
@@ -64,31 +59,28 @@ _run_seed :: proc(run: ^Seed_Run) {
 	random_state := rand.create(run.seed)
 	context.random_generator = rand.default_random_generator(&random_state)
 
-	ctx := cpu.context_create(CONTEXT_SIZE)
-	defer cpu.context_destroy(ctx)
-	ml.context_scope(ctx)
-
 	game: cartpole.State
 	cartpole.init(&game)
 	defer cartpole.destroy(&game)
 
-	brain := agent.make(cartpole.reward)
-	agent.boot(brain)
+	brain := agent.create(cartpole.SENSOR_COUNT, cartpole.ACTION_COUNT, cartpole.reward, normalize=cartpole.normalize)
 	defer agent.destroy(brain)
-	defer agent.shutdown(brain)
+
+	sensor: [cartpole.SENSOR_COUNT]f32
+	action: [cartpole.ACTION_COUNT]f32
 
 	sim_time:   f64
-	episode:    u64 = 1
 	mastered:   bool
 	low_streak: int
 
 	for {
-		action  := agent.act(brain)
-		control := action[agent.ACTION_AXIS_X]
-		done    := cartpole.step(&game, control, cartpole.FIXED_DELTA)
+		agent.act(brain, action[:])
+		done := cartpole.step(&game, action[:], cartpole.FIXED_DELTA)
 
 		sim_time += f64(cartpole.FIXED_DELTA)
-		agent.drive(brain, sim_time, cartpole.observe(game), action, episode)
+		cartpole.observe(game, sensor[:])
+		agent.observe(brain, sim_time, sensor[:], applied=action[:])
+		agent.catch_up(brain, sim_time)
 
 		if !done {
 			continue
@@ -137,16 +129,16 @@ _run_seed :: proc(run: ^Seed_Run) {
 		}
 
 		cartpole.reset(&game)
-		episode += 1
+		agent.end_episode(brain)
 	}
 
-	run.value_fit, run.fit_samples = agent.value_fit(brain)
+	summary        := agent.stats(brain)
+	run.value_fit   = summary.value_fit
+	run.fit_samples = summary.fit_samples
 }
 
 @(test)
 test_cartpole_learns_fast_and_holds :: proc(t: ^testing.T) {
-	cpu.set_thread_count(1)
-
 	sweep:   Sweep
 	runs:    [SEEDS]Seed_Run
 	workers: [SEEDS]^thread.Thread
