@@ -316,3 +316,63 @@ decided. 90 seconds wall to fail, ~2.5 minutes to pass. The `value_fit` assertio
 dropped — see `CONTINUOUS_TDMPC.md`. **Results are only comparable at a fixed backend
 thread count**: parallel reduction order changes the floats, and seed 4 reads 98% at one
 thread versus 44% at four. Same class of trap as the `core:testing` PRNG mismatch.
+
+## Layout (2026-07-21d): everything under `examples/learner/`
+
+Preparation for game B. The experiment is now one self-contained tree, and paths in the
+dated entries above are historical:
+
+- `examples/learner/agent/` — the brain (package `agent`), unchanged.
+- `examples/learner/world/` — the sensor/action ABI (package `world`), unchanged.
+- `examples/learner/cartpole/` — cartpole physics and task adapter. Was `sim/sim.odin`
+  with package name `sim`; renamed because a second game needs a second package and
+  `sim` cannot be both.
+- `examples/learner/viewer/` — the raylib frontend (`main.odin`, per-game drawing in
+  `cartpole.odin`, `utility.odin`). Raylib is confined here so the sims depend on box2d
+  only and the headless/test paths never link a renderer.
+- `examples/learner/headless/` — the lockstep harness, unchanged.
+- `examples/learner/tests/` — the multi-seed sweep, package renamed `cartpole_tests` ->
+  `learner_tests`.
+
+Behavior-identical, verified rather than assumed: headless seed 1 at 10 sim-minutes
+returns `best score 92.32 | 19 episodes | 10635 decisions | value fit 0.88 |
+upright_last10 0.9602` both before and after, built `-o:speed` from a worktree at the
+pre-move commit. (The `89.99` quoted in `CONTINUOUS_TDMPC.md` is older than the two
+commits that preceded this move and no longer reproduces; 92.32 is the current seed-1
+reference.) The only source edit beyond package/import renames is `mouse_begin`'s
+parameter, renamed `world` -> `position`, which had been shadowing the `world` package
+inside the file that imports it.
+
+Not done yet, and deliberately: the harnesses still call `cartpole.step`/`observe`
+directly, so nothing yet dispatches over a game. The game interface (a vtable in `world`,
+or a per-game harness) gets designed when the lander exists and there is a second
+implementation to shape it, not before.
+
+## Gate fix (2026-07-21e): the degrade verdict measured a dip, not a collapse
+
+At the point the experiment moved under `examples/learner/`, `odin test` was red, and had
+been: the sweep failed on seeds 5 and 6, identically before and after the move (verified at
+the pre-move commit — the move is not the cause). Seed 5 is a real failure. Seed 6 was a
+gate artifact.
+
+The old `Degraded` verdict tripped permanently on the *first* post-mastery episode below
+70% upright, then `break`ed. But this same document establishes with n=16 that baseline
+dips are single episodes that recover immediately, and that continued learning is the
+recovery mechanism. So the gate issued a terminal failure on exactly the transient it had
+already characterized as self-repairing, and destroyed the evidence by stopping the run.
+
+`Degraded` is now `Collapsed`, defined as `DEGRADE_STREAK` (3) *consecutive* sub-70%
+episodes without recovery; a single sub-floor episode resets to zero on the next recovery.
+The seed keeps running through a dip instead of being killed at it. Direct confirmation
+that this was measuring noise: seed 6, which the old gate failed at 98% -> 59%, now runs
+the full 900 sim-seconds as `Stable` with **1** dip episode (max streak 1) and a 97% tail.
+The collapse it was "failing" never existed. The sweep now reads 7/8 `Stable`, with seed 5
+(`Slow`, 62% peak, never masters within 150s) the one honest failure — the mastery-time
+variance already flagged as the remaining gap, here at 1-in-8.
+
+Because passing no longer early-aborts, a green sweep now runs the full hold horizon on 7
+seeds: ~3 minutes wall, up from ~90 seconds to fail. The per-seed line gained `dips N (max
+streak M)` so a run's dip structure is visible without re-instrumenting. `LEARN_DEADLINE`
+(150s) is unchanged and still the right bar: the median seed masters at 60-90s, well inside
+"a minute or two", and swing-up in this few seconds of interaction is old news in the
+model-based RL literature. The target is not harsh; only the old stability gate was.

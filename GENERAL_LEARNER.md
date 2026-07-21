@@ -13,6 +13,7 @@ Make an AGI agent with these characteristics:
 - Generalizes into reality - it doesn't matter if the model is playing a game or controlling a real-world robot
 - Applies cross-cutting experience - humans can improve at some tasks indirectly by learning others
 - Has long-term perfect recall - I have a theory that a model can have a hard data base (knowledge not baked into weights) that it can learn to reference for long-term recall
+- Resistant to unknown/unseen influences - humans don't have visibility of the entire state of everything that affects them, and can still function and not catastrophically collapse
 - Experiences the world and learns in serial, is always learning 'online', doesn't depend on pretraining and being frozen
 - Can learn from direct experience, or by observation
 - Can optionally learn in serial for massively in-parallel knowledge consumption (not sure if possible)

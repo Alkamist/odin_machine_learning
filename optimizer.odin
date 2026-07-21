@@ -205,4 +205,3 @@ warmup_cosine_schedule :: proc(step, total_steps, warmup_steps: int, peak_value,
 	t := builtin.clamp(f32(step - warmup_steps) / f32(total_steps - warmup_steps), 0, 1)
 	return final_value + (peak_value - final_value) * 0.5 * (1 + math.cos(math.PI * t))
 }
-

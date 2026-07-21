@@ -1,4 +1,4 @@
-package sim
+package cartpole
 
 import "core:math"
 
@@ -139,15 +139,15 @@ mouse_destroy :: proc(state: State) {
 	}
 }
 
-mouse_begin :: proc(state: ^State, world: [2]f32) {
-	state.mouse_target = world
+mouse_begin :: proc(state: ^State, position: [2]f32) {
+	state.mouse_target = position
 	state.mouse_active = true
 
-	b2.Body_SetTransform(state.mouse_body, world, b2.MakeRot(0))
+	b2.Body_SetTransform(state.mouse_body, position, b2.MakeRot(0))
 	b2.Body_SetLinearVelocity(state.mouse_body, {0, 0})
 	b2.Body_Enable(state.mouse_body)
 
-	state.mouse_position_ = world
+	state.mouse_position_ = position
 }
 
 mouse_end :: proc(state: ^State) {

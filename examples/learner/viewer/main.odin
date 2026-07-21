@@ -1,21 +1,21 @@
 package main
 
-import cpu "../../backends/cpu"
+import cpu "../../../backends/cpu"
 
-import "sim"
-import "agent"
-import "world"
+import "../cartpole"
+import "../agent"
+import "../world"
 
 THREAD_COUNT :: 4
 
 main :: proc() {
 	cpu.set_thread_count(THREAD_COUNT)
 
-	game_state: sim.State
-	sim.init(&game_state)
-	defer sim.destroy(&game_state)
+	game_state: cartpole.State
+	cartpole.init(&game_state)
+	defer cartpole.destroy(&game_state)
 
-	brain := agent.make(sim.reward)
+	brain := agent.make(cartpole.reward)
 	defer agent.destroy(brain)
 	agent.start(brain)
 	defer agent.stop(brain)
@@ -39,7 +39,7 @@ main :: proc() {
 		if toggle_pressed() {
 			human = !human
 			if human {
-				sim.mouse_end(&game_state)
+				cartpole.mouse_end(&game_state)
 				human_begin(&controls)
 			}
 			else {
@@ -49,13 +49,13 @@ main :: proc() {
 
 		if !human {
 			if mouse_pressed() {
-				sim.mouse_begin(&game_state, mouse_position())
+				cartpole.mouse_begin(&game_state, mouse_position())
 			}
 			if mouse_held() {
 				game_state.mouse_target = mouse_position()
 			}
 			else {
-				sim.mouse_end(&game_state)
+				cartpole.mouse_end(&game_state)
 			}
 		}
 
@@ -65,7 +65,7 @@ main :: proc() {
 
 		applied: world.Action
 
-		for fixed_timestep(&timestep, sim.FIXED_DELTA) {
+		for fixed_timestep(&timestep, cartpole.FIXED_DELTA) {
 			if !human {
 				action := agent.act(brain)
 				control = action[world.ACTION_AXIS_X]
@@ -76,13 +76,13 @@ main :: proc() {
 				applied = world.Action{world.ACTION_AXIS_X=control}
 			}
 
-			done := sim.step(&game_state, control, sim.FIXED_DELTA)
+			done := cartpole.step(&game_state, control, cartpole.FIXED_DELTA)
 
-			sim_time += f64(sim.FIXED_DELTA)
-			agent.sense(brain, sim_time, sim.observe(game_state), applied, episode)
+			sim_time += f64(cartpole.FIXED_DELTA)
+			agent.sense(brain, sim_time, cartpole.observe(game_state), applied, episode)
 
 			if done {
-				sim.reset(&game_state)
+				cartpole.reset(&game_state)
 				episode += 1
 			}
 		}

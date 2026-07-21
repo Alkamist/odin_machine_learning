@@ -191,4 +191,3 @@ backward :: proc(loss: Tensor, loc := #caller_location) {
 		backend.backward(_current_ctx.operations[i], loc)
 	}
 }
-

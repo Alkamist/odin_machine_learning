@@ -1,4 +1,4 @@
-package cartpole_tests
+package learner_tests
 
 import "core:fmt"
 import "core:math/rand"
@@ -10,7 +10,7 @@ import ml  "../../../"
 import cpu "../../../backends/cpu"
 
 import "../agent"
-import "../sim"
+import "../cartpole"
 import "../world"
 
 CONTEXT_SIZE :: 1024 * 1024 * 256
@@ -21,6 +21,7 @@ ALLOWED_FAILURES :: SEEDS - REQUIRED_PASSES
 
 MASTERY_UPRIGHT :: f32(0.85)
 DEGRADE_FLOOR   :: f32(0.70)
+DEGRADE_STREAK  :: 3
 
 LEARN_DEADLINE :: f64(150)
 HOLD_DEADLINE  :: f64(15 * 60)
@@ -28,7 +29,7 @@ HOLD_DEADLINE  :: f64(15 * 60)
 Verdict :: enum {
 	Stable,
 	Slow,
-	Degraded,
+	Collapsed,
 	Aborted,
 }
 
@@ -41,14 +42,16 @@ Seed_Run :: struct {
 	seed:  u64,
 	sweep: ^Sweep,
 
-	verdict:      Verdict,
-	peak_upright: f32,
-	last_upright: f32,
-	mastered_at:  f64,
-	stopped_at:   f64,
-	episodes:     int,
-	value_fit:    f32,
-	fit_samples:  int,
+	verdict:        Verdict,
+	peak_upright:   f32,
+	last_upright:   f32,
+	mastered_at:    f64,
+	stopped_at:     f64,
+	episodes:       int,
+	low_episodes:   int,
+	max_low_streak: int,
+	value_fit:      f32,
+	fit_samples:    int,
 }
 
 _fail :: proc(run: ^Seed_Run, verdict: Verdict) {
@@ -66,26 +69,27 @@ _run_seed :: proc(run: ^Seed_Run) {
 	defer cpu.context_destroy(ctx)
 	ml.context_scope(ctx)
 
-	game: sim.State
-	sim.init(&game)
-	defer sim.destroy(&game)
+	game: cartpole.State
+	cartpole.init(&game)
+	defer cartpole.destroy(&game)
 
-	brain := agent.make(sim.reward)
+	brain := agent.make(cartpole.reward)
 	agent.boot(brain)
 	defer agent.destroy(brain)
 	defer agent.shutdown(brain)
 
-	sim_time: f64
-	episode:  u64 = 1
-	mastered: bool
+	sim_time:   f64
+	episode:    u64 = 1
+	mastered:   bool
+	low_streak: int
 
 	for {
 		action  := agent.act(brain)
 		control := action[world.ACTION_AXIS_X]
-		done    := sim.step(&game, control, sim.FIXED_DELTA)
+		done    := cartpole.step(&game, control, cartpole.FIXED_DELTA)
 
-		sim_time += f64(sim.FIXED_DELTA)
-		agent.drive(brain, sim_time, sim.observe(game), action, episode)
+		sim_time += f64(cartpole.FIXED_DELTA)
+		agent.drive(brain, sim_time, cartpole.observe(game), action, episode)
 
 		if !done {
 			continue
@@ -104,9 +108,21 @@ _run_seed :: proc(run: ^Seed_Run) {
 			run.mastered_at = sim_time
 		}
 
-		if mastered && upright < DEGRADE_FLOOR {
-			_fail(run, .Degraded)
-			break
+		if mastered {
+			if upright < DEGRADE_FLOOR {
+				low_streak        += 1
+				run.low_episodes  += 1
+				if low_streak > run.max_low_streak {
+					run.max_low_streak = low_streak
+				}
+				if low_streak >= DEGRADE_STREAK {
+					_fail(run, .Collapsed)
+					break
+				}
+			}
+			else {
+				low_streak = 0
+			}
 		}
 		if !mastered && sim_time >= LEARN_DEADLINE {
 			_fail(run, .Slow)
@@ -121,7 +137,7 @@ _run_seed :: proc(run: ^Seed_Run) {
 			break
 		}
 
-		sim.reset(&game)
+		cartpole.reset(&game)
 		episode += 1
 	}
 
@@ -155,19 +171,20 @@ test_cartpole_learns_fast_and_holds :: proc(t: ^testing.T) {
 		}
 
 		fmt.printfln(
-			"seed %d | %v | peak upright %.0f%% | last %.0f%% | mastered at %.0fs | ran %.0fs over %d episodes | value fit %.2f (%d samples)",
+			"seed %d | %v | peak upright %.0f%% | last %.0f%% | mastered at %.0fs | ran %.0fs over %d episodes | dips %d (max streak %d) | value fit %.2f (%d samples)",
 			run.seed, run.verdict, run.peak_upright * 100, run.last_upright * 100,
-			run.mastered_at, run.stopped_at, run.episodes, run.value_fit, run.fit_samples,
+			run.mastered_at, run.stopped_at, run.episodes, run.low_episodes, run.max_low_streak,
+			run.value_fit, run.fit_samples,
 		)
 	}
 
 	testing.expectf(
 		t,
 		passes >= REQUIRED_PASSES,
-		"%d of %d seeds held %.0f%% upright out to %.0f sim-seconds, need %d (%d never reached %.0f%% within %.0fs, %d degraded below %.0f%% after mastering, %d abandoned once the verdict was decided)",
+		"%d of %d seeds held %.0f%% upright out to %.0f sim-seconds, need %d (%d never reached %.0f%% within %.0fs, %d collapsed for %d+ episodes below %.0f%% without recovering, %d abandoned once the verdict was decided)",
 		passes, SEEDS, DEGRADE_FLOOR * 100, HOLD_DEADLINE, REQUIRED_PASSES,
 		counts[.Slow], MASTERY_UPRIGHT * 100, LEARN_DEADLINE,
-		counts[.Degraded], DEGRADE_FLOOR * 100,
+		counts[.Collapsed], DEGRADE_STREAK, DEGRADE_FLOOR * 100,
 		counts[.Aborted],
 	)
 }

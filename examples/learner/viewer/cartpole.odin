@@ -4,7 +4,7 @@ import "core:math"
 
 import rl "vendor:raylib"
 
-import "sim"
+import "../cartpole"
 
 window_open :: proc() {
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
@@ -79,14 +79,14 @@ human_accumulate :: proc(controls: ^Human_Control) {
 }
 
 human_consume :: proc(controls: ^Human_Control) -> f32 {
-	velocity        := clamp(controls.pending / sim.FIXED_DELTA, -MOUSE_SPEED, MOUSE_SPEED)
+	velocity        := clamp(controls.pending / cartpole.FIXED_DELTA, -MOUSE_SPEED, MOUSE_SPEED)
 	controls.pending = 0
-	return velocity / sim.CART_SPEED
+	return velocity / cartpole.CART_SPEED
 }
 
-box_draw :: proc(box: sim.Box, color: rl.Color, interpolation: f32) {
-	position := math.lerp(box.position_, sim.box_position(box), interpolation)
-	rotation := lerp_angle(-rl.RAD2DEG * box.rotation_, -rl.RAD2DEG * sim.box_rotation(box), interpolation)
+box_draw :: proc(box: cartpole.Box, color: rl.Color, interpolation: f32) {
+	position := math.lerp(box.position_, cartpole.box_position(box), interpolation)
+	rotation := lerp_angle(-rl.RAD2DEG * box.rotation_, -rl.RAD2DEG * cartpole.box_rotation(box), interpolation)
 	rl.DrawRectanglePro(
 		{position.x, -position.y, box.size.x, box.size.y},
 		box.size / 2.0,
@@ -95,7 +95,7 @@ box_draw :: proc(box: sim.Box, color: rl.Color, interpolation: f32) {
 	)
 }
 
-draw :: proc(state: sim.State, interpolation: f32) {
+draw :: proc(state: cartpole.State, interpolation: f32) {
 	camera: rl.Camera2D
 	camera.offset = {
 		f32(rl.GetScreenWidth())  / 2.0,
@@ -111,17 +111,17 @@ draw :: proc(state: sim.State, interpolation: f32) {
 	box_draw(state.pole, rl.GREEN,    interpolation)
 
 	if state.mouse_active {
-		position := math.lerp(state.mouse_position_, sim.mouse_position(state), interpolation)
-		rl.DrawCircleV({position.x, -position.y}, sim.MOUSE_RADIUS, rl.YELLOW)
+		position := math.lerp(state.mouse_position_, cartpole.mouse_position(state), interpolation)
+		rl.DrawCircleV({position.x, -position.y}, cartpole.MOUSE_RADIUS, rl.YELLOW)
 	}
 
-	position := math.lerp(state.cart.position_, sim.box_position(state.cart), interpolation)
+	position := math.lerp(state.cart.position_, cartpole.box_position(state.cart), interpolation)
 	draw_text_centered(rl.TextFormat("%.2f", state.score), 10, position.x, position.y + 50, rl.WHITE)
 
 	rl.EndMode2D()
 
 	rl.DrawText(rl.TextFormat("High Score: %.2f", state.high_score),            20, 68, 20, rl.WHITE)
-	rl.DrawText(rl.TextFormat("Time: %.2f",       sim.TIME_LIMIT - state.time), 20, 92, 20, rl.WHITE)
+	rl.DrawText(rl.TextFormat("Time: %.2f",       cartpole.TIME_LIMIT - state.time), 20, 92, 20, rl.WHITE)
 }
 
 draw_status :: proc(human: bool, decisions: int, policy_match: f32) {

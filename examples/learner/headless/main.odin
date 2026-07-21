@@ -9,7 +9,7 @@ import "core:time"
 import ml  "../../../"
 import cpu "../../../backends/cpu"
 
-import "../sim"
+import "../cartpole"
 import "../agent"
 import "../world"
 
@@ -61,11 +61,11 @@ main :: proc() {
 
 	ml.context_scope(ctx)
 
-	game: sim.State
-	sim.init(&game)
-	defer sim.destroy(&game)
+	game: cartpole.State
+	cartpole.init(&game)
+	defer cartpole.destroy(&game)
 
-	brain := agent.make(sim.reward)
+	brain := agent.make(cartpole.reward)
 	agent.boot(brain)
 	defer agent.destroy(brain)
 	defer agent.shutdown(brain)
@@ -89,10 +89,10 @@ main :: proc() {
 	for sim_time < minutes * 60 {
 		action  := agent.act(brain)
 		control := action[world.ACTION_AXIS_X]
-		done    := sim.step(&game, control, sim.FIXED_DELTA)
+		done    := cartpole.step(&game, control, cartpole.FIXED_DELTA)
 
-		sim_time += f64(sim.FIXED_DELTA)
-		agent.drive(brain, sim_time, sim.observe(game), action, episode)
+		sim_time += f64(cartpole.FIXED_DELTA)
+		agent.drive(brain, sim_time, cartpole.observe(game), action, episode)
 
 		if done {
 			duration       := game.time
@@ -136,7 +136,7 @@ main :: proc() {
 				sim_time / max(wall_elapsed, 1e-9),
 			)
 
-			sim.reset(&game)
+			cartpole.reset(&game)
 			episode += 1
 		}
 	}

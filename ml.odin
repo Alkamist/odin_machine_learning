@@ -546,4 +546,3 @@ he_initialization :: proc(t: Tensor, input_features: int) {
 xavier_initialization :: proc(t: Tensor, input_features, output_features: int) {
 	fill_normal(t, 0, math.sqrt(2 / f32(input_features + output_features)))
 }
-
