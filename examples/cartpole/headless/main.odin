@@ -10,8 +10,8 @@ import ml  "../../../"
 import cpu "../../../backends/cpu"
 
 import "../sim"
-import "../../agent"
-import "../../world"
+import "../agent"
+import "../world"
 
 THREAD_COUNT :: 4
 

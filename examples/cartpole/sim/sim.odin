@@ -4,7 +4,7 @@ import "core:math"
 
 import b2 "vendor:box2d"
 
-import "../../world"
+import "../world"
 
 FIXED_DELTA :: 1.0 / 60.0
 

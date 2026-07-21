@@ -16,6 +16,7 @@ Make an AGI agent with these characteristics:
 - Experiences the world and learns in serial, is always learning 'online', doesn't depend on pretraining and being frozen
 - Can learn from direct experience, or by observation
 - Can optionally learn in serial for massively in-parallel knowledge consumption (not sure if possible)
+- Does not need dense reward shaping, and can receive instructions from humans in a reasonable way. I don't know what this looks like, but the gist of the 'magic' I want, is how you can talk to a human, describe what you want them to do, and then they can do it. We don't need that level of complexity yet, but the agent should have some way for you to get it to do what you want.
 
 ## Current Goal
 
@@ -27,6 +28,10 @@ The next game planned is Lunar Lander.
 
 ## Testing Constraints
 
-Tests must be fast, and smart. If a learner is showing extreme instability in 2 minutes, there is absolutely no reason to run a 20 minute horizon test, don't waste time.
+Use `-o:speed` when testing.
+
+Tests must be fast, efficient, and smart. If a learner is showing extreme instability in 2 minutes, there is absolutely no reason to run a 20 minute horizon test, don't waste time.
 
 Tests must be stochastic, locking one seed and doing a test on that is not proof of robustness. You must show results over multiple seeds.
+
+Tests must have a way to early-out when further runtime will give no further knowledge. I don't want a 20+ minute test to run, then hear later that at 2 minutes it was obvious what the result was.

@@ -2,32 +2,65 @@ package cartpole_tests
 
 import "core:fmt"
 import "core:math/rand"
+import "core:sync"
 import "core:testing"
+import "core:thread"
 
 import ml  "../../../"
 import cpu "../../../backends/cpu"
 
+import "../agent"
 import "../sim"
-import "../../agent"
-import "../../world"
+import "../world"
 
-THREAD_COUNT :: 4
 CONTEXT_SIZE :: 1024 * 1024 * 256
 
-Run_Result :: struct {
-	best_score:   f32,
-	best_upright: f32,
+SEEDS            :: 8
+REQUIRED_PASSES  :: 7
+ALLOWED_FAILURES :: SEEDS - REQUIRED_PASSES
+
+MASTERY_UPRIGHT :: f32(0.85)
+DEGRADE_FLOOR   :: f32(0.70)
+
+LEARN_DEADLINE :: f64(150)
+HOLD_DEADLINE  :: f64(15 * 60)
+
+Verdict :: enum {
+	Stable,
+	Slow,
+	Degraded,
+	Aborted,
+}
+
+Sweep :: struct {
+	failures: int,
+	abort:    bool,
+}
+
+Seed_Run :: struct {
+	seed:  u64,
+	sweep: ^Sweep,
+
+	verdict:      Verdict,
+	peak_upright: f32,
+	last_upright: f32,
+	mastered_at:  f64,
+	stopped_at:   f64,
 	episodes:     int,
 	value_fit:    f32,
 	fit_samples:  int,
 }
 
-@(require_results)
-_run_learning :: proc(seed: u64, sim_seconds: f64) -> (result: Run_Result) {
-	random_state := rand.create(seed)
-	context.random_generator = rand.default_random_generator(&random_state)
+_fail :: proc(run: ^Seed_Run, verdict: Verdict) {
+	run.verdict = verdict
+	if sync.atomic_add(&run.sweep.failures, 1) + 1 > ALLOWED_FAILURES {
+		sync.atomic_store(&run.sweep.abort, true)
+	}
+}
 
-	cpu.set_thread_count(THREAD_COUNT)
+_run_seed :: proc(run: ^Seed_Run) {
+	random_state := rand.create(run.seed)
+	context.random_generator = rand.default_random_generator(&random_state)
 
 	ctx := cpu.context_create(CONTEXT_SIZE)
 	defer cpu.context_destroy(ctx)
@@ -44,8 +77,9 @@ _run_learning :: proc(seed: u64, sim_seconds: f64) -> (result: Run_Result) {
 
 	sim_time: f64
 	episode:  u64 = 1
+	mastered: bool
 
-	for sim_time < sim_seconds {
+	for {
 		action  := agent.act(brain)
 		control := action[world.ACTION_AXIS_X]
 		done    := sim.step(&game, control, sim.FIXED_DELTA)
@@ -53,59 +87,87 @@ _run_learning :: proc(seed: u64, sim_seconds: f64) -> (result: Run_Result) {
 		sim_time += f64(sim.FIXED_DELTA)
 		agent.drive(brain, sim_time, sim.observe(game), action, episode)
 
-		if done {
-			upright := game.upright_time / max(game.time, 1e-9)
-
-			if game.score > result.best_score {
-				result.best_score = game.score
-			}
-			if upright > result.best_upright {
-				result.best_upright = upright
-			}
-			result.episodes += 1
-			sim.reset(&game)
-			episode += 1
+		if !done {
+			continue
 		}
+
+		upright := game.upright_time / max(game.time, 1e-9)
+
+		run.episodes    += 1
+		run.last_upright = upright
+		run.stopped_at   = sim_time
+		if upright > run.peak_upright {
+			run.peak_upright = upright
+		}
+		if !mastered && upright >= MASTERY_UPRIGHT {
+			mastered        = true
+			run.mastered_at = sim_time
+		}
+
+		if mastered && upright < DEGRADE_FLOOR {
+			_fail(run, .Degraded)
+			break
+		}
+		if !mastered && sim_time >= LEARN_DEADLINE {
+			_fail(run, .Slow)
+			break
+		}
+		if sim_time >= HOLD_DEADLINE {
+			run.verdict = .Stable
+			break
+		}
+		if sync.atomic_load(&run.sweep.abort) {
+			run.verdict = .Aborted
+			break
+		}
+
+		sim.reset(&game)
+		episode += 1
 	}
 
-	result.value_fit, result.fit_samples = agent.value_fit(brain)
-	return
+	run.value_fit, run.fit_samples = agent.value_fit(brain)
 }
 
 @(test)
-test_cartpole_learns_fast :: proc(t: ^testing.T) {
-	SIM_SECONDS       :: f64(150)
-	UPRIGHT_THRESHOLD :: f32(0.5)
-	FIT_THRESHOLD     :: f32(0.5)
-	FIT_MINIMUM       :: 64
+test_cartpole_learns_fast_and_holds :: proc(t: ^testing.T) {
+	cpu.set_thread_count(1)
 
-	for seed in u64(1) ..= 2 {
-		result := _run_learning(seed, SIM_SECONDS)
+	sweep:   Sweep
+	runs:    [SEEDS]Seed_Run
+	workers: [SEEDS]^thread.Thread
 
-		testing.expectf(
-			t,
-			result.best_upright >= UPRIGHT_THRESHOLD,
-			"seed %d: best episode held the pole inverted %.0f%% of the time, need %.0f%% (a freely spinning pole already reads ~14%%)",
-			seed, result.best_upright * 100, UPRIGHT_THRESHOLD * 100,
-		)
+	for &run, index in runs {
+		run = {seed=u64(index + 1), sweep=&sweep}
+		workers[index] = thread.create_and_start_with_poly_data(&run, _run_seed)
+	}
+	for worker in workers {
+		thread.join(worker)
+		thread.destroy(worker)
+	}
 
-		testing.expectf(
-			t,
-			result.fit_samples >= FIT_MINIMUM,
-			"seed %d: only %d value-fit samples, need %d (buffer chains too short to judge Q)",
-			seed, result.fit_samples, FIT_MINIMUM,
-		)
+	passes: int
+	counts: [Verdict]int
 
-		testing.expectf(
-			t,
-			result.value_fit >= FIT_THRESHOLD,
-			"seed %d: value fit %.2f below %.2f over %d samples (Q does not track observed discounted return)",
-			seed, result.value_fit, FIT_THRESHOLD, result.fit_samples,
-		)
+	for run in runs {
+		counts[run.verdict] += 1
+		if run.verdict == .Stable {
+			passes += 1
+		}
 
 		fmt.printfln(
-			"seed %d | best score %.2f | best upright %.0f%% | episodes %d | value fit %.2f (%d samples)",
-			seed, result.best_score, result.best_upright * 100, result.episodes, result.value_fit, result.fit_samples,
+			"seed %d | %v | peak upright %.0f%% | last %.0f%% | mastered at %.0fs | ran %.0fs over %d episodes | value fit %.2f (%d samples)",
+			run.seed, run.verdict, run.peak_upright * 100, run.last_upright * 100,
+			run.mastered_at, run.stopped_at, run.episodes, run.value_fit, run.fit_samples,
 		)
 	}
+
+	testing.expectf(
+		t,
+		passes >= REQUIRED_PASSES,
+		"%d of %d seeds held %.0f%% upright out to %.0f sim-seconds, need %d (%d never reached %.0f%% within %.0fs, %d degraded below %.0f%% after mastering, %d abandoned once the verdict was decided)",
+		passes, SEEDS, DEGRADE_FLOOR * 100, HOLD_DEADLINE, REQUIRED_PASSES,
+		counts[.Slow], MASTERY_UPRIGHT * 100, LEARN_DEADLINE,
+		counts[.Degraded], DEGRADE_FLOOR * 100,
+		counts[.Aborted],
+	)
 }

@@ -9,9 +9,9 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
-import ml  "../../"
-import     "../../networks/mlp"
-import cpu "../../backends/cpu"
+import ml  "../../../"
+import     "../../../networks/mlp"
+import cpu "../../../backends/cpu"
 
 import "../world"
 
