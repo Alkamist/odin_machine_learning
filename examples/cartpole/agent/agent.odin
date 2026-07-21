@@ -39,9 +39,10 @@ PLAN_MIN_STD  :: f32(0.05)
 POLICY_SEED_SAMPLES :: 16
 
 ANALOG_STD :: f32(0.3)
-GUMBEL_TEMP :: f32(1)
 
 PESSIMISM :: f32(1)
+
+BOOTSTRAP_WEIGHT :: f32(0)
 
 VALUE_ENSEMBLE :: 2
 TAU            :: f32(0.01)
@@ -68,11 +69,12 @@ CONTEXT_SIZE :: 1024 * 1024 * 256
 Sensor :: [SENSOR_SIZE]f32
 
 Transition :: struct {
-	sensor: Sensor,
-	action: Action,
-	delta:  Sensor,
-	reward: f32,
-	dead:   bool,
+	sensor:  Sensor,
+	action:  Action,
+	delta:   Sensor,
+	reward:  f32,
+	dead:    bool,
+	planned: bool,
 }
 
 Snapshot :: struct {
@@ -126,6 +128,7 @@ Agent :: struct {
 	plan: [PLAN_HORIZON]Plan_Step,
 
 	previous:           Sensor,
+	previous_planned:   bool,
 	has_previous:       bool,
 	last_episode:       u64,
 	next_decision_time: f64,
@@ -300,7 +303,7 @@ _plan_init_step :: proc() -> (step: Plan_Step) {
 _decide :: proc(a: ^Agent, snapshot: Snapshot) {
 	if a.has_previous {
 		transition_reward, transition_dead := a.reward(snapshot.sensor)
-		transition := Transition{sensor=a.previous, action=snapshot.applied, reward=transition_reward, dead=transition_dead}
+		transition := Transition{sensor=a.previous, action=snapshot.applied, reward=transition_reward, dead=transition_dead, planned=a.previous_planned}
 		for i in 0 ..< SENSOR_SIZE {
 			transition.delta[i] = snapshot.sensor[i] - a.previous[i]
 		}
@@ -308,6 +311,7 @@ _decide :: proc(a: ^Agent, snapshot: Snapshot) {
 	}
 
 	action: Action
+	used_planner := a.decisions >= WARMUP_DECISIONS
 	if a.decisions < WARMUP_DECISIONS {
 		for j := 0; j < BINARY_COUNT; j += 1 {
 			action[j] = 1 if rand.float32() < 0.5 else 0
@@ -341,10 +345,11 @@ _decide :: proc(a: ^Agent, snapshot: Snapshot) {
 	a.latch = action
 	sync.mutex_unlock(&a.action_mutex)
 
-	a.previous      = snapshot.sensor
-	a.has_previous  = true
-	a.train_credit  = min(a.train_credit + TRAIN_STEPS, TRAIN_BACKLOG)
-	a.refine_budget = REFINES_PER_DECISION - 1
+	a.previous         = snapshot.sensor
+	a.previous_planned = used_planner
+	a.has_previous     = true
+	a.train_credit     = min(a.train_credit + TRAIN_STEPS, TRAIN_BACKLOG)
+	a.refine_budget    = REFINES_PER_DECISION - 1
 
 	sync.atomic_store(&a.decisions, a.decisions + 1)
 }
@@ -538,64 +543,52 @@ _train_policy :: proc(a: ^Agent) {
 		return
 	}
 
-	states := builtin.make([]f32, TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
+	states         := builtin.make([]f32, TRAIN_BATCH_SIZE * SENSOR_SIZE,  context.temp_allocator)
+	analog_targets := builtin.make([]f32, TRAIN_BATCH_SIZE * ANALOG_COUNT, context.temp_allocator)
+	binary_targets := builtin.make([]f32, TRAIN_BATCH_SIZE * BINARY_COUNT, context.temp_allocator)
 
-	for b in 0 ..< TRAIN_BATCH_SIZE {
+	count    := 0
+	attempts := 0
+	for count < TRAIN_BATCH_SIZE && attempts < TRAIN_BATCH_SIZE * 8 {
+		attempts += 1
 		transition := a.buffer[_sample_index(a)]
-		for i in 0 ..< SENSOR_SIZE {
-			states[b * SENSOR_SIZE + i] = transition.sensor[i]
+		if !transition.planned {
+			continue
 		}
+		for i in 0 ..< SENSOR_SIZE {
+			states[count * SENSOR_SIZE + i] = transition.sensor[i]
+		}
+		for j := 0; j < BINARY_COUNT; j += 1 {
+			binary_targets[count * BINARY_COUNT + j] = transition.action[j]
+		}
+		for k in 0 ..< ANALOG_COUNT {
+			analog_targets[count * ANALOG_COUNT + k] = transition.action[BINARY_COUNT + k]
+		}
+		count += 1
+	}
+
+	if count == 0 {
+		return
 	}
 
 	if ml.pass(training=true) {
-		state_tensor := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+		state_tensor := ml.tensor(states[:count * SENSOR_SIZE], []int{count, SENSOR_SIZE})
 		policy_out   := mlp.forward(a.policy, state_tensor)
-		means        := ml.slice_trailing(policy_out, BINARY_COUNT, POLICY_OUT)
 
-		eps := builtin.make([]f32, TRAIN_BATCH_SIZE * ANALOG_COUNT, context.temp_allocator)
-		for i in 0 ..< TRAIN_BATCH_SIZE * ANALOG_COUNT {
-			eps[i] = _randn()
-		}
-		eps_tensor    := ml.tensor(eps, []int{TRAIN_BATCH_SIZE, ANALOG_COUNT})
-		analog_action := ml.tanh(ml.add(means, ml.mul(eps_tensor, ml.scalar(.F32, ANALOG_STD))))
+		means      := ml.slice_trailing(policy_out, BINARY_COUNT, POLICY_OUT)
+		analog_tgt := ml.tensor(analog_targets[:count * ANALOG_COUNT], []int{count, ANALOG_COUNT})
+		loss       := ml.mean(ml.mean_squared_error(ml.tanh(means), analog_tgt))
 
-		action_tensor: ml.Tensor
 		when BINARY_COUNT > 0 {
-			logits := ml.slice_trailing(policy_out, 0, BINARY_COUNT)
-
-			gumbel := builtin.make([]f32, TRAIN_BATCH_SIZE * BINARY_COUNT, context.temp_allocator)
-			for i in 0 ..< TRAIN_BATCH_SIZE * BINARY_COUNT {
-				u := rand.float32()
-				gumbel[i] = math.ln(u) - math.ln(1 - u)
-			}
-			gumbel_tensor := ml.tensor(gumbel, []int{TRAIN_BATCH_SIZE, BINARY_COUNT})
-			binary_action := ml.sigmoid(ml.div(ml.add(logits, gumbel_tensor), ml.scalar(.F32, GUMBEL_TEMP)))
-
-			action_tensor = ml.concat(binary_action, analog_action)
+			logits     := ml.slice_trailing(policy_out, 0, BINARY_COUNT)
+			binary_tgt := ml.tensor(binary_targets[:count * BINARY_COUNT], []int{count, BINARY_COUNT})
+			loss = ml.add(loss, ml.mean(ml.mean_squared_error(ml.sigmoid(logits), binary_tgt)))
 		}
-		else {
-			action_tensor = analog_action
-		}
-
-		critic_input := ml.concat(state_tensor, action_tensor)
-
-		q: ml.Tensor
-		for v in 0 ..< VALUE_ENSEMBLE {
-			q_v := mlp.forward(a.values[v], critic_input)
-			q = q_v if v == 0 else ml.min(q, q_v)
-		}
-
-		min_q := ml.reshape(q, []int{TRAIN_BATCH_SIZE})
-		loss  := ml.mean(ml.mul(min_q, ml.scalar(.F32, -1)))
 
 		ml.backward(loss)
 
 		if ml.optimizer_step(&a.policy_opt) {
 			mlp.update(&a.policy_opt, a.policy)
-		}
-
-		for v in 0 ..< VALUE_ENSEMBLE {
-			mlp.zero_gradients(a.values[v])
 		}
 	}
 }
@@ -854,52 +847,54 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]Action, r
 		discount *= PLAN_DISCOUNT
 	}
 
-	terminal_states := builtin.make([]f32, PARTICLES * SENSOR_SIZE,  context.temp_allocator)
-	terminal_rows   := builtin.make([]f32, PARTICLES * POLICY_OUT,   context.temp_allocator)
-	critic_inputs   := builtin.make([]f32, PARTICLES * CRITIC_INPUT, context.temp_allocator)
+	when BOOTSTRAP_WEIGHT > 0 {
+		terminal_states := builtin.make([]f32, PARTICLES * SENSOR_SIZE,  context.temp_allocator)
+		terminal_rows   := builtin.make([]f32, PARTICLES * POLICY_OUT,   context.temp_allocator)
+		critic_inputs   := builtin.make([]f32, PARTICLES * CRITIC_INPUT, context.temp_allocator)
 
-	terminal_q: [VALUE_ENSEMBLE][]f32
-	for v in 0 ..< VALUE_ENSEMBLE {
-		terminal_q[v] = builtin.make([]f32, PARTICLES, context.temp_allocator)
-	}
-
-	for p in 0 ..< PARTICLES {
-		for i in 0 ..< SENSOR_SIZE {
-			terminal_states[p * SENSOR_SIZE + i] = states[p][i]
+		terminal_q: [VALUE_ENSEMBLE][]f32
+		for v in 0 ..< VALUE_ENSEMBLE {
+			terminal_q[v] = builtin.make([]f32, PARTICLES, context.temp_allocator)
 		}
-	}
-
-	if ml.pass() {
-		terminal_input := ml.tensor(terminal_states, []int{PARTICLES, SENSOR_SIZE})
-		ml.get_data(mlp.forward(a.policy, terminal_input), terminal_rows)
 
 		for p in 0 ..< PARTICLES {
-			action := _sample_row(terminal_rows[p * POLICY_OUT:][:POLICY_OUT])
-			base   := p * CRITIC_INPUT
 			for i in 0 ..< SENSOR_SIZE {
-				critic_inputs[base + i] = states[p][i]
-			}
-			for d in 0 ..< ACTION_DIM {
-				critic_inputs[base + SENSOR_SIZE + d] = action[d]
+				terminal_states[p * SENSOR_SIZE + i] = states[p][i]
 			}
 		}
 
-		critic_tensor := ml.tensor(critic_inputs, []int{PARTICLES, CRITIC_INPUT})
-		for v in 0 ..< VALUE_ENSEMBLE {
-			ml.get_data(mlp.forward(a.values[v], critic_tensor), terminal_q[v])
-		}
-	}
+		if ml.pass() {
+			terminal_input := ml.tensor(terminal_states, []int{PARTICLES, SENSOR_SIZE})
+			ml.get_data(mlp.forward(a.policy, terminal_input), terminal_rows)
 
-	for p in 0 ..< PARTICLES {
-		if !alive[p] {
-			continue
+			for p in 0 ..< PARTICLES {
+				action := _sample_row(terminal_rows[p * POLICY_OUT:][:POLICY_OUT])
+				base   := p * CRITIC_INPUT
+				for i in 0 ..< SENSOR_SIZE {
+					critic_inputs[base + i] = states[p][i]
+				}
+				for d in 0 ..< ACTION_DIM {
+					critic_inputs[base + SENSOR_SIZE + d] = action[d]
+				}
+			}
+
+			critic_tensor := ml.tensor(critic_inputs, []int{PARTICLES, CRITIC_INPUT})
+			for v in 0 ..< VALUE_ENSEMBLE {
+				ml.get_data(mlp.forward(a.values[v], critic_tensor), terminal_q[v])
+			}
 		}
 
-		bootstrap := terminal_q[0][p]
-		for v in 1 ..< VALUE_ENSEMBLE {
-			bootstrap = min(bootstrap, terminal_q[v][p])
+		for p in 0 ..< PARTICLES {
+			if !alive[p] {
+				continue
+			}
+
+			bootstrap := terminal_q[0][p]
+			for v in 1 ..< VALUE_ENSEMBLE {
+				bootstrap = min(bootstrap, terminal_q[v][p])
+			}
+			scores[p] += BOOTSTRAP_WEIGHT * discount * bootstrap
 		}
-		scores[p] += discount * bootstrap
 	}
 
 	for n in 0 ..< PLAN_SAMPLES {

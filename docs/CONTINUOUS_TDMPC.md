@@ -152,3 +152,51 @@ to lunar lander.
   raise if the value estimates are too noisy.
 - **Perturbation input** for cartpole once the mouse is the control (click-to-shove, a
   key, or automated random shoves — the last is best for repeatable retention probes).
+
+## Outcome (2026-07-20): validation gate met, value function taken off the critical path
+
+The continuous rewrite (Level 1) landed and worked, but its *first* form learned
+markedly slower than the discrete pre-TD-MPC baseline. Diagnosis: the pivot changed more
+than the action space — it also put the learned value function on the critical path of
+both downstream consumers, and Q is the slowest thing in the system to learn:
+
+- The CEM planner's return was dominated by the terminal Q bootstrap
+  (`0.98^20 ≈ 0.67` of a Q whose magnitude ~100+ exceeds the horizon reward sum), so the
+  planner was only as good as a from-scratch Q.
+- The policy was trained by the deterministic policy gradient through Q
+  (`maximize min_i Q_i`), which points nowhere while Q is garbage.
+
+The fix restores the discrete baseline's learning recipe *within* the continuous
+formulation — the reward is analytic and the 5-D dynamics model learns in a few hundred
+frames, so neither consumer needs Q to be fast:
+
+- **Pure-reward planner.** The terminal bootstrap in `_rollout` is gated behind
+  `BOOTSTRAP_WEIGHT :: f32(0)` (compile-time `when`, zero cost when off). The planner
+  scores rollouts on the true reward through the dynamics ensemble — myopic but
+  incorruptible.
+- **Behavior-cloning policy.** `_train_policy` regresses the policy toward the planner's
+  own actions stored in the buffer (`tanh(mean) → analog action`,
+  `sigmoid(logit) → binary bit`), trained only on planner-authored transitions (new
+  `Transition.planned` flag, tracked via `Agent.previous_planned`, so random warmup
+  actions are excluded). This is a supervised target available from the first
+  post-warmup decision.
+- **Q kept as background substrate.** `_train_value` still runs; Q simply feeds nothing
+  yet. It is ready for the trust-aware bootstrap (§4 of `CONTINUAL_LEARNING.md`) and the
+  retention experiments, which are the reason it exists at all on this task.
+
+Result (headless, `-o:speed`, seeds 1-4, 3 sim-min): episode 1 (~525 decisions) already
+scores 44-69, versus the old TD-MPC needing ~5 episodes to reach ~84. Fast learning
+restored; the "continuous cartpole learns at least as well as the discrete baseline"
+gate is met.
+
+Coverage: `examples/cartpole/tests/` (package `cartpole_tests`, kept out of the main
+`tests` suite so box2d stays unlinked there) runs the real sim+agent headless for
+90 sim-seconds at seeds 1-2 and asserts best score ≥ 45 (~30s wall). Run with
+`odin test examples/cartpole/tests -o:speed`.
+
+Standing implication for the roadmap: on cartpole the value function does no work. It is
+insurance for harder games (where the horizon can't span the reward) and the load-bearing
+object the retention thesis is about. The clean next step when Q should re-enter planning
+is the trust-aware bootstrap — scale `BOOTSTRAP_WEIGHT` by ensemble agreement — rather
+than the current all-or-nothing constant, so a from-scratch or corrupted Q degrades
+gracefully to the pure-reward planner instead of poisoning it.
