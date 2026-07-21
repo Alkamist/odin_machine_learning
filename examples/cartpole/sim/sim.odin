@@ -33,12 +33,6 @@ SPIN_WEIGHT    :: f32(2)
 BARRIER_ONSET  :: f32(0.5)
 BARRIER_WEIGHT :: f32(20)
 
-Action :: enum {
-	None,
-	Left,
-	Right,
-}
-
 Category :: enum u64 {
 	Normal,
 	Pole,
@@ -269,28 +263,6 @@ pole_angle :: proc(state: State) -> f32 {
 @(require_results)
 pole_spin :: proc(state: State) -> f32 {
 	return b2.Body_GetAngularVelocity(state.pole.body)
-}
-
-@(require_results)
-action_control :: proc(action: Action) -> f32 {
-	switch action {
-	case .None:  return 0
-	case .Left:  return -1
-	case .Right: return 1
-	}
-	return 0
-}
-
-@(require_results)
-control_action :: proc(control: f32) -> Action {
-	DEADZONE :: f32(0.2)
-	if control >  DEADZONE {
-		return .Right
-	}
-	if control < -DEADZONE {
-		return .Left
-	}
-	return .None
 }
 
 step :: proc(state: ^State, control: f32, delta: f32) -> (done: bool) {

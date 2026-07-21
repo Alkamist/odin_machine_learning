@@ -122,6 +122,19 @@ registry_update :: proc(opt: ^Optimizer, r: ^Registry, loc := #caller_location) 
 	}
 }
 
+registry_zero_gradients :: proc(r: ^Registry, loc := #caller_location) {
+	backend := current_context(loc=loc).backend
+	for parameter in r.parameters {
+		if .Train not_in parameter.flags {
+			continue
+		}
+		if parameter.tensor.buffers[.Gradient] == (Backend_Buffer{}) {
+			continue
+		}
+		backend.buffer_scale(parameter.tensor.buffers[.Gradient], parameter.tensor.count, 0, loc)
+	}
+}
+
 registry_copy :: proc(dst, src: ^Registry, loc := #caller_location) {
 	assert(builtin.len(dst.parameters) == builtin.len(src.parameters), "registries must have the same parameter count", loc=loc)
 	for parameter, i in src.parameters {

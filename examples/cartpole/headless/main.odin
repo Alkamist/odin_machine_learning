@@ -14,8 +14,6 @@ import "../agent"
 
 THREAD_COUNT :: 4
 
-#assert(len(sim.Action) == agent.ACTION_COUNT)
-
 main :: proc() {
 	minutes := f64(10)
 	seed    := u64(1)
@@ -60,7 +58,7 @@ main :: proc() {
 
 	for sim_time < minutes * 60 {
 		action  := agent.act(brain)
-		control := sim.action_control(sim.Action(action))
+		control := action[0]
 		done    := sim.step(&game, control, sim.FIXED_DELTA)
 
 		sim_time += f64(sim.FIXED_DELTA)

@@ -71,3 +71,8 @@ update :: proc(opt: ^ml.Optimizer, mlp: Mlp) {
 	mlp := mlp
 	ml.registry_update(opt, &mlp.params)
 }
+
+zero_gradients :: proc(mlp: Mlp) {
+	mlp := mlp
+	ml.registry_zero_gradients(&mlp.params)
+}

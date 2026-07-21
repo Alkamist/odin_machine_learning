@@ -14,11 +14,16 @@ import     "../../../networks/mlp"
 import cpu "../../../backends/cpu"
 
 SENSOR_SIZE  :: 5
-ACTION_COUNT :: 3
+BINARY_COUNT :: 0
+ANALOG_COUNT :: 1
+ACTION_DIM   :: BINARY_COUNT + ANALOG_COUNT
+
+Action :: [ACTION_DIM]f32
 
 Reward_Proc :: proc(sensor: [SENSOR_SIZE]f32) -> (reward: f32, dead: bool)
 
-MODEL_INPUT :: SENSOR_SIZE + ACTION_COUNT
+MODEL_INPUT :: SENSOR_SIZE + ACTION_DIM
+POLICY_OUT  :: BINARY_COUNT + ANALOG_COUNT
 HIDDEN_SIZE :: 32
 
 ENSEMBLE_SIZE :: 5
@@ -28,14 +33,18 @@ PLAN_SAMPLES  :: 64
 PLAN_ELITES   :: 8
 PLAN_DISCOUNT :: f32(0.98)
 
+PLAN_INIT_STD :: f32(0.5)
+PLAN_MIN_STD  :: f32(0.05)
+
 POLICY_SEED_SAMPLES :: 16
-POLICY_TEMPERATURE  :: f32(1)
+
+ANALOG_STD :: f32(0.3)
+GUMBEL_TEMP :: f32(1)
 
 PESSIMISM :: f32(1)
 
 VALUE_ENSEMBLE :: 2
 TAU            :: f32(0.01)
-ENTROPY_WEIGHT :: f32(1)
 DEATH_PENALTY  :: f32(40)
 
 BUFFER_CAPACITY  :: 4096
@@ -60,7 +69,7 @@ Sensor :: [SENSOR_SIZE]f32
 
 Transition :: struct {
 	sensor: Sensor,
-	action: int,
+	action: Action,
 	delta:  Sensor,
 	reward: f32,
 	dead:   bool,
@@ -70,8 +79,14 @@ Snapshot :: struct {
 	valid:   bool,
 	time:    f64,
 	sensor:  Sensor,
-	applied: int,
+	applied: Action,
 	episode: u64,
+}
+
+Plan_Step :: struct {
+	analog_mean: [ANALOG_COUNT]f32,
+	analog_std:  [ANALOG_COUNT]f32,
+	binary_prob: [BINARY_COUNT]f32,
 }
 
 Agent :: struct {
@@ -83,7 +98,8 @@ Agent :: struct {
 	mailbox_mutex: sync.Mutex,
 	mailbox:       Snapshot,
 
-	latch:          int,
+	action_mutex:   sync.Mutex,
+	latch:          Action,
 	decisions:      int,
 	agreement_bits: u32,
 
@@ -107,7 +123,7 @@ Agent :: struct {
 	delta_sq_mean: Sensor,
 	delta_samples: int,
 
-	plan: [PLAN_HORIZON][ACTION_COUNT]f32,
+	plan: [PLAN_HORIZON]Plan_Step,
 
 	previous:           Sensor,
 	has_previous:       bool,
@@ -138,15 +154,18 @@ stop :: proc(a: ^Agent) {
 	thread.destroy(a.worker)
 }
 
-sense :: proc(a: ^Agent, time: f64, sensor: [SENSOR_SIZE]f32, applied: int, episode: u64) {
+sense :: proc(a: ^Agent, time: f64, sensor: [SENSOR_SIZE]f32, applied: Action, episode: u64) {
 	sync.mutex_lock(&a.mailbox_mutex)
 	a.mailbox = {valid=true, time=time, sensor=sensor, applied=applied, episode=episode}
 	sync.mutex_unlock(&a.mailbox_mutex)
 }
 
 @(require_results)
-act :: proc(a: ^Agent) -> int {
-	return sync.atomic_load(&a.latch)
+act :: proc(a: ^Agent) -> (action: Action) {
+	sync.mutex_lock(&a.action_mutex)
+	action = a.latch
+	sync.mutex_unlock(&a.action_mutex)
+	return
 }
 
 decisions :: proc(a: ^Agent) -> int {
@@ -163,12 +182,12 @@ boot :: proc(a: ^Agent) {
 		a.models[m] = mlp.make(MODEL_INPUT, HIDDEN_SIZE, SENSOR_SIZE)
 		a.opts[m]   = ml.optimizer_make(learning_rate=LEARNING_RATE)
 	}
-	a.policy     = mlp.make(SENSOR_SIZE, HIDDEN_SIZE, ACTION_COUNT)
+	a.policy     = mlp.make(SENSOR_SIZE, HIDDEN_SIZE, POLICY_OUT)
 	a.policy_opt = ml.optimizer_make(learning_rate=POLICY_RATE)
 
 	for v in 0 ..< VALUE_ENSEMBLE {
-		a.values[v]        = mlp.make(SENSOR_SIZE, HIDDEN_SIZE, ACTION_COUNT)
-		a.value_targets[v] = mlp.make(SENSOR_SIZE, HIDDEN_SIZE, ACTION_COUNT)
+		a.values[v]        = mlp.make(SENSOR_SIZE + ACTION_DIM, HIDDEN_SIZE, 1)
+		a.value_targets[v] = mlp.make(SENSOR_SIZE + ACTION_DIM, HIDDEN_SIZE, 1)
 		a.value_opts[v]    = ml.optimizer_make(learning_rate=LEARNING_RATE)
 		mlp.copy(a.value_targets[v], a.values[v])
 	}
@@ -221,7 +240,7 @@ _step_brain :: proc(a: ^Agent, snapshot: Snapshot) -> (idle: bool) {
 	return
 }
 
-drive :: proc(a: ^Agent, time: f64, sensor: [SENSOR_SIZE]f32, applied: int, episode: u64) {
+drive :: proc(a: ^Agent, time: f64, sensor: [SENSOR_SIZE]f32, applied: Action, episode: u64) {
 	snapshot := Snapshot{valid=true, time=time, sensor=sensor, applied=applied, episode=episode}
 	for {
 		idle := _step_brain(a, snapshot)
@@ -262,10 +281,20 @@ _run :: proc(a: ^Agent) {
 _forget_episode :: proc(a: ^Agent) {
 	a.has_previous = false
 	for h in 0 ..< PLAN_HORIZON {
-		for action_index in 0 ..< ACTION_COUNT {
-			a.plan[h][action_index] = 1.0 / f32(ACTION_COUNT)
-		}
+		a.plan[h] = _plan_init_step()
 	}
+}
+
+@(require_results)
+_plan_init_step :: proc() -> (step: Plan_Step) {
+	for k in 0 ..< ANALOG_COUNT {
+		step.analog_mean[k] = 0
+		step.analog_std[k]  = PLAN_INIT_STD
+	}
+	for j := 0; j < BINARY_COUNT; j += 1 {
+		step.binary_prob[j] = 0.5
+	}
+	return
 }
 
 _decide :: proc(a: ^Agent, snapshot: Snapshot) {
@@ -278,24 +307,39 @@ _decide :: proc(a: ^Agent, snapshot: Snapshot) {
 		_remember(a, transition)
 	}
 
-	action: int
+	action: Action
 	if a.decisions < WARMUP_DECISIONS {
-		action = rand.int_max(ACTION_COUNT)
+		for j := 0; j < BINARY_COUNT; j += 1 {
+			action[j] = 1 if rand.float32() < 0.5 else 0
+		}
+		for k in 0 ..< ANALOG_COUNT {
+			action[BINARY_COUNT + k] = rand.float32() * 2 - 1
+		}
 	}
 	else {
 		_plan_shift(a)
 		_plan_refine(a, snapshot.sensor)
 		action = _plan_action(a)
 
-		match := f32(0)
-		if _policy_action(a, snapshot.sensor) == action {
-			match = 1
+		policy_action := _policy_mean(a, snapshot.sensor)
+		match := f32(1)
+		for j := 0; j < BINARY_COUNT; j += 1 {
+			if action[j] != policy_action[j] {
+				match = 0
+			}
+		}
+		for k in 0 ..< ANALOG_COUNT {
+			if abs(action[BINARY_COUNT + k] - policy_action[BINARY_COUNT + k]) > 0.25 {
+				match = 0
+			}
 		}
 		a.agreement += (match - a.agreement) * AGREEMENT_RATE
 		sync.atomic_store(&a.agreement_bits, transmute(u32)a.agreement)
 	}
 
-	sync.atomic_store(&a.latch, action)
+	sync.mutex_lock(&a.action_mutex)
+	a.latch = action
+	sync.mutex_unlock(&a.action_mutex)
 
 	a.previous      = snapshot.sensor
 	a.has_previous  = true
@@ -322,9 +366,52 @@ _remember :: proc(a: ^Agent, transition: Transition) {
 }
 
 @(require_results)
-_policy_action :: proc(a: ^Agent, sensor: Sensor) -> int {
-	input  := builtin.make([]f32, SENSOR_SIZE,  context.temp_allocator)
-	logits := builtin.make([]f32, ACTION_COUNT, context.temp_allocator)
+_sigmoid :: proc(x: f32) -> f32 {
+	return 1.0 / (1.0 + math.exp(-x))
+}
+
+@(require_results)
+_randn :: proc() -> f32 {
+	return rand.float32_normal(0, 1)
+}
+
+@(require_results)
+_sample_row :: proc(row: []f32) -> (action: Action) {
+	for j := 0; j < BINARY_COUNT; j += 1 {
+		action[j] = 1 if rand.float32() < _sigmoid(row[j]) else 0
+	}
+	for k in 0 ..< ANALOG_COUNT {
+		mean := row[BINARY_COUNT + k]
+		action[BINARY_COUNT + k] = math.tanh(mean + ANALOG_STD * _randn())
+	}
+	return
+}
+
+@(require_results)
+_mean_row :: proc(row: []f32) -> (action: Action) {
+	for j := 0; j < BINARY_COUNT; j += 1 {
+		action[j] = 1 if _sigmoid(row[j]) > 0.5 else 0
+	}
+	for k in 0 ..< ANALOG_COUNT {
+		action[BINARY_COUNT + k] = math.tanh(row[BINARY_COUNT + k])
+	}
+	return
+}
+
+@(require_results)
+_policy_sample :: proc(a: ^Agent, sensor: Sensor) -> Action {
+	return _sample_row(_policy_row(a, sensor))
+}
+
+@(require_results)
+_policy_mean :: proc(a: ^Agent, sensor: Sensor) -> Action {
+	return _mean_row(_policy_row(a, sensor))
+}
+
+@(require_results)
+_policy_row :: proc(a: ^Agent, sensor: Sensor) -> []f32 {
+	input := builtin.make([]f32, SENSOR_SIZE, context.temp_allocator)
+	row   := builtin.make([]f32, POLICY_OUT,  context.temp_allocator)
 
 	for i in 0 ..< SENSOR_SIZE {
 		input[i] = sensor[i]
@@ -333,16 +420,9 @@ _policy_action :: proc(a: ^Agent, sensor: Sensor) -> int {
 	if ml.pass() {
 		x      := ml.tensor(input, []int{1, SENSOR_SIZE})
 		output := mlp.forward(a.policy, x)
-		ml.get_data(output, logits)
+		ml.get_data(output, row)
 	}
-
-	best := 0
-	for action_index in 1 ..< ACTION_COUNT {
-		if logits[action_index] > logits[best] {
-			best = action_index
-		}
-	}
-	return best
+	return row
 }
 
 _train_value :: proc(a: ^Agent) {
@@ -350,11 +430,11 @@ _train_value :: proc(a: ^Agent) {
 		return
 	}
 
-	states     := builtin.make([]f32,  TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
-	successors := builtin.make([]f32,  TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
-	actions    := builtin.make([]int,  TRAIN_BATCH_SIZE,               context.temp_allocator)
-	rewards    := builtin.make([]f32,  TRAIN_BATCH_SIZE,               context.temp_allocator)
-	deaths     := builtin.make([]bool, TRAIN_BATCH_SIZE,               context.temp_allocator)
+	states     := builtin.make([]f32,    TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
+	successors := builtin.make([]f32,    TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
+	actions    := builtin.make([]Action, TRAIN_BATCH_SIZE,               context.temp_allocator)
+	rewards    := builtin.make([]f32,    TRAIN_BATCH_SIZE,               context.temp_allocator)
+	deaths     := builtin.make([]bool,   TRAIN_BATCH_SIZE,               context.temp_allocator)
 
 	for b in 0 ..< TRAIN_BATCH_SIZE {
 		transition := a.buffer[_sample_index(a)]
@@ -367,19 +447,35 @@ _train_value :: proc(a: ^Agent) {
 		deaths[b]  = transition.dead
 	}
 
-	probabilities := builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
-	targets       := builtin.make([]f32, TRAIN_BATCH_SIZE,               context.temp_allocator)
+	CRITIC_INPUT :: SENSOR_SIZE + ACTION_DIM
+
+	successor_rows := builtin.make([]f32, TRAIN_BATCH_SIZE * POLICY_OUT,   context.temp_allocator)
+	critic_next    := builtin.make([]f32, TRAIN_BATCH_SIZE * CRITIC_INPUT, context.temp_allocator)
+	targets        := builtin.make([]f32, TRAIN_BATCH_SIZE,               context.temp_allocator)
 
 	target_q: [VALUE_ENSEMBLE][]f32
 	for v in 0 ..< VALUE_ENSEMBLE {
-		target_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
+		target_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE, context.temp_allocator)
 	}
 
 	if ml.pass() {
 		successor_tensor := ml.tensor(successors, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
-		ml.get_data(ml.softmax(mlp.forward(a.policy, successor_tensor)), probabilities)
+		ml.get_data(mlp.forward(a.policy, successor_tensor), successor_rows)
+
+		for b in 0 ..< TRAIN_BATCH_SIZE {
+			action := _sample_row(successor_rows[b * POLICY_OUT:][:POLICY_OUT])
+			base   := b * CRITIC_INPUT
+			for i in 0 ..< SENSOR_SIZE {
+				critic_next[base + i] = successors[b * SENSOR_SIZE + i]
+			}
+			for d in 0 ..< ACTION_DIM {
+				critic_next[base + SENSOR_SIZE + d] = action[d]
+			}
+		}
+
+		critic_next_tensor := ml.tensor(critic_next, []int{TRAIN_BATCH_SIZE, CRITIC_INPUT})
 		for v in 0 ..< VALUE_ENSEMBLE {
-			ml.get_data(mlp.forward(a.value_targets[v], successor_tensor), target_q[v])
+			ml.get_data(mlp.forward(a.value_targets[v], critic_next_tensor), target_q[v])
 		}
 	}
 
@@ -389,32 +485,32 @@ _train_value :: proc(a: ^Agent) {
 			continue
 		}
 
-		expectation: f32
-		for action_index in 0 ..< ACTION_COUNT {
-			idx := b * ACTION_COUNT + action_index
-			q   := target_q[0][idx]
-			for v in 1 ..< VALUE_ENSEMBLE {
-				q = min(q, target_q[v][idx])
-			}
-			expectation += probabilities[idx] * q
+		q := target_q[0][b]
+		for v in 1 ..< VALUE_ENSEMBLE {
+			q = min(q, target_q[v][b])
 		}
-		targets[b] = rewards[b] + PLAN_DISCOUNT * expectation
+		targets[b] = rewards[b] + PLAN_DISCOUNT * q
 	}
 
-	gather := builtin.make([]int, TRAIN_BATCH_SIZE, context.temp_allocator)
+	critic_now := builtin.make([]f32, TRAIN_BATCH_SIZE * CRITIC_INPUT, context.temp_allocator)
 	for b in 0 ..< TRAIN_BATCH_SIZE {
-		gather[b] = b * ACTION_COUNT + actions[b]
+		base := b * CRITIC_INPUT
+		for i in 0 ..< SENSOR_SIZE {
+			critic_now[base + i] = states[b * SENSOR_SIZE + i]
+		}
+		for d in 0 ..< ACTION_DIM {
+			critic_now[base + SENSOR_SIZE + d] = actions[b][d]
+		}
 	}
 
 	if ml.pass(training=true) {
-		x        := ml.tensor(states,  []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
-		y        := ml.tensor(targets, []int{TRAIN_BATCH_SIZE})
+		x        := ml.tensor(critic_now, []int{TRAIN_BATCH_SIZE, CRITIC_INPUT})
+		y        := ml.tensor(targets,    []int{TRAIN_BATCH_SIZE})
 		total: ml.Tensor
 
 		for v in 0 ..< VALUE_ENSEMBLE {
 			q_values   := mlp.forward(a.values[v], x)
-			flat       := ml.reshape(q_values, []int{TRAIN_BATCH_SIZE * ACTION_COUNT})
-			prediction := ml.select(flat, gather)
+			prediction := ml.reshape(q_values, []int{TRAIN_BATCH_SIZE})
 			loss       := ml.mean(ml.mean_squared_error(prediction, y))
 
 			total = loss if v == 0 else ml.add(total, loss)
@@ -442,8 +538,7 @@ _train_policy :: proc(a: ^Agent) {
 		return
 	}
 
-	states := builtin.make([]f32, TRAIN_BATCH_SIZE * SENSOR_SIZE,  context.temp_allocator)
-	neg_q  := builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
+	states := builtin.make([]f32, TRAIN_BATCH_SIZE * SENSOR_SIZE, context.temp_allocator)
 
 	for b in 0 ..< TRAIN_BATCH_SIZE {
 		transition := a.buffer[_sample_index(a)]
@@ -452,39 +547,55 @@ _train_policy :: proc(a: ^Agent) {
 		}
 	}
 
-	online_q: [VALUE_ENSEMBLE][]f32
-	for v in 0 ..< VALUE_ENSEMBLE {
-		online_q[v] = builtin.make([]f32, TRAIN_BATCH_SIZE * ACTION_COUNT, context.temp_allocator)
-	}
-
-	if ml.pass() {
-		state_tensor := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
-		for v in 0 ..< VALUE_ENSEMBLE {
-			ml.get_data(mlp.forward(a.values[v], state_tensor), online_q[v])
-		}
-	}
-
-	for idx in 0 ..< TRAIN_BATCH_SIZE * ACTION_COUNT {
-		q := online_q[0][idx]
-		for v in 1 ..< VALUE_ENSEMBLE {
-			q = min(q, online_q[v][idx])
-		}
-		neg_q[idx] = -q
-	}
-
 	if ml.pass(training=true) {
-		x             := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
-		neg_q_tensor  := ml.tensor(neg_q,  []int{TRAIN_BATCH_SIZE, ACTION_COUNT})
-		logits        := mlp.forward(a.policy, x)
-		probabilities := ml.softmax(logits)
-		value_term    := ml.mean(ml.sum(ml.mul(probabilities, neg_q_tensor)))
-		entropy_term  := ml.mul(ml.mean(ml.entropy(probabilities)), ml.scalar(.F32, -ENTROPY_WEIGHT))
-		loss          := ml.add(value_term, entropy_term)
+		state_tensor := ml.tensor(states, []int{TRAIN_BATCH_SIZE, SENSOR_SIZE})
+		policy_out   := mlp.forward(a.policy, state_tensor)
+		means        := ml.slice_trailing(policy_out, BINARY_COUNT, POLICY_OUT)
+
+		eps := builtin.make([]f32, TRAIN_BATCH_SIZE * ANALOG_COUNT, context.temp_allocator)
+		for i in 0 ..< TRAIN_BATCH_SIZE * ANALOG_COUNT {
+			eps[i] = _randn()
+		}
+		eps_tensor    := ml.tensor(eps, []int{TRAIN_BATCH_SIZE, ANALOG_COUNT})
+		analog_action := ml.tanh(ml.add(means, ml.mul(eps_tensor, ml.scalar(.F32, ANALOG_STD))))
+
+		action_tensor: ml.Tensor
+		when BINARY_COUNT > 0 {
+			logits := ml.slice_trailing(policy_out, 0, BINARY_COUNT)
+
+			gumbel := builtin.make([]f32, TRAIN_BATCH_SIZE * BINARY_COUNT, context.temp_allocator)
+			for i in 0 ..< TRAIN_BATCH_SIZE * BINARY_COUNT {
+				u := rand.float32()
+				gumbel[i] = math.ln(u) - math.ln(1 - u)
+			}
+			gumbel_tensor := ml.tensor(gumbel, []int{TRAIN_BATCH_SIZE, BINARY_COUNT})
+			binary_action := ml.sigmoid(ml.div(ml.add(logits, gumbel_tensor), ml.scalar(.F32, GUMBEL_TEMP)))
+
+			action_tensor = ml.concat(binary_action, analog_action)
+		}
+		else {
+			action_tensor = analog_action
+		}
+
+		critic_input := ml.concat(state_tensor, action_tensor)
+
+		q: ml.Tensor
+		for v in 0 ..< VALUE_ENSEMBLE {
+			q_v := mlp.forward(a.values[v], critic_input)
+			q = q_v if v == 0 else ml.min(q, q_v)
+		}
+
+		min_q := ml.reshape(q, []int{TRAIN_BATCH_SIZE})
+		loss  := ml.mean(ml.mul(min_q, ml.scalar(.F32, -1)))
 
 		ml.backward(loss)
 
 		if ml.optimizer_step(&a.policy_opt) {
 			mlp.update(&a.policy_opt, a.policy)
+		}
+
+		for v in 0 ..< VALUE_ENSEMBLE {
+			mlp.zero_gradients(a.values[v])
 		}
 	}
 }
@@ -506,14 +617,13 @@ _delta_deviation :: proc(a: ^Agent, i: int) -> f32 {
 	return max(math.sqrt(max(variance, 0)), 1e-4)
 }
 
-_encode :: proc(sensor: Sensor, action: int, dst: []f32) {
+_encode :: proc(sensor: Sensor, action: Action, dst: []f32) {
 	for i in 0 ..< SENSOR_SIZE {
 		dst[i] = sensor[i]
 	}
-	for i in 0 ..< ACTION_COUNT {
-		dst[SENSOR_SIZE + i] = 0
+	for d in 0 ..< ACTION_DIM {
+		dst[SENSOR_SIZE + d] = action[d]
 	}
-	dst[SENSOR_SIZE + action] = 1
 }
 
 _train :: proc(a: ^Agent) {
@@ -560,33 +670,42 @@ _plan_shift :: proc(a: ^Agent) {
 	for h in 0 ..< PLAN_HORIZON - 1 {
 		a.plan[h] = a.plan[h + 1]
 	}
-	for action_index in 0 ..< ACTION_COUNT {
-		a.plan[PLAN_HORIZON - 1][action_index] = 1.0 / f32(ACTION_COUNT)
-	}
+	a.plan[PLAN_HORIZON - 1] = _plan_init_step()
 }
 
 @(require_results)
-_plan_action :: proc(a: ^Agent) -> int {
-	best := 0
-	for action_index in 1 ..< ACTION_COUNT {
-		if a.plan[0][action_index] > a.plan[0][best] {
-			best = action_index
-		}
+_plan_action :: proc(a: ^Agent) -> (action: Action) {
+	for j := 0; j < BINARY_COUNT; j += 1 {
+		action[j] = 1 if a.plan[0].binary_prob[j] > 0.5 else 0
 	}
-	return best
+	for k in 0 ..< ANALOG_COUNT {
+		action[BINARY_COUNT + k] = clamp(a.plan[0].analog_mean[k], -1, 1)
+	}
+	return
+}
+
+@(require_results)
+_sample_plan_step :: proc(step: Plan_Step) -> (action: Action) {
+	for j := 0; j < BINARY_COUNT; j += 1 {
+		action[j] = 1 if rand.float32() < step.binary_prob[j] else 0
+	}
+	for k in 0 ..< ANALOG_COUNT {
+		action[BINARY_COUNT + k] = clamp(step.analog_mean[k] + step.analog_std[k] * _randn(), -1, 1)
+	}
+	return
 }
 
 _plan_refine :: proc(a: ^Agent, sensor: Sensor) {
-	sequences := builtin.make([][PLAN_HORIZON]int, PLAN_SAMPLES, context.temp_allocator)
-	returns   := builtin.make([]f32,               PLAN_SAMPLES, context.temp_allocator)
-	order     := builtin.make([]int,               PLAN_SAMPLES, context.temp_allocator)
+	sequences := builtin.make([][PLAN_HORIZON]Action, PLAN_SAMPLES, context.temp_allocator)
+	returns   := builtin.make([]f32,                  PLAN_SAMPLES, context.temp_allocator)
+	order     := builtin.make([]int,                  PLAN_SAMPLES, context.temp_allocator)
 
 	seeded := POLICY_SEED_SAMPLES
 	_policy_seed(a, sensor, sequences[:seeded])
 
 	for n in seeded ..< PLAN_SAMPLES {
 		for h in 0 ..< PLAN_HORIZON {
-			sequences[n][h] = _sample_action(a.plan[h])
+			sequences[n][h] = _sample_plan_step(a.plan[h])
 		}
 	}
 
@@ -606,24 +725,38 @@ _plan_refine :: proc(a: ^Agent, sensor: Sensor) {
 	}
 
 	for h in 0 ..< PLAN_HORIZON {
-		counts: [ACTION_COUNT]f32
-		for e in 0 ..< PLAN_ELITES {
-			counts[sequences[order[e]][h]] += 1.0 / f32(PLAN_ELITES)
+		for k in 0 ..< ANALOG_COUNT {
+			mean: f32
+			for e in 0 ..< PLAN_ELITES {
+				mean += sequences[order[e]][h][BINARY_COUNT + k] / f32(PLAN_ELITES)
+			}
+			variance: f32
+			for e in 0 ..< PLAN_ELITES {
+				diff := sequences[order[e]][h][BINARY_COUNT + k] - mean
+				variance += diff * diff / f32(PLAN_ELITES)
+			}
+			std := max(math.sqrt(variance), PLAN_MIN_STD)
+
+			a.plan[h].analog_mean[k] = 0.5 * a.plan[h].analog_mean[k] + 0.5 * mean
+			a.plan[h].analog_std[k]  = 0.5 * a.plan[h].analog_std[k]  + 0.5 * std
 		}
-		for action_index in 0 ..< ACTION_COUNT {
-			a.plan[h][action_index] = 0.5 * a.plan[h][action_index] + 0.5 * counts[action_index]
-			a.plan[h][action_index] = max(a.plan[h][action_index], 0.02)
+		for j := 0; j < BINARY_COUNT; j += 1 {
+			rate: f32
+			for e in 0 ..< PLAN_ELITES {
+				rate += sequences[order[e]][h][j] / f32(PLAN_ELITES)
+			}
+			a.plan[h].binary_prob[j] = 0.5 * a.plan[h].binary_prob[j] + 0.5 * rate
 		}
 	}
 }
 
-_policy_seed :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int) {
+_policy_seed :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]Action) {
 	count := len(sequences)
 
-	states       := builtin.make([]Sensor, count,                context.temp_allocator)
+	states       := builtin.make([]Sensor, count,               context.temp_allocator)
 	inputs       := builtin.make([]f32,    count * MODEL_INPUT,  context.temp_allocator)
 	observations := builtin.make([]f32,    count * SENSOR_SIZE,  context.temp_allocator)
-	logits       := builtin.make([]f32,    count * ACTION_COUNT, context.temp_allocator)
+	rows         := builtin.make([]f32,    count * POLICY_OUT,   context.temp_allocator)
 	deltas       := builtin.make([]f32,    count * SENSOR_SIZE,  context.temp_allocator)
 
 	for p in 0 ..< count {
@@ -639,10 +772,10 @@ _policy_seed :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int) 
 			}
 
 			x := ml.tensor(observations, []int{count, SENSOR_SIZE})
-			ml.get_data(mlp.forward(a.policy, x), logits)
+			ml.get_data(mlp.forward(a.policy, x), rows)
 
 			for p in 0 ..< count {
-				action := _sample_logits(logits[p * ACTION_COUNT:][:ACTION_COUNT])
+				action := _sample_row(rows[p * POLICY_OUT:][:POLICY_OUT])
 				sequences[p][h] = action
 				_encode(states[p], action, inputs[p * MODEL_INPUT:][:MODEL_INPUT])
 			}
@@ -670,22 +803,9 @@ _apply_delta :: proc(a: ^Agent, state: ^Sensor, deltas: []f32) {
 	}
 }
 
-@(require_results)
-_sample_logits :: proc(logits: []f32) -> int {
-	highest := logits[0]
-	for i in 1 ..< ACTION_COUNT {
-		highest = max(highest, logits[i])
-	}
-
-	probabilities: [ACTION_COUNT]f32
-	for i in 0 ..< ACTION_COUNT {
-		probabilities[i] = math.exp((logits[i] - highest) / POLICY_TEMPERATURE)
-	}
-	return _sample_action(probabilities)
-}
-
-_rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, returns: []f32) {
-	PARTICLES :: PLAN_SAMPLES * ENSEMBLE_SIZE
+_rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]Action, returns: []f32) {
+	PARTICLES    :: PLAN_SAMPLES * ENSEMBLE_SIZE
+	CRITIC_INPUT :: SENSOR_SIZE + ACTION_DIM
 
 	states := builtin.make([]Sensor, PARTICLES,                  context.temp_allocator)
 	alive  := builtin.make([]bool,   PARTICLES,                  context.temp_allocator)
@@ -735,11 +855,12 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 	}
 
 	terminal_states := builtin.make([]f32, PARTICLES * SENSOR_SIZE,  context.temp_allocator)
-	terminal_probs  := builtin.make([]f32, PARTICLES * ACTION_COUNT, context.temp_allocator)
+	terminal_rows   := builtin.make([]f32, PARTICLES * POLICY_OUT,   context.temp_allocator)
+	critic_inputs   := builtin.make([]f32, PARTICLES * CRITIC_INPUT, context.temp_allocator)
 
 	terminal_q: [VALUE_ENSEMBLE][]f32
 	for v in 0 ..< VALUE_ENSEMBLE {
-		terminal_q[v] = builtin.make([]f32, PARTICLES * ACTION_COUNT, context.temp_allocator)
+		terminal_q[v] = builtin.make([]f32, PARTICLES, context.temp_allocator)
 	}
 
 	for p in 0 ..< PARTICLES {
@@ -750,9 +871,22 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 
 	if ml.pass() {
 		terminal_input := ml.tensor(terminal_states, []int{PARTICLES, SENSOR_SIZE})
-		ml.get_data(ml.softmax(mlp.forward(a.policy, terminal_input)), terminal_probs)
+		ml.get_data(mlp.forward(a.policy, terminal_input), terminal_rows)
+
+		for p in 0 ..< PARTICLES {
+			action := _sample_row(terminal_rows[p * POLICY_OUT:][:POLICY_OUT])
+			base   := p * CRITIC_INPUT
+			for i in 0 ..< SENSOR_SIZE {
+				critic_inputs[base + i] = states[p][i]
+			}
+			for d in 0 ..< ACTION_DIM {
+				critic_inputs[base + SENSOR_SIZE + d] = action[d]
+			}
+		}
+
+		critic_tensor := ml.tensor(critic_inputs, []int{PARTICLES, CRITIC_INPUT})
 		for v in 0 ..< VALUE_ENSEMBLE {
-			ml.get_data(mlp.forward(a.values[v], terminal_input), terminal_q[v])
+			ml.get_data(mlp.forward(a.values[v], critic_tensor), terminal_q[v])
 		}
 	}
 
@@ -761,14 +895,9 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 			continue
 		}
 
-		bootstrap: f32
-		for action_index in 0 ..< ACTION_COUNT {
-			idx := p * ACTION_COUNT + action_index
-			q   := terminal_q[0][idx]
-			for v in 1 ..< VALUE_ENSEMBLE {
-				q = min(q, terminal_q[v][idx])
-			}
-			bootstrap += terminal_probs[idx] * q
+		bootstrap := terminal_q[0][p]
+		for v in 1 ..< VALUE_ENSEMBLE {
+			bootstrap = min(bootstrap, terminal_q[v][p])
 		}
 		scores[p] += discount * bootstrap
 	}
@@ -786,23 +915,4 @@ _rollout :: proc(a: ^Agent, sensor: Sensor, sequences: [][PLAN_HORIZON]int, retu
 		deviation := math.sqrt(max(sq_mean - mean * mean, 0))
 		returns[n] = mean - PESSIMISM * deviation
 	}
-}
-
-@(require_results)
-_sample_action :: proc(probabilities: [ACTION_COUNT]f32) -> int {
-	total: f32
-	for p in probabilities {
-		total += p
-	}
-
-	target := rand.float32() * total
-	sum:    f32
-
-	for action_index in 0 ..< ACTION_COUNT {
-		sum += probabilities[action_index]
-		if target <= sum {
-			return action_index
-		}
-	}
-	return ACTION_COUNT - 1
 }

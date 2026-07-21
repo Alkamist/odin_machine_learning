@@ -7,8 +7,6 @@ import "./agent"
 
 THREAD_COUNT :: 4
 
-#assert(len(sim.Action) == agent.ACTION_COUNT)
-
 main :: proc() {
 	cpu.set_thread_count(THREAD_COUNT)
 
@@ -64,17 +62,17 @@ main :: proc() {
 			human_accumulate(&controls)
 		}
 
-		applied: int
+		applied: agent.Action
 
 		for fixed_timestep(&timestep, sim.FIXED_DELTA) {
 			if !human {
 				action := agent.act(brain)
-				control = sim.action_control(sim.Action(action))
+				control = action[0]
 				applied = action
 			}
 			else {
 				control = human_consume(&controls)
-				applied = int(sim.control_action(control))
+				applied = agent.Action{control}
 			}
 
 			done := sim.step(&game_state, control, sim.FIXED_DELTA)
