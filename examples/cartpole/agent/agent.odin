@@ -73,6 +73,13 @@ REFINE_INTERVAL      :: TRAIN_STEPS / REFINES_PER_DECISION
 
 CONTEXT_SIZE :: 1024 * 1024 * 256
 
+Frozen :: enum {
+	Models,
+	Policy,
+}
+
+Frozen_Set :: bit_set[Frozen]
+
 Transition :: struct {
 	sensor:  Sensor,
 	action:  Action,
@@ -98,6 +105,7 @@ Plan_Step :: struct {
 
 Agent :: struct {
 	reward: Reward_Proc,
+	frozen: Frozen_Set,
 
 	worker:  ^thread.Thread,
 	running: bool,
@@ -366,12 +374,14 @@ _remember :: proc(a: ^Agent, transition: Transition) {
 		a.buffer_count += 1
 	}
 
-	a.delta_samples += 1
-	rate := 1.0 / f32(a.delta_samples)
-	for i in 0 ..< SENSOR_SIZE {
-		d := transition.delta[i]
-		a.delta_mean[i]    += (d     - a.delta_mean[i])    * rate
-		a.delta_sq_mean[i] += (d * d - a.delta_sq_mean[i]) * rate
+	if .Models not_in a.frozen {
+		a.delta_samples += 1
+		rate := 1.0 / f32(a.delta_samples)
+		for i in 0 ..< SENSOR_SIZE {
+			d := transition.delta[i]
+			a.delta_mean[i]    += (d     - a.delta_mean[i])    * rate
+			a.delta_sq_mean[i] += (d * d - a.delta_sq_mean[i]) * rate
+		}
 	}
 }
 
@@ -665,7 +675,7 @@ value_fit :: proc(a: ^Agent) -> (correlation: f32, samples: int) {
 }
 
 _train_policy :: proc(a: ^Agent) {
-	if a.buffer_count < TRAIN_MINIMUM {
+	if a.buffer_count < TRAIN_MINIMUM || .Policy in a.frozen {
 		return
 	}
 
@@ -746,7 +756,7 @@ _encode :: proc(sensor: Sensor, action: Action, dst: []f32) {
 }
 
 _train :: proc(a: ^Agent) {
-	if a.buffer_count < TRAIN_MINIMUM {
+	if a.buffer_count < TRAIN_MINIMUM || .Models in a.frozen {
 		return
 	}
 

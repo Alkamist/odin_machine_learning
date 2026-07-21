@@ -4,6 +4,13 @@ Research notes for the cartpole agent and the learning framework that grows out 
 Written 2026-07-19, at the point where the TD-MPC agent first exhibited catastrophic
 forgetting and we built the headless harness to study it.
 
+> **Status (2026-07-21).** Everything from here to "Experimental ladder" is preserved as
+> written and is now partly historical. The agent it describes was discrete-action; the
+> agent is continuous-action as of `CONTINUOUS_TDMPC.md`, and the value bootstrap that
+> section 4 of "The observed failure" blames is disabled (`BOOTSTRAP_WEIGHT :: 0`). The
+> failure it studies still happens, but not on the schedule diagnosed here — see
+> "Follow-up (2026-07-21c)" at the end for what is currently true and measured.
+
 ## The goal
 
 A general learning framework that learns the way a human does. Two properties matter
@@ -215,3 +222,97 @@ mild slump we captured.
   truly game-agnostic reusable package (runtime-sized sensor/action spaces, the
   sin/cos renormalization in `_apply_delta` is the last game-specific wart, now
   isolated in one proc), and a value head timescale for the agent's own tick rate.
+
+## Follow-up (2026-07-21c): cartpole's instability is not forgetting, and learning is what repairs it
+
+Before implementing the ladder above, we measured which component's *continued training*
+the degradation actually depends on. The answer invalidates the ladder's premise on this
+task.
+
+**Layout.** `examples/world` and `examples/agent` moved under `examples/cartpole/`; the
+brain is now `examples/cartpole/agent/`, its sensor/action ABI `examples/cartpole/world/`.
+The `agent`-imports-`world`-but-never-`sim` split is preserved — that is what
+compiler-enforces the brain's ignorance of the game. The harness is
+`headless.exe [minutes] [seed] [none|models|policy|both] [freeze_after_seconds]`, where
+the freeze modes suspend training of the dynamics ensemble (weights *and* the delta
+normalizer statistics, which must move together or the frozen weights silently change
+meaning through `_apply_delta`) and/or the policy, from the later of mastery and
+`freeze_after`. `agent.Frozen_Set` is the knob.
+
+**The 2026-07-19 timing diagnosis no longer fits.** That section blamed buffer turnover:
+4096 transitions ≈ 7 episodes, buffer fills at episode 8, slump at episode 12. Episodes
+are 600 decisions now, so turnover is still ~episode 7, but degradation lands at episodes
+19-24 across every seed that shows it. And the mechanism's step 4 (planner poisoned by a
+corrupted Q) cannot apply, because `BOOTSTRAP_WEIGHT` is 0 and Q feeds nothing. The
+headless harness also has no perturbation source at all, so "a perturbation drops the
+agent into a forgotten region" cannot be the trigger here either.
+
+**Arm 1 — freeze at mastery** (16 seeds x 15 sim-min, paired by seed; a seed counts as
+degraded if any post-mastery episode falls below 70% upright):
+
+| arm | degraded | mean upright over last 10 episodes |
+| --- | --- | --- |
+| baseline | 3/16 | 94.9% |
+| freeze dynamics | 3/16 | 92.6% |
+| freeze policy | 1/16 | 94.8% |
+| freeze both | 3/16 | 91.2% |
+
+Freezing the dynamics ensemble bought nothing and sometimes brought degradation *forward*
+(seed 6: 570s -> 180s; seed 14: 720s -> 90s). Freezing the policy looked protective, but
+3-vs-1 at n=16 is not significant. Both readings are confounded: freezing at mastery
+conflates "stops rotting" with "stops improving", and an agent frozen the moment it first
+touches 85% is simply an immature agent.
+
+**Arm 2 — freeze late, at 600 sim-seconds** (16 seeds x 20 sim-min, counting every episode
+below 70% upright in the 600s+ window, 304 post-freeze episodes per arm):
+
+| arm | seeds affected | bad episodes | rate |
+| --- | --- | --- | --- |
+| baseline, still learning | 2/16 | 2 | 0.7% |
+| frozen at 600s | 3/16 | 19 | 6.2% |
+
+The counts are similar; the *shape* is not, and that is the finding. Baseline dips are
+single episodes that recover immediately (seed 2 at 660s, seed 14 at 720s, each one
+episode). Frozen dips do not recover: seed 9, which is perfectly clean in baseline, drops
+at 660s and reads 12%, 5%, 47%, 17%, 6%, 16%, 69%, 38%, 61%, 63%, 18%, 12% for the rest
+of the run. Seed 2 goes from a one-episode blip to six bad episodes.
+
+**Conclusion: continued online learning is net protective on cartpole, and it is the
+recovery mechanism.** The degradation events are not caused by learning overwriting
+knowledge — they happen with learning fully switched off, and switching learning off is
+what turns a recoverable dip into a permanent one. The learned components at 600s are not
+a sufficient standalone controller; ongoing adaptation is doing continuous real work.
+
+**Implication for the ladder.** Reservoir sampling and k-WTA both trade plasticity for
+retention. On a task where plasticity is what repairs the failure, both should be expected
+to make cartpole *worse*, and a k-WTA result showing "flatter forgetting curve" here would
+be measuring nothing, because there is no forgetting curve to flatten. Do not run rungs 3
+and 4 against single-task cartpole.
+
+This does **not** refute the retention thesis. It says cartpole alone cannot test it: a
+single task whose state distribution keeps being revisited never poses the retention
+problem. Retention is a cross-task claim — master A, master B, retest A — so the ladder
+needs game B to be meaningful, and it should be built there rather than here. What
+survives to game B unchanged: the trust-aware bootstrap (rung 5) is still worth doing and
+is independent of all of this.
+
+**What the remaining gap actually is.** Measured against the current goal, two things, and
+neither is forgetting:
+
+- *Mastery-time variance.* All 16 seeds master cartpole, but 4/16 need more than 150
+  sim-seconds (up to 240s). The agent is not failing to learn; it is sometimes taking four
+  minutes instead of ninety seconds. Against "on the order of a minute or two" those are
+  real misses.
+- *Rare transient dips.* 2 bad episodes in 304 while learning, both self-repairing within
+  one episode.
+
+**Coverage.** `examples/cartpole/tests/learning_check.odin` is now a multi-seed sweep with
+early-out at both levels: 8 seeds on 8 threads (thread-local ml contexts, backend thread
+count set to 1 so seed-parallelism replaces op-parallelism rather than contending with it),
+each seed stopping the instant its own verdict is knowable (`Slow` if it misses 85% upright
+by 150 sim-seconds, `Degraded` on the first sub-70% episode after mastery), plus a shared
+atomic failure counter that aborts every remaining seed once the sweep's verdict is
+decided. 90 seconds wall to fail, ~2.5 minutes to pass. The `value_fit` assertion was
+dropped — see `CONTINUOUS_TDMPC.md`. **Results are only comparable at a fixed backend
+thread count**: parallel reduction order changes the floats, and seed 4 reads 98% at one
+thread versus 44% at four. Same class of trap as the `core:testing` PRNG mismatch.

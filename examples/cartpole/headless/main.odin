@@ -13,11 +13,16 @@ import "../sim"
 import "../agent"
 import "../world"
 
-THREAD_COUNT :: 4
+THREAD_COUNT :: 1
+
+MASTERY_UPRIGHT :: f32(0.85)
+DEGRADE_FLOOR   :: f32(0.70)
 
 main :: proc() {
-	minutes := f64(10)
-	seed    := u64(1)
+	minutes      := f64(10)
+	seed         := u64(1)
+	freeze_after := f64(0)
+	freeze:       agent.Frozen_Set
 
 	if len(os.args) > 1 {
 		if value, ok := strconv.parse_f64(os.args[1]); ok {
@@ -27,6 +32,22 @@ main :: proc() {
 	if len(os.args) > 2 {
 		if value, ok := strconv.parse_u64(os.args[2]); ok {
 			seed = value
+		}
+	}
+	if len(os.args) > 3 {
+		switch os.args[3] {
+		case "none":
+		case "models": freeze = {.Models}
+		case "policy": freeze = {.Policy}
+		case "both":   freeze = {.Models, .Policy}
+		case:
+			fmt.eprintfln("unknown freeze mode %q, expected none, models, policy, or both", os.args[3])
+			os.exit(1)
+		}
+	}
+	if len(os.args) > 4 {
+		if value, ok := strconv.parse_f64(os.args[4]); ok {
+			freeze_after = value
 		}
 	}
 
@@ -52,10 +73,14 @@ main :: proc() {
 	sim_time: f64
 	episode:  u64 = 1
 
-	best_score:   f32
-	best_upright: f32
-	scores:       [dynamic]f32
-	uprights:     [dynamic]f32
+	best_score:    f32
+	best_upright:  f32
+	mastered:      bool
+	mastered_at:   f64
+	degraded:      bool
+	degraded_at:   f64
+	scores:        [dynamic]f32
+	uprights:      [dynamic]f32
 	defer delete(scores)
 	defer delete(uprights)
 
@@ -84,6 +109,18 @@ main :: proc() {
 			}
 			if upright > best_upright {
 				best_upright = upright
+			}
+
+			if !mastered && upright >= MASTERY_UPRIGHT {
+				mastered    = true
+				mastered_at = sim_time
+			}
+			if mastered && sim_time >= freeze_after {
+				brain.frozen = freeze
+			}
+			if mastered && !degraded && upright < DEGRADE_FLOOR {
+				degraded    = true
+				degraded_at = sim_time
 			}
 
 			fmt.printfln(
@@ -131,4 +168,9 @@ main :: proc() {
 	fmt.printfln("final match      %.0f%%", agent.policy_match(brain) * 100)
 	fmt.printfln("value fit        %.2f (%d samples)", final_fit, fit_samples)
 	fmt.printfln("overall speedup  %.1fx", sim_time / max(wall_elapsed, 1e-9))
+
+	fmt.printfln(
+		"result seed=%d freeze=%v freeze_after=%.0f mastered=%v mastered_at=%.0f degraded=%v degraded_at=%.0f upright_last10=%.4f episodes=%d",
+		seed, freeze, freeze_after, mastered, mastered_at, degraded, degraded_at, recent_upright, len(scores),
+	)
 }

@@ -192,7 +192,9 @@ gate is met.
 Coverage: `examples/cartpole/tests/` (package `cartpole_tests`, kept out of the main
 `tests` suite so box2d stays unlinked there) runs the real sim+agent headless for
 90 sim-seconds at seeds 1-2 and asserts best score ≥ 45 (~30s wall). Run with
-`odin test examples/cartpole/tests -o:speed`.
+`odin test examples/cartpole/tests -o:speed`. *(Superseded twice: the score gate became
+an upright gate in the 2026-07-21b follow-up, and the whole check was rewritten as a
+multi-seed early-outing sweep on 2026-07-21c — see `CONTINUAL_LEARNING.md`.)*
 
 Standing implication for the roadmap: on cartpole the value function does no work. It is
 insurance for harder games (where the horizon can't span the reward) and the load-bearing
@@ -271,7 +273,10 @@ decimal), taken before starting game B:
   against `min_i Q_i(s, a)`. Measured: **0.76 after one episode, 0.84-0.87 thereafter**.
   Q was in fact learning a sensible function the whole time; it was simply unread. The
   learning check now asserts fit ≥ 0.5, so the trust-aware bootstrap will be debugging one
-  new thing rather than two.
+  new thing rather than two. *(The assertion was dropped on 2026-07-21c: a seed that never
+  learned to balance at all still reported fit 0.91, so the statistic measures Q's
+  self-consistency with the return it actually observes, not competence. Still reported,
+  no longer gated; it earns a gate back when the bootstrap reads it.)*
 - **The sin/cos renormalization is now data, not code.** `_apply_delta`'s hardcoded
   `state[2]/state[3]` wart is replaced by `[]Angle_Pair` passed to `agent.make` and copied
   into a fixed `MAX_ANGLE_PAIRS` array, with bounds asserted at construction. Cartpole
