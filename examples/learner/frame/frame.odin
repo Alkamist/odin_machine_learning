@@ -1,6 +1,8 @@
-package main
+package frame
 
 import "core:time"
+
+MAX_STEPS :: 8
 
 Fixed_Timestep :: struct {
 	is_looping:    bool,
@@ -11,8 +13,6 @@ Fixed_Timestep :: struct {
 
 @(require_results)
 fixed_timestep :: proc(step: ^Fixed_Timestep, fixed_delta: f32) -> bool {
-	MAX_STEPS :: 8
-
 	if !step.is_looping {
 		current_tick := time.tick_now()
 		if step.previous_tick._nsec != 0 {

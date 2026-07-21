@@ -5,6 +5,7 @@ import "core:math"
 import rl "vendor:raylib"
 
 import "../cartpole"
+import "../frame"
 
 window_open :: proc() {
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
@@ -86,7 +87,7 @@ human_consume :: proc(controls: ^Human_Control) -> f32 {
 
 box_draw :: proc(box: cartpole.Box, color: rl.Color, interpolation: f32) {
 	position := math.lerp(box.position_, cartpole.box_position(box), interpolation)
-	rotation := lerp_angle(-rl.RAD2DEG * box.rotation_, -rl.RAD2DEG * cartpole.box_rotation(box), interpolation)
+	rotation := frame.lerp_angle(-rl.RAD2DEG * box.rotation_, -rl.RAD2DEG * cartpole.box_rotation(box), interpolation)
 	rl.DrawRectanglePro(
 		{position.x, -position.y, box.size.x, box.size.y},
 		box.size / 2.0,

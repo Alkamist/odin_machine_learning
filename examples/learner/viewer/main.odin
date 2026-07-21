@@ -2,6 +2,8 @@ package main
 
 import cpu "../../../backends/cpu"
 
+import "../frame"
+
 import "../cartpole"
 import "../agent"
 import "../world"
@@ -23,7 +25,7 @@ main :: proc() {
 	human:    bool
 	control:  f32
 	controls: Human_Control
-	timestep: Fixed_Timestep
+	timestep: frame.Fixed_Timestep
 
 	sim_time: f64
 	episode:  u64 = 1
@@ -65,7 +67,7 @@ main :: proc() {
 
 		applied: world.Action
 
-		for fixed_timestep(&timestep, cartpole.FIXED_DELTA) {
+		for frame.fixed_timestep(&timestep, cartpole.FIXED_DELTA) {
 			if !human {
 				action := agent.act(brain)
 				control = action[world.ACTION_AXIS_X]
