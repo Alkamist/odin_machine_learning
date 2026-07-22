@@ -34,7 +34,7 @@ main :: proc() {
 	lander.init(&game)
 	defer lander.destroy(&game)
 
-	brain := agent.create(lander.SENSOR_COUNT, lander.ACTION_COUNT, lander.reward, normalize=lander.normalize, compute_threads=THREAD_COUNT)
+	brain := agent.create(lander.SENSOR_COUNT, lander.ACTION_COUNT, lander.reward, normalize=lander.normalize, pacing_tolerance=agent.PACING_PINNED, compute_threads=THREAD_COUNT)
 	defer agent.destroy(brain)
 
 	sensor: [lander.SENSOR_COUNT]f32
@@ -90,8 +90,8 @@ main :: proc() {
 				sim_time / max(wall_elapsed, 1e-9),
 			)
 
+			agent.end_episode(brain, sensor[:])
 			lander.reset(&game)
-			agent.end_episode(brain)
 		}
 	}
 
@@ -122,6 +122,7 @@ main :: proc() {
 	fmt.printfln("crashed         %d", counts[.Crashed])
 	fmt.printfln("timed out       %d", counts[.Timeout])
 	fmt.printfln("value fit       %.2f (%d samples)", summary.value_fit, summary.fit_samples)
+	fmt.printfln("value trust     %.2f", summary.value_trust)
 	fmt.printfln("total decisions %d", summary.decisions)
 	fmt.printfln("final match     %.0f%%", summary.policy_match * 100)
 	fmt.printfln("overall speedup %.1fx", sim_time / max(wall_elapsed, 1e-9))

@@ -118,8 +118,8 @@ main :: proc() {
 			agent.observe(brain, sim_time, sensor[:], applied=applied[:])
 
 			if done {
+				agent.end_episode(brain, sensor[:])
 				cartpole.reset(&game)
-				agent.end_episode(brain)
 			}
 		}
 

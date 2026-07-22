@@ -128,8 +128,8 @@ _run_seed :: proc(run: ^Seed_Run) {
 			break
 		}
 
+		agent.end_episode(brain, sensor[:])
 		cartpole.reset(&game)
-		agent.end_episode(brain)
 	}
 
 	summary        := agent.stats(brain)

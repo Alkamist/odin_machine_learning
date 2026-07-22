@@ -356,7 +356,7 @@ normalize :: proc(sensor: []f32) {
 }
 
 @(require_results)
-reward :: proc(sensor: []f32) -> (reward: f32, dead: bool) {
+reward :: proc(sensor: []f32) -> (reward: f32, done: bool, failed: bool) {
 	cos_angle := sensor[SENSOR_ANGLE_COS]
 	spin      := sensor[SENSOR_SPIN] * W_SCALE
 
@@ -376,6 +376,7 @@ reward :: proc(sensor: []f32) -> (reward: f32, dead: bool) {
 	barrier := max(abs(sensor[SENSOR_X]) - BARRIER_ONSET, 0)
 	reward  -= BARRIER_WEIGHT * barrier * barrier
 
-	dead = abs(sensor[SENSOR_X]) > 0.9
+	done   = abs(sensor[SENSOR_X]) > 0.9
+	failed = done
 	return
 }

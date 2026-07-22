@@ -128,8 +128,8 @@ main :: proc() {
 				sim_time / max(wall_elapsed, 1e-9),
 			)
 
+			agent.end_episode(brain, sensor[:])
 			cartpole.reset(&game)
-			agent.end_episode(brain)
 		}
 	}
 

@@ -110,8 +110,33 @@ _forget_episode :: proc(a: ^Agent) {
 	_plan_reset(a)
 }
 
+_close_episode :: proc(a: ^Agent) {
+	if a.has_previous {
+		action := make([]f32, a.action_count, allocator=context.temp_allocator)
+		sync.mutex_lock(&a.action_mutex)
+		copy(action, a.latch)
+		sync.mutex_unlock(&a.action_mutex)
+
+		reward, done, failed := a.score(a.ending_snapshot)
+		_remember(a, a.previous, action, a.ending_snapshot, reward, failed, done, a.previous_planned)
+	}
+	_forget_episode(a)
+}
+
 @(require_results)
 _step :: proc(a: ^Agent) -> (idle: bool) {
+	sync.mutex_lock(&a.ending_mutex)
+	ending := a.ending
+	if ending {
+		copy(a.ending_snapshot, a.ending_sensor)
+		a.ending = false
+	}
+	sync.mutex_unlock(&a.ending_mutex)
+
+	if ending {
+		_close_episode(a)
+	}
+
 	if a.snapshot.episode != a.last_episode {
 		_forget_episode(a)
 		a.last_episode = a.snapshot.episode
@@ -147,8 +172,13 @@ _decide :: proc(a: ^Agent) {
 
 	if a.has_previous {
 		applied := a.snapshot.has_applied ? a.snapshot.applied : a.latch
-		reward, dead := a.score(sensor)
-		_remember(a, a.previous, applied, sensor, reward, dead, a.previous_planned)
+		reward, done, failed := a.score(sensor)
+		_remember(a, a.previous, applied, sensor, reward, failed, done, a.previous_planned)
+
+		if done {
+			_forget_episode(a)
+			return
+		}
 	}
 
 	action       := make([]f32, a.action_count, allocator=context.temp_allocator)
@@ -193,7 +223,10 @@ _decide :: proc(a: ^Agent) {
 
 	if a.decisions % VALUE_FIT_INTERVAL == 0 {
 		correlation, samples := _value_fit(a)
+		a.value_trust = _trust(correlation, samples)
+
 		sync.atomic_store(&a.published_value_fit,   transmute(u32)correlation)
+		sync.atomic_store(&a.published_value_trust, transmute(u32)a.value_trust)
 		sync.atomic_store(&a.published_fit_samples, samples)
 	}
 }

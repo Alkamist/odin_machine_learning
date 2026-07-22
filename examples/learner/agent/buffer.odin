@@ -18,7 +18,7 @@ _buffer_delta :: proc(a: ^Agent, index: int) -> []f32 {
 	return a.buffer_deltas[index * a.sensor_count:][:a.sensor_count]
 }
 
-_remember :: proc(a: ^Agent, sensor, action, successor: []f32, reward: f32, dead, planned: bool) {
+_remember :: proc(a: ^Agent, sensor, action, successor: []f32, reward: f32, dead, terminal, planned: bool) {
 	index := a.buffer_next
 
 	copy(_buffer_sensor(a, index), sensor)
@@ -29,9 +29,10 @@ _remember :: proc(a: ^Agent, sensor, action, successor: []f32, reward: f32, dead
 		delta[i] = successor[i] - sensor[i]
 	}
 
-	a.buffer_rewards[index] = reward
-	a.buffer_dead[index]    = dead
-	a.buffer_planned[index] = planned
+	a.buffer_rewards[index]  = reward
+	a.buffer_dead[index]     = dead
+	a.buffer_terminal[index] = terminal
+	a.buffer_planned[index]  = planned
 
 	a.buffer_next = (a.buffer_next + 1) % BUFFER_CAPACITY
 	if a.buffer_count < BUFFER_CAPACITY {

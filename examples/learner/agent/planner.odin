@@ -135,6 +135,48 @@ _policy_seed :: proc(a: ^Agent, sensor: []f32, sequences: []f32, count: int) {
 	}
 }
 
+_bootstrap :: proc(a: ^Agent, states: []f32, alive: []bool, scores: []f32, weight: f32) {
+	PARTICLES :: PLAN_SAMPLES * ENSEMBLE_SIZE
+
+	input_size := _encoded_size(a)
+
+	rows   := make([]f32, PARTICLES * a.action_count, allocator=context.temp_allocator)
+	inputs := make([]f32, PARTICLES * input_size,     allocator=context.temp_allocator)
+	action := make([]f32, a.action_count,             allocator=context.temp_allocator)
+
+	estimates: [VALUE_ENSEMBLE][]f32
+	for v in 0 ..< VALUE_ENSEMBLE {
+		estimates[v] = make([]f32, PARTICLES, allocator=context.temp_allocator)
+	}
+
+	if ml.pass() {
+		x := ml.tensor(states, []int{PARTICLES, a.sensor_count})
+		ml.get_data(mlp.forward(a.policy, x), rows)
+
+		for p in 0 ..< PARTICLES {
+			_mean_row(a, rows[p * a.action_count:][:a.action_count], action)
+			_encode(a, states[p * a.sensor_count:][:a.sensor_count], action, inputs[p * input_size:][:input_size])
+		}
+
+		y := ml.tensor(inputs, []int{PARTICLES, input_size})
+		for v in 0 ..< VALUE_ENSEMBLE {
+			ml.get_data(mlp.forward(a.values[v], y), estimates[v])
+		}
+	}
+
+	for p in 0 ..< PARTICLES {
+		if !alive[p] {
+			continue
+		}
+
+		q := estimates[0][p]
+		for v in 1 ..< VALUE_ENSEMBLE {
+			q = min(q, estimates[v][p])
+		}
+		scores[p] += weight * q
+	}
+}
+
 _rollout :: proc(a: ^Agent, sensor: []f32, sequences: []f32, returns: []f32) {
 	PARTICLES :: PLAN_SAMPLES * ENSEMBLE_SIZE
 
@@ -174,18 +216,26 @@ _rollout :: proc(a: ^Agent, sensor: []f32, sequences: []f32, returns: []f32) {
 					state := states[particle * a.sensor_count:][:a.sensor_count]
 					_apply_delta(a, state, deltas[n * a.sensor_count:][:a.sensor_count])
 
-					reward, dead     := a.score(state)
-					scores[particle] += discount * reward
+					reward, done, failed := a.score(state)
+					scores[particle]     += discount * reward
 
-					if dead {
-						scores[particle] -= DEATH_PENALTY
-						alive[particle]   = false
+					if failed {
+						scores[particle] -= discount * DEATH_PENALTY
+					}
+					if done {
+						alive[particle] = false
 					}
 				}
 			}
 		}
 
 		discount *= PLAN_DISCOUNT
+	}
+
+	when BOOTSTRAP_ENABLED {
+		if a.value_trust > 0 {
+			_bootstrap(a, states, alive, scores, discount * a.value_trust)
+		}
 	}
 
 	for n in 0 ..< PLAN_SAMPLES {

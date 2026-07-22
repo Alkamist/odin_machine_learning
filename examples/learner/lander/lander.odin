@@ -241,8 +241,8 @@ step :: proc(state: ^State, action: []f32, delta: f32) -> (done: bool) {
 	sensor: [SENSOR_COUNT]f32
 	observe(state^, sensor[:])
 
-	step_reward, _ := reward(sensor[:])
-	state.score    += step_reward * delta
+	step_reward, _, _ := reward(sensor[:])
+	state.score       += step_reward * delta
 
 	state.outcome = classify(sensor[:])
 	if state.outcome == .Flying && state.time > TIME_LIMIT {
@@ -304,7 +304,7 @@ normalize :: proc(sensor: []f32) {
 }
 
 @(require_results)
-reward :: proc(sensor: []f32) -> (reward: f32, dead: bool) {
+reward :: proc(sensor: []f32) -> (reward: f32, done: bool, failed: bool) {
 	offset     := sensor[SENSOR_X]
 	height     := sensor[SENSOR_Y]
 	velocity_x := sensor[SENSOR_VELOCITY_X]
@@ -320,8 +320,10 @@ reward :: proc(sensor: []f32) -> (reward: f32, dead: bool) {
 	switch classify(sensor) {
 	case .Landed:
 		reward += LANDING_BONUS
+		done    = true
 	case .Missed, .Crashed:
-		dead = true
+		done   = true
+		failed = true
 	case .Flying, .Timeout:
 	}
 	return

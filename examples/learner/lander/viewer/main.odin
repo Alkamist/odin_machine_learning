@@ -159,8 +159,8 @@ main :: proc() {
 				if outcome == .Landed {
 					landings += 1
 				}
+				agent.end_episode(brain, sensor[:])
 				lander.reset(&game)
-				agent.end_episode(brain)
 			}
 		}
 

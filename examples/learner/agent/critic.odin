@@ -16,6 +16,7 @@ _train_value :: proc(a: ^Agent) {
 	critic_now := make([]f32,  TRAIN_BATCH_SIZE * critic_input,   allocator=context.temp_allocator)
 	rewards    := make([]f32,  TRAIN_BATCH_SIZE,                  allocator=context.temp_allocator)
 	deaths     := make([]bool, TRAIN_BATCH_SIZE,                  allocator=context.temp_allocator)
+	terminals  := make([]bool, TRAIN_BATCH_SIZE,                  allocator=context.temp_allocator)
 
 	for b in 0 ..< TRAIN_BATCH_SIZE {
 		index  := _sample_index(a)
@@ -29,8 +30,9 @@ _train_value :: proc(a: ^Agent) {
 
 		_encode(a, sensor, _buffer_action(a, index), critic_now[b * critic_input:][:critic_input])
 
-		rewards[b] = a.buffer_rewards[index]
-		deaths[b]  = a.buffer_dead[index]
+		rewards[b]   = a.buffer_rewards[index]
+		deaths[b]    = a.buffer_dead[index]
+		terminals[b] = a.buffer_terminal[index]
 	}
 
 	successor_rows := make([]f32, TRAIN_BATCH_SIZE * a.action_count, allocator=context.temp_allocator)
@@ -61,6 +63,10 @@ _train_value :: proc(a: ^Agent) {
 	for b in 0 ..< TRAIN_BATCH_SIZE {
 		if deaths[b] {
 			targets[b] = rewards[b] - DEATH_PENALTY
+			continue
+		}
+		if terminals[b] {
+			targets[b] = rewards[b]
 			continue
 		}
 
@@ -128,6 +134,9 @@ _observed_return :: proc(a: ^Agent, position: int) -> (observed: f32, ok: bool) 
 			observed -= discount * DEATH_PENALTY
 			return observed, true
 		}
+		if a.buffer_terminal[index] {
+			return observed, true
+		}
 
 		discount *= PLAN_DISCOUNT
 		cursor   += 1
@@ -168,6 +177,14 @@ _correlation :: proc(x, y: []f32) -> f32 {
 		return 0
 	}
 	return covariance / spread
+}
+
+@(require_results)
+_trust :: proc(correlation: f32, samples: int) -> f32 {
+	if samples < BOOTSTRAP_MIN_SAMPLES {
+		return 0
+	}
+	return clamp((correlation - BOOTSTRAP_TRUST_FLOOR) / (BOOTSTRAP_TRUST_PEAK - BOOTSTRAP_TRUST_FLOOR), 0, 1)
 }
 
 @(require_results)
