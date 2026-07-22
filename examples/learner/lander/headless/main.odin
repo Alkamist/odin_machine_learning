@@ -121,6 +121,7 @@ main :: proc() {
 	fmt.printfln("missed pad      %d", counts[.Missed])
 	fmt.printfln("crashed         %d", counts[.Crashed])
 	fmt.printfln("timed out       %d", counts[.Timeout])
+	fmt.printfln("value fit       %.2f (%d samples)", summary.value_fit, summary.fit_samples)
 	fmt.printfln("total decisions %d", summary.decisions)
 	fmt.printfln("final match     %.0f%%", summary.policy_match * 100)
 	fmt.printfln("overall speedup %.1fx", sim_time / max(wall_elapsed, 1e-9))
