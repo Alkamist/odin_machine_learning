@@ -34,7 +34,7 @@ main :: proc() {
 	lander.init(&game)
 	defer lander.destroy(&game)
 
-	brain := agent.create(lander.SENSOR_COUNT, lander.ACTION_COUNT, lander.reward, normalize=lander.normalize, pacing_tolerance=agent.PACING_PINNED, compute_threads=THREAD_COUNT)
+	brain := agent.create(lander.SENSOR_COUNT, lander.ACTION_COUNT, lander.reward, potential=lander.POTENTIAL_ENABLED ? lander.potential : nil, normalize=lander.normalize, pacing_tolerance=agent.PACING_PINNED, compute_threads=THREAD_COUNT)
 	defer agent.destroy(brain)
 
 	sensor: [lander.SENSOR_COUNT]f32

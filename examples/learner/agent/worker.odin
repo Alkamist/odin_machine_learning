@@ -117,8 +117,11 @@ _close_episode :: proc(a: ^Agent) {
 		copy(action, a.latch)
 		sync.mutex_unlock(&a.action_mutex)
 
+		before               := _potential(a, a.previous)
 		reward, done, failed := a.score(a.ending_snapshot)
-		_remember(a, a.previous, action, a.ending_snapshot, reward, failed, done, a.previous_planned)
+		shaped               := _shaped_reward(a, reward, before, a.ending_snapshot, done)
+
+		_remember(a, a.previous, action, a.ending_snapshot, shaped, failed, done, a.previous_planned)
 	}
 	_forget_episode(a)
 }
@@ -171,9 +174,12 @@ _decide :: proc(a: ^Agent) {
 	sensor := a.snapshot.sensor
 
 	if a.has_previous {
-		applied := a.snapshot.has_applied ? a.snapshot.applied : a.latch
+		applied              := a.snapshot.has_applied ? a.snapshot.applied : a.latch
+		before               := _potential(a, a.previous)
 		reward, done, failed := a.score(sensor)
-		_remember(a, a.previous, applied, sensor, reward, failed, done, a.previous_planned)
+		shaped               := _shaped_reward(a, reward, before, sensor, done)
+
+		_remember(a, a.previous, applied, sensor, shaped, failed, done, a.previous_planned)
 
 		if done {
 			_forget_episode(a)

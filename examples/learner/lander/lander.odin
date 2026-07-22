@@ -61,6 +61,15 @@ VEL_WEIGHT  :: f32(3)
 TILT_WEIGHT :: f32(3)
 SPIN_WEIGHT :: f32(2)
 
+REWARD_DENSE         :: 0
+REWARD_NO_POS        :: 1
+REWARD_GOAL          :: 2
+REWARD_POTENTIAL_POS :: 3
+REWARD_POTENTIAL     :: 4
+
+REWARD_MODE       :: #config(LANDER_REWARD, REWARD_DENSE)
+POTENTIAL_ENABLED :: REWARD_MODE == REWARD_POTENTIAL_POS || REWARD_MODE == REWARD_POTENTIAL
+
 PAD_SURFACE_Y :: GROUND_Y + GROUND_SIZE.y / 2.0
 
 CONTACT_CAPACITY :: 8
@@ -304,18 +313,44 @@ normalize :: proc(sensor: []f32) {
 }
 
 @(require_results)
-reward :: proc(sensor: []f32) -> (reward: f32, done: bool, failed: bool) {
-	offset     := sensor[SENSOR_X]
-	height     := sensor[SENSOR_Y]
-	velocity_x := sensor[SENSOR_VELOCITY_X]
-	velocity_y := sensor[SENSOR_VELOCITY_Y]
-	cos_angle  := sensor[SENSOR_ANGLE_COS]
-	spin       := sensor[SENSOR_SPIN]
+potential :: proc(sensor: []f32) -> f32 {
+	offset := sensor[SENSOR_X]
+	height := sensor[SENSOR_Y]
 
-	reward  = -POS_WEIGHT * (offset * offset + height * height)
-	reward -=  VEL_WEIGHT * (velocity_x * velocity_x + velocity_y * velocity_y)
-	reward -=  TILT_WEIGHT * (1 - cos_angle)
-	reward -=  SPIN_WEIGHT * spin * spin
+	value := -POS_WEIGHT * (offset * offset + height * height)
+
+	when REWARD_MODE == REWARD_POTENTIAL {
+		velocity_x := sensor[SENSOR_VELOCITY_X]
+		velocity_y := sensor[SENSOR_VELOCITY_Y]
+		cos_angle  := sensor[SENSOR_ANGLE_COS]
+		spin       := sensor[SENSOR_SPIN]
+
+		value -= VEL_WEIGHT * (velocity_x * velocity_x + velocity_y * velocity_y)
+		value -= TILT_WEIGHT * (1 - cos_angle)
+		value -= SPIN_WEIGHT * spin * spin
+	}
+	return value
+}
+
+@(require_results)
+reward :: proc(sensor: []f32) -> (reward: f32, done: bool, failed: bool) {
+	when REWARD_MODE == REWARD_DENSE {
+		offset := sensor[SENSOR_X]
+		height := sensor[SENSOR_Y]
+
+		reward -= POS_WEIGHT * (offset * offset + height * height)
+	}
+
+	when REWARD_MODE == REWARD_DENSE || REWARD_MODE == REWARD_NO_POS {
+		velocity_x := sensor[SENSOR_VELOCITY_X]
+		velocity_y := sensor[SENSOR_VELOCITY_Y]
+		cos_angle  := sensor[SENSOR_ANGLE_COS]
+		spin       := sensor[SENSOR_SPIN]
+
+		reward -= VEL_WEIGHT * (velocity_x * velocity_x + velocity_y * velocity_y)
+		reward -= TILT_WEIGHT * (1 - cos_angle)
+		reward -= SPIN_WEIGHT * spin * spin
+	}
 
 	switch classify(sensor) {
 	case .Landed:

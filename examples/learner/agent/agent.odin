@@ -5,11 +5,13 @@ import "base:runtime"
 import "core:mem"
 import "core:sync"
 import "core:thread"
+import "core:time"
 
 import ml "../../../"
 import    "../../../networks/mlp"
 
 Score_Proc     :: proc(sensor: []f32) -> (reward: f32, done: bool, failed: bool)
+Potential_Proc :: proc(sensor: []f32) -> f32
 Normalize_Proc :: proc(sensor: []f32)
 
 HIDDEN_SIZE   :: 32
@@ -18,7 +20,7 @@ ENSEMBLE_SIZE :: 5
 PLAN_HORIZON  :: 20
 PLAN_SAMPLES  :: 64
 PLAN_ELITES   :: 8
-PLAN_DISCOUNT :: f32(0.98)
+PLAN_DISCOUNT :: f32(#config(LEARNER_DISCOUNT, 0.98))
 
 PLAN_INIT_STD :: f32(0.5)
 PLAN_MIN_STD  :: f32(0.05)
@@ -61,6 +63,9 @@ REFINE_INTERVAL      :: TRAIN_STEPS / REFINES_PER_DECISION
 PACING_ASYNC  :: DECISION_PERIOD
 PACING_PINNED :: f64(0)
 
+CATCH_UP_SPINS :: 64
+CATCH_UP_SLEEP :: 50 * time.Microsecond
+
 CONTEXT_SIZE :: 1024 * 1024 * 256
 
 Frozen :: enum {
@@ -84,6 +89,7 @@ Agent :: struct {
 	action_count: int,
 
 	score:     Score_Proc,
+	potential: Potential_Proc,
 	normalize: Normalize_Proc,
 
 	decision_period:  f64,
@@ -161,6 +167,7 @@ Agent :: struct {
 create :: proc(
 	sensor_count, action_count: int,
 	score:                      Score_Proc,
+	potential:                  Potential_Proc = nil,
 	normalize:                  Normalize_Proc = nil,
 	decision_period          := DECISION_PERIOD,
 	pacing_tolerance         := PACING_ASYNC,
@@ -180,6 +187,7 @@ create :: proc(
 		sensor_count     = sensor_count,
 		action_count     = action_count,
 		score            = score,
+		potential        = potential,
 		normalize        = normalize,
 		decision_period  = decision_period,
 		pacing_tolerance = pacing_tolerance,
@@ -306,16 +314,36 @@ stats :: proc(a: ^Agent) -> Stats {
 	}
 }
 
-catch_up :: proc(a: ^Agent, time: f64) {
+catch_up :: proc(a: ^Agent, moment: f64) {
+	spins: int
+
 	for sync.atomic_load(&a.running) {
-		if transmute(f64)sync.atomic_load(&a.published_processed_time) >= time - a.pacing_tolerance {
+		if transmute(f64)sync.atomic_load(&a.published_processed_time) >= moment - a.pacing_tolerance {
 			return
 		}
-		thread.yield()
+
+		spins += 1
+		if spins < CATCH_UP_SPINS {
+			thread.yield()
+		}
+		else {
+			time.sleep(CATCH_UP_SLEEP)
+		}
 	}
 }
 
 @(require_results)
 _frozen :: proc(a: ^Agent) -> Frozen_Set {
 	return transmute(Frozen_Set)sync.atomic_load(&a.frozen_bits)
+}
+
+@(require_results)
+_potential :: proc(a: ^Agent, sensor: []f32) -> f32 {
+	return a.potential != nil ? a.potential(sensor) : 0
+}
+
+@(require_results)
+_shaped_reward :: proc(a: ^Agent, reward, previous_potential: f32, sensor: []f32, done: bool) -> f32 {
+	successor_potential := done ? 0 : _potential(a, sensor)
+	return reward + PLAN_DISCOUNT * successor_potential - previous_potential
 }

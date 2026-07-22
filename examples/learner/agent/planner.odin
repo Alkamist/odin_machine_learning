@@ -213,11 +213,13 @@ _rollout :: proc(a: ^Agent, sensor: []f32, sequences: []f32, returns: []f32) {
 						continue
 					}
 
-					state := states[particle * a.sensor_count:][:a.sensor_count]
+					state  := states[particle * a.sensor_count:][:a.sensor_count]
+					before := _potential(a, state)
+
 					_apply_delta(a, state, deltas[n * a.sensor_count:][:a.sensor_count])
 
 					reward, done, failed := a.score(state)
-					scores[particle]     += discount * reward
+					scores[particle]     += discount * _shaped_reward(a, reward, before, state, done)
 
 					if failed {
 						scores[particle] -= discount * DEATH_PENALTY
